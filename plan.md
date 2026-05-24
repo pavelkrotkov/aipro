@@ -73,6 +73,21 @@ The Python orchestrator should do this:
 
 Do not implement the workflow as one giant long-running Claude/Codex/Gemini prompt. That will stall, lose state, hallucinate current PR status, duplicate comments, or get confused by stale review threads.
 
+### V1 Scope Constraint
+
+V1 should prove the loop with the fewest moving parts:
+
+- one primary coding agent: `codex_cli`
+- one configured reviewer adapter
+- one fix iteration per workflow run
+- one coherent fix commit per iteration
+- trusted same-repository PR branches only for write-back
+- bot-authored review threads only for auto-reply and auto-resolution
+
+The architecture may keep adapter points for Claude Code, Gemini, Amazon Q, and
+future OSS tools, but those providers should be added after the single-agent
+loop is reliable and idempotent.
+
 ---
 
 ## 3. Repository Strategy
@@ -220,33 +235,21 @@ done_label: "ai-loop-done"
 error_label: "ai-loop-error"
 
 main_coder:
-  provider: claude_code_cli
-  command: "claude"
+  provider: codex_cli
+  command: "codex"
   args:
-    - "-p"
+    - "exec"
     - "{prompt}"
   timeout_seconds: 1800
   output_file: ".ai-orchestrator-result.json"
 
 phases:
-  - id: initial_360_review
+  - id: initial_review
     reviewers:
       - gemini_github
-      - amazon_q_github
     max_rounds: 1
-    trigger_mode: parallel
-    handle_mode: batch
-    poll_interval_seconds: 30
-    per_reviewer_timeout_seconds: 600
-    phase_timeout_seconds: 900
-    stop_when_empty: false
-
-  - id: gemini_stabilization
-    reviewers:
-      - gemini_github
-    max_rounds: 5
     trigger_mode: sequential
-    handle_mode: per_reviewer
+    handle_mode: batch
     poll_interval_seconds: 30
     per_reviewer_timeout_seconds: 600
     phase_timeout_seconds: 900
@@ -261,7 +264,7 @@ reviewers:
     trigger_comment: |
       /gemini review this pull request again. Focus only on correctness, security, data loss, race conditions, broken tests, API compatibility, and risky behavior changes. Ignore style-only nits unless they hide a real defect.
   amazon_q_github:
-    enabled: true
+    enabled: false
     bot_logins:
       - "amazon-q-developer[bot]"
       - "aws-q-developer[bot]"
@@ -280,7 +283,8 @@ git:
   commit_author_name: "AI PR Orchestrator"
   commit_author_email: "ai-pr-orchestrator@example.com"
   commit_message_prefix: "fix: address AI review feedback"
-  squash_on_done: true
+  squash_on_done: false
+  allow_history_rewrite: false
 
 ci:
   require_green_before_next_review_round: true
@@ -294,10 +298,10 @@ safety:
   disallow_workflow_file_changes: true
   never_auto_resolve_human_threads: true
   require_clean_worktree_before_agent: true
-  max_total_iterations: 10
-  max_commits_per_run: 5
-  max_coder_invocations_per_run: 5
-  max_reviewer_triggers_per_run: 15
+  max_total_iterations: 3
+  max_commits_per_run: 1
+  max_coder_invocations_per_run: 1
+  max_reviewer_triggers_per_run: 3
   max_prompt_tokens: 100000
   allowed_pr_author_associations:
     - "OWNER"
@@ -321,11 +325,11 @@ A coder adapter invokes a tool that can edit the working tree.
 
 v1 examples:
 
-- `claude_code_cli`
 - `codex_cli`
 
 Future:
 
+- `claude_code_cli`
 - `aider_cli`
 - `opencode_cli`
 - `goose_cli`
@@ -351,10 +355,10 @@ A reviewer adapter triggers and collects review feedback.
 v1 examples:
 
 - `gemini_github`
-- `amazon_q_github`
 
 Future:
 
+- `amazon_q_github`
 - `codex_github`
 - `claude_github`
 - `generic_cli`
@@ -585,6 +589,11 @@ Side effects happen only in an action executor.
 
 The orchestrator runs as a **long-lived process** within a single GitHub Actions job. Instead of doing one state transition per Actions run and relying on cron for re-entry, the orchestrator loops internally with tight polling intervals.
 
+For V1, "long-lived" means the job may wait for the configured reviewer and CI
+checks, but it should perform at most one coding-agent invocation and one fix
+commit before terminating. Multi-round repair loops are a later capability once
+idempotency and safety are proven.
+
 ### 10.1 Outer Loop
 
 ```python
@@ -633,7 +642,10 @@ def poll_until_reviewer_responses_or_timeout(state, config, pr_number):
             break
 ```
 
-This means if Gemini responds in 30s and Amazon Q in 3 minutes, processing starts at 3 minutes instead of waiting the full phase timeout.
+With one reviewer, processing starts as soon as that reviewer responds or the
+reviewer timeout expires. When multi-reviewer phases are added later, processing
+should start as soon as all configured reviewers have responded or their
+individual timeouts have expired.
 
 ### 10.3 State Machine Flow
 
@@ -668,7 +680,7 @@ if state.status == handling:
     invoke main coder (output via file, see 12.1)
     validate JSON result
     if tests were passing before and fail after coder changes:
-        git reset --hard to pre-coder state
+        restore the worktree to the pre-coder checkpoint
         move to needs_human
     apply decisions:
         - reply to threads
@@ -687,7 +699,7 @@ if state.status == ci_wait:
     if CI failed:
         move to needs_human
 if state.status == done:
-    squash orchestrator commits if configured (see 11)
+    leave PR history unchanged in v1
     post final summary once
     apply done label if configured
     remove active label if configured
@@ -715,7 +727,6 @@ class PlannedAction:
         "resolve_thread",
         "commit_changes",
         "push_branch",
-        "squash_orchestrator_commits",
         "add_label",
         "remove_label",
         "post_final_summary",
@@ -730,17 +741,17 @@ Every durable mutation should be recorded in state as soon as possible.
 
 If a run crashes after a reply but before resolution, rerunning should not repost the same reply. It should continue from the saved state and resolve the thread if still appropriate.
 
-### 11.1 Commit Squash on Done
+### 11.1 History Rewrites
 
-Before posting the final DONE summary, if more than one orchestrator commit was made during the run and `git.squash_on_done` is enabled:
+Automatic history rewriting is out of scope for v1.
 
-1. Identify all commits authored by the orchestrator (matched by `commit_author_email`)
-2. Squash them into a single commit with a combined message
-3. Force-push the branch
+The orchestrator must not force-push or squash commits automatically. Keeping
+history unchanged is less tidy, but it avoids rewriting user branches and makes
+idempotency easier to reason about.
 
-This keeps the PR history clean. The state comment records the individual commit SHAs for audit purposes.
-
-If force-push is disallowed by repo policy, skip the squash and note it in the summary.
+After v1 is stable, a separate maintainer-triggered cleanup command may produce
+a proposed squash plan. That command should be disabled by default and should
+never run on untrusted branches.
 
 ---
 
@@ -756,7 +767,7 @@ The agent must:
 - reject invalid findings with evidence
 - request human help when needed
 - run targeted tests
-- make no more than one coherent commit
+- leave coherent worktree changes for the orchestrator to commit
 - return strict JSON
 - not post GitHub comments
 - not trigger reviewers
@@ -812,8 +823,8 @@ Your job:
 10. Do not post GitHub comments.
 11. Do not trigger reviewer bots.
 12. Do not resolve GitHub conversations.
-13. Do not make more than one commit.
-14. If no code changes are needed, make no commit.
+13. Do not create commits; leave worktree changes for the orchestrator.
+14. If no code changes are needed, leave the worktree clean.
 
 Verdicts:
 - accepted: the reviewer found a real issue and the code was fixed.
@@ -1081,8 +1092,8 @@ Config:
 
 ```yaml
 safety:
-  max_coder_invocations_per_run: 5
-  max_reviewer_triggers_per_run: 15
+  max_coder_invocations_per_run: 1
+  max_reviewer_triggers_per_run: 3
 ```
 
 When limits are hit, move to `needs_human` with a cost summary.
@@ -1093,7 +1104,7 @@ Full token-level cost tracking is a v2 concern. For v1, invocation counts are su
 
 After each coder invocation, if the test suite was passing before the coder ran and fails after:
 
-1. `git reset --hard` to the pre-coder state
+1. Restore the worktree to the pre-coder checkpoint
 2. Move to `needs_human` with a summary of what the coder tried and why tests regressed
 
 Do not push broken code.
@@ -1196,7 +1207,7 @@ Test:
 - commit when changed
 - one commit max
 - test regression -> rollback
-- squash on done
+- no automatic force-push or squash
 - push mocked or disabled
 
 ### 20.5 Live GitHub Tests
@@ -1207,7 +1218,89 @@ Never run live mutation tests by default.
 
 ---
 
-## 21. Issue Backlog
+## 21. Public Repository Assessment
+
+No exact open-source Robobun replacement has been identified. The closest public
+projects should be treated as references, templates, or future adapter sources,
+not as a ready replacement for this orchestrator.
+
+Closest behavioral templates:
+
+- `wwind123/coding-review-agent-loop`
+  - Local Python CLI coordinating Claude, Codex, Gemini, and `gh`.
+  - Useful reference for review-loop behavior.
+  - Small enough to study or fork experimentally, but not a production GitHub
+    state-machine base.
+  - https://github.com/wwind123/coding-review-agent-loop
+
+- `gersmann/codex-review-action`
+  - Codex-focused GitHub Action for PR review and thread handling.
+  - Useful reference for GitHub Action packaging, triggering, deduplication, and
+    Codex-specific adapter behavior.
+  - Too provider-specific to be the core orchestrator.
+  - https://github.com/gersmann/codex-review-action
+
+- `axeldelafosse/loop`
+  - Local Bun/tmux loop for coordinating Codex and Claude.
+  - Useful for session orchestration ideas.
+  - Not a GitHub PR review-thread state machine.
+  - https://github.com/axeldelafosse/loop
+
+- `hamelsmu/claude-review-loop`
+  - Claude Code plugin that uses Codex as a parallel reviewer.
+  - Useful reference for treating reviewer comments as hypotheses.
+  - Not a standalone GitHub Action orchestrator.
+  - https://github.com/hamelsmu/claude-review-loop
+
+Possible heavy replacement:
+
+- Optio
+  - Full agentic engineering platform with ticket-to-PR-to-merge workflows.
+  - Supports multiple coding agents.
+  - Much heavier than the thin action-plus-config architecture here.
+  - https://optio.host/
+
+Useful building blocks:
+
+- `openai/codex-action`
+  - Reference for Codex GitHub Action integration and structured task execution.
+  - https://github.com/openai/codex-action
+
+- `anthropics/claude-code-action`
+  - Reference for Claude Code GitHub integration and automation patterns.
+  - https://github.com/anthropics/claude-code-action
+
+- `google-github-actions/run-gemini-cli`
+  - Reference for invoking Gemini CLI from GitHub Actions.
+  - https://github.com/google-github-actions/run-gemini-cli
+
+- `The-PR-Agent/pr-agent`
+  - Mature PR diff and review plumbing.
+  - Good reference for provider abstractions and comment generation.
+  - Too broad to fork as the orchestration core.
+  - https://github.com/The-PR-Agent/pr-agent
+
+- `vercel-labs/openreview`
+  - Reference for sandboxed AI review infrastructure and inline comments.
+  - https://github.com/vercel-labs/openreview
+
+- `All-Hands-AI/OpenHands` and `SWE-agent/mini-swe-agent`
+  - Possible OSS coding-agent engines for future adapters.
+  - Too large or differently scoped for the V1 orchestrator core.
+  - https://github.com/All-Hands-AI/OpenHands
+  - https://github.com/SWE-agent/mini-swe-agent
+
+Recommendation:
+
+- Build this repository as a small orchestrator with explicit adapters.
+- Do not fork PR-Agent, OpenHands, or a full platform as the core.
+- Use `coding-review-agent-loop`, `codex-review-action`, and
+  `claude-review-loop` as behavioral references.
+- Use official provider actions and CLIs for adapter implementation details.
+
+---
+
+## 22. Issue Backlog
 
 ### Milestone 0 — Skeleton
 
@@ -1277,7 +1370,7 @@ Acceptance criteria:
 
 ### Milestone 3 — Adapters
 
-**Issue 5: Implement coder adapter interface and Claude Code adapter**
+**Issue 5: Implement coder adapter interface and Codex CLI adapter**
 
 Acceptance criteria:
 
@@ -1288,7 +1381,7 @@ Acceptance criteria:
 - stdout/stderr capture
 - output file extraction (`.ai-orchestrator-result.json`)
 - stdout JSON fallback
-- Claude Code CLI adapter working
+- Codex CLI adapter working
 
 ---
 
@@ -1305,11 +1398,11 @@ Acceptance criteria:
 
 ---
 
-**Issue 7: Implement Amazon Q reviewer adapter**
+**Issue 7: Add a second reviewer adapter**
 
 Acceptance criteria:
 
-- `amazon_q_github` adapter working
+- second reviewer adapter selected after v1 is stable
 - trigger comments generated
 - bot authors matched
 - findings collected after trigger timestamp
@@ -1404,7 +1497,7 @@ Acceptance criteria:
 - no commit if unchanged
 - push branch
 - enforce max commits per run
-- squash orchestrator commits on done if configured
+- never force-push or squash automatically in v1
 
 ---
 
@@ -1423,7 +1516,7 @@ Acceptance criteria:
 
 ---
 
-## 22. Recommended Implementation Order
+## 23. Recommended Implementation Order
 
 Implement in this order:
 
@@ -1433,7 +1526,7 @@ Implement in this order:
 4. Pure state machine with fake data
 5. Fake GitHub client
 6. Reviewer adapter interface + Gemini adapter
-7. Coder adapter interface + Claude Code adapter
+7. Coder adapter interface + Codex CLI adapter
 8. Agent prompt builder and JSON validator
 9. Decision application policy + conflict detection
 10. GitHub client (metadata + GraphQL)
@@ -1443,20 +1536,20 @@ Implement in this order:
 14. Dry-run
 15. End-to-end fake-client happy path
 16. Real GitHub dry-run
-17. Amazon Q adapter
+17. Second reviewer adapter
 18. GitHub Actions workflow
 
 Do not start by wiring real Claude/Codex/Gemini. First get the pure state machine and fake-client tests passing.
 
 ---
 
-## 23. v1 Definition of Done
+## 24. v1 Definition of Done
 
 v1 is complete when:
 
 - `aipro dry-run --pr N` shows state and planned actions
 - `aipro run --pr N` can create/read/update hidden state comments
-- reviewer adapters can trigger Gemini and Amazon Q review comments
+- one configured reviewer adapter can trigger review comments
 - unresolved bot review threads can be collected
 - per-reviewer polling works (no blanket wait)
 - fake primary coder can return decisions
@@ -1470,7 +1563,7 @@ v1 is complete when:
 - cost limits are enforced
 - CI can gate phase progression (CI failure -> needs_human)
 - test regression triggers rollback
-- orchestrator commits are squashed on done
+- orchestrator never force-pushes or squashes automatically
 - DONE, NEEDS_HUMAN, and ERROR states work with @-mentions
 - dry-run performs zero mutations
 - unit tests cover the state machine
@@ -1478,7 +1571,7 @@ v1 is complete when:
 
 ---
 
-## 24. v1 Non-Goals
+## 25. v1 Non-Goals
 
 Do not implement initially:
 
@@ -1493,6 +1586,7 @@ Do not implement initially:
 - daemon mode
 - complex UI
 - automatic CI-fix flow (coder fixing CI failures)
+- automatic commit squash or force-push
 - codex_github / claude_github reviewer adapters (add as fast-follows)
 - generic CLI reviewer/coder adapters
 - token-level cost tracking
@@ -1500,7 +1594,7 @@ Do not implement initially:
 
 ---
 
-## 25. Strategic End State
+## 26. Strategic End State
 
 The orchestrator should eventually allow policies like:
 
