@@ -169,6 +169,14 @@ class TestRollback:
         repo.rollback()
         assert (repo.path / "untracked.txt").read_text() == "keep me\n"
 
+    def test_rollback_discards_staged_changes(self, repo: GitRepo) -> None:
+        (repo.path / "README.md").write_text("dirty\n")
+        subprocess.run(["git", "add", "README.md"], cwd=repo.path, check=True)
+        assert repo.is_clean() is False
+        repo.rollback()
+        assert repo.is_clean() is True
+        assert (repo.path / "README.md").read_text() == "init\n"
+
 
 # ---------------------------------------------------------------------------
 # Safety
