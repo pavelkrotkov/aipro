@@ -122,17 +122,30 @@ def test_rejects_config_missing_main_coder_section(tmp_path: Path) -> None:
         load_config(config_path)
 
 
-def test_rejects_invalid_values(tmp_path: Path) -> None:
+def test_rejects_unknown_provider(tmp_path: Path) -> None:
     config_path = write_config(
         tmp_path,
         """
 main_coder:
   provider: unknown
-  timeout_seconds: -1
 """,
     )
 
     with pytest.raises(ConfigError, match=r"main_coder\.provider"):
+        load_config(config_path)
+
+
+def test_rejects_negative_timeout(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+main_coder:
+  provider: codex_cli
+  timeout_seconds: -1
+""",
+    )
+
+    with pytest.raises(ConfigError, match=r"main_coder\.timeout_seconds"):
         load_config(config_path)
 
 

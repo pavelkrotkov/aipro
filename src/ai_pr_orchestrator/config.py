@@ -160,32 +160,12 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
 
 
 def _main_coder(raw: dict[str, Any]) -> MainCoderConfig:
-    _validate_keys(
-        raw,
-        {"provider", "command", "args", "timeout_seconds", "output_file", "env"},
-        "main_coder",
-    )
-    provider = _string(raw, "provider", field_path="main_coder.provider", required=True)
-    if provider not in VALID_PROVIDERS:
+    config = _dataclass_from_mapping(MainCoderConfig, raw, "main_coder")
+    if config.provider not in VALID_PROVIDERS:
         raise ConfigError(
-            f"main_coder.provider must be one of {sorted(VALID_PROVIDERS)}, got {provider!r}"
+            f"main_coder.provider must be one of {sorted(VALID_PROVIDERS)}, got {config.provider!r}"
         )
-
-    return MainCoderConfig(
-        provider=provider,
-        command=_string(raw, "command", "codex", field_path="main_coder.command"),
-        args=_string_list(raw, "args", ["exec", "{prompt}"], field_path="main_coder.args"),
-        timeout_seconds=_positive_int(
-            raw, "timeout_seconds", 1800, field_path="main_coder.timeout_seconds"
-        ),
-        output_file=_string(
-            raw,
-            "output_file",
-            ".ai-orchestrator-result.json",
-            field_path="main_coder.output_file",
-        ),
-        env=_string_list(raw, "env", field_path="main_coder.env"),
-    )
+    return config
 
 
 def _reviewers(raw: dict[str, Any]) -> dict[str, ReviewerConfig]:
@@ -288,30 +268,10 @@ def _bool_value(value: Any, field_path: str) -> bool:
     return value
 
 
-def _positive_int(
-    raw: dict[str, Any],
-    key: str,
-    default: int,
-    *,
-    field_path: str | None = None,
-) -> int:
-    return _positive_int_value(raw.get(key, default), field_path or key)
-
-
 def _positive_int_value(value: Any, field_path: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ConfigError(f"{field_path} must be a non-negative integer")
     return value
-
-
-def _string_list(
-    raw: dict[str, Any],
-    key: str,
-    default: list[str] | None = None,
-    *,
-    field_path: str | None = None,
-) -> list[str]:
-    return _string_list_value(raw.get(key, default or []), field_path or key)
 
 
 def _string_list_value(value: Any, field_path: str) -> list[str]:
