@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, field
 from pathlib import Path
-from typing import Any, get_origin, get_type_hints
+from typing import Any, cast, get_origin, get_type_hints
 
 import yaml
 
@@ -194,13 +194,15 @@ def _dataclass_from_mapping(type_: type[Any], raw: dict[str, Any], prefix: str) 
             raise ConfigError(f"{field_path} is required")
 
         default = _default_value(field_info)
-        value = raw.get(field_name, default)
+        value = raw.get(field_name)
+        if value is None:
+            value = default
         field_type = type_hints.get(field_name)
 
         if field_type is bool:
             kwargs[field_name] = _bool_value(value, field_path)
         elif field_type is int:
-            kwargs[field_name] = _positive_int_value(value, field_path)
+            kwargs[field_name] = _non_negative_int_value(value, field_path)
         elif field_type is str:
             kwargs[field_name] = _string_value(value, field_path)
         elif get_origin(field_type) is list:
@@ -250,7 +252,9 @@ def _string(
     required: bool = False,
 ) -> str:
     path = field_path or key
-    value = raw.get(key, default)
+    value = raw.get(key)
+    if value is None:
+        value = default
     if required and value in (None, ""):
         raise ConfigError(f"{path} is required")
     return _string_value(value, path)
@@ -268,7 +272,7 @@ def _bool_value(value: Any, field_path: str) -> bool:
     return value
 
 
-def _positive_int_value(value: Any, field_path: str) -> int:
+def _non_negative_int_value(value: Any, field_path: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ConfigError(f"{field_path} must be a non-negative integer")
     return value
@@ -277,4 +281,4 @@ def _positive_int_value(value: Any, field_path: str) -> int:
 def _string_list_value(value: Any, field_path: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ConfigError(f"{field_path} must be a list of strings")
-    return [str(item) for item in value]
+    return list(cast(list[str], value))

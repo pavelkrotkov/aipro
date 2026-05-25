@@ -15,8 +15,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface."""
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.pr is not None and args.pr <= 0:
-        raise SystemExit("Pull request number must be a positive integer")
 
     if args.command == "inspect":
         return runner.inspect(pr_number=args.pr)
@@ -46,15 +44,27 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_run_arguments(dry_run_parser)
 
     inspect_parser = subparsers.add_parser("inspect", help="Inspect a pull request")
-    inspect_parser.add_argument("--pr", type=int, required=True, help="Pull request number")
+    inspect_parser.add_argument(
+        "--pr", type=_positive_int, required=True, help="Pull request number"
+    )
 
     return parser
 
 
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--pr", type=int, help="Pull request number")
+    group.add_argument("--pr", type=_positive_int, help="Pull request number")
     group.add_argument("--event-path", help="Path to a GitHub event JSON file")
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _pr_number_from_event(event_path: Path) -> int:

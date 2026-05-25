@@ -108,6 +108,32 @@ main_coder:
     assert config.safety.max_total_iterations == 3
 
 
+def test_blank_optional_values_fall_back_to_defaults(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+enabled_label:
+main_coder:
+  provider: codex_cli
+  command:
+  args:
+  timeout_seconds:
+ci:
+  required_checks:
+  ignored_checks:
+""",
+    )
+
+    config = load_config(config_path)
+
+    assert config.enabled_label == "ai-loop"
+    assert config.main_coder.command == "codex"
+    assert config.main_coder.args == ["exec", "{prompt}"]
+    assert config.main_coder.timeout_seconds == 1800
+    assert config.ci.required_checks == []
+    assert config.ci.ignored_checks == ["AI PR Review Loop"]
+
+
 def test_rejects_config_missing_required_main_coder_provider(tmp_path: Path) -> None:
     config_path = write_config(tmp_path, "main_coder: {}\n")
 

@@ -27,9 +27,12 @@ def test_run_pr_invokes_runner(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("command", ["run", "dry-run", "inspect"])
-def test_pr_argument_must_be_positive(command: str) -> None:
-    with pytest.raises(SystemExit, match="positive integer"):
+def test_pr_argument_must_be_positive(command: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
         cli.main([command, "--pr", "0"])
+
+    assert exc_info.value.code == 2
+    assert "must be a positive integer" in capsys.readouterr().err
 
 
 def test_dry_run_pr_sets_dry_run_flag(monkeypatch: pytest.MonkeyPatch) -> None:
