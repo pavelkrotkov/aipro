@@ -46,4 +46,3 @@ jobs:
         with:
           persist-credentials: false
       - run: pipx run zizmor .github/workflows
-        continue-on-error: true
