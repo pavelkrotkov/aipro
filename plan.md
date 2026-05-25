@@ -221,7 +221,7 @@ notifications:
     - "@pavelkrotkov"
 ```
 
-### Authentication
+### Authentication & Subprocess Security
 
 Provider credentials are injected as environment variables in the GitHub Actions
 workflow. The `main_coder.env` list declares which env vars the coder adapter
@@ -237,6 +237,33 @@ env:
 
 The orchestrator itself authenticates to GitHub using `GH_TOKEN` /
 `GITHUB_TOKEN` via `httpx` (not the `gh` CLI for API calls).
+
+#### Token Scope Separation
+
+The orchestrator and coder subprocess use separate tokens with minimal
+privileges:
+
+- **Orchestrator token** (`AI_ORCHESTRATOR_GITHUB_TOKEN`): `pull_requests: write`,
+  `contents: write`, `checks: read`. Used for reading/writing PR comments,
+  labels, and pushing commits.
+- **Coder subprocess**: receives **no GitHub token**. The coder operates only on
+  the local worktree clone. It reads code and writes file changes; the
+  orchestrator handles all git push operations after validating the coder's
+  output.
+
+This separation prevents the coding agent from making network calls to GitHub
+(or misusing broad identity permissions) if it executes arbitrary generated
+scripts or tests during its run. The orchestrator's token is never passed in
+`main_coder.env`.
+
+The GitHub Actions workflow must declare minimum permissions explicitly:
+
+```yaml
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+```
 
 ---
 
@@ -321,6 +348,17 @@ The orchestrator:
 
 This avoids all git-branch state management complexity. The JSON payload is small
 (finding IDs and verdicts, not full diffs or logs).
+
+### 7.1 State Size Guard
+
+Before writing the state comment, the orchestrator checks the serialized JSON
+size. If the payload exceeds 50KB (well under GitHub's 65,536-character comment
+limit), the orchestrator refuses to write, transitions to `needs_human`, and
+posts a diagnostic explaining that state has grown too large. This provides a
+clean failure mode instead of risking silent truncation or API rejection.
+
+V2 migrates to the orphan branch strategy (`aipro-state/prs/N.json`) which
+removes this size constraint entirely.
 
 If the state comment is missing or corrupt, the orchestrator re-initializes from
 the PR's current state.
