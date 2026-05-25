@@ -129,6 +129,10 @@ ai-pr-orchestrator/
       state_machine.py
       state_store.py
       runner.py
+      state/
+        __init__.py
+        branch_store.py
+        status_comment.py
       github/
         __init__.py
         client.py
@@ -153,6 +157,11 @@ ai-pr-orchestrator/
         prompt_builder.py
         json_output.py
         schemas.py
+      llm/
+        __init__.py
+        gateway.py
+        litellm.py
+        openrouter.py
       ci/
         __init__.py
         checks.py
@@ -271,6 +280,14 @@ reviewers:
     trigger_comment: |
       /q review
 
+llm_gateways:
+  litellm:
+    enabled: false
+    base_url: null
+  openrouter:
+    enabled: false
+    base_url: "https://openrouter.ai/api/v1"
+
 thread_policy:
   auto_resolve_bot_threads: true
   never_resolve_human_threads: true
@@ -288,9 +305,16 @@ git:
 
 ci:
   require_green_before_next_review_round: true
-  poll_interval_seconds: 30
-  poll_timeout_seconds: 1800
+  resume_from_check_events: true
+  required_checks: []
+  ignored_checks:
+    - "AI PR Review Loop"
   relevant_failed_log_lines: 300
+
+state:
+  branch: "aipro-state"
+  path_template: "prs/{pr_number}.json"
+  status_comment: true
 
 safety:
   only_run_on_labeled_prs: true
@@ -303,6 +327,8 @@ safety:
   max_coder_invocations_per_run: 1
   max_reviewer_triggers_per_run: 3
   max_prompt_tokens: 100000
+  halt_on_repeated_patch: true
+  halt_on_repeated_rebuttal: true
   allowed_pr_author_associations:
     - "OWNER"
     - "MEMBER"
@@ -330,6 +356,7 @@ v1 examples:
 Future:
 
 - `claude_code_cli`
+- `generic_llm`
 - `aider_cli`
 - `opencode_cli`
 - `goose_cli`
@@ -361,6 +388,7 @@ Future:
 - `amazon_q_github`
 - `codex_github`
 - `claude_github`
+- `generic_llm`
 - `generic_cli`
 
 Interface:
@@ -385,7 +413,36 @@ Do not hard-code Gemini/Codex/Claude into the state machine. The state machine s
 
 ---
 
-### 6.3 Normalized Finding
+### 6.3 LLM Gateway Adapter
+
+Provider-specific CLI and GitHub integrations still need adapters because they
+edit repositories, trigger GitHub bots, manage auth, and expose different
+process semantics. However, simple chat-style coder or reviewer modes should not
+require a bespoke adapter for every model vendor.
+
+Add a `generic_llm` adapter backed by an LLM gateway such as LiteLLM or
+OpenRouter.
+
+The gateway adapter should standardize:
+
+- message format
+- model selection
+- timeout and retry behavior
+- structured JSON response extraction
+- provider auth configuration
+- token and secret redaction
+
+The gateway adapter must still return the same normalized `AgentRunResult` and
+must pass through the same JSON validator. It is an adapter implementation
+detail, not a replacement for the core `CoderAdapter` and `ReviewerAdapter`
+interfaces.
+
+Use the gateway when the provider behaves like a chat/completions API. Keep
+dedicated adapters for repo-editing CLIs and GitHub-native reviewers.
+
+---
+
+### 6.4 Normalized Finding
 
 Every reviewer's feedback should be normalized into a common shape.
 
@@ -415,7 +472,7 @@ Derive `is_outdated` from GitHub's `outdated` field on review comments. Outdated
 
 ---
 
-### 6.4 Finding Conflict Detection
+### 6.5 Finding Conflict Detection
 
 Before passing findings to the coder, group findings by `(path, line_range)` where `line_range` is `line ± 5`.
 
@@ -431,25 +488,33 @@ For v1, conflict detection is simple: same file + overlapping line range + diffe
 
 ## 7. State Storage
 
-Use a hidden PR comment as the durable state store for v1.
+Use a dedicated orphan state branch as the durable state store for v1.
 
-Example:
+The PR comment should be a human-readable status surface and pointer only. It
+must not be the source of truth for detailed state because GitHub issue comments
+have payload limits and become fragile as reviewers, findings, and histories
+grow.
 
-```markdown
-## AI PR Orchestrator State
-Current phase: `gemini_stabilization`
-Current round: `2 / 5`
-Current head: `abc123`
-Last updated: `2026-05-24T14:12:00Z`
-<!-- ai-pr-orchestrator-state
+State branch:
+
+```text
+aipro-state
+  prs/
+    123.json
+    124.json
+```
+
+State file example:
+
+```json
 {
   "version": 1,
   "pr_number": 123,
   "head_sha": "abc123",
   "base_sha": "base456",
-  "phase_index": 1,
-  "phase_id": "gemini_stabilization",
-  "round_index": 2,
+  "phase_index": 0,
+  "phase_id": "initial_review",
+  "round_index": 1,
   "status": "waiting",
   "updated_at": "2026-05-24T14:12:00Z",
   "handled_findings": {
@@ -461,44 +526,84 @@ Last updated: `2026-05-24T14:12:00Z`
     }
   },
   "archived_findings": {
-    "initial_360_review": {"accepted": 3, "rejected": 2, "needs_human": 0}
+    "initial_review": {"accepted": 3, "rejected": 2, "needs_human": 0}
   },
   "trigger_history": [
     {
       "reviewer": "gemini_github",
-      "phase_id": "gemini_stabilization",
-      "round_index": 2,
+      "phase_id": "initial_review",
+      "round_index": 1,
       "head_sha": "abc123",
       "trigger_comment_id": "IC_kwDO...",
       "created_at": "2026-05-24T14:00:00Z"
     }
   ],
+  "patch_attempts": [
+    {
+      "head_sha": "abc123",
+      "diff_hash": "sha256:...",
+      "finding_ids": ["PRRT_kwD..."],
+      "result": "ci_failed",
+      "failure_hash": "sha256:..."
+    }
+  ],
   "cost": {
-    "coder_invocations": 2,
-    "reviewer_triggers": 4,
+    "coder_invocations": 1,
+    "reviewer_triggers": 1,
     "total_api_calls": 23
   },
   "commits_made": [],
   "last_error": null,
   "done_reason": null
 }
--->
+```
+
+Status comment example:
+
+```markdown
+## AI PR Orchestrator State
+Current phase: `initial_review`
+Current round: `1 / 1`
+Current head: `abc123`
+State branch: `aipro-state`
+State file: `prs/123.json`
+State commit: `def789`
+Last updated: `2026-05-24T14:12:00Z`
+<!-- ai-pr-orchestrator-status pr=123 state_commit=def789 -->
 ```
 
 State store must support:
 
-- create state comment
-- find state comment
-- update state comment with optimistic concurrency (check `updated_at` before write)
-- parse hidden JSON
-- render visible status summary
+- create the orphan `aipro-state` branch if missing
+- read `prs/{pr_number}.json`
+- write `prs/{pr_number}.json`
+- push state updates as normal commits to `aipro-state`
+- reject non-fast-forward state pushes and retry after fetching current state
+- render and update a compact visible status comment
+- keep the status comment under a small fixed size
 - recover from malformed state safely
 - maintain idempotency across reruns
 - compact `handled_findings` when entries exceed 150 (archive completed phases into summary counts)
+- store only identifiers, hashes, compact summaries, and decision metadata in
+  state; do not store full diffs, full logs, or large prompt payloads
 
-Optimistic concurrency: before writing state, re-read the state comment. If `updated_at` has changed since the last read, another run modified state concurrently. In this case, re-read the current state, re-run the transition function against the new state, then write. If it changed again, abort with an error rather than risk corruption.
+Interface:
 
-Do not commit state files into the PR branch in v1. That would pollute the diff and trigger more review loops.
+```python
+class StateStore:
+    def read(self, pr_number: int) -> RuntimeState | None: ...
+    def write(self, state: RuntimeState, expected_state_sha: str | None) -> str: ...
+    def update_status_comment(self, state: RuntimeState, state_sha: str) -> None: ...
+```
+
+Optimistic concurrency: state writes should be fast-forward-only commits to the
+state branch. If the push is rejected because another run updated the branch,
+fetch the latest state, re-run the pure transition function against the new
+state, and retry once. If it conflicts again, exit cleanly and let GitHub Actions
+concurrency queue the next run.
+
+Do not commit state files into the PR branch in v1. That would pollute the diff
+and trigger more review loops.
 
 ---
 
@@ -533,6 +638,8 @@ class RuntimeState:
     trigger_history: list[ReviewerTrigger]
     handled_findings: dict[str, HandledFinding]
     archived_findings: dict[str, dict[str, int]]
+    patch_attempts: list[PatchAttempt]
+    rebuttal_history: dict[str, list[str]]
     cost: CostTracker
     commits_made: list[str]
     created_at: datetime
@@ -587,19 +694,23 @@ Side effects happen only in an action executor.
 
 ## 10. Execution Model
 
-The orchestrator runs as a **long-lived process** within a single GitHub Actions job. Instead of doing one state transition per Actions run and relying on cron for re-entry, the orchestrator loops internally with tight polling intervals.
+The orchestrator runs as a bounded process within a GitHub Actions job. It may
+poll for reviewer responses inside the job, but it must not burn runner minutes
+waiting for CI to finish.
 
-For V1, "long-lived" means the job may wait for the configured reviewer and CI
-checks, but it should perform at most one coding-agent invocation and one fix
-commit before terminating. Multi-round repair loops are a later capability once
-idempotency and safety are proven.
+For V1, the job should perform at most one coding-agent invocation and one fix
+commit before terminating. If a pushed commit requires CI, the orchestrator saves
+`ci_wait` state to the state branch, updates the status comment, and exits. A
+later `check_run`, `check_suite`, or `status` event resumes the state machine.
+
+This avoids paying for idle GitHub Actions time while other workflows run.
 
 ### 10.1 Outer Loop
 
 ```python
 def run(pr_number: int, config: Config):
     state = load_or_create_state(pr_number)
-    while not terminal(state.status):
+    while runnable_in_this_job(state.status):
         snapshot = hydrate_pr_snapshot(pr_number)
         state, actions = transition(state, snapshot, config, now())
         execute(actions)
@@ -610,15 +721,15 @@ def run(pr_number: int, config: Config):
                 state, config, pr_number
             )
         elif state.status == "ci_wait":
-            poll_until_ci_complete_or_timeout(
-                state, config, pr_number,
-                interval=config.ci.poll_interval_seconds
-            )
+            update_status_comment(state)
+            return
 
-    execute_terminal_actions(state, config)
+    if terminal(state.status):
+        execute_terminal_actions(state, config)
 ```
 
-The job has a `timeout-minutes: 90` cap. If the job times out mid-run, the saved state allows the next event-triggered run to resume where it left off.
+The job has a `timeout-minutes` cap. If the job times out mid-run, the saved
+state allows the next event-triggered run to resume where it left off.
 
 ### 10.2 Reviewer Polling (waiting status)
 
@@ -666,19 +777,20 @@ if state.status == triggering:
     record trigger comments and timestamps
     move to waiting
 if state.status == waiting:
-    (outer loop handles polling — see 10.2)
+    (outer loop handles bounded reviewer polling — see 10.2)
     collect reviewer findings after trigger timestamp
     auto-classify outdated findings as stale
     if no findings and stop_when_empty:
         advance to next phase or done
     if findings exist:
-        run conflict detection (see 6.4)
+        run conflict detection (see 6.5)
         move to handling
 if state.status == handling:
     check prompt size; if too large, split findings into batches
     build coder task from current findings
     invoke main coder (output via file, see 12.1)
     validate JSON result
+    check stagnation against prior patch/rebuttal history
     if tests were passing before and fail after coder changes:
         restore the worktree to the pre-coder checkpoint
         move to needs_human
@@ -688,12 +800,15 @@ if state.status == handling:
         - do not resolve human threads
     commit/push if working tree changed
     if changes were pushed and CI gate enabled:
-        move to ci_wait
+        save ci_wait state and exit; do not poll CI inside this job
     else:
         advance round or phase
 if state.status == ci_wait:
-    (outer loop handles polling — see 10.1)
-    collect CI status
+    resume only from check_run/check_suite/status/manual events
+    ignore events whose SHA does not match state.head_sha
+    collect CI status for required checks
+    if CI pending:
+        leave state as ci_wait and exit
     if CI passed:
         advance round or phase
     if CI failed:
@@ -721,7 +836,8 @@ The pure state machine should emit actions such as:
 class PlannedAction:
     type: Literal[
         "post_pr_comment",
-        "update_state_comment",
+        "write_state_branch",
+        "update_status_comment",
         "invoke_coder",
         "reply_to_thread",
         "resolve_thread",
@@ -887,8 +1003,22 @@ If the total prompt (findings + diff + instructions) exceeds `safety.max_prompt_
 
 1. Include higher-severity findings first
 2. Prioritize findings on files with the most review comments
-3. Truncate the diff to only files mentioned in included findings
-4. If findings must be split, process them in separate batches within the same round
+3. Include a scoped diff for files mentioned in included findings
+4. Include dependency hints where cheap to compute, such as imports, symbol
+   search results, call sites, or type references
+5. If findings must be split, process them in separate batches within the same round
+
+Prompt truncation must not imply that the agent is forbidden from inspecting the
+rest of the repository. The prompt is the starting packet, not the full context
+boundary.
+
+If the agent changes a shared interface, function signature, public type,
+configuration key, database schema, workflow file, or other cross-file contract,
+it must search or read dependent files before finalizing the patch. At minimum,
+the agent should run targeted repository searches such as `rg` for changed
+symbols and then run the configured tests. If dependent usage cannot be verified
+within the available budget, the agent should return `needs_human` rather than
+guess.
 
 ---
 
@@ -907,6 +1037,7 @@ The orchestrator must validate:
 - no more than one commit is created
 - test results are reported
 - if conflicting findings exist and the coder accepted both sides, reject the output
+- generated patch and rebuttal hashes do not repeat a known failed attempt
 
 Invalid output should move the run to error or retry once, depending on config.
 
@@ -1012,6 +1143,11 @@ on:
     types: [submitted]
   pull_request_review_comment:
     types: [created]
+  check_run:
+    types: [completed]
+  check_suite:
+    types: [completed]
+  status:
   workflow_dispatch:
     inputs:
       pr:
@@ -1020,7 +1156,7 @@ on:
         type: string
 
 concurrency:
-  group: ai-pr-orchestrator-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_run.pull_requests[0].number || github.event.check_suite.pull_requests[0].number || github.event.inputs.pr || github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -1053,7 +1189,18 @@ jobs:
           aipro run --event-path "$GITHUB_EVENT_PATH"
 ```
 
-The cron schedule from the original design has been removed. The orchestrator now runs as a long-lived process (up to 90 minutes) within a single job, polling internally for reviewer responses and CI status. Event-driven triggers handle new PR activity. If a run times out, the next event-triggered run resumes from saved state.
+The cron schedule from the original design has been removed. The orchestrator
+uses GitHub Actions concurrency as the primary lock and the state branch as the
+secondary optimistic concurrency guard.
+
+Reviewer waiting may happen inside the job for the configured reviewer timeout.
+CI waiting should not. When the orchestrator enters `ci_wait`, it saves state and
+exits. `check_run`, `check_suite`, and `status` events wake the orchestrator back
+up; the Python layer maps the event SHA to the open PR, confirms the SHA matches
+the saved state, and advances only when the configured required checks are
+complete.
+
+If a run times out, the next event-triggered run resumes from saved state.
 
 If you need a fallback for missed events, add a conservative schedule trigger (e.g., `cron: "0 */6 * * *"`) rather than every 10 minutes.
 
@@ -1066,6 +1213,8 @@ v1 must enforce:
 - require `ai-loop` label if configured
 - skip fork PRs by default
 - skip untrusted author associations by default
+- require GitHub Actions concurrency in the target workflow
+- keep state-branch optimistic concurrency as a secondary guard
 - never auto-resolve human review threads
 - block or require human review for `.github/workflows/**` changes
 - require clean worktree before invoking coder
@@ -1109,20 +1258,68 @@ After each coder invocation, if the test suite was passing before the coder ran 
 
 Do not push broken code.
 
+### 18.3 Stagnation Detection
+
+The orchestrator must stop wasting tokens when the same failed behavior repeats.
+
+Track compact hashes in state:
+
+```python
+class PatchAttempt:
+    head_sha: str
+    diff_hash: str
+    finding_ids: list[str]
+    result: Literal["tests_failed", "ci_failed", "review_rejected", "pushed"]
+    failure_hash: str | None
+
+class RebuttalAttempt:
+    finding_id: str
+    reply_hash: str
+    reviewer: str
+    result: Literal["posted", "reviewer_repeated", "needs_human"]
+```
+
+Stagnation rules:
+
+- If the coder proposes the same diff hash for the same findings after tests or
+  CI already failed, move to `needs_human`.
+- If the coder posts the same rebuttal for a finding that the reviewer repeats
+  or rejects, move to `needs_human`.
+- If the same required check fails with the same compact failure summary after a
+  previous attempted fix, move to `needs_human`.
+- If the loop reaches the same `(head_sha, phase_id, round_index, finding_ids)`
+  with no new findings and no new patch, move to `done` or `needs_human`
+  according to policy rather than invoking the coder again.
+
+Normalize diff hashes by excluding volatile metadata and hashing the actual file
+patch content. Normalize failure hashes from check name, failing command, and a
+small stable excerpt of the failure.
+
 ---
 
 ## 19. CI Policy
 
 The orchestrator should require green CI before moving to the next review phase if configured.
 
-For v1, CI failure stops the loop:
+For v1, CI is event-driven:
 
 ```
-if CI pending:
-    continue polling (handled by outer loop)
+if a fix commit is pushed and CI gate is enabled:
+    save state as ci_wait
+    update status comment
+    exit without polling
+if a check_run/check_suite/status event arrives:
+    map event SHA to an open PR
+    load state for that PR
+    ignore event if SHA != state.head_sha
+    read configured required checks
+    ignore configured ignored checks and the orchestrator workflow itself
+if required CI is still pending:
+    leave state as ci_wait and exit
 if CI passed:
     advance phase or round
 if CI failed:
+    record failure hash for stagnation detection
     move to needs_human with failed check names and relevant logs
 ```
 
@@ -1140,8 +1337,9 @@ Pure unit tests should cover:
 
 - config loading
 - state serialization
-- hidden comment parsing/rendering
-- optimistic concurrency conflict detection
+- state branch read/write planning
+- status comment rendering
+- state-branch optimistic concurrency conflict detection
 - pure state transitions
 - phase advancement
 - timeout behavior
@@ -1155,6 +1353,7 @@ Pure unit tests should cover:
 - prompt building (including size management)
 - agent JSON validation (including conflict contradiction check)
 - decision application policy
+- stagnation detection
 - cost tracking and limit enforcement
 
 ### 20.2 Fake GitHub Client Tests
@@ -1164,6 +1363,8 @@ Use an in-memory fake GitHub client.
 Test:
 
 - initial state creation
+- state branch update
+- status comment update
 - reviewer trigger posting
 - per-reviewer polling behavior
 - collection of bot-authored findings
@@ -1174,7 +1375,8 @@ Test:
 - not resolving human threads
 - idempotent reruns
 - crash recovery after partial actions
-- optimistic concurrency abort
+- state branch non-fast-forward retry and abort
+- CI event resume from `ci_wait`
 - Gemini empty -> next phase
 - max rounds -> done
 
@@ -1329,7 +1531,7 @@ Acceptance criteria:
 
 ### Milestone 1 — State and Models
 
-**Issue 3: Implement core models and hidden PR comment state store**
+**Issue 3: Implement core models, state branch store, and status comment**
 
 Acceptance criteria:
 
@@ -1337,9 +1539,11 @@ Acceptance criteria:
 - phases and statuses validated
 - decisions validated
 - future-compatible version field included
-- parse existing state comment
-- render state comment
-- update state comment with optimistic concurrency
+- create/read/write `prs/{pr_number}.json` on `aipro-state`
+- update state branch with fast-forward-only optimistic concurrency
+- retry once after non-fast-forward rejection
+- render compact status comment
+- update existing status comment
 - compact handled_findings when threshold exceeded
 - handle malformed state safely
 
@@ -1409,6 +1613,19 @@ Acceptance criteria:
 
 ---
 
+**Fast-follow: Add generic LLM gateway adapter**
+
+Acceptance criteria:
+
+- `generic_llm` coder/reviewer adapter can call LiteLLM or OpenRouter
+- gateway output still passes the same JSON validator
+- provider selection is configuration-driven
+- provider credentials are redacted from logs
+- dedicated CLI/GitHub adapters remain available for tools that do more than
+  chat completions
+
+---
+
 ### Milestone 4 — State Machine and Runner
 
 **Issue 8: Implement pure transition engine**
@@ -1426,7 +1643,7 @@ Acceptance criteria:
 
 ---
 
-**Issue 9: Implement action executor and long-lived runner loop**
+**Issue 9: Implement action executor and bounded runner loop**
 
 Acceptance criteria:
 
@@ -1434,7 +1651,9 @@ Acceptance criteria:
 - supports dry-run
 - records durable actions in state
 - safe retry after partial failure
-- long-lived loop with internal polling for reviewers and CI
+- bounded loop with internal polling for reviewers only
+- save `ci_wait` state and exit instead of polling CI
+- resume from check_run/check_suite/status events
 - per-reviewer response tracking
 - job timeout awareness
 
@@ -1467,6 +1686,7 @@ Acceptance criteria:
 - handles invalid JSON
 - handles missing fields
 - detects contradictory conflict resolutions
+- detects repeated failed patch/rebuttal hashes
 - reads from output file with stdout fallback
 
 ---
@@ -1505,7 +1725,8 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- parse pull_request, issue_comment, pull_request_review, pull_request_review_comment, workflow_dispatch events
+- parse pull_request, issue_comment, pull_request_review, pull_request_review_comment, check_run, check_suite, status, and workflow_dispatch events
+- map check/status event SHAs to open PRs
 - dry-run: no mutations, prints state, phase, planned actions
 - final DONE/NEEDS_HUMAN/ERROR summary posted once
 - @-mentions included if configured
@@ -1522,7 +1743,7 @@ Implement in this order:
 
 1. Package skeleton and CLI
 2. Config loader
-3. State models and hidden state comment parser/renderer
+3. State models, state branch store, and status comment renderer
 4. Pure state machine with fake data
 5. Fake GitHub client
 6. Reviewer adapter interface + Gemini adapter
@@ -1531,15 +1752,16 @@ Implement in this order:
 9. Decision application policy + conflict detection
 10. GitHub client (metadata + GraphQL)
 11. Git manager
-12. Long-lived runner loop with polling
-13. Event-path parsing
+12. Bounded runner loop with reviewer polling and CI suspension
+13. Event-path parsing, including check/status resume
 14. Dry-run
 15. End-to-end fake-client happy path
 16. Real GitHub dry-run
 17. Second reviewer adapter
 18. GitHub Actions workflow
 
-Do not start by wiring real Claude/Codex/Gemini. First get the pure state machine and fake-client tests passing.
+Do not start by wiring real Claude/Codex/Gemini into GitHub mutations. First get
+the pure state machine and fake-client tests passing.
 
 ---
 
@@ -1548,10 +1770,12 @@ Do not start by wiring real Claude/Codex/Gemini. First get the pure state machin
 v1 is complete when:
 
 - `aipro dry-run --pr N` shows state and planned actions
-- `aipro run --pr N` can create/read/update hidden state comments
+- `aipro run --pr N` can create/read/update state branch files and status comments
 - one configured reviewer adapter can trigger review comments
 - unresolved bot review threads can be collected
 - per-reviewer polling works (no blanket wait)
+- CI wait saves state and exits instead of blocking the runner
+- check/status events resume from `ci_wait`
 - fake primary coder can return decisions
 - decisions can be applied to GitHub threads
 - bot threads can be replied to and resolved
@@ -1563,6 +1787,7 @@ v1 is complete when:
 - cost limits are enforced
 - CI can gate phase progression (CI failure -> needs_human)
 - test regression triggers rollback
+- repeated failed patches/rebuttals transition to `needs_human`
 - orchestrator never force-pushes or squashes automatically
 - DONE, NEEDS_HUMAN, and ERROR states work with @-mentions
 - dry-run performs zero mutations
@@ -1577,6 +1802,7 @@ Do not implement initially:
 
 - external webhook server
 - database-backed state
+- durable state stored only in PR comments
 - multi-repo dashboard
 - full semantic embeddings for duplicate detection
 - support for GitLab/Bitbucket
@@ -1586,6 +1812,7 @@ Do not implement initially:
 - daemon mode
 - complex UI
 - automatic CI-fix flow (coder fixing CI failures)
+- in-run polling for long CI jobs
 - automatic commit squash or force-push
 - codex_github / claude_github reviewer adapters (add as fast-follows)
 - generic CLI reviewer/coder adapters
