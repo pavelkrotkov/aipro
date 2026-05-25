@@ -202,13 +202,13 @@ def _dataclass_from_mapping(type_: type[Any], raw: dict[str, Any], prefix: str) 
         if field_type is bool:
             kwargs[field_name] = _bool_value(value, field_path)
         elif field_type is int:
-            kwargs[field_name] = _non_negative_int_value(value, field_path)
+            kwargs[field_name] = _positive_int_value(value, field_path)
         elif field_type is str:
             kwargs[field_name] = _string_value(value, field_path)
-        elif get_origin(field_type) is list:
+        elif field_type is list or get_origin(field_type) is list:
             kwargs[field_name] = _string_list_value(value, field_path)
         else:
-            kwargs[field_name] = value
+            raise ConfigError(f"{field_path} has unsupported type annotation {field_type!r}")
     return type_(**kwargs)
 
 
@@ -272,9 +272,9 @@ def _bool_value(value: Any, field_path: str) -> bool:
     return value
 
 
-def _non_negative_int_value(value: Any, field_path: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ConfigError(f"{field_path} must be a non-negative integer")
+def _positive_int_value(value: Any, field_path: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ConfigError(f"{field_path} must be a positive integer")
     return value
 
 

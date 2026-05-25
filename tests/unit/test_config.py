@@ -1,8 +1,9 @@
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
-from ai_pr_orchestrator.config import ConfigError, load_config
+from ai_pr_orchestrator.config import ConfigError, _dataclass_from_mapping, load_config
 
 
 def write_config(tmp_path: Path, content: str) -> Path:
@@ -175,6 +176,20 @@ main_coder:
         load_config(config_path)
 
 
+def test_rejects_zero_integer_values(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+main_coder:
+  provider: codex_cli
+  timeout_seconds: 0
+""",
+    )
+
+    with pytest.raises(ConfigError, match="positive integer"):
+        load_config(config_path)
+
+
 def test_handles_empty_config_file_gracefully(tmp_path: Path) -> None:
     config_path = write_config(tmp_path, "")
 
@@ -228,6 +243,25 @@ reviewers:
     config = load_config(config_path)
 
     assert config.reviewers["gemini_github"].bot_logins == []
+
+
+def test_dataclass_validation_accepts_plain_list_annotation() -> None:
+    @dataclass
+    class PlainListConfig:
+        values: list = field(default_factory=list)
+
+    config = _dataclass_from_mapping(PlainListConfig, {"values": ["a"]}, "plain")
+
+    assert config.values == ["a"]
+
+
+def test_dataclass_validation_rejects_unsupported_annotations() -> None:
+    @dataclass
+    class UnsupportedConfig:
+        values: dict[str, str] = field(default_factory=dict)
+
+    with pytest.raises(ConfigError, match="unsupported type annotation"):
+        _dataclass_from_mapping(UnsupportedConfig, {"values": {}}, "unsupported")
 
 
 def test_parses_safety_block(tmp_path: Path) -> None:

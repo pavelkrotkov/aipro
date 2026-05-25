@@ -24,6 +24,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if event_path is not None:
         pr_number = _pr_number_from_event(event_path)
     elif pr_number is None:
+        # argparse enforces this today; keep the guard for direct parser changes.
         raise SystemExit("Either --pr or --event-path must be provided")
 
     return runner.run(
