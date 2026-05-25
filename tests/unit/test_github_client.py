@@ -131,9 +131,9 @@ def test_add_label() -> None:
 
 @respx.mock
 def test_remove_label() -> None:
-    route = respx.delete(
-        f"{BASE}/repos/{OWNER}/{REPO}/issues/42/labels/old-label"
-    ).mock(return_value=httpx.Response(204))
+    route = respx.delete(f"{BASE}/repos/{OWNER}/{REPO}/issues/42/labels/old-label").mock(
+        return_value=httpx.Response(204)
+    )
     with _make_client() as client:
         client.remove_label(42, "old-label")
 
@@ -145,9 +145,7 @@ def test_remove_label() -> None:
 
 @respx.mock
 def test_get_check_runs() -> None:
-    route = respx.get(
-        f"{BASE}/repos/{OWNER}/{REPO}/commits/abc123/check-runs"
-    ).mock(
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/commits/abc123/check-runs").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -266,9 +264,7 @@ def test_resolve_review_thread() -> None:
 @respx.mock
 def test_graphql_error_raises() -> None:
     respx.post(GQL).mock(
-        return_value=httpx.Response(
-            200, json={"errors": [{"message": "something went wrong"}]}
-        )
+        return_value=httpx.Response(200, json={"errors": [{"message": "something went wrong"}]})
     )
     with _make_client() as client, pytest.raises(GitHubClientError, match="GraphQL error"):
         client.get_review_threads(42)
