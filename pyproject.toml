@@ -1,0 +1,43 @@
+[project]
+name = "ai-pr-orchestrator"
+version = "0.1.0"
+description = "AI PR review orchestration tool."
+readme = "plan.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+aipro = "ai_pr_orchestrator.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config"]
+
+[tool.coverage.run]
+branch = true
+source = ["ai_pr_orchestrator"]
+
+[tool.coverage.report]
+show_missing = true
+
+[dependency-groups]
+dev = [
+    "pip-audit>=2.10.0",
+    "pre-commit>=4.6.0",
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.14",
+    "ty>=0.0.39",
+]
