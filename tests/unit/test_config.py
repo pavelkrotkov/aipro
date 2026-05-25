@@ -145,7 +145,7 @@ def test_rejects_config_missing_required_main_coder_provider(tmp_path: Path) -> 
 def test_rejects_config_missing_main_coder_section(tmp_path: Path) -> None:
     config_path = write_config(tmp_path, "enabled_label: ai-loop\n")
 
-    with pytest.raises(ConfigError, match=r"main_coder\.provider"):
+    with pytest.raises(ConfigError, match="main_coder section is required"):
         load_config(config_path)
 
 
@@ -190,10 +190,26 @@ main_coder:
         load_config(config_path)
 
 
+def test_allows_zero_for_relevant_failed_log_lines(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+main_coder:
+  provider: codex_cli
+ci:
+  relevant_failed_log_lines: 0
+""",
+    )
+
+    config = load_config(config_path)
+
+    assert config.ci.relevant_failed_log_lines == 0
+
+
 def test_handles_empty_config_file_gracefully(tmp_path: Path) -> None:
     config_path = write_config(tmp_path, "")
 
-    with pytest.raises(ConfigError, match=r"main_coder\.provider"):
+    with pytest.raises(ConfigError, match="main_coder section is required"):
         load_config(config_path)
 
 
@@ -262,6 +278,26 @@ def test_dataclass_validation_rejects_unsupported_annotations() -> None:
 
     with pytest.raises(ConfigError, match="unsupported type annotation"):
         _dataclass_from_mapping(UnsupportedConfig, {"values": {}}, "unsupported")
+
+
+def test_dataclass_validation_supports_optional_pep604_annotations() -> None:
+    @dataclass
+    class OptionalConfig:
+        value: str | None = None
+
+    config = _dataclass_from_mapping(OptionalConfig, {"value": "set"}, "optional")
+
+    assert config.value == "set"
+
+
+def test_dataclass_validation_supports_blank_optional_values() -> None:
+    @dataclass
+    class OptionalConfig:
+        value: str | None = None
+
+    config = _dataclass_from_mapping(OptionalConfig, {"value": None}, "optional")
+
+    assert config.value is None
 
 
 def test_parses_safety_block(tmp_path: Path) -> None:

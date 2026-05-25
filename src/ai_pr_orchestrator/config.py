@@ -1,10 +1,9 @@
 """Configuration loading and validation."""
 
-from __future__ import annotations
-
+import types
 from dataclasses import MISSING, dataclass, field
 from pathlib import Path
-from typing import Any, cast, get_origin, get_type_hints
+from typing import Any, Union, cast, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -140,9 +139,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
         enabled_label=_string(raw, "enabled_label", "ai-loop"),
         done_label=_string(raw, "done_label", "ai-loop-done"),
         error_label=_string(raw, "error_label", "ai-loop-error"),
-        main_coder=_main_coder(
-            _mapping(raw, "main_coder", required=True, required_path="main_coder.provider")
-        ),
+        main_coder=_main_coder(_mapping(raw, "main_coder", required=True)),
         reviewers=_reviewers(_mapping(raw, "reviewers")),
         review_phase=_dataclass_from_mapping(
             ReviewPhaseConfig, _mapping(raw, "review_phase"), "review_phase"
@@ -197,12 +194,14 @@ def _dataclass_from_mapping(type_: type[Any], raw: dict[str, Any], prefix: str) 
         value = raw.get(field_name)
         if value is None:
             value = default
-        field_type = type_hints.get(field_name)
+        field_type, is_optional = _resolve_optional_type(type_hints.get(field_name))
 
-        if field_type is bool:
+        if value is None and is_optional:
+            kwargs[field_name] = None
+        elif field_type is bool:
             kwargs[field_name] = _bool_value(value, field_path)
         elif field_type is int:
-            kwargs[field_name] = _positive_int_value(value, field_path)
+            kwargs[field_name] = _int_value(value, field_path, allow_zero=_allows_zero(field_path))
         elif field_type is str:
             kwargs[field_name] = _string_value(value, field_path)
         elif field_type is list or get_origin(field_type) is list:
@@ -210,6 +209,25 @@ def _dataclass_from_mapping(type_: type[Any], raw: dict[str, Any], prefix: str) 
         else:
             raise ConfigError(f"{field_path} has unsupported type annotation {field_type!r}")
     return type_(**kwargs)
+
+
+def _resolve_optional_type(field_type: Any) -> tuple[Any, bool]:
+    origin = get_origin(field_type)
+    if origin not in (Union, types.UnionType):
+        return field_type, False
+
+    args = get_args(field_type)
+    if type(None) not in args:
+        return field_type, False
+
+    non_none_args = [arg for arg in args if arg is not type(None)]
+    if len(non_none_args) != 1:
+        return field_type, True
+    return non_none_args[0], True
+
+
+def _allows_zero(field_path: str) -> bool:
+    return field_path == "ci.relevant_failed_log_lines"
 
 
 def _validate_keys(raw: dict[str, Any], allowed_keys: set[str], prefix: str) -> None:
@@ -226,17 +244,11 @@ def _default_value(field_info: Any) -> Any:
     return None
 
 
-def _mapping(
-    raw: dict[str, Any],
-    key: str,
-    *,
-    required: bool = False,
-    required_path: str | None = None,
-) -> dict[str, Any]:
+def _mapping(raw: dict[str, Any], key: str, *, required: bool = False) -> dict[str, Any]:
     value = raw.get(key)
     if value is None:
         if required:
-            raise ConfigError(f"{required_path or key} is required")
+            raise ConfigError(f"{key} section is required")
         return {}
     if not isinstance(value, dict):
         raise ConfigError(f"{key} must be a mapping")
@@ -249,14 +261,11 @@ def _string(
     default: str = "",
     *,
     field_path: str | None = None,
-    required: bool = False,
 ) -> str:
     path = field_path or key
     value = raw.get(key)
     if value is None:
         value = default
-    if required and value in (None, ""):
-        raise ConfigError(f"{path} is required")
     return _string_value(value, path)
 
 
@@ -272,8 +281,13 @@ def _bool_value(value: Any, field_path: str) -> bool:
     return value
 
 
-def _positive_int_value(value: Any, field_path: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+def _int_value(value: Any, field_path: str, *, allow_zero: bool) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ConfigError(f"{field_path} must be an integer")
+    if allow_zero:
+        if value < 0:
+            raise ConfigError(f"{field_path} must be a non-negative integer")
+    elif value <= 0:
         raise ConfigError(f"{field_path} must be a positive integer")
     return value
 

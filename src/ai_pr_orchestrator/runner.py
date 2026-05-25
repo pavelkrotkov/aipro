@@ -14,11 +14,11 @@ def run(*, pr_number: int, dry_run: bool, event_path: Path | None = None) -> int
     """Run the orchestrator for a pull request."""
     _ = (pr_number, dry_run, event_path)
     print(NOT_IMPLEMENTED_MESSAGE, file=sys.stderr)
-    return 2
+    return 1
 
 
 def inspect(*, pr_number: int) -> int:
     """Inspect the orchestrator inputs for a pull request."""
     _ = pr_number
     print(NOT_IMPLEMENTED_MESSAGE, file=sys.stderr)
-    return 2
+    return 1
