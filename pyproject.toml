@@ -5,6 +5,7 @@ description = "AI PR review orchestration tool."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "httpx>=0.28.0",
     "pyyaml>=6.0.3",
 ]
 
@@ -40,6 +41,7 @@ dev = [
     "pre-commit>=4.6.0",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
+    "respx>=0.22.0",
     "ruff>=0.15.14",
     "ty>=0.0.39",
 ]
