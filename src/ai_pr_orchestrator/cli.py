@@ -15,6 +15,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.pr is not None and args.pr <= 0:
+        raise SystemExit("Pull request number must be a positive integer")
 
     if args.command == "inspect":
         return runner.inspect(pr_number=args.pr)
@@ -68,6 +70,6 @@ def _pr_number_from_event(event_path: Path) -> int:
         pr_number = event["pull_request"]["number"]
     except (KeyError, TypeError) as exc:
         raise SystemExit(f"{event_path} does not contain pull_request.number") from exc
-    if not isinstance(pr_number, int):
-        raise SystemExit(f"{event_path} pull_request.number must be an integer")
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+        raise SystemExit(f"{event_path} pull_request.number must be a positive integer")
     return pr_number

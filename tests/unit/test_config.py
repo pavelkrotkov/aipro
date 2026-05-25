@@ -172,6 +172,25 @@ git:
         load_config(config_path)
 
 
+def test_config_validation_uses_type_annotations_not_default_values(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+main_coder:
+  provider: codex_cli
+reviewers:
+  gemini_github:
+    enabled: true
+    bot_logins: []
+    trigger_comment: "/gemini review"
+""",
+    )
+
+    config = load_config(config_path)
+
+    assert config.reviewers["gemini_github"].bot_logins == []
+
+
 def test_parses_safety_block(tmp_path: Path) -> None:
     config_path = write_config(
         tmp_path,

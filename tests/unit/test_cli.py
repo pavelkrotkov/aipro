@@ -26,6 +26,12 @@ def test_run_pr_invokes_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == [("run", 123, False, None)]
 
 
+@pytest.mark.parametrize("command", ["run", "dry-run", "inspect"])
+def test_pr_argument_must_be_positive(command: str) -> None:
+    with pytest.raises(SystemExit, match="positive integer"):
+        cli.main([command, "--pr", "0"])
+
+
 def test_dry_run_pr_sets_dry_run_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[int, bool, Path | None]] = []
 
@@ -67,6 +73,14 @@ def test_run_with_event_path_reads_event_file(
 
     assert cli.main(["run", "--event-path", str(event_path)]) == 0
     assert calls == [(456, False, event_path)]
+
+
+def test_run_with_non_positive_event_pr_exits_cleanly(tmp_path: Path) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text('{"pull_request": {"number": 0}}', encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="positive integer"):
+        cli.main(["run", "--event-path", str(event_path)])
 
 
 def test_run_with_missing_event_path_exits_cleanly(tmp_path: Path) -> None:

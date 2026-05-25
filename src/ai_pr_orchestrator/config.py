@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, get_origin, get_type_hints
 
 import yaml
 
@@ -201,20 +201,29 @@ def _reviewers(raw: dict[str, Any]) -> dict[str, ReviewerConfig]:
 
 def _dataclass_from_mapping(type_: type[Any], raw: dict[str, Any], prefix: str) -> Any:
     _validate_keys(raw, set(type_.__dataclass_fields__), prefix)
+    type_hints = get_type_hints(type_)
 
     kwargs: dict[str, Any] = {}
     for field_name, field_info in type_.__dataclass_fields__.items():
         field_path = f"{prefix}.{field_name}"
+        if (
+            field_info.default is MISSING
+            and field_info.default_factory is MISSING
+            and field_name not in raw
+        ):
+            raise ConfigError(f"{field_path} is required")
+
         default = _default_value(field_info)
         value = raw.get(field_name, default)
+        field_type = type_hints.get(field_name)
 
-        if isinstance(default, bool):
+        if field_type is bool:
             kwargs[field_name] = _bool_value(value, field_path)
-        elif isinstance(default, int):
+        elif field_type is int:
             kwargs[field_name] = _positive_int_value(value, field_path)
-        elif isinstance(default, str):
+        elif field_type is str:
             kwargs[field_name] = _string_value(value, field_path)
-        elif isinstance(default, list):
+        elif get_origin(field_type) is list:
             kwargs[field_name] = _string_list_value(value, field_path)
         else:
             kwargs[field_name] = value
