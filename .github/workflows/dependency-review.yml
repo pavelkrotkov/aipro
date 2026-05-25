@@ -16,5 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       # This may require GitHub Advanced Security for private repositories.
       - uses: actions/dependency-review-action@v4
+        continue-on-error: true

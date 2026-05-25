@@ -2,7 +2,7 @@
 name = "ai-pr-orchestrator"
 version = "0.1.0"
 description = "AI PR review orchestration tool."
-readme = "plan.md"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
 

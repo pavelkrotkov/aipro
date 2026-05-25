@@ -1,0 +1,40 @@
+# AI PR Orchestrator
+
+AI PR Orchestrator is a Python-based GitHub PR orchestration tool for coordinating
+AI coding agents and AI reviewers.
+
+The current repository contains the project plan, minimal package scaffolding, and
+repo hygiene automation.
+
+## Development
+
+Install the project and development tools:
+
+```sh
+uv sync --all-extras --dev
+```
+
+Run the test suite:
+
+```sh
+uv run pytest
+```
+
+Run linting and formatting:
+
+```sh
+uv run ruff check .
+uv run ruff format .
+```
+
+Run type checking:
+
+```sh
+uv run ty check .
+```
+
+Install pre-commit hooks:
+
+```sh
+uv run pre-commit install
+```
