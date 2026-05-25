@@ -187,18 +187,7 @@ class RuntimeState:
         _validate_status(self.status)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        for f in fields(self):
-            val = getattr(self, f.name)
-            if f.name == "handled_findings":
-                d[f.name] = {k: v.to_dict() for k, v in val.items()}
-            elif f.name == "trigger_history":
-                d[f.name] = [t.to_dict() for t in val]
-            elif f.name == "cost":
-                d[f.name] = val.to_dict()
-            else:
-                d[f.name] = _serialize(val)
-        return d
+        return {f.name: _serialize(getattr(self, f.name)) for f in fields(self)}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RuntimeState:
@@ -287,15 +276,7 @@ class AgentRunResult:
     token_usage: TokenUsage = field(default_factory=TokenUsage)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "changed": self.changed,
-            "summary": self.summary,
-            "decisions": [d.to_dict() for d in self.decisions],
-            "needs_human": self.needs_human,
-            "commit_message": self.commit_message,
-            "tests": [t.to_dict() for t in self.tests],
-            "token_usage": self.token_usage.to_dict(),
-        }
+        return {f.name: _serialize(getattr(self, f.name)) for f in fields(self)}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgentRunResult:
