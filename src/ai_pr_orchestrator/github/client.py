@@ -17,7 +17,7 @@ _DEFAULT_BASE_URL = "https://api.github.com"
 _GRAPHQL_URL = "https://api.github.com/graphql"
 _MAX_RETRIES = 4
 _INITIAL_BACKOFF = 1.0
-_TOKEN_REDACT_RE = re.compile(r"(gh[ps]_\w{4})\w+")
+_TOKEN_REDACT_RE = re.compile(r"((?:gh[pousr]|github_pat)_\w{4})\w+")
 
 
 def _redact_token(text: str) -> str:
@@ -149,23 +149,24 @@ class GitHubClient:
                 variables["after"] = cursor
 
             data = self._graphql(graphql.REVIEW_THREADS_QUERY, variables)
-            thread_connection = (
-                data.get("data", {})
-                .get("repository", {})
-                .get("pullRequest", {})
-                .get("reviewThreads", {})
-            )
+            data_dict = data.get("data") or {}
+            repo_dict = data_dict.get("repository") or {}
+            pr_dict = repo_dict.get("pullRequest") or {}
+            thread_connection = pr_dict.get("reviewThreads") or {}
 
-            for node in thread_connection.get("nodes", []):
+            for node in thread_connection.get("nodes") or []:
+                if not node:
+                    continue
                 comments = [
                     models.ReviewComment(
                         id=c["id"],
                         body=c["body"],
-                        author=c.get("author", {}).get("login", ""),
+                        author=(c.get("author") or {}).get("login", ""),
                         path=c.get("path", ""),
                         created_at=c.get("createdAt", ""),
                     )
-                    for c in node.get("comments", {}).get("nodes", [])
+                    for c in (node.get("comments") or {}).get("nodes") or []
+                    if c
                 ]
                 threads.append(
                     models.ReviewThread(
@@ -177,9 +178,9 @@ class GitHubClient:
                     )
                 )
 
-            page_info = thread_connection.get("pageInfo", {})
+            page_info = thread_connection.get("pageInfo") or {}
             if page_info.get("hasNextPage"):
-                cursor = page_info["endCursor"]
+                cursor = page_info.get("endCursor")
             else:
                 break
 
@@ -306,7 +307,9 @@ def _parse_comment(data: dict[str, Any]) -> models.Comment:
 
 def _is_rate_limited(response: httpx.Response) -> bool:
     remaining = response.headers.get("x-ratelimit-remaining")
-    return remaining is not None and remaining == "0"
+    if remaining == "0":
+        return True
+    return "retry-after" in response.headers
 
 
 def _retry_wait(response: httpx.Response, attempt: int) -> float:

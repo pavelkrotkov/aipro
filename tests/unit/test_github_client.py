@@ -334,6 +334,28 @@ def test_rate_limit_gives_up(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(sleeps) == 3  # MAX_RETRIES - 1
 
 
+# --- Rate limiting: 403 with retry-after (secondary/abuse limit) ---
+
+
+@respx.mock
+def test_403_with_retry_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("ai_pr_orchestrator.github.client.time.sleep", sleeps.append)
+
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/1").mock(
+        side_effect=[
+            httpx.Response(403, headers={"retry-after": "3"}),
+            httpx.Response(200, json=_pr_json(1)),
+        ]
+    )
+    with _make_client() as client:
+        pr = client.get_pr(1)
+
+    assert route.call_count == 2
+    assert sleeps == [3.0]
+    assert pr.number == 1
+
+
 # --- 403 without rate limit is not retried ---
 
 
@@ -527,6 +549,19 @@ def test_token_redacted_in_error_messages() -> None:
     msg = "Auth failed with token ghp_abcd1234567890abcdef"
     assert "ghp_abcd****" in _redact_token(msg)
     assert "1234567890abcdef" not in _redact_token(msg)
+
+
+def test_fine_grained_pat_redacted() -> None:
+    msg = "token github_pat_abcd1234567890abcdef"
+    assert "github_pat_abcd****" in _redact_token(msg)
+    assert "1234567890abcdef" not in _redact_token(msg)
+
+
+def test_all_token_prefixes_redacted() -> None:
+    for prefix in ("gho_", "ghu_", "ghr_", "ghp_", "ghs_"):
+        msg = f"token {prefix}abcd1234567890"
+        redacted = _redact_token(msg)
+        assert f"{prefix}abcd****" in redacted
 
 
 def test_github_client_error_redacts_token() -> None:
