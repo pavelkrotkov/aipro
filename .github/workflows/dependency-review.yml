@@ -19,5 +19,5 @@ jobs:
         with:
           persist-credentials: false
       # This may require GitHub Advanced Security for private repositories.
-      - uses: actions/dependency-review-action@v4
+      - uses: actions/dependency-review-action@v5
         continue-on-error: true
