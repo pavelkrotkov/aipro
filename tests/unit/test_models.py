@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -29,8 +30,8 @@ NOW = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
 LATER = datetime(2026, 5, 25, 13, 0, 0, tzinfo=UTC)
 
 
-def _make_state(**overrides: object) -> RuntimeState:
-    defaults: dict[str, object] = {
+def _make_state(**overrides: Any) -> RuntimeState:
+    defaults: dict[str, Any] = {
         "version": 1,
         "pr_number": 42,
         "head_sha": "abc123",
@@ -40,7 +41,7 @@ def _make_state(**overrides: object) -> RuntimeState:
         "updated_at": NOW,
     }
     defaults.update(overrides)
-    return RuntimeState(**defaults)  # type: ignore[arg-type]
+    return RuntimeState(**defaults)
 
 
 def _roundtrip_json(data: dict) -> dict:
