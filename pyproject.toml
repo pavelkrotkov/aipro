@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "AI PR review orchestration tool."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pyyaml>=6.0.3",
+]
 
 [project.scripts]
 aipro = "ai_pr_orchestrator.cli:main"
