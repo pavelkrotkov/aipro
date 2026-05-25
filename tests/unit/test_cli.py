@@ -67,3 +67,26 @@ def test_run_with_event_path_reads_event_file(
 
     assert cli.main(["run", "--event-path", str(event_path)]) == 0
     assert calls == [(456, False, event_path)]
+
+
+def test_run_with_missing_event_path_exits_cleanly(tmp_path: Path) -> None:
+    event_path = tmp_path / "missing.json"
+
+    with pytest.raises(SystemExit, match="Failed to read event file"):
+        cli.main(["run", "--event-path", str(event_path)])
+
+
+def test_run_with_invalid_event_json_exits_cleanly(tmp_path: Path) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text("{", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="not valid JSON"):
+        cli.main(["run", "--event-path", str(event_path)])
+
+
+def test_run_with_invalid_event_shape_exits_cleanly(tmp_path: Path) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match=r"pull_request\.number"):
+        cli.main(["run", "--event-path", str(event_path)])

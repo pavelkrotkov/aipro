@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Sequence
+from json import JSONDecodeError
 from pathlib import Path
 
 from ai_pr_orchestrator import runner
@@ -22,6 +23,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     event_path = Path(args.event_path) if args.event_path else None
     if event_path is not None:
         pr_number = _pr_number_from_event(event_path)
+    elif pr_number is None:
+        raise SystemExit("Either --pr or --event-path must be provided")
 
     return runner.run(
         pr_number=pr_number,
@@ -53,11 +56,17 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _pr_number_from_event(event_path: Path) -> int:
-    with event_path.open(encoding="utf-8") as event_file:
-        event = json.load(event_file)
+    try:
+        with event_path.open(encoding="utf-8") as event_file:
+            event = json.load(event_file)
+    except OSError as exc:
+        raise SystemExit(f"Failed to read event file {event_path}: {exc}") from exc
+    except JSONDecodeError as exc:
+        raise SystemExit(f"Event file {event_path} is not valid JSON: {exc}") from exc
+
     try:
         pr_number = event["pull_request"]["number"]
-    except KeyError as exc:
+    except (KeyError, TypeError) as exc:
         raise SystemExit(f"{event_path} does not contain pull_request.number") from exc
     if not isinstance(pr_number, int):
         raise SystemExit(f"{event_path} pull_request.number must be an integer")

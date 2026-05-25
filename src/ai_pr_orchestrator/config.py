@@ -104,17 +104,45 @@ class Config:
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     """Load and validate an AI PR Orchestrator YAML config file."""
     config_path = Path(path)
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    try:
+        content = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Failed to read configuration file {config_path}: {exc}") from exc
+
+    try:
+        raw = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML in configuration file {config_path}: {exc}") from exc
+
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
         raise ConfigError("config must be a YAML mapping")
+    _validate_keys(
+        raw,
+        {
+            "enabled_label",
+            "done_label",
+            "error_label",
+            "main_coder",
+            "reviewers",
+            "review_phase",
+            "thread_policy",
+            "git",
+            "ci",
+            "safety",
+            "notifications",
+        },
+        "config",
+    )
 
     return Config(
         enabled_label=_string(raw, "enabled_label", "ai-loop"),
         done_label=_string(raw, "done_label", "ai-loop-done"),
         error_label=_string(raw, "error_label", "ai-loop-error"),
-        main_coder=_main_coder(_mapping(raw, "main_coder")),
+        main_coder=_main_coder(
+            _mapping(raw, "main_coder", required=True, required_path="main_coder.provider")
+        ),
         reviewers=_reviewers(_mapping(raw, "reviewers")),
         review_phase=_dataclass_from_mapping(
             ReviewPhaseConfig, _mapping(raw, "review_phase"), "review_phase"
@@ -132,6 +160,11 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
 
 
 def _main_coder(raw: dict[str, Any]) -> MainCoderConfig:
+    _validate_keys(
+        raw,
+        {"provider", "command", "args", "timeout_seconds", "output_file", "env"},
+        "main_coder",
+    )
     provider = _string(raw, "provider", field_path="main_coder.provider", required=True)
     if provider not in VALID_PROVIDERS:
         raise ConfigError(
@@ -167,6 +200,8 @@ def _reviewers(raw: dict[str, Any]) -> dict[str, ReviewerConfig]:
 
 
 def _dataclass_from_mapping(type_: type[Any], raw: dict[str, Any], prefix: str) -> Any:
+    _validate_keys(raw, set(type_.__dataclass_fields__), prefix)
+
     kwargs: dict[str, Any] = {}
     for field_name, field_info in type_.__dataclass_fields__.items():
         field_path = f"{prefix}.{field_name}"
@@ -186,6 +221,12 @@ def _dataclass_from_mapping(type_: type[Any], raw: dict[str, Any], prefix: str) 
     return type_(**kwargs)
 
 
+def _validate_keys(raw: dict[str, Any], allowed_keys: set[str], prefix: str) -> None:
+    for key in raw:
+        if key not in allowed_keys:
+            raise ConfigError(f"Unknown configuration key: {prefix}.{key}")
+
+
 def _default_value(field_info: Any) -> Any:
     if field_info.default_factory is not MISSING:
         return field_info.default_factory()
@@ -194,11 +235,17 @@ def _default_value(field_info: Any) -> Any:
     return None
 
 
-def _mapping(raw: dict[str, Any], key: str, *, required: bool = False) -> dict[str, Any]:
+def _mapping(
+    raw: dict[str, Any],
+    key: str,
+    *,
+    required: bool = False,
+    required_path: str | None = None,
+) -> dict[str, Any]:
     value = raw.get(key)
     if value is None:
         if required:
-            raise ConfigError(f"{key} is required")
+            raise ConfigError(f"{required_path or key} is required")
         return {}
     if not isinstance(value, dict):
         raise ConfigError(f"{key} must be a mapping")

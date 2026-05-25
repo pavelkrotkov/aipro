@@ -115,6 +115,13 @@ def test_rejects_config_missing_required_main_coder_provider(tmp_path: Path) -> 
         load_config(config_path)
 
 
+def test_rejects_config_missing_main_coder_section(tmp_path: Path) -> None:
+    config_path = write_config(tmp_path, "enabled_label: ai-loop\n")
+
+    with pytest.raises(ConfigError, match=r"main_coder\.provider"):
+        load_config(config_path)
+
+
 def test_rejects_invalid_values(tmp_path: Path) -> None:
     config_path = write_config(
         tmp_path,
@@ -133,6 +140,35 @@ def test_handles_empty_config_file_gracefully(tmp_path: Path) -> None:
     config_path = write_config(tmp_path, "")
 
     with pytest.raises(ConfigError, match=r"main_coder\.provider"):
+        load_config(config_path)
+
+
+def test_wraps_config_file_read_errors(tmp_path: Path) -> None:
+    config_path = tmp_path / ".github" / "ai-review-loop.yml"
+
+    with pytest.raises(ConfigError, match="Failed to read configuration file"):
+        load_config(config_path)
+
+
+def test_wraps_invalid_yaml_errors(tmp_path: Path) -> None:
+    config_path = write_config(tmp_path, "main_coder: [")
+
+    with pytest.raises(ConfigError, match="Invalid YAML"):
+        load_config(config_path)
+
+
+def test_rejects_unknown_nested_config_keys(tmp_path: Path) -> None:
+    config_path = write_config(
+        tmp_path,
+        """
+main_coder:
+  provider: codex_cli
+git:
+  commit_author_namee: typo
+""",
+    )
+
+    with pytest.raises(ConfigError, match=r"Unknown configuration key: git\.commit_author_namee"):
         load_config(config_path)
 
 
