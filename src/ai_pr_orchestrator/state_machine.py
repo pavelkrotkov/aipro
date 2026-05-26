@@ -45,8 +45,7 @@ def transition(
 ) -> tuple[RuntimeState, list[PlannedAction]]:
     """Advance state and return planned side effects without performing I/O."""
     if state.status in TERMINAL_STATUSES:
-        terminal_state = _touch(state, now)
-        return terminal_state, _terminal_actions(terminal_state, config)
+        return _touch(state, now), []
 
     label_action = _label_removed_transition(state, snapshot, config, now)
     if label_action is not None:
@@ -61,7 +60,15 @@ def transition(
         return limit_action
 
     if state.status == "init":
-        return _with_status(state, "triggering", now), [_status_action("triggering")]
+        return (
+            _replace_state(
+                state,
+                now,
+                status="triggering",
+                round_index=state.round_index + 1,
+            ),
+            [_status_action("triggering")],
+        )
     if state.status == "triggering":
         return _transition_triggering(state, snapshot, config, now)
     if state.status == "waiting":
@@ -88,6 +95,10 @@ def _transition_triggering(
         for name, reviewer in config.reviewers.items()
         if reviewer.enabled and reviewer.trigger_comment
     ]
+    if not enabled_reviewers:
+        new_state = _with_status(state, "error", now, last_error="no_reviewers_configured")
+        return new_state, _terminal_actions(new_state, config)
+
     actions = [
         PlannedAction(
             "post_pr_comment",
@@ -123,7 +134,7 @@ def _transition_triggering(
         trigger_history=[*state.trigger_history, *triggers],
         cost=new_cost,
     )
-    return new_state, actions or [PlannedAction("noop", {"reason": "no_reviewers_configured"})]
+    return new_state, actions
 
 
 def _transition_waiting(
@@ -243,7 +254,10 @@ def _transition_handling(
     decision_actions = _decision_actions(result)
     if result.changed:
         write_actions = [
-            PlannedAction("commit_changes", {"message": result.commit_message}),
+            PlannedAction(
+                "commit_changes",
+                {"message": result.commit_message or config.git.commit_message_prefix},
+            ),
             PlannedAction("push_branch", {"head_sha": state.head_sha}),
         ]
         if config.ci.require_green_before_done:

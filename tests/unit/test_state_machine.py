@@ -109,6 +109,7 @@ def test_init_moves_to_triggering_when_label_present_and_safety_passes() -> None
     state, actions = transition(make_state(), make_snapshot(), make_config(), NOW)
 
     assert state.status == "triggering"
+    assert state.round_index == 1
     assert action_types(actions) == ["update_status_comment"]
 
 
@@ -121,6 +122,19 @@ def test_triggering_records_reviewer_trigger_and_waits() -> None:
     assert state.cost.reviewer_triggers == 1
     assert state.trigger_history[0].reviewer_name == "gemini"
     assert action_types(actions) == ["post_pr_comment"]
+
+
+def test_triggering_errors_when_no_reviewers_are_configured() -> None:
+    state, actions = transition(
+        make_state(status="triggering"),
+        make_snapshot(),
+        make_config(reviewers={}),
+        NOW,
+    )
+
+    assert state.status == "error"
+    assert state.last_error == "no_reviewers_configured"
+    assert action_types(actions) == ["post_final_summary", "add_label"]
 
 
 def test_waiting_moves_to_handling_when_findings_are_collected() -> None:
@@ -194,6 +208,22 @@ def test_handling_commits_pushes_and_waits_for_ci_when_gate_enabled() -> None:
         "push_branch",
         "update_status_comment",
     ]
+
+
+def test_handling_uses_configured_commit_message_when_result_has_no_message() -> None:
+    state, actions = transition(
+        make_state(status="handling"),
+        make_snapshot(
+            coder_result=make_result(commit_message=None),
+            worktree_changed=True,
+        ),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "ci_wait"
+    commit_action = next(action for action in actions if action.type == "commit_changes")
+    assert commit_action.payload["message"] == "fix: address AI review feedback"
 
 
 def test_handling_finishes_when_ci_gate_disabled() -> None:
@@ -465,7 +495,7 @@ def test_handling_records_token_usage_from_coder_result() -> None:
     assert state.cost.output_tokens == 7
 
 
-def test_terminal_states_plan_summary_and_labels() -> None:
+def test_already_terminal_states_do_not_replan_actions() -> None:
     state, actions = transition(
         make_state(status="done", done_reason="completed"),
         make_snapshot(),
@@ -474,4 +504,4 @@ def test_terminal_states_plan_summary_and_labels() -> None:
     )
 
     assert state.status == "done"
-    assert action_types(actions) == ["post_final_summary", "add_label", "remove_label"]
+    assert action_types(actions) == []
