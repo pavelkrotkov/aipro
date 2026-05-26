@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -115,6 +116,25 @@ def test_find_state_comment_returns_last_valid_state_comment() -> None:
     assert found == StateComment(comment_id=102, body=comments[2]["body"], state=newer)
 
 
+def test_find_state_comment_returns_last_valid_state_comment_from_generator() -> None:
+    older = _make_state(head_sha="older")
+    newer = _make_state(head_sha="newer")
+    comments = (
+        comment
+        for comment in [
+            {"id": 100, "body": serialize_state_comment(older)},
+            {"id": 101, "body": "ordinary comment"},
+            {"id": 102, "body": serialize_state_comment(newer)},
+        ]
+    )
+
+    found = find_state_comment(comments)
+
+    assert found is not None
+    assert found.comment_id == 102
+    assert found.state == newer
+
+
 def test_find_state_comment_accepts_parser_supported_marker_spacing() -> None:
     state = _make_state()
     body = serialize_state_comment(state).replace("<!-- aipro-state", "<!--\n  aipro-state")
@@ -130,6 +150,14 @@ def test_find_state_comment_returns_none_when_no_state_comment_exists() -> None:
 
 def test_parse_state_comment_returns_none_for_corrupt_json() -> None:
     body = f"header\n\n{STATE_COMMENT_MARKER}\n{{not-json}}\n-->"
+
+    assert parse_state_comment(body) is None
+
+
+def test_parse_state_comment_returns_none_for_corrupt_nested_state() -> None:
+    payload = _make_state().to_dict()
+    payload["handled_findings"] = {"bad": None}
+    body = f"{STATE_COMMENT_MARKER}\n{json.dumps(payload)}\n-->"
 
     assert parse_state_comment(body) is None
 

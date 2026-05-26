@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from ai_pr_orchestrator.models import ModelError, RuntimeState
 
@@ -82,25 +82,51 @@ def parse_state_comment(body: str) -> RuntimeState | None:
             if not isinstance(payload, dict):
                 continue
             return RuntimeState.from_dict(payload)
-        except (json.JSONDecodeError, ModelError, TypeError, ValueError):
+        except (
+            json.JSONDecodeError,
+            ModelError,
+            TypeError,
+            ValueError,
+            AttributeError,
+            KeyError,
+        ):
             continue
     return None
 
 
 def find_state_comment(comments: Iterable[Mapping[str, Any]]) -> StateComment | None:
     """Find the last PR comment containing valid RuntimeState metadata."""
-    for comment in reversed(list(comments)):
-        body = comment.get("body")
-        if not isinstance(body, str) or "aipro-state" not in body:
-            continue
-        state = parse_state_comment(body)
-        if state is None or "id" not in comment:
-            continue
-        comment_id = comment["id"]
-        if not isinstance(comment_id, (int, str)):
-            continue
-        return StateComment(comment_id=comment_id, body=body, state=state)
+    if isinstance(comments, Sequence):
+        comment_sequence = cast(Sequence[Mapping[str, Any]], comments)
+        return _find_state_comment_from_latest(reversed(comment_sequence))
+
+    latest: StateComment | None = None
+    for comment in comments:
+        state_comment = _state_comment_from_comment(comment)
+        if state_comment is not None:
+            latest = state_comment
+    return latest
+
+
+def _find_state_comment_from_latest(comments: Iterable[Mapping[str, Any]]) -> StateComment | None:
+    for comment in comments:
+        state_comment = _state_comment_from_comment(comment)
+        if state_comment is not None:
+            return state_comment
     return None
+
+
+def _state_comment_from_comment(comment: Mapping[str, Any]) -> StateComment | None:
+    body = comment.get("body")
+    if not isinstance(body, str) or "aipro-state" not in body:
+        return None
+    state = parse_state_comment(body)
+    if state is None or "id" not in comment:
+        return None
+    comment_id = comment["id"]
+    if not isinstance(comment_id, (int, str)):
+        return None
+    return StateComment(comment_id=comment_id, body=body, state=state)
 
 
 def prepare_state_comment_update(
