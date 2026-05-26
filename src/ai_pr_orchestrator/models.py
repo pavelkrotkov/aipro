@@ -28,6 +28,7 @@ ActionType = Literal[
     "resolve_thread",
     "commit_changes",
     "push_branch",
+    "rollback_changes",
     "add_label",
     "remove_label",
     "post_final_summary",
@@ -126,9 +127,12 @@ class CostTracker:
 
     def exceeds_limits(self, config: Any) -> bool:
         safety = config.safety
+        # Invocation counts are durable usage totals: equality means the budget
+        # is spent, not exceeded. Token usage is a hard ceiling because it is
+        # only known after an API response has already completed.
         return (
-            self.coder_invocations >= safety.max_coder_invocations_per_run
-            or self.reviewer_triggers >= safety.max_reviewer_triggers_per_run
+            self.coder_invocations > safety.max_coder_invocations_per_run
+            or self.reviewer_triggers > safety.max_reviewer_triggers_per_run
             or self.input_tokens + self.output_tokens >= safety.max_prompt_tokens
         )
 
@@ -178,6 +182,8 @@ class RuntimeState:
     trigger_history: list[ReviewerTrigger] = field(default_factory=list)
     cost: CostTracker = field(default_factory=CostTracker)
     commits_made: list[str] = field(default_factory=list)
+    last_coder_round_index: int | None = None
+    ci_wait_started_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     last_error: str | None = None
@@ -195,7 +201,7 @@ class RuntimeState:
         filtered = {k: v for k, v in data.items() if k in known}
         if "status" in filtered:
             _validate_status(filtered["status"])
-        for dt_field in ("created_at", "updated_at"):
+        for dt_field in ("ci_wait_started_at", "created_at", "updated_at"):
             if dt_field in filtered and isinstance(filtered[dt_field], str):
                 filtered[dt_field] = _str_to_dt(filtered[dt_field])
         if "handled_findings" in filtered and isinstance(filtered["handled_findings"], dict):
@@ -269,11 +275,11 @@ class TokenUsage:
 class AgentRunResult:
     changed: bool
     summary: str
-    decisions: list[Decision]
+    decisions: list[Decision] | None = None
     needs_human: bool = False
     commit_message: str | None = None
-    tests: list[TestResult] = field(default_factory=list)
-    token_usage: TokenUsage = field(default_factory=TokenUsage)
+    tests: list[TestResult] | None = field(default_factory=list)
+    token_usage: TokenUsage | None = field(default_factory=TokenUsage)
 
     def to_dict(self) -> dict[str, Any]:
         return {f.name: _serialize(getattr(self, f.name)) for f in fields(self)}

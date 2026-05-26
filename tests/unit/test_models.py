@@ -141,6 +141,7 @@ class TestRuntimeStateRoundTrip:
             trigger_history=[trigger],
             cost=cost,
             commits_made=["sha1", "sha2"],
+            last_coder_round_index=1,
             last_error="some error",
             done_reason="completed",
         )
@@ -150,6 +151,7 @@ class TestRuntimeStateRoundTrip:
         assert restored.round_index == 1
         assert restored.status == "handling"
         assert restored.commits_made == ["sha1", "sha2"]
+        assert restored.last_coder_round_index == 1
         assert restored.last_error == "some error"
         assert restored.done_reason == "completed"
         assert restored.cost.input_tokens == 1000
@@ -250,14 +252,26 @@ class TestCostTracker:
         assert cost.input_tokens == 1000
         assert cost.output_tokens == 500
 
-    def test_exceeds_limits_on_coder_invocations(self) -> None:
+    def test_allows_coder_invocations_at_limit(self) -> None:
         cost = CostTracker(coder_invocations=1)
+        config = _fake_config(max_coder_invocations_per_run=1)
+
+        assert cost.exceeds_limits(config) is False
+
+    def test_exceeds_limits_above_coder_invocations(self) -> None:
+        cost = CostTracker(coder_invocations=2)
         config = _fake_config(max_coder_invocations_per_run=1)
 
         assert cost.exceeds_limits(config) is True
 
-    def test_exceeds_limits_on_reviewer_triggers(self) -> None:
+    def test_allows_reviewer_triggers_at_limit(self) -> None:
         cost = CostTracker(reviewer_triggers=3)
+        config = _fake_config(max_reviewer_triggers_per_run=3)
+
+        assert cost.exceeds_limits(config) is False
+
+    def test_exceeds_limits_above_reviewer_triggers(self) -> None:
+        cost = CostTracker(reviewer_triggers=4)
         config = _fake_config(max_reviewer_triggers_per_run=3)
 
         assert cost.exceeds_limits(config) is True
@@ -356,13 +370,30 @@ class TestAgentRunResult:
 
         assert restored.changed is True
         assert restored.summary == "Fixed null pointer issue"
+        assert restored.decisions is not None
         assert len(restored.decisions) == 1
         assert restored.decisions[0].verdict == "accepted"
         assert restored.decisions[0].thread_id == "t1"
+        assert restored.tests is not None
         assert len(restored.tests) == 1
         assert restored.tests[0].result == "passed"
+        assert restored.token_usage is not None
         assert restored.token_usage.input_tokens == 5000
         assert restored.commit_message == "fix: null check"
+
+    def test_nullable_decoded_fields_round_trip(self) -> None:
+        result = AgentRunResult(
+            changed=False,
+            summary="No changes",
+            decisions=None,
+            tests=None,
+            token_usage=None,
+        )
+        restored = AgentRunResult.from_dict(_roundtrip_json(result.to_dict()))
+
+        assert restored.decisions is None
+        assert restored.tests is None
+        assert restored.token_usage is None
 
 
 # --- PlannedAction ---
