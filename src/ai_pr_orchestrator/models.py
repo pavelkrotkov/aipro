@@ -179,6 +179,7 @@ class RuntimeState:
     trigger_history: list[ReviewerTrigger] = field(default_factory=list)
     cost: CostTracker = field(default_factory=CostTracker)
     commits_made: list[str] = field(default_factory=list)
+    last_coder_round_index: int | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     last_error: str | None = None

@@ -141,6 +141,7 @@ class TestRuntimeStateRoundTrip:
             trigger_history=[trigger],
             cost=cost,
             commits_made=["sha1", "sha2"],
+            last_coder_round_index=1,
             last_error="some error",
             done_reason="completed",
         )
@@ -150,6 +151,7 @@ class TestRuntimeStateRoundTrip:
         assert restored.round_index == 1
         assert restored.status == "handling"
         assert restored.commits_made == ["sha1", "sha2"]
+        assert restored.last_coder_round_index == 1
         assert restored.last_error == "some error"
         assert restored.done_reason == "completed"
         assert restored.cost.input_tokens == 1000

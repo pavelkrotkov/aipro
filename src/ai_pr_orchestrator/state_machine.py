@@ -184,7 +184,7 @@ def _transition_handling(
         return new_state, [_status_action("init", reason="head_sha_changed")]
 
     if snapshot.coder_result is None:
-        if state.cost.coder_invocations >= state.round_index:
+        if state.last_coder_round_index == state.round_index:
             return _touch(state, now), [PlannedAction("noop", {"reason": "waiting_for_coder"})]
         if state.cost.coder_invocations + 1 > config.safety.max_coder_invocations_per_run:
             return _cost_limit_transition(state, config, now)
@@ -194,7 +194,12 @@ def _transition_handling(
             coder_invocations=state.cost.coder_invocations + 1,
             total_api_calls=state.cost.total_api_calls + 1,
         )
-        new_state = _replace_state(state, now, cost=new_cost)
+        new_state = _replace_state(
+            state,
+            now,
+            cost=new_cost,
+            last_coder_round_index=state.round_index,
+        )
         return new_state, [
             PlannedAction(
                 "invoke_coder",
@@ -400,7 +405,7 @@ def _error(
 def _decision_actions(result: AgentRunResult) -> list[PlannedAction]:
     actions: list[PlannedAction] = []
     for decision in result.decisions:
-        if decision.reply:
+        if decision.reply and decision.thread_id:
             actions.append(
                 PlannedAction(
                     "reply_to_thread",
@@ -411,7 +416,7 @@ def _decision_actions(result: AgentRunResult) -> list[PlannedAction]:
                     },
                 )
             )
-        if decision.should_resolve:
+        if decision.should_resolve and decision.thread_id:
             actions.append(
                 PlannedAction(
                     "resolve_thread",

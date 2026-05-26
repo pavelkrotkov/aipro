@@ -184,14 +184,39 @@ def test_handling_plans_coder_invocation_before_result_exists() -> None:
 
     assert state.status == "handling"
     assert state.cost.coder_invocations == 1
+    assert state.last_coder_round_index == 1
     assert action_types(actions) == ["invoke_coder"]
 
 
 def test_handling_waits_when_coder_was_already_invoked_for_round() -> None:
     state, actions = transition(
-        make_state(status="handling", round_index=1, cost=CostTracker(coder_invocations=1)),
+        make_state(
+            status="handling",
+            round_index=1,
+            cost=CostTracker(coder_invocations=1),
+            last_coder_round_index=1,
+        ),
         make_snapshot(findings=[make_finding()]),
         make_config(),
+        NOW,
+    )
+
+    assert state.status == "handling"
+    assert state.cost.coder_invocations == 1
+    assert action_types(actions) == ["noop"]
+    assert actions[0].payload["reason"] == "waiting_for_coder"
+
+
+def test_handling_uses_last_coder_round_not_cumulative_invocation_count() -> None:
+    state, actions = transition(
+        make_state(
+            status="handling",
+            round_index=2,
+            cost=CostTracker(coder_invocations=1),
+            last_coder_round_index=2,
+        ),
+        make_snapshot(findings=[make_finding()]),
+        make_config(safety=SafetyConfig(max_coder_invocations_per_run=3)),
         NOW,
     )
 
@@ -238,6 +263,29 @@ def test_handling_uses_configured_commit_message_when_result_has_no_message() ->
     assert state.status == "ci_wait"
     commit_action = next(action for action in actions if action.type == "commit_changes")
     assert commit_action.payload["message"] == "fix: address AI review feedback"
+
+
+def test_handling_skips_thread_actions_when_decision_has_no_thread_id() -> None:
+    decision = Decision(
+        finding_id="f1",
+        verdict="accepted",
+        confidence="high",
+        reason="valid",
+        reply="Fixed",
+        should_resolve=True,
+    )
+
+    state, actions = transition(
+        make_state(status="handling"),
+        make_snapshot(coder_result=make_result(changed=False, decisions=[decision])),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "done"
+    assert state.handled_findings["f1"].verdict == "accepted"
+    assert "reply_to_thread" not in action_types(actions)
+    assert "resolve_thread" not in action_types(actions)
 
 
 def test_handling_finishes_when_ci_gate_disabled() -> None:
