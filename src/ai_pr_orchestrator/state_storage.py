@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ai_pr_orchestrator.models import ModelError, RuntimeState
@@ -89,13 +89,13 @@ def find_state_comment(comments: Iterable[Mapping[str, Any]]) -> StateComment | 
     """Find the first PR comment containing valid RuntimeState metadata."""
     for comment in comments:
         body = comment.get("body")
-        if not isinstance(body, str) or STATE_COMMENT_MARKER not in body:
+        if not isinstance(body, str):
             continue
         state = parse_state_comment(body)
         if state is None or "id" not in comment:
             continue
         comment_id = comment["id"]
-        if not isinstance(comment_id, int | str):
+        if not isinstance(comment_id, (int, str)):
             continue
         return StateComment(comment_id=comment_id, body=body, state=state)
     return None
@@ -108,7 +108,7 @@ def prepare_state_comment_update(
     expected_updated_at: datetime,
 ) -> StateComment:
     """Prepare an edit for an existing state comment after an optimistic lock check."""
-    if existing.state.updated_at != expected_updated_at:
+    if _lock_timestamp(existing.state.updated_at) != _lock_timestamp(expected_updated_at):
         raise StateConflictError(
             "RuntimeState comment was updated by another process: "
             f"expected updated_at {expected_updated_at.isoformat()}, "
@@ -123,3 +123,9 @@ def prepare_state_comment_update(
 
 def _state_json(state: RuntimeState) -> str:
     return json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def _lock_timestamp(dt: datetime) -> datetime:
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)

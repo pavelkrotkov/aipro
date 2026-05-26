@@ -75,6 +75,15 @@ def test_find_state_comment_scans_comment_bodies_for_marker() -> None:
     assert found == StateComment(comment_id=101, body=comments[1]["body"], state=state)
 
 
+def test_find_state_comment_accepts_parser_supported_marker_spacing() -> None:
+    state = _make_state()
+    body = serialize_state_comment(state).replace("<!-- aipro-state", "<!--\n  aipro-state")
+
+    found = find_state_comment([{"id": 101, "body": body}])
+
+    assert found == StateComment(comment_id=101, body=body, state=state)
+
+
 def test_find_state_comment_returns_none_when_no_state_comment_exists() -> None:
     assert find_state_comment([{"id": 100, "body": "ordinary comment"}]) is None
 
@@ -136,3 +145,20 @@ def test_prepare_update_preserves_comment_id() -> None:
     assert updated.comment_id == 101
     assert updated.state == new_state
     assert parse_state_comment(updated.body) == new_state
+
+
+def test_prepare_update_treats_naive_expected_updated_at_as_utc() -> None:
+    existing = StateComment(
+        comment_id=101,
+        body=serialize_state_comment(_make_state()),
+        state=_make_state(),
+    )
+    new_state = _make_state(status="done", updated_at=LATER)
+
+    updated = prepare_state_comment_update(
+        existing,
+        new_state,
+        expected_updated_at=NOW.replace(tzinfo=None),
+    )
+
+    assert updated.comment_id == 101
