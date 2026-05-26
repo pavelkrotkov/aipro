@@ -80,8 +80,8 @@ class GitRepo:
         return result.stdout.strip()
 
     def push(self, branch: str) -> None:
-        """Push the current branch to origin. Never force-pushes."""
-        self._run("push", "origin", branch)
+        """Push the current HEAD to the remote branch. Never force-pushes."""
+        self._run("push", "origin", f"HEAD:refs/heads/{branch}")
 
     def fetch_remote_head(self, branch: str) -> str | None:
         """Fetch and return the SHA of the remote branch HEAD, or None if it doesn't exist."""
@@ -106,8 +106,12 @@ class GitRepo:
         return result.stdout
 
     def rollback(self) -> None:
-        """Discard all working-tree changes (tracked files only), restoring pre-coder state."""
+        """Discard all working-tree changes and remove untracked files, restoring pre-coder state.
+
+        Note: this also removes untracked files that existed before the coder ran.
+        """
         self._run("reset", "--hard", "HEAD")
+        self._run("clean", "-fd")
 
     def check_remote_head_matches(self, branch: str, expected_sha: str) -> bool:
         """Return True if the remote HEAD for *branch* matches *expected_sha*.

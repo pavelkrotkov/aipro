@@ -92,10 +92,10 @@ class TestCommit:
 
 
 class TestPush:
-    def test_push_calls_git_push(self, repo: GitRepo) -> None:
+    def test_push_pushes_head_to_remote_branch(self, repo: GitRepo) -> None:
         with patch.object(repo, "_run") as mock_run:
             repo.push("my-branch")
-        mock_run.assert_called_once_with("push", "origin", "my-branch")
+        mock_run.assert_called_once_with("push", "origin", "HEAD:refs/heads/my-branch")
 
     def test_no_force_push(self, repo: GitRepo) -> None:
         with patch.object(repo, "_run") as mock_run:
@@ -103,6 +103,20 @@ class TestPush:
         args = mock_run.call_args[0]
         assert "--force" not in args
         assert "-f" not in args
+
+    def test_push_from_detached_head(self, repo: GitRepo) -> None:
+        _add_origin(repo)
+        head_sha = repo.get_head_sha()
+        subprocess.run(
+            ["git", "checkout", "--detach"], cwd=repo.path, check=True, capture_output=True
+        )
+        (repo.path / "detached.txt").write_text("data\n")
+        repo.commit("detached commit", "Bot", "bot@example.com")
+        new_sha = repo.get_head_sha()
+        assert new_sha != head_sha
+        repo.push("main")
+        remote_sha = repo.fetch_remote_head("main")
+        assert remote_sha == new_sha
 
 
 # ---------------------------------------------------------------------------
@@ -172,11 +186,12 @@ class TestRollback:
         repo.rollback()
         assert repo.is_clean() is True
 
-    def test_rollback_preserves_untracked_files(self, repo: GitRepo) -> None:
-        (repo.path / "untracked.txt").write_text("keep me\n")
+    def test_rollback_removes_untracked_files(self, repo: GitRepo) -> None:
+        (repo.path / "untracked.txt").write_text("coder output\n")
         (repo.path / "README.md").write_text("dirty\n")
         repo.rollback()
-        assert (repo.path / "untracked.txt").read_text() == "keep me\n"
+        assert not (repo.path / "untracked.txt").exists()
+        assert repo.is_clean() is True
 
     def test_rollback_discards_staged_changes(self, repo: GitRepo) -> None:
         (repo.path / "README.md").write_text("dirty\n")
