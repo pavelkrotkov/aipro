@@ -137,6 +137,28 @@ def test_triggering_errors_when_no_reviewers_are_configured() -> None:
     assert action_types(actions) == ["post_final_summary", "add_label"]
 
 
+def test_triggering_waits_when_enabled_reviewer_has_no_trigger_comment() -> None:
+    state, actions = transition(
+        make_state(status="triggering"),
+        make_snapshot(),
+        make_config(
+            reviewers={
+                "auto": ReviewerConfig(
+                    enabled=True,
+                    bot_logins=["auto-reviewer[bot]"],
+                    trigger_comment="",
+                )
+            }
+        ),
+        NOW,
+    )
+
+    assert state.status == "waiting"
+    assert state.cost.reviewer_triggers == 0
+    assert state.trigger_history == []
+    assert actions == []
+
+
 def test_waiting_moves_to_handling_when_findings_are_collected() -> None:
     state, actions = transition(
         make_state(status="waiting"),

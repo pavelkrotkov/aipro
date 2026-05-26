@@ -97,14 +97,16 @@ def _transition_triggering(
     config: Config,
     now: datetime,
 ) -> tuple[RuntimeState, list[PlannedAction]]:
+    has_enabled_reviewers = any(reviewer.enabled for reviewer in config.reviewers.values())
+    if not has_enabled_reviewers:
+        new_state = _with_status(state, "error", now, last_error="no_reviewers_configured")
+        return new_state, _terminal_actions(new_state, config)
+
     enabled_reviewers = [
         (name, reviewer)
         for name, reviewer in config.reviewers.items()
         if reviewer.enabled and reviewer.trigger_comment
     ]
-    if not enabled_reviewers:
-        new_state = _with_status(state, "error", now, last_error="no_reviewers_configured")
-        return new_state, _terminal_actions(new_state, config)
     if (
         state.cost.reviewer_triggers + len(enabled_reviewers)
         > config.safety.max_reviewer_triggers_per_run
