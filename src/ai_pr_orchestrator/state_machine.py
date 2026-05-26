@@ -284,7 +284,9 @@ def _transition_ci_wait(
         return _touch(state, now), [PlannedAction("noop", {"reason": "stale_ci_event"})]
 
     checks = _relevant_checks(snapshot.checks or [], config, state.head_sha)
-    if not checks or any(check.status != "completed" or check.conclusion is None for check in checks):
+    if not checks or any(
+        check.status != "completed" or check.conclusion is None for check in checks
+    ):
         return _touch(state, now), [PlannedAction("noop", {"reason": "ci_pending"})]
 
     if any(check.conclusion not in PASSING_CHECK_CONCLUSIONS for check in checks):

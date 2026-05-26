@@ -113,7 +113,9 @@ def test_init_moves_to_triggering_when_label_present_and_safety_passes() -> None
 
 
 def test_triggering_records_reviewer_trigger_and_waits() -> None:
-    state, actions = transition(make_state(status="triggering"), make_snapshot(), make_config(), NOW)
+    state, actions = transition(
+        make_state(status="triggering"), make_snapshot(), make_config(), NOW
+    )
 
     assert state.status == "waiting"
     assert state.cost.reviewer_triggers == 1
