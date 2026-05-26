@@ -57,6 +57,20 @@ def test_parse_state_comment_extracts_runtime_state() -> None:
     assert parsed == state
 
 
+def test_parse_state_comment_scans_past_invalid_marker_to_valid_state() -> None:
+    state = _make_state(status="handling", head_sha="def456")
+    body = f"<!-- aipro-state\nnot-json\n-->\n\n{serialize_state_comment(state)}"
+
+    assert parse_state_comment(body) == state
+
+
+def test_parse_state_comment_ignores_marker_prefix_matches() -> None:
+    state = _make_state(status="handling", head_sha="def456")
+    body = f"<!-- aipro-state-v2\n{{}}\n-->\n\n{serialize_state_comment(state)}"
+
+    assert parse_state_comment(body) == state
+
+
 def test_state_comment_round_trips_through_markdown() -> None:
     state = _make_state(base_sha="base123", commits_made=["sha1", "sha2"])
 

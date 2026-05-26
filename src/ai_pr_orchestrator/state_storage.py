@@ -14,7 +14,7 @@ from ai_pr_orchestrator.models import ModelError, RuntimeState
 MAX_STATE_JSON_BYTES = 50_000
 STATE_COMMENT_MARKER = "<!-- aipro-state"
 
-_STATE_START_RE = re.compile(r"<!--\s*aipro-state")
+_STATE_START_RE = re.compile(r"<!--\s*aipro-state(?=\s|$)")
 
 
 class StateStorageError(ValueError):
@@ -63,7 +63,7 @@ def serialize_state_comment(
             f"Head: `{state.head_sha}`",
             f"Updated: `{state.updated_at.isoformat()}`",
             "",
-            f"{STATE_COMMENT_MARKER}",
+            STATE_COMMENT_MARKER,
             json_payload,
             "-->",
         ]
@@ -72,27 +72,24 @@ def serialize_state_comment(
 
 def parse_state_comment(body: str) -> RuntimeState | None:
     """Extract RuntimeState from a PR comment body, returning None when absent or corrupt."""
-    match = _STATE_START_RE.search(body)
-    if match is None:
-        return None
+    for match in _STATE_START_RE.finditer(body):
+        end_index = body.find("-->", match.end())
+        if end_index == -1:
+            continue
 
-    end_index = body.find("-->", match.end())
-    if end_index == -1:
-        return None
-
-    try:
-        payload = json.loads(body[match.end() : end_index].strip())
-        if not isinstance(payload, dict):
-            return None
-        return RuntimeState.from_dict(payload)
-    except (json.JSONDecodeError, ModelError, TypeError, ValueError):
-        return None
+        try:
+            payload = json.loads(body[match.end() : end_index].strip())
+            if not isinstance(payload, dict):
+                continue
+            return RuntimeState.from_dict(payload)
+        except (json.JSONDecodeError, ModelError, TypeError, ValueError):
+            continue
+    return None
 
 
 def find_state_comment(comments: Iterable[Mapping[str, Any]]) -> StateComment | None:
     """Find the last PR comment containing valid RuntimeState metadata."""
-    last_state_comment: StateComment | None = None
-    for comment in comments:
+    for comment in reversed(list(comments)):
         body = comment.get("body")
         if not isinstance(body, str) or "aipro-state" not in body:
             continue
@@ -102,8 +99,8 @@ def find_state_comment(comments: Iterable[Mapping[str, Any]]) -> StateComment | 
         comment_id = comment["id"]
         if not isinstance(comment_id, (int, str)):
             continue
-        last_state_comment = StateComment(comment_id=comment_id, body=body, state=state)
-    return last_state_comment
+        return StateComment(comment_id=comment_id, body=body, state=state)
+    return None
 
 
 def prepare_state_comment_update(
@@ -134,5 +131,7 @@ def _state_json(state: RuntimeState) -> str:
 
 def _lock_timestamp(dt: datetime) -> datetime:
     if dt.tzinfo is None or dt.utcoffset() is None:
+        # RuntimeState deserialization treats naive timestamps as UTC; keep the lock input
+        # contract aligned for callers that pass a previously parsed updated_at value.
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
