@@ -7,11 +7,11 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ai_pr_orchestrator.config import Config
+from ai_pr_orchestrator.decision_application import apply_decisions
 from ai_pr_orchestrator.models import (
     AgentRunResult,
     CheckRun,
     Finding,
-    HandledFinding,
     PlannedAction,
     PullRequest,
     ReviewerTrigger,
@@ -263,23 +263,41 @@ def _transition_handling(
         )
         return new_state, _terminal_actions(new_state, config)
 
-    handled_findings = {
-        **state.handled_findings,
-        **{
-            decision.finding_id: HandledFinding(
-                finding_id=decision.finding_id,
-                verdict=decision.verdict,
-                confidence=decision.confidence,
-                reason=decision.reason,
-                reply=decision.reply,
-                should_resolve=decision.should_resolve,
-                changed_files=decision.changed_files or [],
-                handled_at=now,
-            )
-            for decision in _decisions(result)
-        },
-    }
-    decision_actions = _decision_actions(result)
+    bot_ids = _bot_finding_ids(snapshot.findings, config)
+    app_result = apply_decisions(
+        _decisions(result),
+        config.thread_policy,
+        bot_ids,
+        state.handled_findings,
+        now,
+    )
+    handled_findings = app_result.handled_findings
+    decision_actions = app_result.actions
+
+    if app_result.has_needs_human:
+        new_state = _replace_state(
+            state,
+            now,
+            status="needs_human",
+            handled_findings=handled_findings,
+            cost=new_cost,
+            last_error="decision_needs_human",
+        )
+        if result.changed:
+            write_actions = [
+                PlannedAction(
+                    "commit_changes",
+                    {"message": result.commit_message or config.git.commit_message_prefix},
+                ),
+                PlannedAction("push_branch", {"head_sha": state.head_sha}),
+            ]
+            return new_state, [
+                *decision_actions,
+                *write_actions,
+                *_terminal_actions(new_state, config),
+            ]
+        return new_state, [*decision_actions, *_terminal_actions(new_state, config)]
+
     if result.changed:
         write_actions = [
             PlannedAction(
@@ -426,20 +444,14 @@ def _error(
     return new_state, _terminal_actions(new_state, config)
 
 
-def _decision_actions(result: AgentRunResult) -> list[PlannedAction]:
-    actions = _decision_reply_actions(result)
-    for decision in _decisions(result):
-        if decision.should_resolve and decision.thread_id:
-            actions.append(
-                PlannedAction(
-                    "resolve_thread",
-                    {
-                        "finding_id": decision.finding_id,
-                        "thread_id": decision.thread_id,
-                    },
-                )
-            )
-    return actions
+def _bot_finding_ids(findings: list[Finding] | None, config: Config) -> frozenset[str]:
+    if not findings:
+        return frozenset()
+    return frozenset(
+        f.id
+        for f in findings
+        if config.reviewers.get(f.source) and config.reviewers[f.source].bot_logins
+    )
 
 
 def _decision_reply_actions(result: AgentRunResult) -> list[PlannedAction]:
