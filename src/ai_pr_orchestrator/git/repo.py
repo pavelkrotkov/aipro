@@ -83,11 +83,17 @@ class GitRepo:
         """Push the current branch to origin. Never force-pushes."""
         self._run("push", "origin", branch)
 
-    def fetch_remote_head(self, branch: str) -> str:
-        """Fetch and return the SHA of the remote branch HEAD."""
-        self._run("fetch", "origin", branch)
-        result = self._run("rev-parse", f"origin/{branch}")
-        return result.stdout.strip()
+    def fetch_remote_head(self, branch: str) -> str | None:
+        """Fetch and return the SHA of the remote branch HEAD, or None if it doesn't exist."""
+        try:
+            self._run("fetch", "origin", branch)
+            result = self._run("rev-parse", f"origin/{branch}")
+            return result.stdout.strip()
+        except GitError as exc:
+            msg = str(exc).lower()
+            if "couldn't find remote ref" in msg or "ambiguous argument" in msg:
+                return None
+            raise
 
     def get_head_sha(self) -> str:
         """Return the SHA of the current HEAD."""
@@ -104,6 +110,11 @@ class GitRepo:
         self._run("reset", "--hard", "HEAD")
 
     def check_remote_head_matches(self, branch: str, expected_sha: str) -> bool:
-        """Return True if the remote HEAD for *branch* matches *expected_sha*."""
+        """Return True if the remote HEAD for *branch* matches *expected_sha*.
+
+        Returns False if the remote branch does not exist.
+        """
         remote_sha = self.fetch_remote_head(branch)
+        if remote_sha is None:
+            return False
         return remote_sha == expected_sha

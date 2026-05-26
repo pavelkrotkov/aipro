@@ -116,9 +116,17 @@ class TestHeadShaRace:
         sha = repo.fetch_remote_head("main")
         assert len(sha) == 40
 
+    def test_fetch_remote_head_returns_none_for_nonexistent_branch(self, repo: GitRepo) -> None:
+        _add_origin(repo)
+        assert repo.fetch_remote_head("non-existent-branch") is None
+
     def test_race_detected_when_sha_differs(self, repo: GitRepo) -> None:
         _add_origin(repo)
         assert repo.check_remote_head_matches("main", "0" * 40) is False
+
+    def test_race_detected_when_branch_does_not_exist(self, repo: GitRepo) -> None:
+        _add_origin(repo)
+        assert repo.check_remote_head_matches("non-existent-branch", "0" * 40) is False
 
     def test_safe_when_sha_matches(self, repo: GitRepo) -> None:
         _add_origin(repo)
