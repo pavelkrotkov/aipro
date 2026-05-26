@@ -31,7 +31,7 @@ def apply_decisions(
     has_needs_human = False
 
     for decision in decisions:
-        if decision.finding_id in already_handled:
+        if decision.finding_id in handled:
             continue
 
         is_bot = decision.finding_id in bot_finding_ids

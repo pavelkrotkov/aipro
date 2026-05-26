@@ -205,6 +205,15 @@ def test_accepted_without_should_resolve_does_not_resolve() -> None:
     assert "reply_to_thread" in _action_types(result)
 
 
+def test_duplicate_finding_ids_in_batch_are_deduplicated() -> None:
+    d1 = _decision(finding_id="f1", reply="Fix 1")
+    d2 = _decision(finding_id="f1", reply="Fix 1 again")
+    result = apply_decisions([d1, d2], _policy(), BOT_IDS, {}, NOW)
+    reply_actions = [a for a in result.actions if a.type == "reply_to_thread"]
+    assert len(reply_actions) == 1
+    assert reply_actions[0].payload["body"] == "Fix 1"
+
+
 def test_auto_resolve_bot_threads_false_blocks_accepted_resolve() -> None:
     d = _decision(verdict="accepted")
     result = apply_decisions([d], _policy(auto_resolve_bot_threads=False), BOT_IDS, {}, NOW)
