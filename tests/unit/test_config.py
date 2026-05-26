@@ -106,6 +106,7 @@ main_coder:
     assert config.review_phase.reviewer_timeout_seconds == 600
     assert config.ci.required_checks == []
     assert config.ci.ignored_checks == ["AI PR Review Loop"]
+    assert config.ci.timeout_seconds == 900
     assert config.safety.max_total_iterations == 3
 
 

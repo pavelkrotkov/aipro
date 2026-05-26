@@ -239,6 +239,7 @@ def test_handling_commits_pushes_and_waits_for_ci_when_gate_enabled() -> None:
     )
 
     assert state.status == "ci_wait"
+    assert state.ci_wait_started_at == NOW
     assert state.handled_findings["f1"].verdict == "accepted"
     assert action_types(actions) == [
         "reply_to_thread",
@@ -550,6 +551,34 @@ def test_waiting_timeout_needs_human() -> None:
 
     assert state.status == "needs_human"
     assert state.last_error == "reviewer_timeout"
+
+
+def test_waiting_processes_findings_when_timeout_arrives_too() -> None:
+    state, actions = transition(
+        make_state(status="waiting"),
+        make_snapshot(findings=[make_finding()], reviewer_timed_out=True),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "handling"
+    assert action_types(actions) == ["update_status_comment"]
+
+
+def test_ci_wait_times_out() -> None:
+    started_at = datetime(2026, 5, 25, 12, 0, tzinfo=UTC)
+    now = datetime(2026, 5, 25, 12, 15, tzinfo=UTC)
+
+    state, actions = transition(
+        make_state(status="ci_wait", ci_wait_started_at=started_at),
+        make_snapshot(),
+        make_config(),
+        now,
+    )
+
+    assert state.status == "needs_human"
+    assert state.last_error == "ci_timeout"
+    assert action_types(actions) == ["post_final_summary", "add_label"]
 
 
 def test_coder_needs_human_is_terminal() -> None:

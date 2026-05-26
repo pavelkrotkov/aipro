@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from ai_pr_orchestrator.config import Config
@@ -156,6 +156,8 @@ def _transition_waiting(
     now: datetime,
 ) -> tuple[RuntimeState, list[PlannedAction]]:
     findings = snapshot.findings or []
+    if findings:
+        return _with_status(state, "handling", now), [_status_action("handling")]
     if snapshot.reviewer_timed_out:
         new_state = _with_status(
             state,
@@ -164,8 +166,6 @@ def _transition_waiting(
             last_error="reviewer_timeout",
         )
         return new_state, _terminal_actions(new_state, config)
-    if findings:
-        return _with_status(state, "handling", now), [_status_action("handling")]
     if snapshot.reviewer_responded:
         new_state = _with_status(state, "done", now, done_reason="no_findings")
         return new_state, _terminal_actions(new_state, config)
@@ -219,7 +219,7 @@ def _transition_handling(
         ]
 
     result = snapshot.coder_result
-    token_usage = getattr(result, "token_usage", None)
+    token_usage = result.token_usage
     input_tokens = token_usage.input_tokens if token_usage else 0
     output_tokens = token_usage.output_tokens if token_usage else 0
     new_cost = replace(
@@ -293,6 +293,7 @@ def _transition_handling(
                 status="ci_wait",
                 handled_findings=handled_findings,
                 cost=new_cost,
+                ci_wait_started_at=now,
             )
             return new_state, [*decision_actions, *write_actions, _status_action("ci_wait")]
         new_state = _replace_state(
@@ -324,6 +325,11 @@ def _transition_ci_wait(
 ) -> tuple[RuntimeState, list[PlannedAction]]:
     if snapshot.event_head_sha is not None and snapshot.event_head_sha != state.head_sha:
         return _touch(state, now), [PlannedAction("noop", {"reason": "stale_ci_event"})]
+
+    ci_wait_started_at = state.ci_wait_started_at or state.updated_at
+    if now - ci_wait_started_at >= timedelta(seconds=config.ci.timeout_seconds):
+        new_state = _with_status(state, "needs_human", now, last_error="ci_timeout")
+        return new_state, _terminal_actions(new_state, config)
 
     checks = _relevant_checks(snapshot.checks or [], config, state.head_sha)
     if not checks or any(
@@ -394,12 +400,17 @@ def _cost_limit_transition(
     now: datetime,
 ) -> tuple[RuntimeState, list[PlannedAction]]:
     new_state = _with_status(state, "needs_human", now, last_error="cost_limit_reached")
+    actions = _terminal_actions(new_state, config)
     return new_state, [
-        PlannedAction(
-            "post_final_summary",
-            {"reason": "cost_limit_reached", "cost": state.cost.to_dict()},
-        ),
-        PlannedAction("add_label", {"label": config.error_label}),
+        (
+            PlannedAction(
+                "post_final_summary",
+                {"reason": "cost_limit_reached", "cost": state.cost.to_dict()},
+            )
+            if action.type == "post_final_summary"
+            else action
+        )
+        for action in actions
     ]
 
 
@@ -483,11 +494,11 @@ def _relevant_checks(checks: list[CheckRun], config: Config, head_sha: str) -> l
 
 
 def _has_test_regression(result: AgentRunResult) -> bool:
-    return any(test.result == "failed" for test in getattr(result, "tests", None) or [])
+    return any(test.result == "failed" for test in result.tests or [])
 
 
 def _decisions(result: AgentRunResult) -> list[Any]:
-    return getattr(result, "decisions", None) or []
+    return result.decisions or []
 
 
 def _with_status(

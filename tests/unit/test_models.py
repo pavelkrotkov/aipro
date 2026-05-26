@@ -370,13 +370,30 @@ class TestAgentRunResult:
 
         assert restored.changed is True
         assert restored.summary == "Fixed null pointer issue"
+        assert restored.decisions is not None
         assert len(restored.decisions) == 1
         assert restored.decisions[0].verdict == "accepted"
         assert restored.decisions[0].thread_id == "t1"
+        assert restored.tests is not None
         assert len(restored.tests) == 1
         assert restored.tests[0].result == "passed"
+        assert restored.token_usage is not None
         assert restored.token_usage.input_tokens == 5000
         assert restored.commit_message == "fix: null check"
+
+    def test_nullable_decoded_fields_round_trip(self) -> None:
+        result = AgentRunResult(
+            changed=False,
+            summary="No changes",
+            decisions=None,
+            tests=None,
+            token_usage=None,
+        )
+        restored = AgentRunResult.from_dict(_roundtrip_json(result.to_dict()))
+
+        assert restored.decisions is None
+        assert restored.tests is None
+        assert restored.token_usage is None
 
 
 # --- PlannedAction ---

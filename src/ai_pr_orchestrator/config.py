@@ -61,6 +61,7 @@ class CiConfig:
     require_green_before_done: bool = True
     required_checks: list[str] = field(default_factory=list)
     ignored_checks: list[str] = field(default_factory=lambda: ["AI PR Review Loop"])
+    timeout_seconds: int = 900
     relevant_failed_log_lines: int = 300
 
 
