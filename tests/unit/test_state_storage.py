@@ -63,6 +63,18 @@ def test_state_comment_round_trips_through_markdown() -> None:
     assert parse_state_comment(serialize_state_comment(state)) == state
 
 
+def test_state_comment_round_trips_with_html_comment_closer_in_string_field() -> None:
+    state = _make_state(last_error="error with --> HTML comment closing tag")
+    serialized = serialize_state_comment(state)
+    hidden_payload = serialized.split(STATE_COMMENT_MARKER, maxsplit=1)[1].rsplit(
+        "-->", maxsplit=1
+    )[0]
+
+    assert "-->" not in hidden_payload
+    assert "--\\u003e" in hidden_payload
+    assert parse_state_comment(serialized) == state
+
+
 def test_find_state_comment_scans_comment_bodies_for_marker() -> None:
     state = _make_state()
     comments = [
@@ -73,6 +85,20 @@ def test_find_state_comment_scans_comment_bodies_for_marker() -> None:
     found = find_state_comment(comments)
 
     assert found == StateComment(comment_id=101, body=comments[1]["body"], state=state)
+
+
+def test_find_state_comment_returns_last_valid_state_comment() -> None:
+    older = _make_state(head_sha="older")
+    newer = _make_state(head_sha="newer")
+    comments = [
+        {"id": 100, "body": serialize_state_comment(older)},
+        {"id": 101, "body": "ordinary comment"},
+        {"id": 102, "body": serialize_state_comment(newer)},
+    ]
+
+    found = find_state_comment(comments)
+
+    assert found == StateComment(comment_id=102, body=comments[2]["body"], state=newer)
 
 
 def test_find_state_comment_accepts_parser_supported_marker_spacing() -> None:

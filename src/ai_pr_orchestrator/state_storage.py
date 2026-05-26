@@ -86,7 +86,8 @@ def parse_state_comment(body: str) -> RuntimeState | None:
 
 
 def find_state_comment(comments: Iterable[Mapping[str, Any]]) -> StateComment | None:
-    """Find the first PR comment containing valid RuntimeState metadata."""
+    """Find the last PR comment containing valid RuntimeState metadata."""
+    last_state_comment: StateComment | None = None
     for comment in comments:
         body = comment.get("body")
         if not isinstance(body, str):
@@ -97,8 +98,8 @@ def find_state_comment(comments: Iterable[Mapping[str, Any]]) -> StateComment | 
         comment_id = comment["id"]
         if not isinstance(comment_id, (int, str)):
             continue
-        return StateComment(comment_id=comment_id, body=body, state=state)
-    return None
+        last_state_comment = StateComment(comment_id=comment_id, body=body, state=state)
+    return last_state_comment
 
 
 def prepare_state_comment_update(
@@ -122,7 +123,9 @@ def prepare_state_comment_update(
 
 
 def _state_json(state: RuntimeState) -> str:
-    return json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":"))
+    return json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":")).replace(
+        "-->", "--\\u003e"
+    )
 
 
 def _lock_timestamp(dt: datetime) -> datetime:
