@@ -28,6 +28,7 @@ ActionType = Literal[
     "resolve_thread",
     "commit_changes",
     "push_branch",
+    "rollback_changes",
     "add_label",
     "remove_label",
     "post_final_summary",
