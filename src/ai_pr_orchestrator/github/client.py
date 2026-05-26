@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -114,12 +115,12 @@ class GitHubClient:
 
     def remove_label(self, issue_number: int, label: str) -> None:
         self._delete(
-            f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/labels/{label}",
+            f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/labels/{quote(label, safe='')}",
         )
 
     def get_check_runs(self, ref: str) -> list[models.CheckRun]:
         data = self._get_paginated(
-            f"/repos/{self._owner}/{self._repo}/commits/{ref}/check-runs",
+            f"/repos/{self._owner}/{self._repo}/commits/{quote(ref, safe='')}/check-runs",
             items_key="check_runs",
         )
         return [

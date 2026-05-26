@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -140,6 +141,17 @@ def test_remove_label() -> None:
     assert route.called
 
 
+@respx.mock
+def test_remove_label_percent_encodes_slash() -> None:
+    route = respx.delete(f"{BASE}/repos/{OWNER}/{REPO}/issues/42/labels/status%2Fneeds-human").mock(
+        return_value=httpx.Response(204)
+    )
+    with _make_client() as client:
+        client.remove_label(42, "status/needs-human")
+
+    assert route.called
+
+
 # --- REST: get_check_runs ---
 
 
@@ -230,13 +242,16 @@ def test_get_review_threads() -> None:
 def test_reply_to_review_thread() -> None:
     route = respx.post(GQL).mock(
         return_value=httpx.Response(
-            200, json={"data": {"addPullRequestReviewComment": {"comment": {"id": "RC_new"}}}}
+            200,
+            json={"data": {"addPullRequestReviewThreadReply": {"comment": {"id": "RC_new"}}}},
         )
     )
     with _make_client() as client:
         result = client.reply_to_review_thread("RT_1", "fixed")
 
     assert route.called
+    request_body = json.loads(route.calls[0].request.content)
+    assert "addPullRequestReviewThreadReply" in request_body["query"]
     assert result is not None
 
 

@@ -32,7 +32,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
 
 REPLY_TO_REVIEW_THREAD_MUTATION = """
 mutation($threadId: ID!, $body: String!) {
-  addPullRequestReviewComment(input: {
+  addPullRequestReviewThreadReply(input: {
     pullRequestReviewThreadId: $threadId
     body: $body
   }) {
