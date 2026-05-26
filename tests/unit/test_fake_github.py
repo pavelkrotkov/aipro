@@ -23,19 +23,32 @@ from ai_pr_orchestrator.state_storage import (
 NOW = datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
 
 
-def _make_pr(number: int = 42, **overrides) -> PullRequest:
-    defaults = dict(
+def _make_pr(
+    number: int = 42,
+    title: str = "Test PR",
+    body: str = "PR body",
+    state: str = "open",
+    head_sha: str = "abc123",
+    head_ref: str = "feature",
+    base_ref: str = "main",
+    author: str = "author",
+    draft: bool = False,
+    mergeable: bool | None = None,
+    labels: list[str] | None = None,
+) -> PullRequest:
+    return PullRequest(
         number=number,
-        title="Test PR",
-        body="PR body",
-        state="open",
-        head_sha="abc123",
-        head_ref="feature",
-        base_ref="main",
-        author="author",
+        title=title,
+        body=body,
+        state=state,
+        head_sha=head_sha,
+        head_ref=head_ref,
+        base_ref=base_ref,
+        author=author,
+        draft=draft,
+        mergeable=mergeable,
+        labels=labels or [],
     )
-    defaults.update(overrides)
-    return PullRequest(**defaults)
 
 
 def _make_client(**kwargs) -> FakeGitHubClient:
