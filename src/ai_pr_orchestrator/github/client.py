@@ -256,6 +256,11 @@ class GitHubClient:
             response = self._request("GET", url, absolute_url=True)
             body = response.json()
             if items_key is not None:
+                if not isinstance(body, dict):
+                    raise GitHubClientError(
+                        f"Expected a dict response with key {items_key!r},"
+                        f" got {type(body).__name__}"
+                    )
                 all_items.extend(body.get(items_key, []))
             elif isinstance(body, list):
                 all_items.extend(body)
