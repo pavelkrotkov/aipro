@@ -257,8 +257,10 @@ class GitHubClient:
             body = response.json()
             if items_key is not None:
                 all_items.extend(body.get(items_key, []))
-            else:
+            elif isinstance(body, list):
                 all_items.extend(body)
+            else:
+                raise GitHubClientError(f"Expected a list response, got {type(body).__name__}")
             url = _parse_next_link(response.headers.get("link", ""))
 
         return all_items

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ai_pr_orchestrator.github import models
@@ -84,6 +84,11 @@ class FakeGitHubClient:
         self._next_comment_id = 1
         self._next_check_run_id = 1
         self._next_review_comment_id = 1
+
+    def _tick(self) -> datetime:
+        """Advance internal clock by 1 second and return the new time."""
+        self._now += timedelta(seconds=1)
+        return self._now
 
     # --- Seeding helpers ---
 
@@ -169,19 +174,7 @@ class FakeGitHubClient:
         pr = self._prs[number]
         current_labels = self._labels.get(number, [])
         if list(pr.labels) != current_labels:
-            return models.PullRequest(
-                number=pr.number,
-                title=pr.title,
-                body=pr.body,
-                state=pr.state,
-                head_sha=pr.head_sha,
-                head_ref=pr.head_ref,
-                base_ref=pr.base_ref,
-                author=pr.author,
-                draft=pr.draft,
-                mergeable=pr.mergeable,
-                labels=list(current_labels),
-            )
+            return replace(pr, labels=list(current_labels))
         return pr
 
     def get_pr_comments(self, issue_number: int) -> list[models.Comment]:
@@ -210,7 +203,7 @@ class FakeGitHubClient:
             raise KeyError(f"Comment #{comment_id} not found in fake")
         mc = self._comments[comment_id]
         mc.body = body
-        mc.updated_at = datetime.now(UTC)
+        mc.updated_at = self._tick()
         return mc.to_model()
 
     def edit_comment_optimistic(
@@ -225,7 +218,7 @@ class FakeGitHubClient:
                 f"expected {expected_updated_at}, got {mc.updated_at.isoformat()}"
             )
         mc.body = body
-        mc.updated_at = datetime.now(UTC)
+        mc.updated_at = self._tick()
         return mc.to_model()
 
     def add_label(self, issue_number: int, label: str) -> list[dict[str, Any]]:
