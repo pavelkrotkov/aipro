@@ -124,6 +124,12 @@ def test_parse_state_comment_returns_none_when_marker_is_missing() -> None:
     assert parse_state_comment("ordinary comment") is None
 
 
+def test_parse_state_comment_returns_none_when_closing_comment_marker_is_missing() -> None:
+    body = f"header\n\n{STATE_COMMENT_MARKER}\n{' ' * 10_000}"
+
+    assert parse_state_comment(body) is None
+
+
 def test_size_guard_refuses_to_serialize_payload_over_50kb() -> None:
     state = _make_state(last_error="x" * MAX_STATE_JSON_BYTES)
 

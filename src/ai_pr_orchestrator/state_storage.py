@@ -14,7 +14,7 @@ from ai_pr_orchestrator.models import ModelError, RuntimeState
 MAX_STATE_JSON_BYTES = 50_000
 STATE_COMMENT_MARKER = "<!-- aipro-state"
 
-_STATE_COMMENT_RE = re.compile(r"<!--\s*aipro-state\s*(?P<payload>.*?)\s*-->", re.DOTALL)
+_STATE_START_RE = re.compile(r"<!--\s*aipro-state")
 
 
 class StateStorageError(ValueError):
@@ -72,12 +72,16 @@ def serialize_state_comment(
 
 def parse_state_comment(body: str) -> RuntimeState | None:
     """Extract RuntimeState from a PR comment body, returning None when absent or corrupt."""
-    match = _STATE_COMMENT_RE.search(body)
+    match = _STATE_START_RE.search(body)
     if match is None:
         return None
 
+    end_index = body.find("-->", match.end())
+    if end_index == -1:
+        return None
+
     try:
-        payload = json.loads(match.group("payload"))
+        payload = json.loads(body[match.end() : end_index].strip())
         if not isinstance(payload, dict):
             return None
         return RuntimeState.from_dict(payload)
@@ -90,7 +94,7 @@ def find_state_comment(comments: Iterable[Mapping[str, Any]]) -> StateComment | 
     last_state_comment: StateComment | None = None
     for comment in comments:
         body = comment.get("body")
-        if not isinstance(body, str):
+        if not isinstance(body, str) or "aipro-state" not in body:
             continue
         state = parse_state_comment(body)
         if state is None or "id" not in comment:
