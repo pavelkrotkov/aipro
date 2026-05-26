@@ -127,6 +127,9 @@ class CostTracker:
 
     def exceeds_limits(self, config: Any) -> bool:
         safety = config.safety
+        # Invocation counts are durable usage totals: equality means the budget
+        # is spent, not exceeded. Token usage is a hard ceiling because it is
+        # only known after an API response has already completed.
         return (
             self.coder_invocations > safety.max_coder_invocations_per_run
             or self.reviewer_triggers > safety.max_reviewer_triggers_per_run

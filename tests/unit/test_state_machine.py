@@ -288,6 +288,19 @@ def test_handling_skips_thread_actions_when_decision_has_no_thread_id() -> None:
     assert "resolve_thread" not in action_types(actions)
 
 
+def test_handling_tolerates_missing_decisions_from_decoded_result() -> None:
+    state, actions = transition(
+        make_state(status="handling"),
+        make_snapshot(coder_result=make_result(changed=False, decisions=None)),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "done"
+    assert state.handled_findings == {}
+    assert action_types(actions) == ["post_final_summary", "add_label", "remove_label"]
+
+
 def test_handling_finishes_when_ci_gate_disabled() -> None:
     config = make_config(ci=CiConfig(require_green_before_done=False))
 
@@ -398,6 +411,18 @@ def test_workflow_file_change_needs_human() -> None:
     assert state.last_error == "workflow_file_changed"
 
 
+def test_missing_changed_files_are_treated_as_empty_for_safety() -> None:
+    state, actions = transition(
+        make_state(),
+        make_snapshot(pr=make_pr(changed_files=None)),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "triggering"
+    assert action_types(actions) == ["update_status_comment"]
+
+
 def test_coder_invocation_limit_blocks_handling_before_invoke() -> None:
     state, actions = transition(
         make_state(status="handling", round_index=2, cost=CostTracker(coder_invocations=1)),
@@ -414,6 +439,19 @@ def test_coder_invocation_limit_blocks_handling_before_invoke() -> None:
 def test_coder_invocation_at_limit_does_not_block_passive_ci_wait() -> None:
     state, actions = transition(
         make_state(status="ci_wait", cost=CostTracker(coder_invocations=1)),
+        make_snapshot(),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "ci_wait"
+    assert action_types(actions) == ["noop"]
+    assert actions[0].payload["reason"] == "ci_pending"
+
+
+def test_token_limit_does_not_block_passive_ci_wait() -> None:
+    state, actions = transition(
+        make_state(status="ci_wait", cost=CostTracker(input_tokens=100_000)),
         make_snapshot(),
         make_config(),
         NOW,
@@ -538,7 +576,25 @@ def test_test_regression_plans_rollback() -> None:
     )
 
     assert state.status == "needs_human"
-    assert action_types(actions) == ["rollback_changes", "post_final_summary", "add_label"]
+    assert action_types(actions) == [
+        "rollback_changes",
+        "reply_to_thread",
+        "post_final_summary",
+        "add_label",
+    ]
+    assert "resolve_thread" not in action_types(actions)
+
+
+def test_missing_tests_are_treated_as_no_test_regression() -> None:
+    state, actions = transition(
+        make_state(status="handling"),
+        make_snapshot(coder_result=make_result(changed=False, tests=None)),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "done"
+    assert action_types(actions)[-3:] == ["post_final_summary", "add_label", "remove_label"]
 
 
 def test_changed_result_with_clean_worktree_is_error() -> None:
@@ -568,6 +624,18 @@ def test_handling_records_token_usage_from_coder_result() -> None:
 
     assert state.cost.input_tokens == 11
     assert state.cost.output_tokens == 7
+
+
+def test_handling_treats_missing_token_usage_as_zero() -> None:
+    state, _actions = transition(
+        make_state(status="handling"),
+        make_snapshot(coder_result=make_result(changed=False, token_usage=None)),
+        make_config(),
+        NOW,
+    )
+
+    assert state.cost.input_tokens == 0
+    assert state.cost.output_tokens == 0
 
 
 def test_already_terminal_states_do_not_replan_actions() -> None:

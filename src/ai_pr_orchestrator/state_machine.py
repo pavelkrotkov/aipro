@@ -43,7 +43,12 @@ def transition(
     config: Config,
     now: datetime,
 ) -> tuple[RuntimeState, list[PlannedAction]]:
-    """Advance state and return planned side effects without performing I/O."""
+    """Advance state and return planned side effects without performing I/O.
+
+    Executors must record the new pushed commit SHA in persisted state after a
+    successful ``push_branch`` action, before resuming from CI events. The pure
+    state machine cannot know that SHA before the side effect runs.
+    """
     if state.status in TERMINAL_STATUSES:
         return _touch(state, now), []
 
@@ -74,6 +79,8 @@ def transition(
     if state.status == "waiting":
         return _transition_waiting(state, snapshot, config, now)
     if state.status == "collecting":
+        # V1 treats collecting as a persisted alias for the reviewer-response
+        # collection branch handled by waiting.
         return _transition_waiting(state, snapshot, config, now)
     if state.status == "handling":
         return _transition_handling(state, snapshot, config, now)
@@ -212,10 +219,13 @@ def _transition_handling(
         ]
 
     result = snapshot.coder_result
+    token_usage = getattr(result, "token_usage", None)
+    input_tokens = token_usage.input_tokens if token_usage else 0
+    output_tokens = token_usage.output_tokens if token_usage else 0
     new_cost = replace(
         state.cost,
-        input_tokens=state.cost.input_tokens + result.token_usage.input_tokens,
-        output_tokens=state.cost.output_tokens + result.token_usage.output_tokens,
+        input_tokens=state.cost.input_tokens + input_tokens,
+        output_tokens=state.cost.output_tokens + output_tokens,
     )
     if result.needs_human:
         new_state = _replace_state(
@@ -237,6 +247,7 @@ def _transition_handling(
         )
         return new_state, [
             PlannedAction("rollback_changes", {"reason": "test_regression"}),
+            *_decision_reply_actions(result),
             *_terminal_actions(new_state, config),
         ]
 
@@ -260,10 +271,10 @@ def _transition_handling(
                 reason=decision.reason,
                 reply=decision.reply,
                 should_resolve=decision.should_resolve,
-                changed_files=decision.changed_files,
+                changed_files=decision.changed_files or [],
                 handled_at=now,
             )
-            for decision in result.decisions
+            for decision in _decisions(result)
         },
     }
     decision_actions = _decision_actions(result)
@@ -357,7 +368,7 @@ def _safety_transition(
         )
     if config.safety.disallow_workflow_file_changes and any(
         path == ".github/workflows" or path.startswith(".github/workflows/")
-        for path in snapshot.pr.changed_files
+        for path in snapshot.pr.changed_files or []
     ):
         new_state = _with_status(state, "needs_human", now, last_error="workflow_file_changed")
         return new_state, _terminal_actions(new_state, config)
@@ -372,7 +383,7 @@ def _limit_transition(
     if state.round_index >= config.safety.max_total_iterations:
         new_state = _with_status(state, "needs_human", now, last_error="max_iterations_reached")
         return new_state, _terminal_actions(new_state, config)
-    if state.cost.exceeds_limits(config):
+    if state.status != "ci_wait" and state.cost.exceeds_limits(config):
         return _cost_limit_transition(state, config, now)
     return None
 
@@ -403,8 +414,24 @@ def _error(
 
 
 def _decision_actions(result: AgentRunResult) -> list[PlannedAction]:
+    actions = _decision_reply_actions(result)
+    for decision in _decisions(result):
+        if decision.should_resolve and decision.thread_id:
+            actions.append(
+                PlannedAction(
+                    "resolve_thread",
+                    {
+                        "finding_id": decision.finding_id,
+                        "thread_id": decision.thread_id,
+                    },
+                )
+            )
+    return actions
+
+
+def _decision_reply_actions(result: AgentRunResult) -> list[PlannedAction]:
     actions: list[PlannedAction] = []
-    for decision in result.decisions:
+    for decision in _decisions(result):
         if decision.reply and decision.thread_id:
             actions.append(
                 PlannedAction(
@@ -413,16 +440,6 @@ def _decision_actions(result: AgentRunResult) -> list[PlannedAction]:
                         "finding_id": decision.finding_id,
                         "thread_id": decision.thread_id,
                         "body": decision.reply,
-                    },
-                )
-            )
-        if decision.should_resolve and decision.thread_id:
-            actions.append(
-                PlannedAction(
-                    "resolve_thread",
-                    {
-                        "finding_id": decision.finding_id,
-                        "thread_id": decision.thread_id,
                     },
                 )
             )
@@ -466,7 +483,11 @@ def _relevant_checks(checks: list[CheckRun], config: Config, head_sha: str) -> l
 
 
 def _has_test_regression(result: AgentRunResult) -> bool:
-    return any(test.result == "failed" for test in result.tests)
+    return any(test.result == "failed" for test in getattr(result, "tests", None) or [])
+
+
+def _decisions(result: AgentRunResult) -> list[Any]:
+    return getattr(result, "decisions", None) or []
 
 
 def _with_status(
