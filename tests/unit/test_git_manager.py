@@ -114,6 +114,7 @@ class TestHeadShaRace:
     def test_fetch_remote_head_returns_sha(self, repo: GitRepo) -> None:
         _add_origin(repo)
         sha = repo.fetch_remote_head("main")
+        assert sha is not None
         assert len(sha) == 40
 
     def test_fetch_remote_head_returns_none_for_nonexistent_branch(self, repo: GitRepo) -> None:
