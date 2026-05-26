@@ -135,6 +135,18 @@ def test_waiting_moves_to_handling_when_findings_are_collected() -> None:
     assert action_types(actions) == ["update_status_comment"]
 
 
+def test_collecting_uses_reviewer_collection_logic() -> None:
+    state, actions = transition(
+        make_state(status="collecting"),
+        make_snapshot(findings=[make_finding()]),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "handling"
+    assert action_types(actions) == ["update_status_comment"]
+
+
 def test_waiting_finishes_when_reviewer_responded_without_findings() -> None:
     state, actions = transition(
         make_state(status="waiting"),

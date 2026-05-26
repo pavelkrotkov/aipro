@@ -66,6 +66,8 @@ def transition(
         return _transition_triggering(state, snapshot, config, now)
     if state.status == "waiting":
         return _transition_waiting(state, snapshot, config, now)
+    if state.status == "collecting":
+        return _transition_waiting(state, snapshot, config, now)
     if state.status == "handling":
         return _transition_handling(state, snapshot, config, now)
     if state.status == "ci_wait":
