@@ -328,7 +328,7 @@ def test_rate_limit_gives_up(monkeypatch: pytest.MonkeyPatch) -> None:
     respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/1").mock(
         return_value=httpx.Response(429, headers={"retry-after": "1"}),
     )
-    with _make_client() as client, pytest.raises(GitHubClientError, match="Rate limited after"):
+    with _make_client() as client, pytest.raises(GitHubClientError, match="Request failed after"):
         client.get_pr(1)
 
     assert len(sleeps) == 3  # MAX_RETRIES - 1
@@ -626,3 +626,137 @@ def test_rate_limit_uses_reset_header(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert len(sleeps) == 1
     assert sleeps[0] == pytest.approx(5.0, abs=0.1)
+
+
+# --- 5xx retries ---
+
+
+@respx.mock
+def test_502_retries_with_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("ai_pr_orchestrator.github.client.time.sleep", sleeps.append)
+
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/1").mock(
+        side_effect=[
+            httpx.Response(502),
+            httpx.Response(200, json=_pr_json(1)),
+        ]
+    )
+    with _make_client() as client:
+        pr = client.get_pr(1)
+
+    assert route.call_count == 2
+    assert len(sleeps) == 1
+    assert pr.number == 1
+
+
+@respx.mock
+def test_5xx_gives_up_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("ai_pr_orchestrator.github.client.time.sleep", sleeps.append)
+
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/1").mock(
+        return_value=httpx.Response(503),
+    )
+    with _make_client() as client, pytest.raises(GitHubClientError, match="Request failed after"):
+        client.get_pr(1)
+
+    assert len(sleeps) == 3
+
+
+# --- Network error retries ---
+
+
+@respx.mock
+def test_network_error_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("ai_pr_orchestrator.github.client.time.sleep", sleeps.append)
+
+    call_count = 0
+
+    def flaky_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, json=_pr_json(1))
+
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/1").mock(side_effect=flaky_handler)
+    with _make_client() as client:
+        pr = client.get_pr(1)
+
+    assert call_count == 2
+    assert len(sleeps) == 1
+    assert pr.number == 1
+
+
+@respx.mock
+def test_network_error_gives_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("ai_pr_orchestrator.github.client.time.sleep", sleeps.append)
+
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/1").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    with _make_client() as client, pytest.raises(GitHubClientError, match="Network error after"):
+        client.get_pr(1)
+
+    assert len(sleeps) == 3
+
+
+# --- GraphQL null repository/PR errors ---
+
+
+@respx.mock
+def test_graphql_null_repository_raises() -> None:
+    respx.post(GQL).mock(return_value=httpx.Response(200, json={"data": {"repository": None}}))
+    with (
+        _make_client() as client,
+        pytest.raises(GitHubClientError, match="not found or inaccessible"),
+    ):
+        client.get_review_threads(1)
+
+
+@respx.mock
+def test_graphql_null_pull_request_raises() -> None:
+    respx.post(GQL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": {"repository": {"pullRequest": None}}},
+        )
+    )
+    with (
+        _make_client() as client,
+        pytest.raises(GitHubClientError, match="Pull request #1 not found"),
+    ):
+        client.get_review_threads(1)
+
+
+# --- Null user fields ---
+
+
+@respx.mock
+def test_get_pr_with_deleted_user() -> None:
+    pr_data = _pr_json()
+    pr_data["user"] = None
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+        return_value=httpx.Response(200, json=pr_data)
+    )
+    with _make_client() as client:
+        pr = client.get_pr(42)
+
+    assert pr.author == "ghost"
+
+
+@respx.mock
+def test_parse_comment_with_deleted_user() -> None:
+    comment_data = _comment_json()
+    comment_data["user"] = None
+    respx.post(f"{BASE}/repos/{OWNER}/{REPO}/issues/1/comments").mock(
+        return_value=httpx.Response(201, json=comment_data)
+    )
+    with _make_client() as client:
+        comment = client.post_comment(1, "test")
+
+    assert comment is not None
+    assert comment.user == "ghost"

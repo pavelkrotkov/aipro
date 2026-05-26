@@ -82,7 +82,7 @@ class GitHubClient:
             head_sha=data["head"]["sha"],
             head_ref=data["head"]["ref"],
             base_ref=data["base"]["ref"],
-            author=data["user"]["login"],
+            author=(data.get("user") or {}).get("login", "ghost"),
             draft=data.get("draft", False),
             mergeable=data.get("mergeable"),
             labels=[label["name"] for label in data.get("labels", [])],
@@ -150,7 +150,15 @@ class GitHubClient:
 
             data = self._graphql(graphql.REVIEW_THREADS_QUERY, variables)
             data_dict = data.get("data") or {}
+            if "repository" in data_dict and data_dict["repository"] is None:
+                raise GitHubClientError(
+                    f"Repository {self._owner}/{self._repo} not found or inaccessible"
+                )
             repo_dict = data_dict.get("repository") or {}
+            if "pullRequest" in repo_dict and repo_dict["pullRequest"] is None:
+                raise GitHubClientError(
+                    f"Pull request #{pr_number} not found in {self._owner}/{self._repo}"
+                )
             pr_dict = repo_dict.get("pullRequest") or {}
             thread_connection = pr_dict.get("reviewThreads") or {}
 
@@ -262,7 +270,24 @@ class GitHubClient:
         full_url = url if absolute_url else f"{self._base_url}{url}"
 
         for attempt in range(_MAX_RETRIES):
-            response = self._client.request(method, full_url, json=json)
+            try:
+                response = self._client.request(method, full_url, json=json)
+            except httpx.RequestError as exc:
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _INITIAL_BACKOFF * (2**attempt)
+                    logger.warning(
+                        "Network error (%s), retrying in %.1fs (attempt %d/%d)",
+                        exc,
+                        wait,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise GitHubClientError(
+                    f"Network error after {_MAX_RETRIES} retries: {exc}"
+                ) from exc
+
             logger.debug(
                 "%s %s -> %d",
                 method,
@@ -270,13 +295,13 @@ class GitHubClient:
                 response.status_code,
             )
 
-            if response.status_code == 429 or (
+            if response.status_code in (429, 500, 502, 503, 504) or (
                 response.status_code == 403 and _is_rate_limited(response)
             ):
                 wait = _retry_wait(response, attempt)
                 if attempt < _MAX_RETRIES - 1:
                     logger.warning(
-                        "Rate limited (%d), retrying in %.1fs (attempt %d/%d)",
+                        "Transient error (%d), retrying in %.1fs (attempt %d/%d)",
                         response.status_code,
                         wait,
                         attempt + 1,
@@ -285,7 +310,7 @@ class GitHubClient:
                     time.sleep(wait)
                     continue
                 raise GitHubClientError(
-                    f"Rate limited after {_MAX_RETRIES} retries: "
+                    f"Request failed after {_MAX_RETRIES} retries: "
                     f"{method} {full_url} -> {response.status_code}"
                 )
 
@@ -299,7 +324,7 @@ def _parse_comment(data: dict[str, Any]) -> models.Comment:
     return models.Comment(
         id=data["id"],
         body=data["body"],
-        user=data["user"]["login"],
+        user=(data.get("user") or {}).get("login", "ghost"),
         created_at=data["created_at"],
         updated_at=data["updated_at"],
     )
