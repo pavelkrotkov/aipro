@@ -519,7 +519,9 @@ def test_dry_run_skips_post(caplog: pytest.LogCaptureFixture) -> None:
     with _make_client(dry_run=True) as client, caplog.at_level(logging.INFO):
         result = client.post_comment(42, "hello")
 
-    assert result is None
+    assert result.body == "hello"
+    assert result.user == "dry-run"
+    assert result.id == 0
     assert "DRY-RUN" in caplog.text
     assert "POST" in caplog.text
 
@@ -528,7 +530,9 @@ def test_dry_run_skips_patch(caplog: pytest.LogCaptureFixture) -> None:
     with _make_client(dry_run=True) as client, caplog.at_level(logging.INFO):
         result = client.edit_comment(99, "updated")
 
-    assert result is None
+    assert result.id == 99
+    assert result.body == "updated"
+    assert result.user == "dry-run"
     assert "DRY-RUN" in caplog.text
 
 
@@ -538,6 +542,14 @@ def test_dry_run_skips_delete(caplog: pytest.LogCaptureFixture) -> None:
 
     assert "DRY-RUN" in caplog.text
     assert "DELETE" in caplog.text
+
+
+def test_dry_run_add_label_returns_synthetic(caplog: pytest.LogCaptureFixture) -> None:
+    with _make_client(dry_run=True) as client, caplog.at_level(logging.INFO):
+        result = client.add_label(42, "ai-loop")
+
+    assert result == [{"name": "ai-loop"}]
+    assert "DRY-RUN" in caplog.text
 
 
 def test_dry_run_skips_graphql_reply(caplog: pytest.LogCaptureFixture) -> None:

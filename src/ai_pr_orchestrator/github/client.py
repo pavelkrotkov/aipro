@@ -89,29 +89,34 @@ class GitHubClient:
             labels=[label["name"] for label in data.get("labels", [])],
         )
 
-    def post_comment(self, issue_number: int, body: str) -> models.Comment | None:
+    def post_comment(self, issue_number: int, body: str) -> models.Comment:
         data = self._post(
             f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/comments",
             json={"body": body},
         )
         if data is None:
-            return None
+            return models.Comment(id=0, body=body, user="dry-run", created_at="", updated_at="")
         return _parse_comment(data)
 
-    def edit_comment(self, comment_id: int, body: str) -> models.Comment | None:
+    def edit_comment(self, comment_id: int, body: str) -> models.Comment:
         data = self._patch(
             f"/repos/{self._owner}/{self._repo}/issues/comments/{comment_id}",
             json={"body": body},
         )
         if data is None:
-            return None
+            return models.Comment(
+                id=comment_id, body=body, user="dry-run", created_at="", updated_at=""
+            )
         return _parse_comment(data)
 
-    def add_label(self, issue_number: int, label: str) -> list[dict[str, Any]] | None:
-        return self._post(
+    def add_label(self, issue_number: int, label: str) -> list[dict[str, Any]]:
+        data = self._post(
             f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/labels",
             json={"labels": [label]},
         )
+        if data is None:
+            return [{"name": label}]
+        return data
 
     def remove_label(self, issue_number: int, label: str) -> None:
         self._delete(
