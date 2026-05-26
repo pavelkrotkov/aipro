@@ -98,6 +98,11 @@ def _transition_triggering(
     if not enabled_reviewers:
         new_state = _with_status(state, "error", now, last_error="no_reviewers_configured")
         return new_state, _terminal_actions(new_state, config)
+    if (
+        state.cost.reviewer_triggers + len(enabled_reviewers)
+        > config.safety.max_reviewer_triggers_per_run
+    ):
+        return _cost_limit_transition(state, config, now)
 
     actions = [
         PlannedAction(
@@ -179,6 +184,11 @@ def _transition_handling(
         return new_state, [_status_action("init", reason="head_sha_changed")]
 
     if snapshot.coder_result is None:
+        if state.cost.coder_invocations >= state.round_index:
+            return _touch(state, now), [PlannedAction("noop", {"reason": "waiting_for_coder"})]
+        if state.cost.coder_invocations + 1 > config.safety.max_coder_invocations_per_run:
+            return _cost_limit_transition(state, config, now)
+
         new_cost = replace(
             state.cost,
             coder_invocations=state.cost.coder_invocations + 1,
@@ -358,15 +368,23 @@ def _limit_transition(
         new_state = _with_status(state, "needs_human", now, last_error="max_iterations_reached")
         return new_state, _terminal_actions(new_state, config)
     if state.cost.exceeds_limits(config):
-        new_state = _with_status(state, "needs_human", now, last_error="cost_limit_reached")
-        return new_state, [
-            PlannedAction(
-                "post_final_summary",
-                {"reason": "cost_limit_reached", "cost": state.cost.to_dict()},
-            ),
-            PlannedAction("add_label", {"label": config.error_label}),
-        ]
+        return _cost_limit_transition(state, config, now)
     return None
+
+
+def _cost_limit_transition(
+    state: RuntimeState,
+    config: Config,
+    now: datetime,
+) -> tuple[RuntimeState, list[PlannedAction]]:
+    new_state = _with_status(state, "needs_human", now, last_error="cost_limit_reached")
+    return new_state, [
+        PlannedAction(
+            "post_final_summary",
+            {"reason": "cost_limit_reached", "cost": state.cost.to_dict()},
+        ),
+        PlannedAction("add_label", {"label": config.error_label}),
+    ]
 
 
 def _error(

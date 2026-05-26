@@ -176,7 +176,7 @@ def test_waiting_finishes_when_reviewer_responded_without_findings() -> None:
 
 def test_handling_plans_coder_invocation_before_result_exists() -> None:
     state, actions = transition(
-        make_state(status="handling"),
+        make_state(status="handling", round_index=1),
         make_snapshot(findings=[make_finding()]),
         make_config(),
         NOW,
@@ -185,6 +185,20 @@ def test_handling_plans_coder_invocation_before_result_exists() -> None:
     assert state.status == "handling"
     assert state.cost.coder_invocations == 1
     assert action_types(actions) == ["invoke_coder"]
+
+
+def test_handling_waits_when_coder_was_already_invoked_for_round() -> None:
+    state, actions = transition(
+        make_state(status="handling", round_index=1, cost=CostTracker(coder_invocations=1)),
+        make_snapshot(findings=[make_finding()]),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "handling"
+    assert state.cost.coder_invocations == 1
+    assert action_types(actions) == ["noop"]
+    assert actions[0].payload["reason"] == "waiting_for_coder"
 
 
 def test_handling_commits_pushes_and_waits_for_ci_when_gate_enabled() -> None:
@@ -338,7 +352,7 @@ def test_workflow_file_change_needs_human() -> None:
 
 def test_coder_invocation_limit_blocks_handling_before_invoke() -> None:
     state, actions = transition(
-        make_state(status="handling", cost=CostTracker(coder_invocations=1)),
+        make_state(status="handling", round_index=2, cost=CostTracker(coder_invocations=1)),
         make_snapshot(findings=[make_finding()]),
         make_config(),
         NOW,
@@ -347,6 +361,19 @@ def test_coder_invocation_limit_blocks_handling_before_invoke() -> None:
     assert state.status == "needs_human"
     assert state.last_error == "cost_limit_reached"
     assert action_types(actions) == ["post_final_summary", "add_label"]
+
+
+def test_coder_invocation_at_limit_does_not_block_passive_ci_wait() -> None:
+    state, actions = transition(
+        make_state(status="ci_wait", cost=CostTracker(coder_invocations=1)),
+        make_snapshot(),
+        make_config(),
+        NOW,
+    )
+
+    assert state.status == "ci_wait"
+    assert action_types(actions) == ["noop"]
+    assert actions[0].payload["reason"] == "ci_pending"
 
 
 def test_reviewer_trigger_limit_blocks_triggering() -> None:

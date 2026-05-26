@@ -250,14 +250,26 @@ class TestCostTracker:
         assert cost.input_tokens == 1000
         assert cost.output_tokens == 500
 
-    def test_exceeds_limits_on_coder_invocations(self) -> None:
+    def test_allows_coder_invocations_at_limit(self) -> None:
         cost = CostTracker(coder_invocations=1)
+        config = _fake_config(max_coder_invocations_per_run=1)
+
+        assert cost.exceeds_limits(config) is False
+
+    def test_exceeds_limits_above_coder_invocations(self) -> None:
+        cost = CostTracker(coder_invocations=2)
         config = _fake_config(max_coder_invocations_per_run=1)
 
         assert cost.exceeds_limits(config) is True
 
-    def test_exceeds_limits_on_reviewer_triggers(self) -> None:
+    def test_allows_reviewer_triggers_at_limit(self) -> None:
         cost = CostTracker(reviewer_triggers=3)
+        config = _fake_config(max_reviewer_triggers_per_run=3)
+
+        assert cost.exceeds_limits(config) is False
+
+    def test_exceeds_limits_above_reviewer_triggers(self) -> None:
+        cost = CostTracker(reviewer_triggers=4)
         config = _fake_config(max_reviewer_triggers_per_run=3)
 
         assert cost.exceeds_limits(config) is True
