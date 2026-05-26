@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from ai_pr_orchestrator.config import ThreadPolicyConfig
-from ai_pr_orchestrator.decision_application import apply_decisions
+from ai_pr_orchestrator.decision_application import DecisionApplicationResult, apply_decisions
 from ai_pr_orchestrator.models import Decision, HandledFinding
 
 NOW = datetime(2026, 5, 25, 12, 0, tzinfo=UTC)
@@ -11,8 +12,8 @@ BOT_IDS: frozenset[str] = frozenset({"f1"})
 NO_BOTS: frozenset[str] = frozenset()
 
 
-def _policy(**overrides: object) -> ThreadPolicyConfig:
-    defaults = {
+def _policy(**overrides: Any) -> ThreadPolicyConfig:
+    defaults: dict[str, Any] = {
         "auto_resolve_bot_threads": True,
         "never_resolve_human_threads": True,
         "resolve_rejected_bot_threads": True,
@@ -22,8 +23,8 @@ def _policy(**overrides: object) -> ThreadPolicyConfig:
     return ThreadPolicyConfig(**defaults)  # type: ignore[arg-type]
 
 
-def _decision(**overrides: object) -> Decision:
-    defaults: dict[str, object] = {
+def _decision(**overrides: Any) -> Decision:
+    defaults: dict[str, Any] = {
         "finding_id": "f1",
         "verdict": "accepted",
         "confidence": "high",
@@ -37,8 +38,8 @@ def _decision(**overrides: object) -> Decision:
     return Decision(**defaults)  # type: ignore[arg-type]
 
 
-def _action_types(result: object) -> list[str]:
-    return [a.type for a in result.actions]  # type: ignore[union-attr]
+def _action_types(result: DecisionApplicationResult) -> list[str]:
+    return [a.type for a in result.actions]
 
 
 # --- Accepted findings ---
@@ -79,17 +80,13 @@ def test_rejected_plans_reply_with_rebuttal() -> None:
 
 def test_rejected_resolves_bot_thread_when_policy_allows() -> None:
     d = _decision(verdict="rejected")
-    result = apply_decisions(
-        [d], _policy(resolve_rejected_bot_threads=True), BOT_IDS, {}, NOW
-    )
+    result = apply_decisions([d], _policy(resolve_rejected_bot_threads=True), BOT_IDS, {}, NOW)
     assert "resolve_thread" in _action_types(result)
 
 
 def test_rejected_does_not_resolve_when_policy_disallows() -> None:
     d = _decision(verdict="rejected")
-    result = apply_decisions(
-        [d], _policy(resolve_rejected_bot_threads=False), BOT_IDS, {}, NOW
-    )
+    result = apply_decisions([d], _policy(resolve_rejected_bot_threads=False), BOT_IDS, {}, NOW)
     assert "resolve_thread" not in _action_types(result)
 
 
@@ -134,17 +131,13 @@ def test_never_resolves_human_authored_threads() -> None:
 
 def test_require_reply_before_resolve_blocks_resolve_when_no_reply() -> None:
     d = _decision(reply="", verdict="accepted")
-    result = apply_decisions(
-        [d], _policy(require_reply_before_resolve=True), BOT_IDS, {}, NOW
-    )
+    result = apply_decisions([d], _policy(require_reply_before_resolve=True), BOT_IDS, {}, NOW)
     assert "resolve_thread" not in _action_types(result)
 
 
 def test_resolve_allowed_without_reply_when_policy_disabled() -> None:
     d = _decision(reply="", verdict="accepted")
-    result = apply_decisions(
-        [d], _policy(require_reply_before_resolve=False), BOT_IDS, {}, NOW
-    )
+    result = apply_decisions([d], _policy(require_reply_before_resolve=False), BOT_IDS, {}, NOW)
     assert "resolve_thread" in _action_types(result)
 
 
@@ -214,7 +207,5 @@ def test_accepted_without_should_resolve_does_not_resolve() -> None:
 
 def test_auto_resolve_bot_threads_false_blocks_accepted_resolve() -> None:
     d = _decision(verdict="accepted")
-    result = apply_decisions(
-        [d], _policy(auto_resolve_bot_threads=False), BOT_IDS, {}, NOW
-    )
+    result = apply_decisions([d], _policy(auto_resolve_bot_threads=False), BOT_IDS, {}, NOW)
     assert "resolve_thread" not in _action_types(result)
