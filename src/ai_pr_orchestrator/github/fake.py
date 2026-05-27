@@ -94,8 +94,7 @@ class FakeGitHubClient:
 
     def seed_pr(self, pr: models.PullRequest) -> None:
         self._prs[pr.number] = pr
-        if pr.labels:
-            self._labels[pr.number] = list(pr.labels)
+        self._labels[pr.number] = list(pr.labels)
 
     def seed_comment(
         self,
@@ -260,5 +259,15 @@ class FakeGitHubClient:
         self._threads[thread_id].is_resolved = True
         return {"thread": {"id": thread_id, "isResolved": True}}
 
-    def set_check_runs(self, ref: str, runs: list[_MutableCheckRun]) -> None:
-        self._check_runs[ref] = runs
+    def set_check_runs(self, ref: str, runs: list[models.CheckRun]) -> None:
+        self._check_runs[ref] = [
+            _MutableCheckRun(
+                id=run.id,
+                ref=ref,
+                name=run.name,
+                status=run.status,
+                conclusion=run.conclusion,
+                html_url=run.html_url,
+            )
+            for run in runs
+        ]
