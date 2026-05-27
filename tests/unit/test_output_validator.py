@@ -188,6 +188,18 @@ def test_token_usage_fields_are_optional_and_default_to_zero() -> None:
     assert result.token_usage.output_tokens == 0
 
 
+@pytest.mark.parametrize(
+    "token_usage",
+    [
+        {"input_tokens": True, "output_tokens": 0},
+        {"input_tokens": 0, "output_tokens": False},
+    ],
+)
+def test_token_usage_rejects_booleans(token_usage: dict[str, object]) -> None:
+    with pytest.raises(OutputValidationError, match="token_usage"):
+        _validate(_output(token_usage=token_usage))
+
+
 def test_tests_array_is_optional() -> None:
     data = _output()
     data.pop("tests")
@@ -213,6 +225,24 @@ def test_extra_unknown_fields_are_ignored() -> None:
 def test_markdown_code_block_wrapped_json_is_accepted() -> None:
     raw_json = json.dumps(_output())
     wrapped = f"```json\n{raw_json}\n```"
+
+    result = validate_agent_output(wrapped, [_finding("f1")])
+
+    assert result.changed is False
+
+
+def test_markdown_code_block_with_surrounding_text_is_accepted() -> None:
+    raw_json = json.dumps(_output())
+    wrapped = f"Here is the result:\n```json\n{raw_json}\n```\nDone."
+
+    result = validate_agent_output(wrapped, [_finding("f1")])
+
+    assert result.changed is False
+
+
+def test_single_line_markdown_code_block_is_accepted() -> None:
+    raw_json = json.dumps(_output())
+    wrapped = f"```json {raw_json} ```"
 
     result = validate_agent_output(wrapped, [_finding("f1")])
 

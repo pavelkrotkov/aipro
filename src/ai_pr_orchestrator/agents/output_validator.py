@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, cast
 
 from ai_pr_orchestrator.models import AgentRunResult, Finding
@@ -172,18 +173,15 @@ def _validate_token_usage(token_usage: Any) -> None:
     if not isinstance(token_usage, dict):
         raise OutputValidationError("token_usage must be an object")
     for field in ("input_tokens", "output_tokens"):
-        if field in token_usage and (
-            not isinstance(token_usage[field], int) or token_usage[field] < 0
-        ):
-            raise OutputValidationError(f"token_usage.{field} must be a non-negative integer")
+        if field in token_usage:
+            value = token_usage[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise OutputValidationError(f"token_usage.{field} must be a non-negative integer")
 
 
 def _strip_markdown_code_block(output: str) -> str:
     cleaned = output.strip()
-    if not cleaned.startswith("```") or not cleaned.endswith("```"):
-        return cleaned
-
-    first_newline = cleaned.find("\n")
-    if first_newline == -1:
-        return cleaned[3:-3].strip()
-    return cleaned[first_newline + 1 : -3].strip()
+    match = re.search(r"```[a-zA-Z0-9_-]*\s*([\s\S]*?)\s*```", cleaned)
+    if match:
+        return match.group(1).strip()
+    return cleaned

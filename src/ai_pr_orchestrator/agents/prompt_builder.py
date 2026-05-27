@@ -10,6 +10,7 @@ from ai_pr_orchestrator.models import FixTask
 
 CHARS_PER_TOKEN = 4
 TRUNCATION_MARKER = "\n[truncated to fit max_prompt_tokens]\n"
+DIFF_TRUNCATION_SUFFIX = "[diff omitted beyond prompt budget]"
 
 
 class PromptFormatter(Protocol):
@@ -32,43 +33,67 @@ class DefaultPromptFormatter:
     """Default prompt format for text-oriented coding agents."""
 
     def format_prompt(self, context: PromptContext) -> str:
-        task = context.task
-        sections = [
-            "# AI PR Orchestrator Fix Task",
-            "",
-            f"PR: #{task.pr_number}",
-            f"Base branch: {task.base_branch}",
-            f"Head SHA: {task.head_sha}",
-            f"Write the result JSON to: {task.output_file}",
-            "",
-            "## Changed Files",
-            _bullet_list(task.changed_files),
-            "",
-        ]
+        prompt = _format_default_prompt(context, context.task.diff_text)
+        if estimate_prompt_tokens(prompt) <= context.max_prompt_tokens:
+            return prompt
 
-        if task.repo_instructions:
-            sections.extend(
-                [
-                    "## Repository Instructions",
-                    task.repo_instructions,
-                    "",
-                ]
-            )
+        prompt_without_diff = _format_default_prompt(context, "")
+        max_chars = context.max_prompt_tokens * CHARS_PER_TOKEN
+        diff_budget = (
+            max_chars
+            - len(prompt_without_diff)
+            - len(TRUNCATION_MARKER)
+            - len(DIFF_TRUNCATION_SUFFIX)
+        )
+        if diff_budget <= 0:
+            return prompt
 
+        truncated_diff = (
+            context.task.diff_text[:diff_budget].rstrip()
+            + TRUNCATION_MARKER
+            + DIFF_TRUNCATION_SUFFIX
+        )
+        return _format_default_prompt(context, truncated_diff)
+
+
+def _format_default_prompt(context: PromptContext, diff_text: str) -> str:
+    task = context.task
+    sections = [
+        "# AI PR Orchestrator Fix Task",
+        "",
+        f"PR: #{task.pr_number}",
+        f"Base branch: {task.base_branch}",
+        f"Head SHA: {task.head_sha}",
+        f"Write the result JSON to: {task.output_file}",
+        "",
+        "## Changed Files",
+        _bullet_list(task.changed_files),
+        "",
+    ]
+
+    if task.repo_instructions:
         sections.extend(
             [
-                "## Findings",
-                _format_findings(task),
+                "## Repository Instructions",
+                task.repo_instructions,
                 "",
-                "## Pull Request Diff",
-                task.diff_text,
-                "",
-                "## Required Output",
-                "Write a JSON object matching this schema. Include one decision for every finding.",
-                _format_schema(context.output_schema),
             ]
         )
-        return "\n".join(sections)
+
+    sections.extend(
+        [
+            "## Findings",
+            _format_findings(task),
+            "",
+            "## Pull Request Diff",
+            diff_text,
+            "",
+            "## Required Output",
+            "Write a JSON object matching this schema. Include one decision for every finding.",
+            _format_schema(context.output_schema),
+        ]
+    )
+    return "\n".join(sections)
 
 
 @dataclass
