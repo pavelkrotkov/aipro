@@ -90,6 +90,7 @@ def _format_default_prompt(context: PromptContext, diff_text: str) -> str:
             "",
             "## Required Output",
             "Write a JSON object matching this schema. Include one decision for every finding.",
+            "Optional top-level fields: tests, token_usage.",
             _format_schema(context.output_schema),
         ]
     )

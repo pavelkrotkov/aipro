@@ -105,6 +105,23 @@ def test_decision_with_unknown_finding_id_returns_validation_error() -> None:
         _validate(data)
 
 
+def test_duplicate_decision_finding_ids_returns_validation_error() -> None:
+    decision = {
+        "finding_id": "f1",
+        "thread_id": None,
+        "verdict": "rejected",
+        "confidence": "high",
+        "reason": "Reason",
+        "reply": "Reply",
+        "should_resolve": True,
+        "changed_files": [],
+    }
+    data = _output(decisions=[decision, decision])
+
+    with pytest.raises(OutputValidationError, match=r"duplicate decisions.*f1"):
+        _validate(data)
+
+
 def test_invalid_verdict_returns_validation_error() -> None:
     data = _output(
         decisions=[

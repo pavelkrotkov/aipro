@@ -79,6 +79,12 @@ def test_prompt_includes_output_file_path() -> None:
     assert ".ai-orchestrator-result.json" in prompt
 
 
+def test_prompt_identifies_optional_output_fields() -> None:
+    prompt = PromptBuilder().build_prompt(_task())
+
+    assert "Optional top-level fields: tests, token_usage." in prompt
+
+
 def test_prompt_includes_changed_file_paths() -> None:
     prompt = PromptBuilder().build_prompt(_task())
 

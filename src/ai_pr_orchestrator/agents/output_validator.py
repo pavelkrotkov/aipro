@@ -11,7 +11,6 @@ from ai_pr_orchestrator.models import AgentRunResult, Finding
 VALID_VERDICTS = {"accepted", "rejected", "needs_human"}
 VALID_CONFIDENCE = {"low", "medium", "high"}
 VALID_TEST_RESULTS = {"passed", "failed", "not_run"}
-MISSING = object()
 
 
 class OutputValidationError(ValueError):
@@ -30,14 +29,18 @@ def validate_agent_output(output: str, findings: list[Finding]) -> AgentRunResul
     if not isinstance(raw, dict):
         raise OutputValidationError("Agent output must be a JSON object")
 
-    _validate_top_level(raw)
-    decisions = raw["decisions"]
+    normalized = dict(raw)
+    if "tests" in normalized:
+        normalized["tests"] = _normalize_tests(normalized["tests"])
+
+    _validate_top_level(normalized)
+    decisions = normalized["decisions"]
     _validate_decisions(decisions, findings)
-    _validate_tests(raw.get("tests", []))
-    _validate_token_usage(raw.get("token_usage", {}))
+    _validate_tests(normalized.get("tests", []))
+    _validate_token_usage(normalized.get("token_usage", {}))
 
     try:
-        return AgentRunResult.from_dict(raw)
+        return AgentRunResult.from_dict(normalized)
     except TypeError as exc:
         raise OutputValidationError(f"Agent output does not match schema: {exc}") from exc
 
@@ -154,9 +157,7 @@ def _validate_tests(tests: Any) -> None:
         test_data = cast(dict[str, Any], test)
         command = test_data.get("command")
         result = test_data.get("result")
-        if test_data.get("notes") is None:
-            test_data["notes"] = ""
-        notes = test_data["notes"]
+        notes = test_data.get("notes", "")
         if not isinstance(command, str) or not command.strip():
             raise OutputValidationError(f"tests[{index}].command must be a nonempty string")
         if result not in VALID_TEST_RESULTS:
@@ -165,6 +166,23 @@ def _validate_tests(tests: Any) -> None:
             )
         if not isinstance(notes, str):
             raise OutputValidationError(f"tests[{index}].notes must be a string if provided")
+
+
+def _normalize_tests(tests: Any) -> Any:
+    if tests is None or not isinstance(tests, list):
+        return tests
+
+    normalized: list[Any] = []
+    for test in tests:
+        if not isinstance(test, dict):
+            normalized.append(test)
+            continue
+
+        test_data = dict(test)
+        if test_data.get("notes") is None:
+            test_data["notes"] = ""
+        normalized.append(test_data)
+    return normalized
 
 
 def _validate_token_usage(token_usage: Any) -> None:
