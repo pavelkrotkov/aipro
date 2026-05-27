@@ -46,7 +46,7 @@ class DefaultPromptFormatter:
             - len(DIFF_TRUNCATION_SUFFIX)
         )
         if diff_budget <= 0:
-            return prompt
+            return _format_default_prompt(context, DIFF_TRUNCATION_SUFFIX)
 
         truncated_diff = (
             context.task.diff_text[:diff_budget].rstrip()

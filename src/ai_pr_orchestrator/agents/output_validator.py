@@ -154,9 +154,9 @@ def _validate_tests(tests: Any) -> None:
         test_data = cast(dict[str, Any], test)
         command = test_data.get("command")
         result = test_data.get("result")
-        notes = test_data.get("notes", MISSING)
-        if notes is MISSING:
-            notes = ""
+        if test_data.get("notes") is None:
+            test_data["notes"] = ""
+        notes = test_data["notes"]
         if not isinstance(command, str) or not command.strip():
             raise OutputValidationError(f"tests[{index}].command must be a nonempty string")
         if result not in VALID_TEST_RESULTS:

@@ -115,6 +115,22 @@ def test_prompt_truncates_diff_before_critical_sections() -> None:
     assert '"token_usage"' in prompt
 
 
+def test_prompt_omits_diff_when_no_diff_budget_remains() -> None:
+    task = _task(
+        diff_text="diff --git a/large.py b/large.py\n" + ("+x = 1\n" * 2_000),
+        repo_instructions="Preserve this repository instruction.",
+    )
+
+    prompt = PromptBuilder(max_prompt_tokens=330).build_prompt(task)
+
+    assert estimate_prompt_tokens(prompt) <= 330
+    assert "[diff omitted beyond prompt budget]" in prompt
+    assert "+x = 1" not in prompt
+    assert "Preserve this repository instruction." in prompt
+    assert "Handle nullable values before calling strip." in prompt
+    assert "Write a JSON object matching this schema." in prompt
+
+
 def test_adapter_can_override_prompt_format() -> None:
     class CustomFormatter:
         def format_prompt(self, context: PromptContext) -> str:
