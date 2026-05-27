@@ -283,6 +283,7 @@ def _transition_handling(
             cost=new_cost,
             last_error="decision_needs_human",
         )
+        write_actions: list[PlannedAction] = []
         if result.changed:
             write_actions = [
                 PlannedAction(
@@ -291,12 +292,11 @@ def _transition_handling(
                 ),
                 PlannedAction("push_branch", {"head_sha": state.head_sha}),
             ]
-            return new_state, [
-                *decision_actions,
-                *write_actions,
-                *_terminal_actions(new_state, config),
-            ]
-        return new_state, [*decision_actions, *_terminal_actions(new_state, config)]
+        return new_state, [
+            *decision_actions,
+            *write_actions,
+            *_terminal_actions(new_state, config),
+        ]
 
     if result.changed:
         write_actions = [

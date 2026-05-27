@@ -73,7 +73,8 @@ def apply_decisions(
 
 
 def _reply_action(decision: Decision) -> PlannedAction | None:
-    if not decision.reply:
+    reply_body = decision.reply.strip() if decision.reply else ""
+    if not reply_body:
         return None
     if decision.thread_id:
         return PlannedAction(
@@ -81,12 +82,12 @@ def _reply_action(decision: Decision) -> PlannedAction | None:
             {
                 "finding_id": decision.finding_id,
                 "thread_id": decision.thread_id,
-                "body": decision.reply,
+                "body": reply_body,
             },
         )
     return PlannedAction(
         "post_pr_comment",
-        {"finding_id": decision.finding_id, "body": decision.reply},
+        {"finding_id": decision.finding_id, "body": reply_body},
     )
 
 
