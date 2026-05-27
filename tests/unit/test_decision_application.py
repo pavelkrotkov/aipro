@@ -133,6 +133,7 @@ def test_require_reply_before_resolve_blocks_resolve_when_no_reply() -> None:
     d = _decision(reply="", verdict="accepted")
     result = apply_decisions([d], _policy(require_reply_before_resolve=True), BOT_IDS, {}, NOW)
     assert "resolve_thread" not in _action_types(result)
+    assert "f1" not in result.handled_findings
 
 
 def test_resolve_allowed_without_reply_when_policy_disabled() -> None:
@@ -158,6 +159,13 @@ def test_finding_without_thread_id_plans_post_pr_comment() -> None:
     assert "post_pr_comment" in _action_types(result)
     assert "reply_to_thread" not in _action_types(result)
     assert "resolve_thread" not in _action_types(result)
+
+
+def test_no_action_finding_left_unhandled_for_retry() -> None:
+    d = _decision(reply="", verdict="accepted", should_resolve=True)
+    result = apply_decisions([d], _policy(require_reply_before_resolve=True), BOT_IDS, {}, NOW)
+    assert result.actions == []
+    assert "f1" not in result.handled_findings
 
 
 def test_already_handled_finding_is_skipped() -> None:

@@ -39,7 +39,8 @@ def apply_decisions(
         if reply_action:
             actions.append(reply_action)
 
-        if _should_resolve(decision, is_bot, thread_policy, reply_action is not None):
+        resolve_planned = _should_resolve(decision, is_bot, thread_policy, reply_action is not None)
+        if resolve_planned:
             actions.append(
                 PlannedAction(
                     "resolve_thread",
@@ -49,6 +50,9 @@ def apply_decisions(
 
         if decision.verdict == "needs_human":
             has_needs_human = True
+
+        if not reply_action and not resolve_planned:
+            continue
 
         handled[decision.finding_id] = HandledFinding(
             finding_id=decision.finding_id,
