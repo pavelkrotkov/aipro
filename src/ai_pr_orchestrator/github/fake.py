@@ -186,13 +186,14 @@ class FakeGitHubClient:
     def post_comment(self, issue_number: int, body: str) -> models.Comment:
         cid = self._next_comment_id
         self._next_comment_id += 1
+        ts = self._tick()
         mc = _MutableComment(
             id=cid,
             issue_number=issue_number,
             body=body,
             user="fake-bot",
-            created_at=self._now,
-            updated_at=self._now,
+            created_at=ts,
+            updated_at=ts,
         )
         self._comments[cid] = mc
         return mc.to_model()
@@ -248,7 +249,7 @@ class FakeGitHubClient:
             body=body,
             author="fake-bot",
             path=mt.path,
-            created_at=self._now.isoformat(),
+            created_at=self._tick().isoformat(),
         )
         mt.comments.append(rc)
         return {"comment": {"id": rc_id}}
