@@ -197,6 +197,13 @@ def test_tests_array_is_optional() -> None:
     assert result.tests == []
 
 
+def test_test_notes_field_is_optional_and_defaults_to_empty_string() -> None:
+    result = _validate(_output(tests=[{"command": "uv run pytest", "result": "passed"}]))
+
+    assert result.tests is not None
+    assert result.tests[0].notes == ""
+
+
 def test_extra_unknown_fields_are_ignored() -> None:
     result = _validate(_output(extra_future_field={"ok": True}))
 

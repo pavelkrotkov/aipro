@@ -10,6 +10,7 @@ from ai_pr_orchestrator.models import AgentRunResult, Finding
 VALID_VERDICTS = {"accepted", "rejected", "needs_human"}
 VALID_CONFIDENCE = {"low", "medium", "high"}
 VALID_TEST_RESULTS = {"passed", "failed", "not_run"}
+MISSING = object()
 
 
 class OutputValidationError(ValueError):
@@ -146,7 +147,9 @@ def _validate_tests(tests: Any) -> None:
         test_data = cast(dict[str, Any], test)
         command = test_data.get("command")
         result = test_data.get("result")
-        notes = test_data.get("notes", "")
+        notes = test_data.get("notes", MISSING)
+        if notes is MISSING:
+            notes = ""
         if not isinstance(command, str) or not command.strip():
             raise OutputValidationError(f"tests[{index}].command must be a nonempty string")
         if result not in VALID_TEST_RESULTS:
@@ -154,7 +157,7 @@ def _validate_tests(tests: Any) -> None:
                 f"tests[{index}].result must be one of {sorted(VALID_TEST_RESULTS)}"
             )
         if not isinstance(notes, str):
-            raise OutputValidationError(f"tests[{index}].notes must be a string")
+            raise OutputValidationError(f"tests[{index}].notes must be a string if provided")
 
 
 def _validate_token_usage(token_usage: Any) -> None:
