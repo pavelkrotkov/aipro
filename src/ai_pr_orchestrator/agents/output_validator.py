@@ -20,8 +20,9 @@ class OutputValidationError(ValueError):
 def validate_agent_output(output: str, findings: list[Finding]) -> AgentRunResult:
     """Parse and validate coder output JSON."""
 
+    cleaned = _strip_markdown_code_block(output)
     try:
-        raw = json.loads(output)
+        raw = json.loads(cleaned)
     except json.JSONDecodeError as exc:
         raise OutputValidationError(f"Agent output must be valid JSON: {exc.msg}") from exc
 
@@ -70,9 +71,14 @@ def _validate_decisions(decisions: list[Any], findings: list[Finding]) -> None:
         _validate_decision(index, decision)
         decision_ids.append(decision["finding_id"])
 
-    duplicate_ids = sorted(
-        {finding_id for finding_id in decision_ids if decision_ids.count(finding_id) > 1}
-    )
+    seen_ids: set[str] = set()
+    duplicate_ids_set: set[str] = set()
+    for finding_id in decision_ids:
+        if finding_id in seen_ids:
+            duplicate_ids_set.add(finding_id)
+        else:
+            seen_ids.add(finding_id)
+    duplicate_ids = sorted(duplicate_ids_set)
     if duplicate_ids:
         raise OutputValidationError(
             "Agent output has duplicate decisions for finding IDs: " + ", ".join(duplicate_ids)
@@ -170,3 +176,14 @@ def _validate_token_usage(token_usage: Any) -> None:
             not isinstance(token_usage[field], int) or token_usage[field] < 0
         ):
             raise OutputValidationError(f"token_usage.{field} must be a non-negative integer")
+
+
+def _strip_markdown_code_block(output: str) -> str:
+    cleaned = output.strip()
+    if not cleaned.startswith("```") or not cleaned.endswith("```"):
+        return cleaned
+
+    first_newline = cleaned.find("\n")
+    if first_newline == -1:
+        return cleaned[3:-3].strip()
+    return cleaned[first_newline + 1 : -3].strip()

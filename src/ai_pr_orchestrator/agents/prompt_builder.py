@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -166,7 +167,4 @@ def _bullet_list(values: list[str]) -> str:
 
 
 def _format_schema(schema: dict[str, object]) -> str:
-    lines: list[str] = []
-    for key, value in schema.items():
-        lines.append(f"- {key}: {value}")
-    return "\n".join(lines)
+    return json.dumps(schema, indent=2)

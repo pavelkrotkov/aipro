@@ -208,3 +208,12 @@ def test_extra_unknown_fields_are_ignored() -> None:
     result = _validate(_output(extra_future_field={"ok": True}))
 
     assert not hasattr(result, "extra_future_field")
+
+
+def test_markdown_code_block_wrapped_json_is_accepted() -> None:
+    raw_json = json.dumps(_output())
+    wrapped = f"```json\n{raw_json}\n```"
+
+    result = validate_agent_output(wrapped, [_finding("f1")])
+
+    assert result.changed is False
