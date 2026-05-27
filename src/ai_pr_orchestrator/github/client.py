@@ -123,6 +123,13 @@ class GitHubClient:
             f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/labels/{quote(label, safe='')}",
         )
 
+    def get_pr_comments(self, issue_number: int) -> list[models.Comment]:
+        data = self._get_paginated(
+            f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/comments",
+            items_key=None,
+        )
+        return [_parse_comment(c) for c in data]
+
     def get_check_runs(self, ref: str) -> list[models.CheckRun]:
         data = self._get_paginated(
             f"/repos/{self._owner}/{self._repo}/commits/{quote(ref, safe='')}/check-runs",
@@ -241,14 +248,24 @@ class GitHubClient:
             return
         self._request("DELETE", path)
 
-    def _get_paginated(self, path: str, *, items_key: str) -> list[dict[str, Any]]:
+    def _get_paginated(self, path: str, *, items_key: str | None = None) -> list[dict[str, Any]]:
         all_items: list[dict[str, Any]] = []
         url: str | None = f"{self._base_url}{path}"
 
         while url:
             response = self._request("GET", url, absolute_url=True)
             body = response.json()
-            all_items.extend(body.get(items_key, []))
+            if items_key is not None:
+                if not isinstance(body, dict):
+                    raise GitHubClientError(
+                        f"Expected a dict response with key {items_key!r},"
+                        f" got {type(body).__name__}"
+                    )
+                all_items.extend(body.get(items_key, []))
+            elif isinstance(body, list):
+                all_items.extend(body)
+            else:
+                raise GitHubClientError(f"Expected a list response, got {type(body).__name__}")
             url = _parse_next_link(response.headers.get("link", ""))
 
         return all_items

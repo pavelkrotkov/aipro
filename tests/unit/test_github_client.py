@@ -96,6 +96,52 @@ def test_post_comment() -> None:
     assert comment.body == "A comment"
 
 
+# --- REST: get_pr_comments ---
+
+
+@respx.mock
+def test_get_pr_comments() -> None:
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/issues/42/comments").mock(
+        return_value=httpx.Response(200, json=[_comment_json(1), _comment_json(2)])
+    )
+    with _make_client() as client:
+        comments = client.get_pr_comments(42)
+
+    assert route.called
+    assert len(comments) == 2
+    assert comments[0].id == 1
+    assert comments[1].id == 2
+    assert all(isinstance(c, Comment) for c in comments)
+
+
+@respx.mock
+def test_get_pr_comments_pagination() -> None:
+    page1_url = f"{BASE}/repos/{OWNER}/{REPO}/issues/42/comments"
+    page2_url = f"{BASE}/repos/{OWNER}/{REPO}/issues/42/comments?page=2"
+    call_count = 0
+
+    def pagination_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if "page=2" not in str(request.url):
+            return httpx.Response(
+                200,
+                json=[_comment_json(1)],
+                headers={"link": f'<{page2_url}>; rel="next"'},
+            )
+        return httpx.Response(200, json=[_comment_json(2)])
+
+    respx.get(page1_url).mock(side_effect=pagination_handler)
+    respx.get(page2_url).mock(side_effect=pagination_handler)
+    with _make_client() as client:
+        comments = client.get_pr_comments(42)
+
+    assert call_count == 2
+    assert len(comments) == 2
+    assert comments[0].id == 1
+    assert comments[1].id == 2
+
+
 # --- REST: edit_comment ---
 
 
