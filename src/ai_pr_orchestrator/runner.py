@@ -233,15 +233,13 @@ class Runner:
                     # check_run/check_suite event wake us back up.
                     state_comment_id = self._save_state(pr_number, next_state, state_comment_id)
                     return 0
-                state = next_state
-                self._execute_actions(actions, pr_number, gh_pr, state)
+                state = self._execute_actions(actions, pr_number, gh_pr, next_state)
                 state_comment_id = self._save_state(pr_number, state, state_comment_id)
                 continue
 
             snapshot = self._build_snapshot(state, gh_pr, event=event)
             next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
-            state = next_state
-            state = self._execute_actions(actions, pr_number, gh_pr, state)
+            state = self._execute_actions(actions, pr_number, gh_pr, next_state)
             state_comment_id = self._save_state(pr_number, state, state_comment_id)
 
         logger.error("Runner exceeded max transitions for PR #%s", pr_number)
@@ -537,10 +535,10 @@ class Runner:
         ctx = self._ctx
         if ctx.git is None:
             return state
-        # Safety net: state_machine should not emit duplicate commits in one run,
-        # but we double-check using durable state. If the previous run already
-        # committed, skip rather than commit twice on resume.
-        if self._commits_this_run >= 1 or len(state.commits_made) >= 1:
+        # Safety net: never commit twice within a single Runner.run invocation.
+        # Cumulative state.commits_made is not checked here because subsequent
+        # rounds (max_total_iterations > 1) legitimately add new commits.
+        if self._commits_this_run >= 1:
             return state
         message = str(payload.get("message") or ctx.config.git.commit_message_prefix)
         sha = ctx.git.commit(
@@ -581,7 +579,7 @@ class Runner:
             head_sha=state.head_sha,
             base_branch=gh_pr.base_ref or ctx.config.git.base_branch,
             findings=selected,
-            changed_files=[],
+            changed_files=list(gh_pr.changed_files),
             diff_text=diff_text,
             output_file=ctx.config.main_coder.output_file,
         )

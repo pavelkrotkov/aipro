@@ -691,17 +691,24 @@ def test_actions_executed_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
     assert text_comments == ["first", "third"]
 
 
-def test_duplicate_commit_skipped_when_already_committed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_duplicate_commit_skipped_within_single_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Within a single Runner.run, the in-process counter prevents a second
+    commit even if the state machine emits multiple commit_changes actions.
+    Pre-existing commits_made entries from prior runs do NOT block, so a later
+    round's commit can still proceed in a subsequent invocation."""
     from ai_pr_orchestrator.models import PlannedAction
 
     gh = FakeGitHubClient(now=NOW)
     seed_pr(gh)
-    state = initial_state(status="init", round_index=1, commits_made=["existing-sha"])
+    state = initial_state(status="init", round_index=1, commits_made=["prior-run-sha"])
     gh.seed_comment(1, serialize_state_comment(state))
     git = FakeGitRepo(head_sha="head-1", remote_head_sha="head-1", clean=False)
 
     call_count = {"n": 0}
-    planned = [PlannedAction("commit_changes", {"message": "dup"})]
+    planned = [
+        PlannedAction("commit_changes", {"message": "first"}),
+        PlannedAction("commit_changes", {"message": "second"}),
+    ]
 
     def fake_transition(
         s: RuntimeState, snap: Any, cfg: Any, now: datetime
@@ -724,7 +731,7 @@ def test_duplicate_commit_skipped_when_already_committed(monkeypatch: pytest.Mon
         ),
     )
     Runner(ctx).run(1)
-    assert git.commit_count == 0
+    assert git.commit_count == 1
 
 
 # ----- Reviewer polling tests -----
