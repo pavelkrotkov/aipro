@@ -36,7 +36,10 @@ from ai_pr_orchestrator.models import (
 from ai_pr_orchestrator.reviewers.base import ReviewerAdapter
 from ai_pr_orchestrator.state_machine import TERMINAL_STATUSES, TransitionSnapshot, transition
 from ai_pr_orchestrator.state_storage import (
+    StateComment,
+    StateConflictError,
     find_state_comment,
+    prepare_state_comment_update,
     serialize_state_comment,
 )
 
@@ -188,10 +191,25 @@ class Runner:
         # ``commit_changes``) can checkpoint state without threading the id
         # through every helper.
         self._state_comment_id: int | None = None
+        # Optimistic-concurrency lock: the ``updated_at`` of the state we last
+        # loaded or saved. ``_save_state`` re-fetches the comment and refuses
+        # to overwrite if its ``updated_at`` differs from this expectation,
+        # which prevents two concurrent webhook runs from blindly clobbering
+        # each other's mutations.
+        self._state_expected_updated_at: datetime | None = None
 
     def run(self, pr_number: int, *, event: ParsedEvent | None = None) -> int:
         try:
             return self._run(pr_number, event)
+        except StateConflictError:
+            # Another concurrent runner mutated the state comment in the
+            # window between our load and save. Their work is authoritative;
+            # discard ours and exit cleanly. The next webhook event will pick
+            # up wherever they left off.
+            logger.warning(
+                "State conflict on PR #%s; another runner advanced state first", pr_number
+            )
+            return 0
         except Exception:
             logger.exception("Runner crashed for PR #%s", pr_number)
             return 1
@@ -206,9 +224,11 @@ class Runner:
         # checkpoint we saved after commit_changes shows a commit in
         # commits_made — but the remote branch is still on the prior SHA. On
         # resume, detect that and reissue the push so the worktree and the
-        # remote converge. Failures are logged but do not abort the run; the
-        # main state machine will eventually surface a hard error if push is
-        # genuinely impossible.
+        # remote converge. If the recovery push raises, do NOT fall through:
+        # the persisted state would otherwise sit in ci_wait forever waiting
+        # for check_run events that can never arrive for an unpushed commit.
+        # Route to a terminal ``needs_human`` so the operator sees the real
+        # blocker.
         if ctx.git is not None and state.commits_made:
             try:
                 local_head = ctx.git.get_head_sha()
@@ -223,6 +243,18 @@ class Runner:
                         ctx.git.push(gh_pr.head_ref)
             except Exception:
                 logger.exception("Push recovery failed for PR #%s", pr_number)
+                now = ctx.clock()
+                state = replace(
+                    state,
+                    status="needs_human",
+                    last_error="push_recovery_failed",
+                    updated_at=now,
+                )
+                snapshot = self._build_snapshot(state, gh_pr, event=event)
+                _, actions = transition(state, snapshot, ctx.config, now)
+                state = self._execute_actions(actions, pr_number, gh_pr, state)
+                self._save_state(pr_number, state)
+                return 0
 
         # Detect an orphaned coder invocation from a prior process. If the
         # state machine had asked us to invoke the coder (last_coder_round_index
@@ -250,6 +282,13 @@ class Runner:
             return 0
 
         for _ in range(_MAX_TRANSITIONS_PER_RUN):
+            # Refetch the PR at the top of every iteration: an earlier
+            # transition in this same run may have mutated remote state
+            # (pushed a new commit, added/removed a label) and downstream
+            # snapshot consumers (label-removed safety check, head_sha
+            # comparisons) must see the up-to-date view, not the snapshot
+            # we captured before the loop started.
+            gh_pr = ctx.github.get_pr(pr_number)
             if state.status in TERMINAL_STATUSES:
                 self._save_state(pr_number, state)
                 return 0
@@ -290,6 +329,7 @@ class Runner:
         sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
         if sc is not None:
             self._state_comment_id = int(sc.comment_id) if isinstance(sc.comment_id, int) else None
+            self._state_expected_updated_at = sc.state.updated_at
             return sc.state
 
         now = self._ctx.clock()
@@ -303,15 +343,40 @@ class Runner:
         )
         posted = self._ctx.github.post_comment(pr_number, serialize_state_comment(state))
         self._state_comment_id = posted.id
+        self._state_expected_updated_at = state.updated_at
         return state
 
     def _save_state(self, pr_number: int, state: RuntimeState) -> None:
-        body = serialize_state_comment(state)
+        # Fresh PRs without a state comment yet: post once, record id+lock.
         if self._state_comment_id is None:
+            body = serialize_state_comment(state)
             posted = self._ctx.github.post_comment(pr_number, body)
             self._state_comment_id = posted.id
+            self._state_expected_updated_at = state.updated_at
             return
-        self._ctx.github.edit_comment(self._state_comment_id, body)
+
+        # Optimistic concurrency: refetch the current comment body, compare
+        # its ``updated_at`` against the value we recorded at load time (or
+        # at last successful save). If another runner has mutated it in the
+        # interim, raise StateConflictError so the outer loop can bail
+        # without overwriting.
+        existing = self._fetch_current_state_comment(pr_number)
+        if existing is None:
+            # Comment vanished (deleted out from under us); post a fresh one.
+            body = serialize_state_comment(state)
+            posted = self._ctx.github.post_comment(pr_number, body)
+            self._state_comment_id = posted.id
+            self._state_expected_updated_at = state.updated_at
+            return
+
+        expected = self._state_expected_updated_at or existing.state.updated_at
+        prepared = prepare_state_comment_update(existing, state, expected_updated_at=expected)
+        self._ctx.github.edit_comment(self._state_comment_id, prepared.body)
+        self._state_expected_updated_at = state.updated_at
+
+    def _fetch_current_state_comment(self, pr_number: int) -> StateComment | None:
+        comments = self._ctx.github.get_pr_comments(pr_number)
+        return find_state_comment([{"id": c.id, "body": c.body} for c in comments])
 
     # ---- Snapshot builders ----
 
@@ -331,6 +396,7 @@ class Runner:
         coder_result = self._pending_coder_result
         worktree_changed = False
         remote_head_sha: str | None = None
+        remote_head_unverified = False
         event_head_sha = event.head_sha if event else None
 
         if state.status in ("waiting", "collecting"):
@@ -350,6 +416,11 @@ class Runner:
                 except Exception:
                     logger.exception("Failed to fetch remote head for ref %s", gh_pr.head_ref)
                     remote_head_sha = None
+                    # Signal the state machine that the None we just produced
+                    # is "unknown", not "absent". Without this flag the
+                    # handling transition falls back to ``pr.head_sha`` and
+                    # interprets "couldn't verify" as "remote matches".
+                    remote_head_unverified = True
 
         if state.status == "ci_wait":
             raw_checks = ctx.github.get_check_runs(state.head_sha)
@@ -365,6 +436,7 @@ class Runner:
             reviewer_responded=reviewer_responded,
             reviewer_timed_out=reviewer_timed_out,
             worktree_changed=worktree_changed,
+            remote_head_unverified=remote_head_unverified,
         )
 
     def _collect_findings(self, state: RuntimeState, gh_pr: gh_models.PullRequest) -> list[Finding]:
@@ -474,36 +546,46 @@ class Runner:
     def _all_enabled_reviewers_responded(
         self, state: RuntimeState, gh_pr: gh_models.PullRequest
     ) -> bool:
-        """Return True iff every enabled reviewer has posted *something* after
-        its trigger. Used to detect the zero-findings completion case so the
-        state machine can transition to ``done`` instead of timing out.
+        """Return True iff every reviewer triggered in the current round has
+        posted *something* after its trigger. Used to detect the zero-findings
+        completion case so the state machine can transition to ``done``
+        instead of timing out.
+
+        Only reviewers with a ``ReviewerTrigger`` recorded for the current
+        ``state.round_index`` participate in this check. A reviewer that is
+        enabled in config but was *not* triggered this round (e.g. trigger
+        budget exhausted, or newly added between rounds) must not block the
+        short-circuit by virtue of having no post-trigger response.
         """
         ctx = self._ctx
-        triggers_by_reviewer: dict[str, ReviewerTrigger] = {}
-        for trig in state.trigger_history:
-            existing = triggers_by_reviewer.get(trig.reviewer_name)
-            if existing is None or trig.timestamp > existing.timestamp:
-                triggers_by_reviewer[trig.reviewer_name] = trig
-
-        enabled_names = [
-            name
-            for name in ctx.reviewers
-            if (cfg := ctx.config.reviewers.get(name)) is None or cfg.enabled
-        ]
-        if not enabled_names:
+        current_triggers = [t for t in state.trigger_history if t.round_index == state.round_index]
+        if not current_triggers:
+            # Nothing was triggered in the current round — no basis for
+            # declaring the phase complete by zero-findings.
             return False
 
-        for name in enabled_names:
-            reviewer = ctx.reviewers[name]
+        # If multiple triggers per reviewer somehow land in the same round,
+        # keep the newest so ``has_responded`` measures responses after the
+        # latest invocation.
+        latest_by_reviewer: dict[str, ReviewerTrigger] = {}
+        for trig in current_triggers:
+            existing = latest_by_reviewer.get(trig.reviewer_name)
+            if existing is None or trig.timestamp > existing.timestamp:
+                latest_by_reviewer[trig.reviewer_name] = trig
+
+        for name, trig in latest_by_reviewer.items():
+            reviewer = ctx.reviewers.get(name)
+            if reviewer is None:
+                # Trigger refers to a reviewer no longer wired in; skip it
+                # rather than block the short-circuit indefinitely.
+                continue
             has_responded = getattr(reviewer, "has_responded", None)
             if not callable(has_responded):
                 # Reviewer adapter doesn't implement the optional probe; we
                 # cannot prove a response, so refuse to short-circuit.
                 return False
-            trig = triggers_by_reviewer.get(name)
-            ts = trig.timestamp if trig is not None else state.created_at
             try:
-                if not has_responded(state.pr_number, ts):
+                if not has_responded(state.pr_number, trig.timestamp):
                     return False
             except Exception:
                 logger.exception("Reviewer %s has_responded() failed; assuming no response", name)
