@@ -76,13 +76,16 @@ class RunnerContext:
     sleeper: Callable[[float], None] = field(default=time.sleep)
 
 
-def parse_event(event: dict[str, Any], *, event_name: str | None = None) -> ParsedEvent:
+def parse_event(event: Any, *, event_name: str | None = None) -> ParsedEvent:
     """Parse a GitHub Actions event payload into a typed summary.
 
     The payload itself does not include the event type; callers may pass
     ``event_name`` (typically from ``GITHUB_EVENT_NAME``) to disambiguate.
     Without a hint, we infer from the keys present in the payload.
     """
+    if not isinstance(event, dict):
+        # Malformed payloads (lists, scalars, null) can't yield a PR; bail safely.
+        return ParsedEvent(event_type=event_name or "unknown", pr_number=None, head_sha=None)
     inferred = event_name or _infer_event_name(event)
     if inferred == "pull_request" or inferred == "pull_request_review":
         pr = event.get("pull_request") or {}
@@ -330,9 +333,7 @@ class Runner:
             worktree_changed=worktree_changed,
         )
 
-    def _collect_findings(
-        self, state: RuntimeState, gh_pr: gh_models.PullRequest
-    ) -> list[Finding]:
+    def _collect_findings(self, state: RuntimeState, gh_pr: gh_models.PullRequest) -> list[Finding]:
         ctx = self._ctx
         all_findings: list[Finding] = []
         triggers_by_reviewer: dict[str, ReviewerTrigger] = {}
@@ -386,9 +387,7 @@ class Runner:
                 responded_snapshot = self._build_snapshot(
                     state, gh_pr, event=None, reviewer_responded=True
                 )
-                next_state, actions = transition(
-                    state, responded_snapshot, ctx.config, ctx.clock()
-                )
+                next_state, actions = transition(state, responded_snapshot, ctx.config, ctx.clock())
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 comment_id = self._save_state(pr_number, state, comment_id)
@@ -399,9 +398,7 @@ class Runner:
                 timed_out_snapshot = self._build_snapshot(
                     state, gh_pr, event=None, reviewer_timed_out=True
                 )
-                next_state, actions = transition(
-                    state, timed_out_snapshot, ctx.config, ctx.clock()
-                )
+                next_state, actions = transition(state, timed_out_snapshot, ctx.config, ctx.clock())
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 comment_id = self._save_state(pr_number, state, comment_id)
@@ -418,9 +415,7 @@ class Runner:
             _MAX_POLL_ITERATIONS,
             pr_number,
         )
-        timed_out_snapshot = self._build_snapshot(
-            state, gh_pr, event=None, reviewer_timed_out=True
-        )
+        timed_out_snapshot = self._build_snapshot(state, gh_pr, event=None, reviewer_timed_out=True)
         next_state, actions = transition(state, timed_out_snapshot, ctx.config, ctx.clock())
         state = next_state
         state = self._execute_actions(actions, pr_number, gh_pr, state)
@@ -462,9 +457,7 @@ class Runner:
                 if not has_responded(state.pr_number, ts):
                     return False
             except Exception:
-                logger.exception(
-                    "Reviewer %s has_responded() failed; assuming no response", name
-                )
+                logger.exception("Reviewer %s has_responded() failed; assuming no response", name)
                 return False
         return True
 

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -214,15 +215,15 @@ def build_ctx(
     reviewers: dict[str, Any] | None = None,
     git: FakeGitRepo | None = None,
     config: Config | None = None,
-    clock: FakeClock | None = None,
-    sleeper: FakeSleeper | None = None,
+    clock: Callable[[], datetime] | None = None,
+    sleeper: Callable[[float], None] | None = None,
 ) -> RunnerContext:
     cfg = config or make_config()
     return RunnerContext(
         github=gh,
         coder=coder or FakeCoderAdapter(),
         reviewers=reviewers or {"fake": FakeReviewerAdapter(name="fake")},
-        git=git,
+        git=cast(Any, git),
         config=cfg,
         clock=clock or FakeClock(),
         sleeper=sleeper or FakeSleeper(),
@@ -417,9 +418,9 @@ def _setup_action_test(
     call_count = {"n": 0}
     actions_iter = iter([planned_actions, []])
 
-    def fake_transition(s: RuntimeState, snap: Any, cfg: Any, now: datetime) -> tuple[
-        RuntimeState, list[Any]
-    ]:
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
         call_count["n"] += 1
         try:
             actions = next(actions_iter)
@@ -468,9 +469,9 @@ def test_reply_to_thread_action(monkeypatch: pytest.MonkeyPatch) -> None:
     call_count = {"n": 0}
     planned = [PlannedAction("reply_to_thread", {"thread_id": "t1", "body": "reply!"})]
 
-    def fake_transition(s: RuntimeState, snap: Any, cfg: Any, now: datetime) -> tuple[
-        RuntimeState, list[Any]
-    ]:
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
         call_count["n"] += 1
         if call_count["n"] >= 2:
             return replace(s, status="done", done_reason="completed", updated_at=now), []
@@ -496,9 +497,9 @@ def test_resolve_thread_action(monkeypatch: pytest.MonkeyPatch) -> None:
     call_count = {"n": 0}
     planned = [PlannedAction("resolve_thread", {"thread_id": "t1"})]
 
-    def fake_transition(s: RuntimeState, snap: Any, cfg: Any, now: datetime) -> tuple[
-        RuntimeState, list[Any]
-    ]:
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
         call_count["n"] += 1
         if call_count["n"] >= 2:
             return replace(s, status="done", done_reason="completed", updated_at=now), []
@@ -566,9 +567,9 @@ def test_remove_label_action(monkeypatch: pytest.MonkeyPatch) -> None:
     call_count = {"n": 0}
     planned = [PlannedAction("remove_label", {"label": "ai-loop"})]
 
-    def fake_transition(s: RuntimeState, snap: Any, cfg: Any, now: datetime) -> tuple[
-        RuntimeState, list[Any]
-    ]:
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
         call_count["n"] += 1
         if call_count["n"] >= 2:
             return replace(s, status="done", done_reason="completed", updated_at=now), []
@@ -636,9 +637,9 @@ def test_invoke_coder_action(monkeypatch: pytest.MonkeyPatch) -> None:
     git = FakeGitRepo(head_sha=pr.head_sha, remote_head_sha=pr.head_sha)
     call_count = {"n": 0}
 
-    def fake_transition(s: RuntimeState, snap: Any, cfg: Any, now: datetime) -> tuple[
-        RuntimeState, list[Any]
-    ]:
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
         call_count["n"] += 1
         if call_count["n"] == 1:
             return s, [
@@ -673,9 +674,9 @@ def test_actions_executed_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
         PlannedAction("post_pr_comment", {"body": "third"}),
     ]
 
-    def fake_transition(s: RuntimeState, snap: Any, cfg: Any, now: datetime) -> tuple[
-        RuntimeState, list[Any]
-    ]:
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
         call_count["n"] += 1
         if call_count["n"] >= 2:
             return replace(s, status="done", done_reason="completed", updated_at=now), []
@@ -702,9 +703,9 @@ def test_duplicate_commit_skipped_when_already_committed(monkeypatch: pytest.Mon
     call_count = {"n": 0}
     planned = [PlannedAction("commit_changes", {"message": "dup"})]
 
-    def fake_transition(s: RuntimeState, snap: Any, cfg: Any, now: datetime) -> tuple[
-        RuntimeState, list[Any]
-    ]:
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
         call_count["n"] += 1
         if call_count["n"] >= 2:
             return replace(s, status="done", done_reason="completed", updated_at=now), []
@@ -714,11 +715,13 @@ def test_duplicate_commit_skipped_when_already_committed(monkeypatch: pytest.Mon
     ctx = build_ctx(
         gh=gh,
         git=git,
-        config=make_config(safety=SafetyConfig(
-            only_run_on_labeled_prs=False,
-            max_commits_per_run=1,
-            max_coder_invocations_per_run=1,
-        )),
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=False,
+                max_commits_per_run=1,
+                max_coder_invocations_per_run=1,
+            )
+        ),
     )
     Runner(ctx).run(1)
     assert git.commit_count == 0
@@ -739,9 +742,7 @@ def test_polling_calls_sleeper_at_configured_interval() -> None:
     clock = FakeClock()
     sleeper = FakeSleeper(clock=clock)
     coder = FakeCoderAdapter(
-        result=AgentRunResult(
-            changed=False, summary="ok", decisions=[], token_usage=TokenUsage()
-        )
+        result=AgentRunResult(changed=False, summary="ok", decisions=[], token_usage=TokenUsage())
     )
     cfg = make_config(
         review_phase=ReviewPhaseConfig(
@@ -774,13 +775,9 @@ def test_polling_stops_when_findings_appear() -> None:
     clock = FakeClock()
     sleeper = FakeSleeper(clock=clock)
     coder = FakeCoderAdapter(
-        result=AgentRunResult(
-            changed=False, summary="ok", decisions=[], token_usage=TokenUsage()
-        )
+        result=AgentRunResult(changed=False, summary="ok", decisions=[], token_usage=TokenUsage())
     )
-    ctx = build_ctx(
-        gh=gh, reviewers={"fake": reviewer}, coder=coder, clock=clock, sleeper=sleeper
-    )
+    ctx = build_ctx(gh=gh, reviewers={"fake": reviewer}, coder=coder, clock=clock, sleeper=sleeper)
     Runner(ctx).run(pr.number)
     # Findings appeared on first poll, so we should NOT have slept at all.
     assert sleeper.calls == []
@@ -802,9 +799,7 @@ def test_polling_times_out_with_reviewer_timeout() -> None:
             phase_timeout_seconds=120,
         )
     )
-    ctx = build_ctx(
-        gh=gh, reviewers={"fake": reviewer}, clock=clock, sleeper=sleeper, config=cfg
-    )
+    ctx = build_ctx(gh=gh, reviewers={"fake": reviewer}, clock=clock, sleeper=sleeper, config=cfg)
     Runner(ctx).run(pr.number)
 
     comments = gh.get_pr_comments(pr.number)
@@ -831,9 +826,7 @@ def test_polling_times_out_with_phase_timeout() -> None:
             phase_timeout_seconds=10,
         )
     )
-    ctx = build_ctx(
-        gh=gh, reviewers={"fake": reviewer}, clock=clock, sleeper=sleeper, config=cfg
-    )
+    ctx = build_ctx(gh=gh, reviewers={"fake": reviewer}, clock=clock, sleeper=sleeper, config=cfg)
     Runner(ctx).run(pr.number)
 
     comments = gh.get_pr_comments(pr.number)
@@ -932,9 +925,7 @@ def test_ci_ignored_checks_filtered() -> None:
     gh.seed_comment(pr.number, serialize_state_comment(state))
 
     event = ParsedEvent(event_type="check_run", pr_number=pr.number, head_sha=pr.head_sha)
-    cfg = make_config(
-        ci=CiConfig(require_green_before_done=True, ignored_checks=["aipro-self"])
-    )
+    cfg = make_config(ci=CiConfig(require_green_before_done=True, ignored_checks=["aipro-self"]))
     ctx = build_ctx(gh=gh, config=cfg)
     assert Runner(ctx).run(pr.number, event=event) == 0
 
@@ -979,8 +970,8 @@ def test_polling_terminates_when_clock_never_advances() -> None:
     ctx = build_ctx(
         gh=gh,
         reviewers={"fake": reviewer},
-        clock=FrozenClock(NOW),  # type: ignore[arg-type]
-        sleeper=instant_sleeper,  # type: ignore[arg-type]
+        clock=FrozenClock(NOW),
+        sleeper=instant_sleeper,
         config=cfg,
     )
     result = Runner(ctx).run(pr.number)
@@ -1008,9 +999,7 @@ def test_reviewer_responded_with_no_findings_transitions_to_done() -> None:
     reviewer = FakeReviewerAdapter(name="fake", findings_by_call=[[]], responded=True)
     clock = FakeClock()
     sleeper = FakeSleeper(clock=clock)
-    ctx = build_ctx(
-        gh=gh, reviewers={"fake": reviewer}, clock=clock, sleeper=sleeper
-    )
+    ctx = build_ctx(gh=gh, reviewers={"fake": reviewer}, clock=clock, sleeper=sleeper)
     Runner(ctx).run(pr.number)
 
     comments = gh.get_pr_comments(pr.number)

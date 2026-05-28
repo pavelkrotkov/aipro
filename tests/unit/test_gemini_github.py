@@ -361,9 +361,7 @@ def test_has_responded_true_with_review_thread_comment_after_trigger() -> None:
     )
     adapter = _make_adapter(client)
 
-    assert (
-        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
-    )
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
 
 
 def test_has_responded_true_with_top_level_pr_comment_after_trigger() -> None:
@@ -378,19 +376,14 @@ def test_has_responded_true_with_top_level_pr_comment_after_trigger() -> None:
     )
     adapter = _make_adapter(client)
 
-    assert (
-        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
-    )
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
 
 
 def test_has_responded_false_when_no_bot_comments() -> None:
     client = FakeGitHubClient(now=NOW)
     adapter = _make_adapter(client)
 
-    assert (
-        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC))
-        is False
-    )
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
 
 
 def test_has_responded_false_when_only_human_comments() -> None:
@@ -403,10 +396,7 @@ def test_has_responded_false_when_only_human_comments() -> None:
     )
     adapter = _make_adapter(client)
 
-    assert (
-        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC))
-        is False
-    )
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
 
 
 def test_has_responded_skips_machine_marker_trigger_comments() -> None:
@@ -436,10 +426,7 @@ def test_has_responded_skips_machine_marker_trigger_comments() -> None:
     )
     adapter = _make_adapter(client)
 
-    assert (
-        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC))
-        is False
-    )
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
 
 
 def test_has_responded_false_when_bot_comment_is_before_trigger() -> None:
@@ -452,10 +439,7 @@ def test_has_responded_false_when_bot_comment_is_before_trigger() -> None:
     )
     adapter = _make_adapter(client)
 
-    assert (
-        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC))
-        is False
-    )
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
 
 
 def test_collect_findings_only_first_comment_per_thread() -> None:
