@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Sequence
 from json import JSONDecodeError
 from pathlib import Path
@@ -77,10 +78,10 @@ def _pr_number_from_event(event_path: Path) -> int:
     except JSONDecodeError as exc:
         raise SystemExit(f"Event file {event_path} is not valid JSON: {exc}") from exc
 
-    try:
-        pr_number = event["pull_request"]["number"]
-    except (KeyError, TypeError) as exc:
-        raise SystemExit(f"{event_path} does not contain pull_request.number") from exc
+    parsed = runner.parse_event(event, event_name=os.environ.get("GITHUB_EVENT_NAME"))
+    pr_number = parsed.pr_number
+    if pr_number is None:
+        raise SystemExit(f"{event_path} does not contain pull_request.number")
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         raise SystemExit(f"{event_path} pull_request.number must be a positive integer")
     return pr_number
