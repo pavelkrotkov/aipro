@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 
 from ai_pr_orchestrator.github.protocol import GitHubClient
@@ -87,31 +88,24 @@ class GeminiGitHubReviewerAdapter:
         comments. The orchestrator's own machine-marker comments are skipped
         so that the trigger itself does not count as a response.
         """
-        # Inline review-thread comments.
-        for thread in self.github.get_review_threads(pr_number):
-            for comment in thread.comments:
-                if not self.matches_author(comment.author):
-                    continue
-                if self._machine_marker in comment.body:
-                    continue
-                try:
-                    created_at = datetime.fromisoformat(comment.created_at)
-                except (ValueError, TypeError):
-                    continue
-                if created_at >= trigger_timestamp:
-                    return True
-
-        # Top-level PR (issue) comments.
-        for pr_comment in self.github.get_pr_comments(pr_number):
-            if not self.matches_author(pr_comment.user):
+        for author, body, created_at_str in self._iter_bot_candidates(pr_number):
+            if not self.matches_author(author):
                 continue
-            if self._machine_marker in pr_comment.body:
+            if self._machine_marker in body:
                 continue
             try:
-                created_at = datetime.fromisoformat(pr_comment.created_at)
+                created_at = datetime.fromisoformat(created_at_str)
             except (ValueError, TypeError):
                 continue
             if created_at >= trigger_timestamp:
                 return True
 
         return False
+
+    def _iter_bot_candidates(self, pr_number: int) -> Iterable[tuple[str, str, str]]:
+        """Yield (author, body, created_at) tuples from all comment sources."""
+        for thread in self.github.get_review_threads(pr_number):
+            for comment in thread.comments:
+                yield comment.author, comment.body, comment.created_at
+        for pr_comment in self.github.get_pr_comments(pr_number):
+            yield pr_comment.user, pr_comment.body, pr_comment.created_at

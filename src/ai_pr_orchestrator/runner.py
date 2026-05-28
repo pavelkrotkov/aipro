@@ -316,6 +316,7 @@ class Runner:
                 try:
                     remote_head_sha = ctx.git.fetch_remote_head(gh_pr.head_ref)
                 except Exception:
+                    logger.exception("Failed to fetch remote head for ref %s", gh_pr.head_ref)
                     remote_head_sha = None
 
         if state.status == "ci_wait":
@@ -499,21 +500,29 @@ class Runner:
             thread_id = payload.get("thread_id")
             if isinstance(thread_id, str):
                 ctx.github.reply_to_review_thread(thread_id, str(payload.get("body", "")))
+            else:
+                logger.warning("reply_to_thread action missing string thread_id; skipping")
             return state
         if kind == "resolve_thread":
             thread_id = payload.get("thread_id")
             if isinstance(thread_id, str):
                 ctx.github.resolve_review_thread(thread_id)
+            else:
+                logger.warning("resolve_thread action missing string thread_id; skipping")
             return state
         if kind == "add_label":
             label = payload.get("label")
             if isinstance(label, str):
                 ctx.github.add_label(pr_number, label)
+            else:
+                logger.warning("add_label action missing string label; skipping")
             return state
         if kind == "remove_label":
             label = payload.get("label")
             if isinstance(label, str):
                 ctx.github.remove_label(pr_number, label)
+            else:
+                logger.warning("remove_label action missing string label; skipping")
             return state
         if kind == "post_final_summary":
             ctx.github.post_comment(pr_number, _build_final_summary(state, payload))
@@ -580,6 +589,7 @@ class Runner:
             try:
                 diff_text = ctx.git.get_diff(base_branch)
             except Exception:
+                logger.exception("Failed to compute diff against base branch %s", base_branch)
                 diff_text = ""
         task = FixTask(
             pr_number=state.pr_number,
