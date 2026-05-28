@@ -81,7 +81,9 @@ def _pr_number_from_event(event_path: Path) -> int:
     parsed = runner.parse_event(event, event_name=os.environ.get("GITHUB_EVENT_NAME"))
     pr_number = parsed.pr_number
     if pr_number is None:
-        raise SystemExit(f"{event_path} does not contain pull_request.number")
+        raise SystemExit(
+            f"Could not determine pull request number from event file {event_path}"
+        )
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         raise SystemExit(f"{event_path} pull_request.number must be a positive integer")
     return pr_number

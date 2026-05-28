@@ -59,6 +59,19 @@ def _comment_json(comment_id: int = 1) -> dict[str, Any]:
     }
 
 
+def _mock_pr_files(pr_number: int, files: list[str] | None = None) -> None:
+    """Mock the PR-files endpoint for ``get_pr`` to consume.
+
+    ``get_pr`` always calls ``/pulls/{n}/files`` to populate ``changed_files``
+    for the disallow_workflow_file_changes safety check; tests that mock only
+    ``/pulls/{n}`` need to satisfy this second request as well.
+    """
+    body = [{"filename": name} for name in (files or [])]
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/{pr_number}/files").mock(
+        return_value=httpx.Response(200, json=body)
+    )
+
+
 # --- REST: get_pr ---
 
 
@@ -67,6 +80,7 @@ def test_get_pr() -> None:
     route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
         return_value=httpx.Response(200, json=_pr_json())
     )
+    _mock_pr_files(42, ["src/a.py", "src/b.py"])
     with _make_client() as client:
         pr = client.get_pr(42)
 
@@ -77,6 +91,38 @@ def test_get_pr() -> None:
     assert pr.head_sha == "abc123"
     assert pr.labels == ["bug", "v1"]
     assert pr.author == "author"
+    assert pr.changed_files == ["src/a.py", "src/b.py"]
+
+
+@respx.mock
+def test_get_pr_marks_fork_when_head_repo_is_fork() -> None:
+    pr_data = _pr_json()
+    pr_data["head"] = {"sha": "abc123", "ref": "feature", "repo": {"fork": True}}
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+        return_value=httpx.Response(200, json=pr_data)
+    )
+    _mock_pr_files(42, [])
+    with _make_client() as client:
+        pr = client.get_pr(42)
+
+    assert pr.is_fork is True
+
+
+@respx.mock
+def test_get_pr_files_returns_filenames() -> None:
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42/files").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"filename": ".github/workflows/ci.yml"},
+                {"filename": "src/main.py"},
+            ],
+        )
+    )
+    with _make_client() as client:
+        files = client.get_pr_files(42)
+
+    assert files == [".github/workflows/ci.yml", "src/main.py"]
 
 
 # --- REST: post_comment ---
@@ -345,6 +391,7 @@ def test_429_retries_with_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -370,6 +417,7 @@ def test_403_rate_limit_retries(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -409,6 +457,7 @@ def test_403_with_retry_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -552,6 +601,7 @@ def test_dry_run_allows_reads() -> None:
     respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
         return_value=httpx.Response(200, json=_pr_json())
     )
+    _mock_pr_files(42)
     with _make_client(dry_run=True) as client:
         pr = client.get_pr(42)
 
@@ -694,6 +744,7 @@ def test_rate_limit_uses_reset_header(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         client.get_pr(1)
 
@@ -715,6 +766,7 @@ def test_502_retries_with_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -755,6 +807,7 @@ def test_network_error_retries(monkeypatch: pytest.MonkeyPatch) -> None:
         return httpx.Response(200, json=_pr_json(1))
 
     respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/1").mock(side_effect=flaky_handler)
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -815,6 +868,7 @@ def test_get_pr_with_deleted_user() -> None:
     respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
         return_value=httpx.Response(200, json=pr_data)
     )
+    _mock_pr_files(42)
     with _make_client() as client:
         pr = client.get_pr(42)
 

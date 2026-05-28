@@ -176,6 +176,11 @@ class FakeGitHubClient:
             return replace(pr, labels=list(current_labels))
         return pr
 
+    def get_pr_files(self, pr_number: int) -> list[str]:
+        if pr_number not in self._prs:
+            raise KeyError(f"PR #{pr_number} not found in fake")
+        return list(self._prs[pr_number].changed_files)
+
     def get_pr_comments(self, issue_number: int) -> list[models.Comment]:
         return [
             mc.to_model()

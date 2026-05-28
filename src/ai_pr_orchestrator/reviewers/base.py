@@ -30,3 +30,15 @@ class ReviewerAdapter(Protocol):
     ) -> list[Finding]:
         """Collect and normalize findings posted by this reviewer after the trigger."""
         ...
+
+    def has_responded(self, pr_number: int, trigger_timestamp: datetime) -> bool:
+        """Return True once the reviewer bot has posted *any* comment after
+        ``trigger_timestamp`` — even one that produced zero findings.
+
+        This lets the runner distinguish "reviewer finished and found nothing"
+        (a happy-path completion) from "reviewer never responded" (a timeout
+        that needs human attention). Implementations should ignore the
+        orchestrator's own trigger comments by checking for the adapter's
+        machine marker.
+        """
+        ...

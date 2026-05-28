@@ -79,3 +79,39 @@ class GeminiGitHubReviewerAdapter:
                 break  # Only take the first matching comment per thread
 
         return findings
+
+    def has_responded(self, pr_number: int, trigger_timestamp: datetime) -> bool:
+        """Return True if the bot has posted any comment after the trigger.
+
+        Looks at both review-thread comments and top-level PR (issue)
+        comments. The orchestrator's own machine-marker comments are skipped
+        so that the trigger itself does not count as a response.
+        """
+        # Inline review-thread comments.
+        for thread in self.github.get_review_threads(pr_number):
+            for comment in thread.comments:
+                if not self.matches_author(comment.author):
+                    continue
+                if self._machine_marker in comment.body:
+                    continue
+                try:
+                    created_at = datetime.fromisoformat(comment.created_at)
+                except ValueError:
+                    continue
+                if created_at >= trigger_timestamp:
+                    return True
+
+        # Top-level PR (issue) comments.
+        for pr_comment in self.github.get_pr_comments(pr_number):
+            if not self.matches_author(pr_comment.user):
+                continue
+            if self._machine_marker in pr_comment.body:
+                continue
+            try:
+                created_at = datetime.fromisoformat(pr_comment.created_at)
+            except ValueError:
+                continue
+            if created_at >= trigger_timestamp:
+                return True
+
+        return False

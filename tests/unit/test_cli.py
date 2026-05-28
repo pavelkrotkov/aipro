@@ -105,5 +105,5 @@ def test_run_with_invalid_event_shape_exits_cleanly(tmp_path: Path) -> None:
     event_path = tmp_path / "event.json"
     event_path.write_text("[]", encoding="utf-8")
 
-    with pytest.raises(SystemExit, match=r"pull_request\.number"):
+    with pytest.raises(SystemExit, match=r"Could not determine"):
         cli.main(["run", "--event-path", str(event_path)])

@@ -49,6 +49,14 @@ NOT_IMPLEMENTED_MESSAGE = "AI PR Orchestrator runner is not implemented yet."
 # in far fewer iterations.
 _MAX_TRANSITIONS_PER_RUN = 50
 
+# Hard cap on reviewer poll iterations as a guardrail against a non-advancing
+# clock (or extreme clock skew) that would otherwise leave the poll loop
+# unable to detect timeouts. The cap is independent of timeout-based exits
+# and is a defense-in-depth measure. When tripped, the loop treats the
+# situation as a reviewer timeout so the state machine routes to
+# ``needs_human`` rather than spinning forever.
+_MAX_POLL_ITERATIONS = 1000
+
 
 @dataclass(frozen=True)
 class ParsedEvent:
@@ -175,6 +183,31 @@ class Runner:
         ctx = self._ctx
         gh_pr = ctx.github.get_pr(pr_number)
         state, state_comment_id = self._load_or_init_state(pr_number, gh_pr)
+
+        # Detect an orphaned coder invocation from a prior process. If the
+        # state machine had asked us to invoke the coder (last_coder_round_index
+        # == round_index) but our in-memory _pending_coder_result is empty
+        # because this is a fresh Runner instance, the prior coder result is
+        # gone for good. Without intervention the loop would emit
+        # ``noop(waiting_for_coder)`` forever. Bail to ``needs_human`` so a
+        # human can decide whether to retry.
+        if (
+            state.status == "handling"
+            and state.last_coder_round_index == state.round_index
+            and self._pending_coder_result is None
+        ):
+            now = ctx.clock()
+            state = replace(
+                state,
+                status="needs_human",
+                last_error="coder_invocation_orphaned",
+                updated_at=now,
+            )
+            snapshot = self._build_snapshot(state, gh_pr, event=event)
+            _, actions = transition(state, snapshot, ctx.config, now)
+            state = self._execute_actions(actions, pr_number, gh_pr, state)
+            state_comment_id = self._save_state(pr_number, state, state_comment_id)
+            return 0
 
         for _ in range(_MAX_TRANSITIONS_PER_RUN):
             if state.status in TERMINAL_STATUSES:
@@ -337,10 +370,25 @@ class Runner:
         deadline_reviewer = start + timedelta(seconds=cfg.reviewer_timeout_seconds)
         deadline_phase = start + timedelta(seconds=cfg.phase_timeout_seconds)
 
-        while True:
+        for _iteration in range(_MAX_POLL_ITERATIONS):
             snapshot = self._build_snapshot(state, gh_pr, event=None)
             if snapshot.findings:
                 next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
+                state = next_state
+                state = self._execute_actions(actions, pr_number, gh_pr, state)
+                comment_id = self._save_state(pr_number, state, comment_id)
+                return state, comment_id
+
+            # If the reviewer responded but produced zero findings, treat the
+            # phase as complete and let the state machine route to
+            # ``done``/``no_findings`` via ``reviewer_responded=True``.
+            if self._all_enabled_reviewers_responded(state, gh_pr):
+                responded_snapshot = self._build_snapshot(
+                    state, gh_pr, event=None, reviewer_responded=True
+                )
+                next_state, actions = transition(
+                    state, responded_snapshot, ctx.config, ctx.clock()
+                )
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 comment_id = self._save_state(pr_number, state, comment_id)
@@ -360,6 +408,65 @@ class Runner:
                 return state, comment_id
 
             ctx.sleeper(cfg.poll_interval_seconds)
+
+        # Guardrail: a non-advancing clock or pathological config left the
+        # loop unable to detect timeouts. Treat as a reviewer timeout so the
+        # state machine routes to ``needs_human``.
+        logger.warning(
+            "Reviewer poll loop hit hard iteration cap (%d) for PR #%s; "
+            "treating as reviewer timeout",
+            _MAX_POLL_ITERATIONS,
+            pr_number,
+        )
+        timed_out_snapshot = self._build_snapshot(
+            state, gh_pr, event=None, reviewer_timed_out=True
+        )
+        next_state, actions = transition(state, timed_out_snapshot, ctx.config, ctx.clock())
+        state = next_state
+        state = self._execute_actions(actions, pr_number, gh_pr, state)
+        comment_id = self._save_state(pr_number, state, comment_id)
+        return state, comment_id
+
+    def _all_enabled_reviewers_responded(
+        self, state: RuntimeState, gh_pr: gh_models.PullRequest
+    ) -> bool:
+        """Return True iff every enabled reviewer has posted *something* after
+        its trigger. Used to detect the zero-findings completion case so the
+        state machine can transition to ``done`` instead of timing out.
+        """
+        ctx = self._ctx
+        triggers_by_reviewer: dict[str, ReviewerTrigger] = {}
+        for trig in state.trigger_history:
+            existing = triggers_by_reviewer.get(trig.reviewer_name)
+            if existing is None or trig.timestamp > existing.timestamp:
+                triggers_by_reviewer[trig.reviewer_name] = trig
+
+        enabled_names = [
+            name
+            for name in ctx.reviewers
+            if (cfg := ctx.config.reviewers.get(name)) is None or cfg.enabled
+        ]
+        if not enabled_names:
+            return False
+
+        for name in enabled_names:
+            reviewer = ctx.reviewers[name]
+            has_responded = getattr(reviewer, "has_responded", None)
+            if not callable(has_responded):
+                # Reviewer adapter doesn't implement the optional probe; we
+                # cannot prove a response, so refuse to short-circuit.
+                return False
+            trig = triggers_by_reviewer.get(name)
+            ts = trig.timestamp if trig is not None else state.created_at
+            try:
+                if not has_responded(state.pr_number, ts):
+                    return False
+            except Exception:
+                logger.exception(
+                    "Reviewer %s has_responded() failed; assuming no response", name
+                )
+                return False
+        return True
 
     # ---- Action execution ----
 
@@ -495,15 +602,12 @@ class Runner:
 def _convert_pr(gh_pr: gh_models.PullRequest, config: Config) -> PullRequest:
     """Adapt a GitHub-API-shaped PullRequest into the orchestrator's model.
 
-    Some fields the state machine inspects (author_association, changed_files,
-    is_fork) are not on the github.models.PullRequest. We default conservatively;
-    the safety checks in the state machine remain accurate for the V1 use case
-    where allowed_pr_author_associations is configured permissively or the
-    runner is invoked manually for trusted PRs.
+    ``author_association`` is not on the github.models.PullRequest; we default
+    to the first allowed association so safety checks pass when the caller has
+    already vetted the PR. ``is_fork`` and ``changed_files`` are propagated
+    from the GitHub model so the state machine's ``disallow_forks`` and
+    ``disallow_workflow_file_changes`` safety checks are accurate.
     """
-    # We don't have author_association from the basic PR payload; default to
-    # the first allowed association so safety checks pass when the caller has
-    # already vetted the PR. Real production use should pre-filter.
     associations = config.safety.allowed_pr_author_associations
     default_assoc = associations[0] if associations else "OWNER"
     return PullRequest(
@@ -515,8 +619,8 @@ def _convert_pr(gh_pr: gh_models.PullRequest, config: Config) -> PullRequest:
         author_association=default_assoc,
         labels=list(gh_pr.labels),
         is_draft=gh_pr.draft,
-        is_fork=False,
-        changed_files=[],
+        is_fork=gh_pr.is_fork,
+        changed_files=list(gh_pr.changed_files),
     )
 
 

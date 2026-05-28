@@ -75,6 +75,10 @@ class GitHubClient:
 
     def get_pr(self, number: int) -> models.PullRequest:
         data = self._get(f"/repos/{self._owner}/{self._repo}/pulls/{number}")
+        head_repo = (data.get("head") or {}).get("repo") or {}
+        is_fork = bool(head_repo.get("fork", False))
+        # Fetch changed files for safety checks (e.g. disallow_workflow_file_changes).
+        changed_files = self.get_pr_files(number)
         return models.PullRequest(
             number=data["number"],
             title=data["title"],
@@ -87,7 +91,16 @@ class GitHubClient:
             draft=data.get("draft", False),
             mergeable=data.get("mergeable"),
             labels=[label["name"] for label in data.get("labels", [])],
+            is_fork=is_fork,
+            changed_files=changed_files,
         )
+
+    def get_pr_files(self, pr_number: int) -> list[str]:
+        data = self._get_paginated(
+            f"/repos/{self._owner}/{self._repo}/pulls/{pr_number}/files",
+            items_key=None,
+        )
+        return [item["filename"] for item in data if isinstance(item, dict) and "filename" in item]
 
     def post_comment(self, issue_number: int, body: str) -> models.Comment:
         data = self._post(

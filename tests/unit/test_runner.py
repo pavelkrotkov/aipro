@@ -58,6 +58,8 @@ class FakeReviewerAdapter:
     trigger_comment: str = "/fake review"
     findings_by_call: list[list[Finding]] = field(default_factory=list)
     call_count: int = 0
+    responded: bool = False
+    has_responded_calls: list[tuple[int, datetime]] = field(default_factory=list)
 
     def matches_author(self, login: str) -> bool:
         return login == self.bot_login
@@ -75,6 +77,10 @@ class FakeReviewerAdapter:
         if self.findings_by_call:
             return list(self.findings_by_call[-1])
         return []
+
+    def has_responded(self, pr_number: int, trigger_timestamp: datetime) -> bool:
+        self.has_responded_calls.append((pr_number, trigger_timestamp))
+        return self.responded
 
 
 @dataclass
@@ -936,3 +942,182 @@ def test_ci_ignored_checks_filtered() -> None:
     sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
     assert sc is not None
     assert sc.state.status == "done"
+
+
+# ----- Hard-cap / clock-skew guardrail -----
+
+
+def test_polling_terminates_when_clock_never_advances() -> None:
+    """If a stuck clock prevents timeout detection, the iteration cap must
+    still terminate the poll loop and route to ``needs_human``."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="waiting", round_index=1, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    reviewer = FakeReviewerAdapter(name="fake", findings_by_call=[[]])
+
+    # Clock that never advances regardless of how often it's queried.
+    class FrozenClock:
+        def __init__(self, now: datetime) -> None:
+            self.now = now
+
+        def __call__(self) -> datetime:
+            return self.now
+
+    # Sleeper that returns immediately and does NOT advance any clock.
+    def instant_sleeper(seconds: float) -> None:
+        return None
+
+    cfg = make_config(
+        review_phase=ReviewPhaseConfig(
+            poll_interval_seconds=5,
+            reviewer_timeout_seconds=60,
+            phase_timeout_seconds=120,
+        )
+    )
+    ctx = build_ctx(
+        gh=gh,
+        reviewers={"fake": reviewer},
+        clock=FrozenClock(NOW),  # type: ignore[arg-type]
+        sleeper=instant_sleeper,  # type: ignore[arg-type]
+        config=cfg,
+    )
+    result = Runner(ctx).run(pr.number)
+    assert result == 0
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "reviewer_timeout"
+
+
+# ----- Zero-findings reviewer completion -----
+
+
+def test_reviewer_responded_with_no_findings_transitions_to_done() -> None:
+    """When the reviewer bot has posted *something* (so has_responded is True)
+    but found no issues, the runner should route to ``done`` with
+    ``done_reason='no_findings'`` instead of timing out."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="waiting", round_index=1, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    reviewer = FakeReviewerAdapter(name="fake", findings_by_call=[[]], responded=True)
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock=clock)
+    ctx = build_ctx(
+        gh=gh, reviewers={"fake": reviewer}, clock=clock, sleeper=sleeper
+    )
+    Runner(ctx).run(pr.number)
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "done"
+    assert sc.state.done_reason == "no_findings"
+
+
+# ----- Orphaned coder invocation on restart -----
+
+
+def test_orphaned_coder_invocation_transitions_to_needs_human() -> None:
+    """If the persisted state shows the coder was already invoked this round
+    but the in-memory ``_pending_coder_result`` is gone (process restart), the
+    runner must terminate as ``needs_human`` instead of waiting forever."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(
+        status="handling",
+        round_index=1,
+        head_sha=pr.head_sha,
+        last_coder_round_index=1,
+    )
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    # Fresh Runner with no pending coder result.
+    ctx = build_ctx(gh=gh)
+    assert Runner(ctx).run(pr.number) == 0
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "coder_invocation_orphaned"
+
+
+# ----- Safety: fork / workflow file changes -----
+
+
+def test_fork_pr_with_disallow_forks_errors() -> None:
+    gh = FakeGitHubClient(now=NOW)
+    pr = gh_models.PullRequest(
+        number=1,
+        title="Forked PR",
+        body="",
+        state="open",
+        head_sha="head-1",
+        head_ref="feature/x",
+        base_ref="main",
+        author="outsider",
+        is_fork=True,
+    )
+    gh.seed_pr(pr)
+    state = initial_state(status="init", round_index=0, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    ctx = build_ctx(
+        gh=gh,
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=False,
+                disallow_forks=True,
+                disallow_workflow_file_changes=False,
+            )
+        ),
+    )
+    assert Runner(ctx).run(pr.number) == 0
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "error"
+    assert "fork" in (sc.state.last_error or "")
+
+
+def test_workflow_file_change_with_disallow_needs_human() -> None:
+    gh = FakeGitHubClient(now=NOW)
+    pr = gh_models.PullRequest(
+        number=1,
+        title="Workflow edit PR",
+        body="",
+        state="open",
+        head_sha="head-1",
+        head_ref="feature/x",
+        base_ref="main",
+        author="pavel",
+        changed_files=[".github/workflows/ci.yml", "src/main.py"],
+    )
+    gh.seed_pr(pr)
+    state = initial_state(status="init", round_index=0, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    ctx = build_ctx(
+        gh=gh,
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=False,
+                disallow_forks=False,
+                disallow_workflow_file_changes=True,
+            )
+        ),
+    )
+    assert Runner(ctx).run(pr.number) == 0
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "workflow_file_changed"

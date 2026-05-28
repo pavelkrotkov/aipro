@@ -340,6 +340,124 @@ def test_collect_findings_empty_review() -> None:
     assert findings == []
 
 
+# --- has_responded tests ---
+
+
+def test_has_responded_true_with_review_thread_comment_after_trigger() -> None:
+    client = FakeGitHubClient(now=NOW)
+    client.seed_thread(
+        "T_1",
+        pr_number=PR_NUMBER,
+        path="src/main.py",
+        comments=[
+            ReviewComment(
+                id="RC_1",
+                body="A finding",
+                author=BOT_LOGIN,
+                path="src/main.py",
+                created_at="2025-06-01T12:05:00+00:00",
+            ),
+        ],
+    )
+    adapter = _make_adapter(client)
+
+    assert (
+        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
+    )
+
+
+def test_has_responded_true_with_top_level_pr_comment_after_trigger() -> None:
+    """A reviewer that posts a top-level PR comment (e.g. a summary review)
+    instead of inline thread comments still counts as having responded."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_comment(
+        PR_NUMBER,
+        body="LGTM overall, no issues found.",
+        user=BOT_LOGIN,
+        created_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert (
+        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
+    )
+
+
+def test_has_responded_false_when_no_bot_comments() -> None:
+    client = FakeGitHubClient(now=NOW)
+    adapter = _make_adapter(client)
+
+    assert (
+        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC))
+        is False
+    )
+
+
+def test_has_responded_false_when_only_human_comments() -> None:
+    client = FakeGitHubClient(now=NOW)
+    client.seed_comment(
+        PR_NUMBER,
+        body="Hey bot, what do you think?",
+        user="some-human",
+        created_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert (
+        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC))
+        is False
+    )
+
+
+def test_has_responded_skips_machine_marker_trigger_comments() -> None:
+    """The orchestrator's own machine-marker trigger comments authored by the
+    bot itself must not count as a response."""
+    client = FakeGitHubClient(now=NOW)
+    marker = "<!-- ai-orchestrator:reviewer=gemini_github -->"
+    client.seed_comment(
+        PR_NUMBER,
+        body=f"{marker}\n@gemini-code-assist review",
+        user=BOT_LOGIN,
+        created_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    client.seed_thread(
+        "T_marker",
+        pr_number=PR_NUMBER,
+        path="src/a.py",
+        comments=[
+            ReviewComment(
+                id="RC_marker",
+                body=f"{marker}\ntrigger",
+                author=BOT_LOGIN,
+                path="src/a.py",
+                created_at="2025-06-01T12:05:00+00:00",
+            ),
+        ],
+    )
+    adapter = _make_adapter(client)
+
+    assert (
+        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC))
+        is False
+    )
+
+
+def test_has_responded_false_when_bot_comment_is_before_trigger() -> None:
+    client = FakeGitHubClient(now=NOW)
+    client.seed_comment(
+        PR_NUMBER,
+        body="Old comment from earlier review",
+        user=BOT_LOGIN,
+        created_at=datetime(2025, 6, 1, 11, 30, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert (
+        adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC))
+        is False
+    )
+
+
 def test_collect_findings_only_first_comment_per_thread() -> None:
     client = FakeGitHubClient(now=NOW)
     client.seed_thread(
