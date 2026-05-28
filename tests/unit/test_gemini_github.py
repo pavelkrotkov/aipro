@@ -243,7 +243,62 @@ def test_collect_findings_deterministic_id() -> None:
 
     findings = adapter.collect_findings(PR_NUMBER, HEAD_SHA, trigger_ts)
 
-    assert findings[0].id == "gemini_github:T_42"
+    assert findings[0].id == "gemini_github:T_42:RC_42"
+
+
+def test_collect_findings_id_includes_comment_for_repeat_thread() -> None:
+    """A follow-up bot comment on the same thread must yield a distinct Finding.id
+    so the dedup in apply_decisions doesn't drop it as already-handled."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_thread(
+        "T_repeat",
+        pr_number=PR_NUMBER,
+        path="src/r.py",
+        comments=[
+            ReviewComment(
+                id="RC_round1",
+                body="Round 1 finding",
+                author=BOT_LOGIN,
+                path="src/r.py",
+                created_at="2025-06-01T12:05:00+00:00",
+            ),
+        ],
+    )
+    adapter = _make_adapter(client)
+
+    round1 = adapter.collect_findings(
+        PR_NUMBER, HEAD_SHA, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
+    )
+
+    client.seed_thread(
+        "T_repeat",
+        pr_number=PR_NUMBER,
+        path="src/r.py",
+        comments=[
+            ReviewComment(
+                id="RC_round1",
+                body="Round 1 finding",
+                author=BOT_LOGIN,
+                path="src/r.py",
+                created_at="2025-06-01T12:05:00+00:00",
+            ),
+            ReviewComment(
+                id="RC_round2",
+                body="Round 2 follow-up",
+                author=BOT_LOGIN,
+                path="src/r.py",
+                created_at="2025-06-01T12:20:00+00:00",
+            ),
+        ],
+    )
+
+    round2 = adapter.collect_findings(
+        PR_NUMBER, HEAD_SHA, datetime(2025, 6, 1, 12, 15, 0, tzinfo=UTC)
+    )
+
+    assert round1[0].id == "gemini_github:T_repeat:RC_round1"
+    assert round2[0].id == "gemini_github:T_repeat:RC_round2"
+    assert round1[0].id != round2[0].id
 
 
 def test_collect_findings_includes_path_body_thread_comment() -> None:

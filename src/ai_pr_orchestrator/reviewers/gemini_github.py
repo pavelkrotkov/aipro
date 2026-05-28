@@ -61,7 +61,7 @@ class GeminiGitHubReviewerAdapter:
 
                 findings.append(
                     Finding(
-                        id=f"{self.name}:{thread.id}",
+                        id=f"{self.name}:{thread.id}:{comment.id}",
                         source=self.name,
                         body=comment.body,
                         created_at=created_at,
