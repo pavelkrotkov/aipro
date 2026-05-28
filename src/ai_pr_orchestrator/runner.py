@@ -82,6 +82,14 @@ def parse_event(event: Any, *, event_name: str | None = None) -> ParsedEvent:
     The payload itself does not include the event type; callers may pass
     ``event_name`` (typically from ``GITHUB_EVENT_NAME``) to disambiguate.
     Without a hint, we infer from the keys present in the payload.
+
+    Note on ``status`` events: GitHub's status webhook carries only a commit
+    SHA (no PR number). Mapping SHA -> PR requires a live GitHub client
+    (``GET /repos/{owner}/{repo}/commits/{sha}/pulls``), which the CLI does
+    not currently wire up. The CLI surfaces a clear error in that case and
+    asks the operator to pass ``--pr`` explicitly. ``parsed.head_sha`` is
+    still populated so downstream consumers (e.g. a future ``status``-aware
+    CLI) can do the lookup.
     """
     if not isinstance(event, dict):
         # Malformed payloads (lists, scalars, null) can't yield a PR; bail safely.
@@ -174,6 +182,12 @@ class Runner:
         self._current_findings: list[Finding] = []
         # Track whether we already produced a commit this run as a safety net.
         self._commits_this_run = 0
+        # ID of the hidden PR comment that persists RuntimeState. Resolved once
+        # by ``_load_or_init_state`` and reused by every ``_save_state`` call
+        # within the run. Stored on the instance so action handlers (e.g.
+        # ``commit_changes``) can checkpoint state without threading the id
+        # through every helper.
+        self._state_comment_id: int | None = None
 
     def run(self, pr_number: int, *, event: ParsedEvent | None = None) -> int:
         try:
@@ -185,7 +199,30 @@ class Runner:
     def _run(self, pr_number: int, event: ParsedEvent | None) -> int:
         ctx = self._ctx
         gh_pr = ctx.github.get_pr(pr_number)
-        state, state_comment_id = self._load_or_init_state(pr_number, gh_pr)
+        state = self._load_or_init_state(pr_number, gh_pr)
+
+        # Push recovery: if a previous run committed locally but the process
+        # died before push_branch ran (or push itself failed mid-flight), the
+        # checkpoint we saved after commit_changes shows a commit in
+        # commits_made — but the remote branch is still on the prior SHA. On
+        # resume, detect that and reissue the push so the worktree and the
+        # remote converge. Failures are logged but do not abort the run; the
+        # main state machine will eventually surface a hard error if push is
+        # genuinely impossible.
+        if ctx.git is not None and state.commits_made:
+            try:
+                local_head = ctx.git.get_head_sha()
+                if local_head == state.commits_made[-1]:
+                    remote_head = ctx.git.fetch_remote_head(gh_pr.head_ref)
+                    if remote_head != local_head:
+                        logger.info(
+                            "Local commit %s not on remote; resuming push for PR #%s",
+                            local_head,
+                            pr_number,
+                        )
+                        ctx.git.push(gh_pr.head_ref)
+            except Exception:
+                logger.exception("Push recovery failed for PR #%s", pr_number)
 
         # Detect an orphaned coder invocation from a prior process. If the
         # state machine had asked us to invoke the coder (last_coder_round_index
@@ -209,19 +246,17 @@ class Runner:
             snapshot = self._build_snapshot(state, gh_pr, event=event)
             _, actions = transition(state, snapshot, ctx.config, now)
             state = self._execute_actions(actions, pr_number, gh_pr, state)
-            state_comment_id = self._save_state(pr_number, state, state_comment_id)
+            self._save_state(pr_number, state)
             return 0
 
         for _ in range(_MAX_TRANSITIONS_PER_RUN):
             if state.status in TERMINAL_STATUSES:
-                state_comment_id = self._save_state(pr_number, state, state_comment_id)
+                self._save_state(pr_number, state)
                 return 0
 
             # waiting/collecting need reviewer polling with a clock-aware loop.
             if state.status in ("waiting", "collecting"):
-                state, state_comment_id = self._poll_reviewers(
-                    state, state_comment_id, pr_number, gh_pr
-                )
+                state = self._poll_reviewers(state, pr_number, gh_pr)
                 continue
 
             # ci_wait: do one transition with current checks; if still pending, exit.
@@ -231,10 +266,10 @@ class Runner:
                 if next_state.status == "ci_wait":
                     # CI hasn't completed yet; persist state and let the next
                     # check_run/check_suite event wake us back up.
-                    state_comment_id = self._save_state(pr_number, next_state, state_comment_id)
+                    self._save_state(pr_number, next_state)
                     return 0
                 state = self._execute_actions(actions, pr_number, gh_pr, next_state)
-                state_comment_id = self._save_state(pr_number, state, state_comment_id)
+                self._save_state(pr_number, state)
                 continue
 
             snapshot = self._build_snapshot(state, gh_pr, event=event)
@@ -243,21 +278,19 @@ class Runner:
             # so a subsequent transition in the same run doesn't see a stale one.
             self._pending_coder_result = None
             state = self._execute_actions(actions, pr_number, gh_pr, next_state)
-            state_comment_id = self._save_state(pr_number, state, state_comment_id)
+            self._save_state(pr_number, state)
 
         logger.error("Runner exceeded max transitions for PR #%s", pr_number)
         return 1
 
     # ---- State loading / saving ----
 
-    def _load_or_init_state(
-        self, pr_number: int, gh_pr: gh_models.PullRequest
-    ) -> tuple[RuntimeState, int | None]:
+    def _load_or_init_state(self, pr_number: int, gh_pr: gh_models.PullRequest) -> RuntimeState:
         comments = self._ctx.github.get_pr_comments(pr_number)
         sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
         if sc is not None:
-            comment_id = int(sc.comment_id) if isinstance(sc.comment_id, int) else None
-            return sc.state, comment_id
+            self._state_comment_id = int(sc.comment_id) if isinstance(sc.comment_id, int) else None
+            return sc.state
 
         now = self._ctx.clock()
         state = RuntimeState(
@@ -269,17 +302,16 @@ class Runner:
             updated_at=now,
         )
         posted = self._ctx.github.post_comment(pr_number, serialize_state_comment(state))
-        return state, posted.id
+        self._state_comment_id = posted.id
+        return state
 
-    def _save_state(
-        self, pr_number: int, state: RuntimeState, comment_id: int | None
-    ) -> int | None:
+    def _save_state(self, pr_number: int, state: RuntimeState) -> None:
         body = serialize_state_comment(state)
-        if comment_id is None:
+        if self._state_comment_id is None:
             posted = self._ctx.github.post_comment(pr_number, body)
-            return posted.id
-        self._ctx.github.edit_comment(comment_id, body)
-        return comment_id
+            self._state_comment_id = posted.id
+            return
+        self._ctx.github.edit_comment(self._state_comment_id, body)
 
     # ---- Snapshot builders ----
 
@@ -363,15 +395,30 @@ class Runner:
     def _poll_reviewers(
         self,
         state: RuntimeState,
-        comment_id: int | None,
         pr_number: int,
         gh_pr: gh_models.PullRequest,
-    ) -> tuple[RuntimeState, int | None]:
+    ) -> RuntimeState:
         ctx = self._ctx
         cfg = ctx.config.review_phase
-        start = ctx.clock()
-        deadline_reviewer = start + timedelta(seconds=cfg.reviewer_timeout_seconds)
-        deadline_phase = start + timedelta(seconds=cfg.phase_timeout_seconds)
+        # Deadlines are anchored to persisted state, NOT to ctx.clock() at
+        # resume time. A new webhook arriving 3h after the trigger must observe
+        # the same deadline as the original invocation — otherwise an already
+        # timed-out ``waiting`` state would keep getting a fresh budget on
+        # every wake-up and never route to ``needs_human``.
+        #
+        # reviewer_timeout: anchored to the most recent ReviewerTrigger (the
+        # newest reviewer the runner is waiting on). Fallback: state.created_at.
+        # phase_timeout: anchored to the *first* ReviewerTrigger so the overall
+        # phase budget caps total wall time across multiple reviewer rounds.
+        # Fallback: state.created_at.
+        if state.trigger_history:
+            latest_trigger_ts = max(t.timestamp for t in state.trigger_history)
+            earliest_trigger_ts = min(t.timestamp for t in state.trigger_history)
+        else:
+            latest_trigger_ts = state.created_at
+            earliest_trigger_ts = state.created_at
+        deadline_reviewer = latest_trigger_ts + timedelta(seconds=cfg.reviewer_timeout_seconds)
+        deadline_phase = earliest_trigger_ts + timedelta(seconds=cfg.phase_timeout_seconds)
 
         for _iteration in range(_MAX_POLL_ITERATIONS):
             snapshot = self._build_snapshot(state, gh_pr, event=None)
@@ -379,8 +426,8 @@ class Runner:
                 next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
-                comment_id = self._save_state(pr_number, state, comment_id)
-                return state, comment_id
+                self._save_state(pr_number, state)
+                return state
 
             # If the reviewer responded but produced zero findings, treat the
             # phase as complete and let the state machine route to
@@ -392,8 +439,8 @@ class Runner:
                 next_state, actions = transition(state, responded_snapshot, ctx.config, ctx.clock())
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
-                comment_id = self._save_state(pr_number, state, comment_id)
-                return state, comment_id
+                self._save_state(pr_number, state)
+                return state
 
             now = ctx.clock()
             if now >= deadline_reviewer or now >= deadline_phase:
@@ -403,8 +450,8 @@ class Runner:
                 next_state, actions = transition(state, timed_out_snapshot, ctx.config, ctx.clock())
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
-                comment_id = self._save_state(pr_number, state, comment_id)
-                return state, comment_id
+                self._save_state(pr_number, state)
+                return state
 
             ctx.sleeper(cfg.poll_interval_seconds)
 
@@ -421,8 +468,8 @@ class Runner:
         next_state, actions = transition(state, timed_out_snapshot, ctx.config, ctx.clock())
         state = next_state
         state = self._execute_actions(actions, pr_number, gh_pr, state)
-        comment_id = self._save_state(pr_number, state, comment_id)
-        return state, comment_id
+        self._save_state(pr_number, state)
+        return state
 
     def _all_enabled_reviewers_responded(
         self, state: RuntimeState, gh_pr: gh_models.PullRequest
@@ -532,7 +579,17 @@ class Runner:
                 ctx.git.rollback()
             return state
         if kind == "commit_changes":
-            return self._do_commit(payload, state)
+            new_state = self._do_commit(payload, state)
+            # Checkpoint immediately so a crash (or push failure) between
+            # commit and push doesn't leave a local commit invisible to the
+            # next run. Without this, ``state.commits_made`` would still be
+            # empty after a successful commit, and on resume the runner would
+            # have no way to detect that it owes the remote a push. With the
+            # checkpoint, the next run sees the local commit recorded and the
+            # push-recovery branch at the top of ``_run`` reissues the push.
+            if new_state is not state:
+                self._save_state(pr_number, new_state)
+            return new_state
         if kind == "push_branch":
             self._do_push(gh_pr)
             return state
@@ -610,21 +667,29 @@ class Runner:
 def _convert_pr(gh_pr: gh_models.PullRequest, config: Config) -> PullRequest:
     """Adapt a GitHub-API-shaped PullRequest into the orchestrator's model.
 
-    ``author_association`` is not on the github.models.PullRequest; we default
-    to the first allowed association so safety checks pass when the caller has
-    already vetted the PR. ``is_fork`` and ``changed_files`` are propagated
-    from the GitHub model so the state machine's ``disallow_forks`` and
+    ``author_association`` is propagated from the GitHub API response so the
+    state machine's ``_safety_transition`` check (``author_association not in
+    allowed_pr_author_associations``) gates real untrusted authors. If the
+    field is missing (older test fixtures, dry-runs against payloads that
+    omit it), we fall back to the sentinel ``"NONE"`` — which is GitHub's
+    own value for "no association" and is treated as untrusted by the
+    default allowlist (``OWNER``/``MEMBER``/``COLLABORATOR``).
+
+    ``is_fork`` and ``changed_files`` are propagated from the GitHub model
+    so the state machine's ``disallow_forks`` and
     ``disallow_workflow_file_changes`` safety checks are accurate.
     """
-    associations = config.safety.allowed_pr_author_associations
-    default_assoc = associations[0] if associations else "OWNER"
+    # ``config`` is accepted for forward compatibility with other adapter
+    # decisions but is intentionally not used to derive author_association,
+    # which must come from the real PR payload.
+    del config
     return PullRequest(
         number=gh_pr.number,
         head_sha=gh_pr.head_sha,
         base_sha=gh_pr.base_ref,
         title=gh_pr.title,
         author_login=gh_pr.author,
-        author_association=default_assoc,
+        author_association=gh_pr.author_association or "NONE",
         labels=list(gh_pr.labels),
         is_draft=gh_pr.draft,
         is_fork=gh_pr.is_fork,

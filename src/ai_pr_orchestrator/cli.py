@@ -81,6 +81,16 @@ def _pr_number_from_event(event_path: Path) -> int:
     parsed = runner.parse_event(event, event_name=os.environ.get("GITHUB_EVENT_NAME"))
     pr_number = parsed.pr_number
     if pr_number is None:
+        # ``status`` webhooks carry a commit SHA but no PR number; mapping SHA
+        # → PR requires a live GitHub client, which the CLI doesn't construct
+        # yet. Surface a clear error instead of the generic "could not
+        # determine" message so operators know to pass ``--pr`` explicitly.
+        if parsed.event_type == "status" and parsed.head_sha is not None:
+            raise SystemExit(
+                f"status events carry a commit SHA ({parsed.head_sha}) but no PR "
+                "number; resolving SHA -> PR is not wired yet. Pass --pr "
+                "explicitly to run on this PR."
+            )
         raise SystemExit(f"Could not determine pull request number from event file {event_path}")
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         raise SystemExit(f"{event_path} pull_request.number must be a positive integer")

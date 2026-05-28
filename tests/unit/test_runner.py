@@ -25,6 +25,7 @@ from ai_pr_orchestrator.models import (
     Decision,
     Finding,
     FixTask,
+    ReviewerTrigger,
     RuntimeState,
     TokenUsage,
 )
@@ -192,6 +193,7 @@ def seed_pr(
     base_ref: str = "main",
     author: str = "pavel",
     labels: list[str] | None = None,
+    author_association: str = "OWNER",
 ) -> gh_models.PullRequest:
     pr = gh_models.PullRequest(
         number=number,
@@ -203,6 +205,7 @@ def seed_pr(
         base_ref=base_ref,
         author=author,
         labels=labels or [],
+        author_association=author_association,
     )
     gh.seed_pr(pr)
     return pr
@@ -842,6 +845,57 @@ def test_polling_times_out_with_phase_timeout() -> None:
     assert sc.state.status == "needs_human"
 
 
+def test_polling_deadline_is_anchored_to_trigger_not_resume() -> None:
+    """A ``waiting`` state whose ReviewerTrigger predates the runner's clock
+    by more than ``reviewer_timeout_seconds`` must immediately time out —
+    without any sleeper calls — because the deadline is anchored to the
+    persisted trigger timestamp, not to the wall-clock at resume.
+
+    Regression test for the bug where ``start = ctx.clock()`` in
+    ``_poll_reviewers`` reset the timeout budget on every webhook wake-up.
+    """
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    # Trigger fired 2 hours ago — well past any reasonable reviewer_timeout.
+    two_hours_ago = NOW - timedelta(hours=2)
+    state = initial_state(
+        status="waiting",
+        round_index=1,
+        head_sha=pr.head_sha,
+        trigger_history=[
+            ReviewerTrigger(
+                reviewer_name="fake",
+                round_index=1,
+                timestamp=two_hours_ago,
+                head_sha=pr.head_sha,
+            )
+        ],
+    )
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    reviewer = FakeReviewerAdapter(name="fake", findings_by_call=[[]])
+    clock = FakeClock(start=NOW)
+    sleeper = FakeSleeper(clock=clock)
+    cfg = make_config(
+        review_phase=ReviewPhaseConfig(
+            poll_interval_seconds=10,
+            reviewer_timeout_seconds=600,
+            phase_timeout_seconds=900,
+        )
+    )
+    ctx = build_ctx(gh=gh, reviewers={"fake": reviewer}, clock=clock, sleeper=sleeper, config=cfg)
+    Runner(ctx).run(pr.number)
+
+    # Deadline was already in the past; no sleep should have been issued.
+    assert sleeper.calls == []
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "reviewer_timeout"
+
+
 # ----- CI resume tests -----
 
 
@@ -1059,6 +1113,7 @@ def test_fork_pr_with_disallow_forks_errors() -> None:
         base_ref="main",
         author="outsider",
         is_fork=True,
+        author_association="OWNER",
     )
     gh.seed_pr(pr)
     state = initial_state(status="init", round_index=0, head_sha=pr.head_sha)
@@ -1095,6 +1150,7 @@ def test_workflow_file_change_with_disallow_needs_human() -> None:
         base_ref="main",
         author="pavel",
         changed_files=[".github/workflows/ci.yml", "src/main.py"],
+        author_association="OWNER",
     )
     gh.seed_pr(pr)
     state = initial_state(status="init", round_index=0, head_sha=pr.head_sha)
@@ -1117,3 +1173,204 @@ def test_workflow_file_change_with_disallow_needs_human() -> None:
     assert sc is not None
     assert sc.state.status == "needs_human"
     assert sc.state.last_error == "workflow_file_changed"
+
+
+def test_untrusted_author_association_errors() -> None:
+    """A PR whose ``author_association`` is not in the allowlist must terminate
+    in ``error`` with ``last_error`` reporting the untrusted association.
+
+    This guards the safety bypass that used to default the association to the
+    first allowed entry — making the state-machine check a no-op against any
+    real author.
+    """
+    gh = FakeGitHubClient(now=NOW)
+    pr = gh_models.PullRequest(
+        number=1,
+        title="Drive-by PR",
+        body="",
+        state="open",
+        head_sha="head-1",
+        head_ref="feature/x",
+        base_ref="main",
+        author="drive-by-contributor",
+        author_association="FIRST_TIME_CONTRIBUTOR",
+    )
+    gh.seed_pr(pr)
+    state = initial_state(status="init", round_index=0, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    ctx = build_ctx(
+        gh=gh,
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=False,
+                disallow_forks=False,
+                disallow_workflow_file_changes=False,
+                allowed_pr_author_associations=["OWNER", "MEMBER", "COLLABORATOR"],
+            )
+        ),
+    )
+    assert Runner(ctx).run(pr.number) == 0
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "error"
+    assert "untrusted_author_association" in (sc.state.last_error or "")
+
+
+def test_missing_author_association_falls_back_to_none_sentinel() -> None:
+    """When the GitHub payload omits ``author_association`` we route through the
+    ``NONE`` sentinel (GitHub's own value for "no association"), which the
+    default allowlist treats as untrusted."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = gh_models.PullRequest(
+        number=1,
+        title="No-assoc PR",
+        body="",
+        state="open",
+        head_sha="head-1",
+        head_ref="feature/x",
+        base_ref="main",
+        author="random",
+        # author_association defaults to "" — we want the runner to coerce
+        # that to ``NONE`` rather than silently inheriting a trusted value.
+    )
+    gh.seed_pr(pr)
+    state = initial_state(status="init", round_index=0, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    ctx = build_ctx(
+        gh=gh,
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=False,
+                disallow_forks=False,
+                disallow_workflow_file_changes=False,
+                allowed_pr_author_associations=["OWNER", "MEMBER", "COLLABORATOR"],
+            )
+        ),
+    )
+    assert Runner(ctx).run(pr.number) == 0
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "error"
+    assert "untrusted_author_association:NONE" in (sc.state.last_error or "")
+
+
+# ----- Commit/push checkpoint and push-recovery -----
+
+
+def test_commit_state_checkpoint_survives_push_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``push_branch`` raises after ``commit_changes`` succeeds, the
+    persisted state must already contain the new commit SHA so the next run
+    can detect the orphan local commit and resume the push.
+
+    Without the post-commit checkpoint, ``state.commits_made`` would still be
+    empty in the persisted comment when the push exception unwinds through
+    ``_run`` — and the next runner would have no idea a local commit exists.
+    """
+    from ai_pr_orchestrator.models import PlannedAction
+
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="init", round_index=1, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    class FailingPushRepo(FakeGitRepo):
+        def push(self, branch: str) -> None:
+            self.push_count += 1
+            self.push_calls.append(branch)
+            raise RuntimeError("network down")
+
+    git = FailingPushRepo(head_sha=pr.head_sha, remote_head_sha=pr.head_sha, clean=False)
+
+    call_count = {"n": 0}
+    planned = [
+        PlannedAction("commit_changes", {"message": "fix: x"}),
+        PlannedAction("push_branch", {}),
+    ]
+
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
+        call_count["n"] += 1
+        if call_count["n"] >= 2:
+            return replace(s, status="done", done_reason="completed", updated_at=now), []
+        return s, planned
+
+    monkeypatch.setattr("ai_pr_orchestrator.runner.transition", fake_transition)
+    ctx = build_ctx(gh=gh, git=cast(Any, git))
+    # Runner.run catches the push exception and returns 1; the key invariant
+    # is that the state comment was checkpointed before the push attempt.
+    assert Runner(ctx).run(pr.number) == 1
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    # The new commit SHA must be in commits_made even though push failed.
+    assert "new-commit-sha" in sc.state.commits_made
+    assert sc.state.head_sha == "new-commit-sha"
+
+
+def test_push_recovery_reissues_push_on_resume() -> None:
+    """If persisted state shows a local commit that is not yet on the remote,
+    the runner must reissue the push at the top of ``_run``."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh, head_sha="prior-sha")
+    state = initial_state(
+        status="ci_wait",
+        round_index=1,
+        head_sha="local-sha",
+        ci_wait_started_at=NOW,
+        commits_made=["local-sha"],
+    )
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    # Worktree HEAD matches the recorded last commit; remote still on prior SHA.
+    git = FakeGitRepo(head_sha="local-sha", remote_head_sha="prior-sha")
+
+    ctx = build_ctx(gh=gh, git=git)
+    Runner(ctx).run(pr.number)
+
+    assert git.push_count == 1
+    assert git.push_calls[0] == "feature/x"
+
+
+def test_push_recovery_skips_when_remote_already_matches() -> None:
+    """No push should be issued when the remote already has the local commit."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh, head_sha="local-sha")
+    state = initial_state(
+        status="ci_wait",
+        round_index=1,
+        head_sha="local-sha",
+        ci_wait_started_at=NOW,
+        commits_made=["local-sha"],
+    )
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    # Remote already matches local; recovery is a no-op.
+    git = FakeGitRepo(head_sha="local-sha", remote_head_sha="local-sha")
+
+    ctx = build_ctx(gh=gh, git=git)
+    Runner(ctx).run(pr.number)
+
+    assert git.push_count == 0
+
+
+def test_push_recovery_no_op_when_no_commits_made() -> None:
+    """When state has never recorded a commit, push-recovery must not run."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="init", round_index=0, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    git = FakeGitRepo(head_sha="some-sha", remote_head_sha="other-sha")
+
+    ctx = build_ctx(gh=gh, git=git)
+    Runner(ctx).run(pr.number)
+
+    # No commits in state -> no recovery push, regardless of remote/local mismatch.
+    assert git.push_count == 0

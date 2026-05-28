@@ -107,3 +107,20 @@ def test_run_with_invalid_event_shape_exits_cleanly(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit, match=r"Could not determine"):
         cli.main(["run", "--event-path", str(event_path)])
+
+
+def test_run_with_status_event_exits_with_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``status`` webhooks carry a SHA but no PR number. Until SHA -> PR
+    lookup is wired in the CLI, surface a clear actionable error pointing
+    operators at ``--pr`` instead of the generic "could not determine"
+    message."""
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "status")
+    event_path = tmp_path / "status.json"
+    event_path.write_text(
+        '{"sha": "abc123def456", "state": "success"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match=r"status events carry a commit SHA"):
+        cli.main(["run", "--event-path", str(event_path)])

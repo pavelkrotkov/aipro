@@ -109,6 +109,38 @@ def test_get_pr_marks_fork_when_head_repo_is_fork() -> None:
 
 
 @respx.mock
+def test_get_pr_populates_author_association_from_payload() -> None:
+    """``get_pr`` must surface the API's ``author_association`` field so the
+    runner-side safety check sees the real value (not a sentinel chosen by the
+    config). When the field is missing the model receives an empty string and
+    the runner adapter coerces that to ``NONE``."""
+    pr_data = _pr_json()
+    pr_data["author_association"] = "FIRST_TIME_CONTRIBUTOR"
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+        return_value=httpx.Response(200, json=pr_data)
+    )
+    _mock_pr_files(42, [])
+    with _make_client() as client:
+        pr = client.get_pr(42)
+
+    assert pr.author_association == "FIRST_TIME_CONTRIBUTOR"
+
+
+@respx.mock
+def test_get_pr_author_association_defaults_to_empty_when_absent() -> None:
+    pr_data = _pr_json()
+    # No author_association on the payload.
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+        return_value=httpx.Response(200, json=pr_data)
+    )
+    _mock_pr_files(42, [])
+    with _make_client() as client:
+        pr = client.get_pr(42)
+
+    assert pr.author_association == ""
+
+
+@respx.mock
 def test_get_pr_files_returns_filenames() -> None:
     respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42/files").mock(
         return_value=httpx.Response(

@@ -93,6 +93,7 @@ class GitHubClient:
             labels=[label["name"] for label in data.get("labels", [])],
             is_fork=is_fork,
             changed_files=changed_files,
+            author_association=data.get("author_association") or "",
         )
 
     def get_pr_files(self, pr_number: int) -> list[str]:

@@ -20,6 +20,7 @@ class PullRequest:
     labels: list[str] = field(default_factory=list)
     is_fork: bool = False
     changed_files: list[str] = field(default_factory=list)
+    author_association: str = ""
 
 
 @dataclass(frozen=True)
