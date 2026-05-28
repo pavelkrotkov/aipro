@@ -96,7 +96,7 @@ class GeminiGitHubReviewerAdapter:
                     continue
                 try:
                     created_at = datetime.fromisoformat(comment.created_at)
-                except ValueError:
+                except (ValueError, TypeError):
                     continue
                 if created_at >= trigger_timestamp:
                     return True
@@ -109,7 +109,7 @@ class GeminiGitHubReviewerAdapter:
                 continue
             try:
                 created_at = datetime.fromisoformat(pr_comment.created_at)
-            except ValueError:
+            except (ValueError, TypeError):
                 continue
             if created_at >= trigger_timestamp:
                 return True

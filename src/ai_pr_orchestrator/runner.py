@@ -239,6 +239,9 @@ class Runner:
 
             snapshot = self._build_snapshot(state, gh_pr, event=event)
             next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
+            # Clear the cached coder result once the transition has consumed it
+            # so a subsequent transition in the same run doesn't see a stale one.
+            self._pending_coder_result = None
             state = self._execute_actions(actions, pr_number, gh_pr, next_state)
             state_comment_id = self._save_state(pr_number, state, state_comment_id)
 
@@ -549,7 +552,10 @@ class Runner:
         if sha is None:
             return state
         self._commits_this_run += 1
-        return replace(state, commits_made=[*state.commits_made, sha])
+        # Track the new commit SHA on state so downstream consumers (e.g. the
+        # CI gate's get_check_runs(state.head_sha)) see the just-pushed commit
+        # instead of the pre-commit HEAD.
+        return replace(state, head_sha=sha, commits_made=[*state.commits_made, sha])
 
     def _do_push(self, gh_pr: gh_models.PullRequest) -> None:
         ctx = self._ctx
@@ -568,16 +574,17 @@ class Runner:
         finding_ids = payload.get("finding_ids") or []
         findings_by_id = {f.id: f for f in self._current_findings}
         selected = [findings_by_id[fid] for fid in finding_ids if fid in findings_by_id]
+        base_branch = gh_pr.base_ref or ctx.config.git.base_branch
         diff_text = ""
         if ctx.git is not None:
             try:
-                diff_text = ctx.git.get_diff(gh_pr.base_ref)
+                diff_text = ctx.git.get_diff(base_branch)
             except Exception:
                 diff_text = ""
         task = FixTask(
             pr_number=state.pr_number,
             head_sha=state.head_sha,
-            base_branch=gh_pr.base_ref or ctx.config.git.base_branch,
+            base_branch=base_branch,
             findings=selected,
             changed_files=list(gh_pr.changed_files),
             diff_text=diff_text,
