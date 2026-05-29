@@ -60,6 +60,8 @@ class GitHubClient:
             timeout=30.0,
         )
         self._owns_client = http_client is None
+        # Per-(pr_number, head_sha) cache of changed files; see get_pr.
+        self._pr_files_cache: dict[tuple[int, str], list[str]] = {}
 
     def close(self) -> None:
         if self._owns_client:
@@ -77,8 +79,17 @@ class GitHubClient:
         data = self._get(f"/repos/{self._owner}/{self._repo}/pulls/{number}")
         head_repo = (data.get("head") or {}).get("repo") or {}
         is_fork = bool(head_repo.get("fork", False))
+        head_sha = data["head"]["sha"]
         # Fetch changed files for safety checks (e.g. disallow_workflow_file_changes).
-        changed_files = self.get_pr_files(number)
+        # The runner refetches the PR on every transition/poll iteration, but the
+        # changed-files list only moves when the head SHA does. Cache by
+        # (number, head_sha) so repeated get_pr calls within a run don't issue a
+        # redundant (paginated) /files request on every tick.
+        cache_key = (number, head_sha)
+        changed_files = self._pr_files_cache.get(cache_key)
+        if changed_files is None:
+            changed_files = self.get_pr_files(number)
+            self._pr_files_cache[cache_key] = changed_files
         return models.PullRequest(
             number=data["number"],
             title=data["title"],

@@ -486,6 +486,19 @@ def _decision_reply_actions(result: AgentRunResult) -> list[PlannedAction]:
     return actions
 
 
+def terminal_actions(state: RuntimeState, config: Config) -> list[PlannedAction]:
+    """Public alias for :func:`_terminal_actions`.
+
+    Callers that force a terminal status outside the normal ``transition``
+    flow (e.g. the runner's push-recovery and orphaned-coder bailouts) need the
+    same visible side effects — final summary comment and status label — that
+    ``transition`` would have emitted. ``transition`` itself returns no actions
+    for an already-terminal input state, so those callers must source the
+    terminal actions directly from here.
+    """
+    return _terminal_actions(state, config)
+
+
 def _terminal_actions(state: RuntimeState, config: Config) -> list[PlannedAction]:
     if state.status == "done":
         return [

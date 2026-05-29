@@ -141,6 +141,40 @@ def test_get_pr_author_association_defaults_to_empty_when_absent() -> None:
 
 
 @respx.mock
+def test_get_pr_caches_changed_files_by_head_sha() -> None:
+    """``get_pr`` is called on every runner transition/poll tick, but the
+    changed-files list only moves when the head SHA does. Repeated calls at the
+    same head SHA must hit the cache and issue exactly one /files request; a
+    head-SHA change must trigger a fresh fetch."""
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+        return_value=httpx.Response(200, json=_pr_json())
+    )
+    files_route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42/files").mock(
+        return_value=httpx.Response(200, json=[{"filename": "src/main.py"}])
+    )
+    with _make_client() as client:
+        first = client.get_pr(42)
+        second = client.get_pr(42)
+        assert first.changed_files == ["src/main.py"]
+        assert second.changed_files == ["src/main.py"]
+        # Two get_pr calls, same head SHA -> only one /files request.
+        assert files_route.call_count == 1
+
+        # A new head SHA invalidates the cache and triggers a fresh fetch.
+        moved = _pr_json()
+        moved["head"] = {"sha": "def456", "ref": "feature", "repo": {}}
+        respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+            return_value=httpx.Response(200, json=moved)
+        )
+        files_route.mock(return_value=httpx.Response(200, json=[{"filename": "src/other.py"}]))
+        third = client.get_pr(42)
+        assert third.changed_files == ["src/other.py"]
+        # Cumulative: cache miss on first call + miss on the moved-SHA call = 2.
+        # The second (same-SHA) call was served from cache and added nothing.
+        assert files_route.call_count == 2
+
+
+@respx.mock
 def test_get_pr_files_returns_filenames() -> None:
     respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42/files").mock(
         return_value=httpx.Response(

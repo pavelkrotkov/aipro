@@ -34,7 +34,12 @@ from ai_pr_orchestrator.models import (
     RuntimeState,
 )
 from ai_pr_orchestrator.reviewers.base import ReviewerAdapter
-from ai_pr_orchestrator.state_machine import TERMINAL_STATUSES, TransitionSnapshot, transition
+from ai_pr_orchestrator.state_machine import (
+    TERMINAL_STATUSES,
+    TransitionSnapshot,
+    terminal_actions,
+    transition,
+)
 from ai_pr_orchestrator.state_storage import (
     StateComment,
     StateConflictError,
@@ -250,8 +255,10 @@ class Runner:
                     last_error="push_recovery_failed",
                     updated_at=now,
                 )
-                snapshot = self._build_snapshot(state, gh_pr, event=event)
-                _, actions = transition(state, snapshot, ctx.config, now)
+                # transition() returns no actions for an already-terminal
+                # state, so source the final-summary/label side effects
+                # directly from the state machine's terminal_actions helper.
+                actions = terminal_actions(state, ctx.config)
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
                 return 0
@@ -275,8 +282,10 @@ class Runner:
                 last_error="coder_invocation_orphaned",
                 updated_at=now,
             )
-            snapshot = self._build_snapshot(state, gh_pr, event=event)
-            _, actions = transition(state, snapshot, ctx.config, now)
+            # transition() no-ops on a terminal state; emit the terminal
+            # side effects (final summary + error label) directly so the
+            # operator sees the bailout on the PR, not just in hidden state.
+            actions = terminal_actions(state, ctx.config)
             state = self._execute_actions(actions, pr_number, gh_pr, state)
             self._save_state(pr_number, state)
             return 0
@@ -290,7 +299,10 @@ class Runner:
             # we captured before the loop started.
             gh_pr = ctx.github.get_pr(pr_number)
             if state.status in TERMINAL_STATUSES:
-                self._save_state(pr_number, state)
+                # State reaching this check was already persisted: either it
+                # was just loaded from the state comment (no mutation since),
+                # or an earlier iteration saved it before ``continue``. A
+                # second save here is a redundant write to GitHub.
                 return 0
 
             # waiting/collecting need reviewer polling with a clock-aware loop.
@@ -442,8 +454,16 @@ class Runner:
     def _collect_findings(self, state: RuntimeState, gh_pr: gh_models.PullRequest) -> list[Finding]:
         ctx = self._ctx
         all_findings: list[Finding] = []
+        # Only collect findings from reviewers triggered in the *current* round.
+        # Using the whole trigger_history (or falling back to state.created_at
+        # for never-triggered reviewers) would pull in comments from prior
+        # rounds — or every comment since the PR opened — and feed stale,
+        # out-of-scope findings into ``handling``. This mirrors the
+        # current-round filter in ``_all_enabled_reviewers_responded``.
         triggers_by_reviewer: dict[str, ReviewerTrigger] = {}
         for trig in state.trigger_history:
+            if trig.round_index != state.round_index:
+                continue
             existing = triggers_by_reviewer.get(trig.reviewer_name)
             if existing is None or trig.timestamp > existing.timestamp:
                 triggers_by_reviewer[trig.reviewer_name] = trig
@@ -453,9 +473,12 @@ class Runner:
             if cfg is not None and not cfg.enabled:
                 continue
             trig = triggers_by_reviewer.get(name)
-            ts = trig.timestamp if trig is not None else state.created_at
+            if trig is None:
+                # Reviewer was not triggered this round; it has no findings in
+                # scope for the current collection pass.
+                continue
             try:
-                found = reviewer.collect_findings(state.pr_number, gh_pr.head_sha, ts)
+                found = reviewer.collect_findings(state.pr_number, gh_pr.head_sha, trig.timestamp)
             except Exception:
                 logger.exception("Reviewer %s failed to collect findings", name)
                 continue
@@ -686,10 +709,13 @@ class Runner:
         ctx = self._ctx
         if ctx.git is None:
             return state
-        # Safety net: never commit twice within a single Runner.run invocation.
-        # Cumulative state.commits_made is not checked here because subsequent
-        # rounds (max_total_iterations > 1) legitimately add new commits.
-        if self._commits_this_run >= 1:
+        # Safety net: cap commits within a single Runner.run invocation at the
+        # configured ``max_commits_per_run``. The scope is intentionally
+        # per-process: a fresh webhook invocation starts a new run and may add
+        # further commits for subsequent rounds (bounded separately by
+        # ``max_total_iterations``). Cumulative ``state.commits_made`` is not
+        # the gate here for that reason.
+        if self._commits_this_run >= ctx.config.safety.max_commits_per_run:
             return state
         message = str(payload.get("message") or ctx.config.git.commit_message_prefix)
         sha = ctx.git.commit(

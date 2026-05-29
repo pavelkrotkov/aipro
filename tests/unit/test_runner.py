@@ -262,7 +262,16 @@ def initial_state(pr_number: int = 1, head_sha: str = "head-1", **overrides: Any
 def test_run_loads_state_and_runs_to_terminal_done() -> None:
     gh = FakeGitHubClient(now=NOW)
     pr = seed_pr(gh)
-    state = initial_state(status="waiting", round_index=1, head_sha=pr.head_sha)
+    state = initial_state(
+        status="waiting",
+        round_index=1,
+        head_sha=pr.head_sha,
+        trigger_history=[
+            ReviewerTrigger(
+                reviewer_name="fake", round_index=1, timestamp=NOW, head_sha=pr.head_sha
+            )
+        ],
+    )
     gh.seed_comment(pr.number, serialize_state_comment(state))
 
     reviewer = FakeReviewerAdapter(name="fake", findings_by_call=[[]])
@@ -786,7 +795,16 @@ def test_polling_calls_sleeper_at_configured_interval() -> None:
 def test_polling_stops_when_findings_appear() -> None:
     gh = FakeGitHubClient(now=NOW)
     pr = seed_pr(gh)
-    state = initial_state(status="waiting", round_index=1, head_sha=pr.head_sha)
+    state = initial_state(
+        status="waiting",
+        round_index=1,
+        head_sha=pr.head_sha,
+        trigger_history=[
+            ReviewerTrigger(
+                reviewer_name="fake", round_index=1, timestamp=NOW, head_sha=pr.head_sha
+            )
+        ],
+    )
     gh.seed_comment(pr.number, serialize_state_comment(state))
 
     finding = Finding(id="f1", source="fake", body="b", created_at=NOW)
@@ -1119,6 +1137,10 @@ def test_orphaned_coder_invocation_transitions_to_needs_human() -> None:
     assert sc is not None
     assert sc.state.status == "needs_human"
     assert sc.state.last_error == "coder_invocation_orphaned"
+    # Terminal side effects must fire even though the runner forces the
+    # status outside the normal transition path.
+    assert any("coder_invocation_orphaned" in c.body for c in comments)
+    assert "ai-loop-error" in gh.get_pr(pr.number).labels
 
 
 # ----- Safety: fork / workflow file changes -----
@@ -1550,10 +1572,16 @@ def test_push_recovery_failure_routes_to_needs_human_terminal_state() -> None:
     ctx = build_ctx(gh=gh, git=git)
     assert Runner(ctx).run(pr.number) == 0
 
-    sc = find_state_comment([{"id": c.id, "body": c.body} for c in gh.get_pr_comments(pr.number)])
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
     assert sc is not None
     assert sc.state.status == "needs_human"
     assert sc.state.last_error == "push_recovery_failed"
+    # The forced-terminal bailout must still emit the visible side effects a
+    # normal transition to needs_human would: a final summary comment naming
+    # the reason, and the error label on the PR.
+    assert any("push_recovery_failed" in c.body for c in comments)
+    assert "ai-loop-error" in gh.get_pr(pr.number).labels
 
 
 def test_state_conflict_on_save_exits_cleanly_without_clobber() -> None:
@@ -1597,3 +1625,106 @@ def test_state_conflict_on_save_exits_cleanly_without_clobber() -> None:
     # We assert the comment carries a body parseable as state and verify the
     # original_updated_at was the value we recorded.
     assert original_updated_at == NOW
+
+
+# ----- Round 7: current-round findings filter, configurable commit cap -----
+
+
+def test_collect_findings_skips_reviewers_without_current_round_trigger() -> None:
+    """``_collect_findings`` must only gather findings from reviewers that were
+    triggered in the *current* round. A reviewer with a trigger from a prior
+    round (or none at all) would otherwise re-surface stale, out-of-scope
+    comments into ``handling``."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    stale = Finding(id="old", source="fake", body="prior-round comment", created_at=NOW)
+    reviewer = FakeReviewerAdapter(name="fake", findings_by_call=[[stale]])
+
+    # round_index=2, but the only trigger on record is for round 1.
+    state = initial_state(
+        status="waiting",
+        round_index=2,
+        head_sha=pr.head_sha,
+        trigger_history=[
+            ReviewerTrigger(
+                reviewer_name="fake", round_index=1, timestamp=NOW, head_sha=pr.head_sha
+            )
+        ],
+    )
+    ctx = build_ctx(gh=gh, reviewers={"fake": reviewer})
+    runner = Runner(ctx)
+
+    assert runner._collect_findings(state, gh.get_pr(pr.number)) == []
+    # Reviewer with no current-round trigger must not even be queried.
+    assert reviewer.call_count == 0
+
+
+def test_collect_findings_includes_current_round_trigger() -> None:
+    """Sanity counterpart: a reviewer triggered this round contributes findings
+    and is queried with its own trigger timestamp."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    finding = Finding(id="f1", source="fake", body="current", created_at=NOW)
+    reviewer = FakeReviewerAdapter(name="fake", findings_by_call=[[finding]])
+
+    state = initial_state(
+        status="waiting",
+        round_index=2,
+        head_sha=pr.head_sha,
+        trigger_history=[
+            ReviewerTrigger(
+                reviewer_name="fake", round_index=2, timestamp=NOW, head_sha=pr.head_sha
+            )
+        ],
+    )
+    ctx = build_ctx(gh=gh, reviewers={"fake": reviewer})
+    runner = Runner(ctx)
+
+    found = runner._collect_findings(state, gh.get_pr(pr.number))
+    assert [f.id for f in found] == ["f1"]
+    assert reviewer.call_count == 1
+
+
+def test_do_commit_honors_configured_max_commits_per_run() -> None:
+    """``_do_commit`` must cap commits-per-run at ``safety.max_commits_per_run``
+    rather than a hard-coded 1. With the knob raised to 2, two commits in the
+    same run are allowed; the third is dropped."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    git = FakeGitRepo(head_sha=pr.head_sha, commit_sha_to_return="sha-x")
+    ctx = build_ctx(
+        gh=gh,
+        git=git,
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=False, max_commits_per_run=2
+            )
+        ),
+    )
+    runner = Runner(ctx)
+    state = initial_state(status="handling", round_index=1, head_sha=pr.head_sha)
+
+    state = runner._do_commit({"message": "first"}, state)
+    state = runner._do_commit({"message": "second"}, state)
+    state = runner._do_commit({"message": "third"}, state)
+
+    # Two commits performed (cap=2); the third is a no-op.
+    assert git.commit_count == 2
+    assert runner._commits_this_run == 2
+
+
+def test_do_commit_default_cap_is_one() -> None:
+    """With the default ``max_commits_per_run=1``, a second commit in the same
+    run is dropped (the original safety contract is preserved)."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    git = FakeGitRepo(head_sha=pr.head_sha, commit_sha_to_return="sha-y")
+    ctx = build_ctx(gh=gh, git=git, config=make_config())
+    runner = Runner(ctx)
+    state = initial_state(status="handling", round_index=1, head_sha=pr.head_sha)
+
+    state = runner._do_commit({"message": "first"}, state)
+    state = runner._do_commit({"message": "second"}, state)
+
+    assert git.commit_count == 1
+    assert runner._commits_this_run == 1
