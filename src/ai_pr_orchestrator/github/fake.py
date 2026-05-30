@@ -229,6 +229,16 @@ class FakeGitHubClient:
             if mc.issue_number == issue_number
         ]
 
+    def get_comment(self, comment_id: int) -> models.Comment | None:
+        mc = self._comments.get(comment_id)
+        return mc.to_model() if mc is not None else None
+
+    def reset_request_cache(self) -> None:
+        # The fake serves from in-memory state, so there's no within-tick
+        # request memo to clear. Present for interface parity with the real
+        # client, which the runner calls between poll ticks.
+        return None
+
     def post_comment(self, issue_number: int, body: str) -> models.Comment:
         cid = self._next_comment_id
         self._next_comment_id += 1

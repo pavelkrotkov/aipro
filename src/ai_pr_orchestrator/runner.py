@@ -243,6 +243,43 @@ class Runner:
         gh_pr = ctx.github.get_pr(pr_number)
         state = self._load_or_init_state(pr_number, gh_pr)
 
+        # Already terminal: the previous run persisted a final state and emitted
+        # its side effects. Bail before any setup (push recovery, orphaned-coder
+        # check, transition loop) so a stray webhook on a finished PR is a cheap
+        # no-op rather than another full pass with redundant get_pr calls.
+        if state.status in TERMINAL_STATUSES:
+            return 0
+
+        # Fork hard-block: when git is wired (the commit/push path is live) we
+        # cannot safely handle a fork PR. ``gh_pr.head_ref`` is just the branch
+        # name on the contributor's fork; ``git push origin
+        # HEAD:refs/heads/{head_ref}`` would create/update that branch in the
+        # *base* repo instead of the fork's PR head — silently diverging from
+        # the PR and possibly clobbering a base-repo branch. Pushing to the fork
+        # remote isn't wired yet, so route to a terminal ``needs_human`` with a
+        # clear reason rather than corrupting the base repo. (Review-only/
+        # dry-run mode runs with ``ctx.git is None`` and is unaffected, so fork
+        # *review* still works; only AI auto-fixes are blocked.) Note this is
+        # distinct from ``safety.disallow_forks``, which errors out forks
+        # entirely; here forks were explicitly allowed for review but still
+        # can't be pushed to.
+        if ctx.git is not None and gh_pr.is_fork:
+            logger.warning(
+                "Fork PR #%s cannot be pushed to (fork remotes unsupported); needs_human",
+                pr_number,
+            )
+            now = ctx.clock()
+            state = replace(
+                state,
+                status="needs_human",
+                last_error="fork_pr_push_unsupported",
+                updated_at=now,
+            )
+            actions = terminal_actions(state, ctx.config)
+            state = self._execute_actions(actions, pr_number, gh_pr, state)
+            self._save_state(pr_number, state)
+            return 0
+
         # Push recovery: if a previous run committed locally but the process
         # died before push_branch ran (or push itself failed mid-flight), the
         # checkpoint we saved after commit_changes shows a commit in
@@ -428,6 +465,16 @@ class Runner:
         self._state_expected_updated_at = state.updated_at
 
     def _fetch_current_state_comment(self, pr_number: int) -> StateComment | None:
+        # Fast path: we already know the state comment's id from load/init, so
+        # fetch just that comment instead of paging every comment on the PR
+        # (which is O(comments) per save and called several times per run).
+        if self._state_comment_id is not None:
+            comment = self._ctx.github.get_comment(self._state_comment_id)
+            if comment is None:
+                # The comment was deleted out from under us; signal "vanished"
+                # so _save_state reposts a fresh one.
+                return None
+            return find_state_comment([{"id": comment.id, "body": comment.body}])
         comments = self._ctx.github.get_pr_comments(pr_number)
         return find_state_comment([{"id": c.id, "body": c.body} for c in comments])
 
@@ -563,6 +610,15 @@ class Runner:
         deadline_phase = earliest_trigger_ts + timedelta(seconds=cfg.phase_timeout_seconds)
 
         for _iteration in range(_MAX_POLL_ITERATIONS):
+            # Drop the client's within-tick request memo so this iteration sees
+            # fresh data, while still collapsing the duplicate get_review_threads
+            # reads *inside* the tick (collect_findings + has_responded). The
+            # client may not implement the optional cache (e.g. some fakes), so
+            # call it defensively.
+            reset_cache = getattr(ctx.github, "reset_request_cache", None)
+            if callable(reset_cache):
+                reset_cache()
+
             # Refetch the PR each iteration: this loop can span the full
             # reviewer/phase timeout (potentially over an hour), during which an
             # operator may remove the orchestrator label, close the PR, or flip
@@ -653,9 +709,21 @@ class Runner:
         for name, trig in latest_by_reviewer.items():
             reviewer = ctx.reviewers.get(name)
             if reviewer is None:
-                # Trigger refers to a reviewer no longer wired in; skip it
-                # rather than block the short-circuit indefinitely.
-                continue
+                # A reviewer was triggered this round but is absent from
+                # ctx.reviewers on resume (config changed, production wiring
+                # failed, plugin unavailable). We can neither collect its
+                # findings nor probe whether it responded, so we must NOT treat
+                # it as "responded" — doing so would let the runner reach
+                # done/no_findings while silently dropping a real review. Refuse
+                # to short-circuit; the poll loop then proceeds to its timeout,
+                # which routes to needs_human so an operator investigates.
+                logger.error(
+                    "Reviewer %s triggered in round %d but missing from ctx.reviewers; "
+                    "cannot confirm response",
+                    name,
+                    state.round_index,
+                )
+                return False
             has_responded = getattr(reviewer, "has_responded", None)
             if not callable(has_responded):
                 # Reviewer adapter doesn't implement the optional probe; we
@@ -810,6 +878,13 @@ class Runner:
         ctx = self._ctx
         if ctx.git is None:
             return
+        # Defense in depth: fork PRs are hard-blocked at the top of _run, but
+        # guard here too so no future code path can push a fork's head_ref to
+        # origin (which would write a branch into the BASE repo, not the fork).
+        if gh_pr.is_fork:
+            raise ValueError(
+                f"Cannot push: PR #{gh_pr.number} is from a fork; fork remotes are unsupported"
+            )
         # Never fall back to the base branch when head_ref is missing: pushing
         # the PR's commits directly onto ``main``/``master`` bypasses PR
         # controls and can corrupt the base branch. Fail loudly instead — the

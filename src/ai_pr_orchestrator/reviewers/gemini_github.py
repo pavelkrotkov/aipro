@@ -82,14 +82,24 @@ class GeminiGitHubReviewerAdapter:
         return findings
 
     def has_responded(self, pr_number: int, trigger_timestamp: datetime) -> bool:
-        """Return True if the bot has responded after the trigger.
+        """Return True if the bot has posted a review-thread comment after the
+        trigger.
 
-        Looks at review-thread comments, top-level PR (issue) comments, and
-        submitted PR reviews. The review body matters because a reviewer can
-        finish with zero inline findings by submitting a ``pull_request_review``
-        without creating any thread or issue comment; without counting it the
-        runner would time out instead of completing ``no_findings``. The
-        orchestrator's own machine-marker comments are skipped so that the
+        This intentionally scans only the *same* source ``collect_findings``
+        reads: inline review-thread comments. The runner uses this probe to
+        decide the zero-findings completion case (``snapshot.findings == []``
+        but the reviewer is done → ``done``/``no_findings``). If we also counted
+        top-level PR comments or review-summary bodies — which
+        ``collect_findings`` does NOT turn into ``Finding``s — then a reviewer
+        that posted actionable feedback there would be marked "responded with no
+        findings" and the runner would complete ``no_findings``, silently
+        dropping that feedback. Restricting the probe to review threads keeps
+        the two methods symmetric: any signal that can mark the phase complete
+        is one that would also have produced a finding. A reviewer that responds
+        only via a comment/review body therefore falls through to the poll
+        timeout, which routes to ``needs_human`` so the feedback is seen.
+
+        The orchestrator's own machine-marker comments are skipped so the
         trigger itself does not count as a response.
         """
         for author, body, created_at_str in self._iter_bot_candidates(pr_number):
@@ -107,13 +117,13 @@ class GeminiGitHubReviewerAdapter:
         return False
 
     def _iter_bot_candidates(self, pr_number: int) -> Iterable[tuple[str, str, str]]:
-        """Yield (author, body, created_at) tuples from all response sources."""
+        """Yield (author, body, created_at) tuples from review-thread comments.
+
+        Deliberately limited to review threads — the one source
+        ``collect_findings`` consumes — so ``has_responded`` cannot signal
+        completion off a comment/review body that would never become a
+        ``Finding``. See ``has_responded`` for the rationale.
+        """
         for thread in self.github.get_review_threads(pr_number):
             for comment in thread.comments:
                 yield comment.author, comment.body, comment.created_at
-        for pr_comment in self.github.get_pr_comments(pr_number):
-            yield pr_comment.user, pr_comment.body, pr_comment.created_at
-        for review in self.github.get_pull_request_reviews(pr_number):
-            # A review's body may be empty (e.g. an APPROVED review with no
-            # text); it still counts as the reviewer having responded.
-            yield review.author, review.body, review.submitted_at

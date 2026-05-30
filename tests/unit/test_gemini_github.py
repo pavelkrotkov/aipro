@@ -364,19 +364,22 @@ def test_has_responded_true_with_review_thread_comment_after_trigger() -> None:
     assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
 
 
-def test_has_responded_true_with_top_level_pr_comment_after_trigger() -> None:
-    """A reviewer that posts a top-level PR comment (e.g. a summary review)
-    instead of inline thread comments still counts as having responded."""
+def test_has_responded_false_for_top_level_pr_comment_after_trigger() -> None:
+    """A top-level PR comment must NOT count as a response. ``collect_findings``
+    only normalizes review-thread comments into Findings, so if a bare PR
+    comment counted here the runner would complete ``no_findings`` and silently
+    drop feedback the bot posted as a top-level comment. It must instead fall
+    through to the poll timeout (→ needs_human)."""
     client = FakeGitHubClient(now=NOW)
     client.seed_comment(
         PR_NUMBER,
-        body="LGTM overall, no issues found.",
+        body="Actually there's a bug on line 10.",
         user=BOT_LOGIN,
         created_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
     )
     adapter = _make_adapter(client)
 
-    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
 
 
 def test_has_responded_false_when_no_bot_comments() -> None:
@@ -475,47 +478,19 @@ def test_collect_findings_only_first_comment_per_thread() -> None:
     assert findings[0].body == "First bot comment"
 
 
-def test_has_responded_true_for_zero_finding_pull_request_review() -> None:
-    """A reviewer can finish with zero inline findings by submitting a review
-    body (a ``pull_request_review``) with no thread/issue comment. That must
-    count as a response so the runner completes ``no_findings`` instead of
-    timing out."""
+def test_has_responded_false_for_pull_request_review_body() -> None:
+    """A submitted ``pull_request_review`` body must NOT count as a response.
+    ``collect_findings`` never turns review bodies into Findings, so counting
+    one here would let the runner complete ``no_findings`` and drop any
+    actionable feedback the bot put in the review summary. It must fall through
+    to the timeout instead."""
     client = FakeGitHubClient(now=NOW)
     client.seed_review(
         PR_NUMBER,
         author=BOT_LOGIN,
-        body="Looks good, no issues found.",
+        body="Please address the issue in the summary.",
         state="COMMENTED",
         submitted_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
-    )
-    adapter = _make_adapter(client)
-
-    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
-
-
-def test_has_responded_true_for_empty_body_review() -> None:
-    """An APPROVED review with an empty body still counts as a response."""
-    client = FakeGitHubClient(now=NOW)
-    client.seed_review(
-        PR_NUMBER,
-        author=BOT_LOGIN,
-        body="",
-        state="APPROVED",
-        submitted_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
-    )
-    adapter = _make_adapter(client)
-
-    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
-
-
-def test_has_responded_false_for_review_before_trigger() -> None:
-    """A review submitted before the trigger must not count."""
-    client = FakeGitHubClient(now=NOW)
-    client.seed_review(
-        PR_NUMBER,
-        author=BOT_LOGIN,
-        body="old review",
-        submitted_at=datetime(2025, 6, 1, 11, 0, 0, tzinfo=UTC),
     )
     adapter = _make_adapter(client)
 

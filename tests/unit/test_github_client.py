@@ -227,6 +227,66 @@ def test_get_pr_comments() -> None:
 
 
 @respx.mock
+def test_get_comment_returns_single_comment() -> None:
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/issues/comments/55").mock(
+        return_value=httpx.Response(200, json=_comment_json(55))
+    )
+    with _make_client() as client:
+        comment = client.get_comment(55)
+
+    assert route.called
+    assert comment is not None
+    assert comment.id == 55
+
+
+@respx.mock
+def test_get_comment_returns_none_on_404() -> None:
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/issues/comments/55").mock(
+        return_value=httpx.Response(404, json={"message": "Not Found"})
+    )
+    with _make_client() as client:
+        comment = client.get_comment(55)
+
+    assert route.called
+    assert comment is None
+
+
+@respx.mock
+def test_get_review_threads_cached_within_tick() -> None:
+    """Two get_review_threads calls issue one GraphQL request until the cache is
+    reset; resetting forces a fresh request."""
+    call_count = 0
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [],
+                            }
+                        }
+                    }
+                }
+            },
+        )
+
+    respx.post(GQL).mock(side_effect=responder)
+    with _make_client() as client:
+        client.get_review_threads(42)
+        client.get_review_threads(42)
+        assert call_count == 1  # second call served from cache
+        client.reset_request_cache()
+        client.get_review_threads(42)
+        assert call_count == 2  # fresh request after reset
+
+
+@respx.mock
 def test_get_pr_comments_pagination() -> None:
     page1_url = f"{BASE}/repos/{OWNER}/{REPO}/issues/42/comments"
     page2_url = f"{BASE}/repos/{OWNER}/{REPO}/issues/42/comments?page=2"

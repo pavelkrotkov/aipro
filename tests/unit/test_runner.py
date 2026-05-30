@@ -1925,3 +1925,182 @@ def test_do_commit_default_cap_is_one() -> None:
 
     assert git.commit_count == 1
     assert runner._commits_this_run == 1
+
+
+# ----- Round 11: terminal early-return, missing adapter, fork hard-block, get_comment -----
+
+
+def test_run_early_returns_on_terminal_loaded_state() -> None:
+    """A stray webhook on a finished PR must short-circuit before any setup."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="done", head_sha=pr.head_sha, done_reason="completed")
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    # A git repo whose calls would raise if push-recovery ran; proves we bail early.
+    git = FakeGitRepo(head_sha=pr.head_sha, raise_on_fetch_remote_head=RuntimeError("boom"))
+
+    ctx = build_ctx(gh=gh, git=git)
+    assert Runner(ctx).run(pr.number) == 0
+    assert git.push_count == 0
+
+
+def test_missing_current_round_reviewer_is_not_treated_as_responded() -> None:
+    """A reviewer triggered this round but absent from ctx.reviewers must block
+    the zero-findings short-circuit (return False), not be skipped."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(
+        status="waiting",
+        round_index=1,
+        head_sha=pr.head_sha,
+        trigger_history=[
+            ReviewerTrigger(
+                reviewer_name="ghost", round_index=1, timestamp=NOW, head_sha=pr.head_sha
+            )
+        ],
+    )
+    # ctx.reviewers has only "fake"; the triggered "ghost" is missing.
+    ctx = build_ctx(gh=gh, reviewers={"fake": FakeReviewerAdapter(name="fake")})
+    runner = Runner(ctx)
+    assert runner._all_enabled_reviewers_responded(state, gh.get_pr(pr.number)) is False
+
+
+def test_fork_pr_hard_blocked_when_git_wired() -> None:
+    """With git wired (commit/push path live), a fork PR must route to a
+    terminal needs_human instead of risking a push into the base repo."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = gh_models.PullRequest(
+        number=1,
+        title="Fork PR",
+        body="",
+        state="open",
+        head_sha="head-1",
+        head_ref="contributor-branch",
+        base_ref="main",
+        author="outsider",
+        is_fork=True,
+        author_association="OWNER",
+    )
+    gh.seed_pr(pr)
+    state = initial_state(status="init", round_index=0, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    git = FakeGitRepo(head_sha=pr.head_sha)
+
+    ctx = build_ctx(
+        gh=gh,
+        git=git,
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=False,
+                disallow_forks=False,
+                disallow_workflow_file_changes=False,
+            )
+        ),
+    )
+    assert Runner(ctx).run(pr.number) == 0
+    assert git.push_count == 0
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "fork_pr_push_unsupported"
+
+
+def test_fork_pr_review_only_not_blocked_when_git_none() -> None:
+    """Review-only mode (ctx.git is None) must NOT hard-block forks; fork review
+    still works, only auto-fixes are blocked."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = gh_models.PullRequest(
+        number=1,
+        title="Fork PR",
+        body="",
+        state="open",
+        head_sha="head-1",
+        head_ref="contributor-branch",
+        base_ref="main",
+        author="outsider",
+        is_fork=True,
+        author_association="OWNER",
+    )
+    gh.seed_pr(pr)
+    state = initial_state(status="done", head_sha=pr.head_sha, done_reason="completed")
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    ctx = build_ctx(
+        gh=gh,
+        git=None,
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=False,
+                disallow_forks=False,
+                disallow_workflow_file_changes=False,
+            )
+        ),
+    )
+    # Terminal state + no git → returns cleanly without the fork block firing.
+    assert Runner(ctx).run(pr.number) == 0
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in gh.get_pr_comments(pr.number)])
+    assert sc is not None
+    assert sc.state.status == "done"
+
+
+def test_do_push_raises_for_fork_pr() -> None:
+    """Defense in depth: _do_push refuses a fork even if reached directly."""
+    gh = FakeGitHubClient(now=NOW)
+    git = FakeGitRepo()
+    ctx = build_ctx(gh=gh, git=git)
+    runner = Runner(ctx)
+    fork_pr = gh_models.PullRequest(
+        number=1,
+        title="Fork",
+        body="",
+        state="open",
+        head_sha="h",
+        head_ref="branch",
+        base_ref="main",
+        author="outsider",
+        is_fork=True,
+    )
+    with pytest.raises(ValueError, match="fork"):
+        runner._do_push(fork_pr)
+    assert git.push_count == 0
+
+
+def test_save_state_uses_targeted_get_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_fetch_current_state_comment must use get_comment(id) once the comment id
+    is known, not page the whole comment list."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="init", round_index=1, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    get_comment_calls = {"n": 0}
+    get_comments_calls = {"n": 0}
+    real_get_comment = gh.get_comment
+    real_get_comments = gh.get_pr_comments
+
+    def counting_get_comment(cid: int) -> Any:
+        get_comment_calls["n"] += 1
+        return real_get_comment(cid)
+
+    def counting_get_comments(num: int) -> Any:
+        get_comments_calls["n"] += 1
+        return real_get_comments(num)
+
+    monkeypatch.setattr(gh, "get_comment", counting_get_comment)
+    monkeypatch.setattr(gh, "get_pr_comments", counting_get_comments)
+
+    call_count = {"n": 0}
+
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
+        call_count["n"] += 1
+        return replace(s, status="done", done_reason="completed", updated_at=now), []
+
+    monkeypatch.setattr("ai_pr_orchestrator.runner.transition", fake_transition)
+    ctx = build_ctx(gh=gh)
+    Runner(ctx).run(pr.number)
+
+    # The save after the transition must have fetched the state comment by id.
+    assert get_comment_calls["n"] >= 1
