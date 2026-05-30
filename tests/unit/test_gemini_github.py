@@ -495,3 +495,51 @@ def test_has_responded_false_for_pull_request_review_body() -> None:
     adapter = _make_adapter(client)
 
     assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
+
+
+def test_has_responded_true_for_approved_review_after_trigger() -> None:
+    """An APPROVED review after the trigger is an explicit no-issues verdict
+    (no inline feedback to drop), so it is the reachable clean-completion
+    signal that lets the runner finish ``no_findings`` instead of timing out."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author=BOT_LOGIN,
+        body="",
+        state="APPROVED",
+        submitted_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
+
+
+def test_has_responded_false_for_approved_review_before_trigger() -> None:
+    """An APPROVED review that predates the trigger is stale and must not count."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author=BOT_LOGIN,
+        body="",
+        state="APPROVED",
+        submitted_at=datetime(2025, 6, 1, 11, 0, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
+
+
+def test_has_responded_false_for_approved_review_by_other_author() -> None:
+    """An APPROVED review from a non-bot author must not count as the reviewer
+    bot completing."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author="some-human",
+        body="",
+        state="APPROVED",
+        submitted_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False

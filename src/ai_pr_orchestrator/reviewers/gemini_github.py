@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from datetime import datetime
 
 from ai_pr_orchestrator.github.protocol import GitHubClient
@@ -82,48 +81,58 @@ class GeminiGitHubReviewerAdapter:
         return findings
 
     def has_responded(self, pr_number: int, trigger_timestamp: datetime) -> bool:
-        """Return True if the bot has posted a review-thread comment after the
-        trigger.
+        """Return True if the bot has signalled completion after the trigger.
 
-        This intentionally scans only the *same* source ``collect_findings``
-        reads: inline review-thread comments. The runner uses this probe to
-        decide the zero-findings completion case (``snapshot.findings == []``
-        but the reviewer is done → ``done``/``no_findings``). If we also counted
-        top-level PR comments or review-summary bodies — which
-        ``collect_findings`` does NOT turn into ``Finding``s — then a reviewer
-        that posted actionable feedback there would be marked "responded with no
-        findings" and the runner would complete ``no_findings``, silently
-        dropping that feedback. Restricting the probe to review threads keeps
-        the two methods symmetric: any signal that can mark the phase complete
-        is one that would also have produced a finding. A reviewer that responds
-        only via a comment/review body therefore falls through to the poll
-        timeout, which routes to ``needs_human`` so the feedback is seen.
+        The runner uses this probe to decide the zero-findings completion case
+        (``snapshot.findings == []`` but the reviewer is done →
+        ``done``/``no_findings``). Two completion signals are recognised, both
+        chosen so they cannot mark the phase complete while dropping actionable
+        feedback:
+
+        1. An **APPROVED** pull-request review submitted after the trigger. An
+           approval is an explicit no-issues verdict — there is no inline
+           feedback to lose — so it is a safe, reachable completion signal. This
+           is the normal clean-run path: Gemini approves with zero findings.
+        2. A review-thread comment after the trigger. This is the same source
+           ``collect_findings`` reads, so it is symmetric — any thread comment
+           that could trip this would already have become a ``Finding`` (making
+           this branch largely redundant), but it is kept so a thread comment
+           that post-dates collection is still treated as a response.
+
+        Deliberately NOT counted: top-level PR comments and non-APPROVED review
+        bodies (``COMMENTED``/``CHANGES_REQUESTED``). ``collect_findings`` does
+        not turn those into ``Finding``s, so counting them would let the runner
+        reach ``no_findings`` while silently dropping feedback the bot posted
+        there. A reviewer that responds only that way falls through to the poll
+        timeout → ``needs_human`` so the feedback is seen.
 
         The orchestrator's own machine-marker comments are skipped so the
         trigger itself does not count as a response.
         """
-        for author, body, created_at_str in self._iter_bot_candidates(pr_number):
-            if not self.matches_author(author):
+        # Signal 1: an APPROVED review after the trigger.
+        for review in self.github.get_pull_request_reviews(pr_number):
+            if not self.matches_author(review.author):
                 continue
-            if self._machine_marker in body:
+            if review.state != "APPROVED":
                 continue
-            try:
-                created_at = datetime.fromisoformat(created_at_str)
-            except (ValueError, TypeError):
-                continue
-            if created_at >= trigger_timestamp:
+            if self._is_after_trigger(review.submitted_at, trigger_timestamp):
                 return True
+
+        # Signal 2: a (non-marker) review-thread comment after the trigger.
+        for thread in self.github.get_review_threads(pr_number):
+            for comment in thread.comments:
+                if not self.matches_author(comment.author):
+                    continue
+                if self._machine_marker in comment.body:
+                    continue
+                if self._is_after_trigger(comment.created_at, trigger_timestamp):
+                    return True
 
         return False
 
-    def _iter_bot_candidates(self, pr_number: int) -> Iterable[tuple[str, str, str]]:
-        """Yield (author, body, created_at) tuples from review-thread comments.
-
-        Deliberately limited to review threads — the one source
-        ``collect_findings`` consumes — so ``has_responded`` cannot signal
-        completion off a comment/review body that would never become a
-        ``Finding``. See ``has_responded`` for the rationale.
-        """
-        for thread in self.github.get_review_threads(pr_number):
-            for comment in thread.comments:
-                yield comment.author, comment.body, comment.created_at
+    @staticmethod
+    def _is_after_trigger(timestamp_str: str, trigger_timestamp: datetime) -> bool:
+        try:
+            return datetime.fromisoformat(timestamp_str) >= trigger_timestamp
+        except (ValueError, TypeError):
+            return False

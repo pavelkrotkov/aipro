@@ -353,6 +353,15 @@ class Runner:
             return 0
 
         for _ in range(_MAX_TRANSITIONS_PER_RUN):
+            if state.status in TERMINAL_STATUSES:
+                # State reaching this check was already persisted: either it
+                # was just loaded from the state comment (no mutation since),
+                # or an earlier iteration saved it before ``continue``. A
+                # second save here is a redundant write to GitHub. Check this
+                # *before* refetching the PR so the terminal/last iteration
+                # doesn't burn a get_pr call.
+                return 0
+
             # Refetch the PR at the top of every iteration: an earlier
             # transition in this same run may have mutated remote state
             # (pushed a new commit, added/removed a label) and downstream
@@ -360,12 +369,6 @@ class Runner:
             # comparisons) must see the up-to-date view, not the snapshot
             # we captured before the loop started.
             gh_pr = ctx.github.get_pr(pr_number)
-            if state.status in TERMINAL_STATUSES:
-                # State reaching this check was already persisted: either it
-                # was just loaded from the state comment (no mutation since),
-                # or an earlier iteration saved it before ``continue``. A
-                # second save here is a redundant write to GitHub.
-                return 0
 
             # waiting/collecting need reviewer polling with a clock-aware loop.
             if state.status in ("waiting", "collecting"):
@@ -589,6 +592,38 @@ class Runner:
     ) -> RuntimeState:
         ctx = self._ctx
         cfg = ctx.config.review_phase
+
+        # Fail fast if any reviewer triggered in the current round is missing
+        # from ctx.reviewers (misconfiguration, missing plugin, failed wiring).
+        # We can neither collect its findings nor confirm its response, so the
+        # loop is guaranteed to time out — polling for the full reviewer_timeout
+        # (up to 15 min) first just burns CI minutes. Route straight to a
+        # terminal needs_human with a clear reason. (``_all_enabled_reviewers_
+        # responded`` still guards the same case defensively for any other
+        # caller.)
+        current_round_triggers = [
+            t for t in state.trigger_history if t.round_index == state.round_index
+        ]
+        for trig in current_round_triggers:
+            if trig.reviewer_name not in ctx.reviewers:
+                logger.error(
+                    "Reviewer %s triggered in round %d but missing from ctx.reviewers; "
+                    "failing fast to needs_human",
+                    trig.reviewer_name,
+                    state.round_index,
+                )
+                now = ctx.clock()
+                state = replace(
+                    state,
+                    status="needs_human",
+                    last_error=f"missing_reviewer_adapter:{trig.reviewer_name}",
+                    updated_at=now,
+                )
+                actions = terminal_actions(state, ctx.config)
+                state = self._execute_actions(actions, pr_number, gh_pr, state)
+                self._save_state(pr_number, state)
+                return state
+
         # Deadlines are anchored to persisted state, NOT to ctx.clock() at
         # resume time. A new webhook arriving 3h after the trigger must observe
         # the same deadline as the original invocation — otherwise an already
@@ -831,7 +866,30 @@ class Runner:
                 self._save_state(pr_number, new_state)
             return new_state
         if kind == "push_branch":
-            self._do_push(gh_pr)
+            try:
+                self._do_push(gh_pr)
+            except Exception:
+                # A failed initial push is dangerous in the require_green path:
+                # commit_changes has already checkpointed (often ci_wait with
+                # head_sha = the local commit), but that commit never reached
+                # the remote, so no CI event can ever arrive for it and the PR
+                # would sit in ci_wait forever. Persist a terminal needs_human
+                # with a clear reason instead of letting the top-level handler
+                # return 1 over the stale non-terminal checkpoint. (Push
+                # recovery at the top of _run will still retry on a later run
+                # if the worktree commit is intact; this just stops the silent
+                # wedge.)
+                logger.exception("push_branch failed for PR #%s", pr_number)
+                now = ctx.clock()
+                state = replace(
+                    state,
+                    status="needs_human",
+                    last_error="push_failed",
+                    updated_at=now,
+                )
+                actions = terminal_actions(state, ctx.config)
+                state = self._execute_actions(actions, pr_number, gh_pr, state)
+                self._save_state(pr_number, state)
             return state
         if kind == "invoke_coder":
             self._do_invoke_coder(payload, gh_pr, state)

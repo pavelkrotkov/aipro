@@ -603,8 +603,9 @@ def test_push_branch_raises_when_head_ref_empty(monkeypatch: pytest.MonkeyPatch)
     from ai_pr_orchestrator.models import PlannedAction
 
     # An empty head_ref must NOT fall back to the base branch (which would push
-    # PR commits straight onto main). The push raises, Runner.run catches it and
-    # exits non-zero, and no push happens.
+    # PR commits straight onto main). _do_push raises; the push_branch action
+    # handler catches it and persists a terminal needs_human (push_failed)
+    # rather than wedging in a non-terminal checkpoint. No push happens.
     actions = [PlannedAction("push_branch", {})]
     gh = FakeGitHubClient(now=NOW)
     pr = seed_pr(gh, head_ref="")
@@ -612,20 +613,19 @@ def test_push_branch_raises_when_head_ref_empty(monkeypatch: pytest.MonkeyPatch)
     gh.seed_comment(pr.number, serialize_state_comment(state))
     git = FakeGitRepo(head_sha=pr.head_sha, remote_head_sha=pr.head_sha, clean=False)
 
-    call_count = {"n": 0}
-
     def fake_transition(
         s: RuntimeState, snap: Any, cfg: Any, now: datetime
     ) -> tuple[RuntimeState, list[Any]]:
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            return s, actions
-        return replace(s, status="done", done_reason="completed", updated_at=now), []
+        return s, actions
 
     monkeypatch.setattr("ai_pr_orchestrator.runner.transition", fake_transition)
     ctx = build_ctx(gh=gh, git=git)
-    assert Runner(ctx).run(pr.number) == 1
+    assert Runner(ctx).run(pr.number) == 0
     assert git.push_count == 0
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in gh.get_pr_comments(pr.number)])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "push_failed"
 
 
 def test_commit_bumps_updated_at(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1524,9 +1524,11 @@ def test_commit_state_checkpoint_survives_push_failure(
 
     monkeypatch.setattr("ai_pr_orchestrator.runner.transition", fake_transition)
     ctx = build_ctx(gh=gh, git=cast(Any, git))
-    # Runner.run catches the push exception and returns 1; the key invariant
-    # is that the state comment was checkpointed before the push attempt.
-    assert Runner(ctx).run(pr.number) == 1
+    # The push_branch handler now catches the failure and persists a terminal
+    # needs_human (push_failed), returning 0. The key invariants: the new commit
+    # SHA was checkpointed (so push recovery can resume it on a later run), and
+    # the persisted state is terminal rather than a wedged ci_wait.
+    assert Runner(ctx).run(pr.number) == 0
 
     comments = gh.get_pr_comments(pr.number)
     sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
@@ -1534,6 +1536,8 @@ def test_commit_state_checkpoint_survives_push_failure(
     # The new commit SHA must be in commits_made even though push failed.
     assert "new-commit-sha" in sc.state.commits_made
     assert sc.state.head_sha == "new-commit-sha"
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "push_failed"
 
 
 def test_push_recovery_reissues_push_on_resume() -> None:
@@ -1963,6 +1967,38 @@ def test_missing_current_round_reviewer_is_not_treated_as_responded() -> None:
     ctx = build_ctx(gh=gh, reviewers={"fake": FakeReviewerAdapter(name="fake")})
     runner = Runner(ctx)
     assert runner._all_enabled_reviewers_responded(state, gh.get_pr(pr.number)) is False
+
+
+def test_poll_reviewers_fails_fast_on_missing_adapter() -> None:
+    """A reviewer triggered this round but absent from ctx.reviewers must route
+    straight to terminal needs_human (missing_reviewer_adapter:<name>) rather
+    than polling for the full reviewer_timeout first."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(
+        status="waiting",
+        round_index=1,
+        head_sha=pr.head_sha,
+        trigger_history=[
+            ReviewerTrigger(
+                reviewer_name="ghost", round_index=1, timestamp=NOW, head_sha=pr.head_sha
+            )
+        ],
+    )
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    sleeper = FakeSleeper()
+    ctx = build_ctx(
+        gh=gh,
+        reviewers={"fake": FakeReviewerAdapter(name="fake")},
+        sleeper=sleeper,
+    )
+    assert Runner(ctx).run(pr.number) == 0
+    # Failed fast: never slept waiting on the missing reviewer.
+    assert sleeper.calls == []
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in gh.get_pr_comments(pr.number)])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "missing_reviewer_adapter:ghost"
 
 
 def test_fork_pr_hard_blocked_when_git_wired() -> None:
