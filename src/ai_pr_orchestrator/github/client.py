@@ -186,7 +186,8 @@ class GitHubClient:
         ``state`` becomes the equivalent check ``status``/``conclusion``
         (``pending`` -> still-running, ``success`` -> passing, ``failure``/
         ``error`` -> failing). Status contexts have no numeric id, so ``id`` is
-        a stable hash of the context name.
+        a process-stable hash of the context name (see
+        ``models.stable_check_run_id``).
         """
         data = self._get_paginated(
             f"/repos/{self._owner}/{self._repo}/commits/{quote(ref, safe='')}/statuses",
@@ -212,7 +213,7 @@ class GitHubClient:
                 conclusion = None
             runs.append(
                 models.CheckRun(
-                    id=abs(hash(context)),
+                    id=models.stable_check_run_id(context),
                     name=context,
                     status=check_status,
                     conclusion=conclusion,

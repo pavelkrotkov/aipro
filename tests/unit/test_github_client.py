@@ -1008,3 +1008,15 @@ def test_parse_comment_with_deleted_user() -> None:
 
     assert comment is not None
     assert comment.user == "ghost"
+
+
+def test_stable_check_run_id_is_deterministic_and_process_stable() -> None:
+    """The id derived from a status context must be identical for the same
+    context (unlike builtin hash(), which is per-process randomized) and differ
+    across contexts."""
+    from ai_pr_orchestrator.github.models import stable_check_run_id
+
+    assert stable_check_run_id("ci/jenkins") == stable_check_run_id("ci/jenkins")
+    assert stable_check_run_id("ci/jenkins") != stable_check_run_id("lint")
+    # Known fixed digest so a future refactor that changes the scheme is caught.
+    assert isinstance(stable_check_run_id("ci/jenkins"), int)

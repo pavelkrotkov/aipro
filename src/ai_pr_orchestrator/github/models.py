@@ -2,7 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
+
+
+def stable_check_run_id(context: str) -> int:
+    """Return a process-stable integer id derived from a status context name.
+
+    Commit-status contexts (Statuses API) have no numeric id of their own, but
+    we adapt them into ``CheckRun``s which carry one. Python's builtin
+    ``hash()`` is randomized per process (``PYTHONHASHSEED``), so the same
+    context would yield a different id on each runner invocation; any logic that
+    ever keys on the id across events would behave non-deterministically. A
+    truncated SHA-1 digest is stable across processes.
+    """
+    return int(hashlib.sha1(context.encode("utf-8")).hexdigest()[:15], 16)
 
 
 @dataclass(frozen=True)

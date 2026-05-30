@@ -178,7 +178,10 @@ class FakeGitHubClient:
         """Seed a Statuses-API context already adapted to CheckRun shape, as
         ``get_commit_statuses`` returns it to the runner."""
         cr = models.CheckRun(
-            id=abs(hash(context)), name=context, status=status, conclusion=conclusion
+            id=models.stable_check_run_id(context),
+            name=context,
+            status=status,
+            conclusion=conclusion,
         )
         self._commit_statuses.setdefault(ref, []).append(cr)
         return cr
