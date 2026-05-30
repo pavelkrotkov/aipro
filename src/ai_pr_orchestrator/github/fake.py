@@ -81,9 +81,12 @@ class FakeGitHubClient:
         self._labels: dict[int, list[str]] = {}
         self._threads: dict[str, _MutableThread] = {}
         self._check_runs: dict[str, list[_MutableCheckRun]] = {}
+        self._commit_statuses: dict[str, list[models.CheckRun]] = {}
+        self._reviews: dict[int, list[models.Review]] = {}
         self._next_comment_id = 1
         self._next_check_run_id = 1
         self._next_review_comment_id = 1
+        self._next_review_id = 1
 
     def _tick(self) -> datetime:
         """Advance internal clock by 1 second and return the new time."""
@@ -165,6 +168,44 @@ class FakeGitHubClient:
         self._check_runs.setdefault(ref, []).append(mcr)
         return mcr.to_model()
 
+    def seed_commit_status(
+        self,
+        ref: str,
+        context: str,
+        status: str,
+        conclusion: str | None = None,
+    ) -> models.CheckRun:
+        """Seed a Statuses-API context already adapted to CheckRun shape, as
+        ``get_commit_statuses`` returns it to the runner."""
+        cr = models.CheckRun(
+            id=models.stable_check_run_id(context),
+            name=context,
+            status=status,
+            conclusion=conclusion,
+        )
+        self._commit_statuses.setdefault(ref, []).append(cr)
+        return cr
+
+    def seed_review(
+        self,
+        pr_number: int,
+        *,
+        author: str,
+        body: str = "",
+        state: str = "COMMENTED",
+        submitted_at: datetime | None = None,
+    ) -> models.Review:
+        review = models.Review(
+            id=self._next_review_id,
+            author=author,
+            body=body,
+            state=state,
+            submitted_at=(submitted_at or self._now).isoformat(),
+        )
+        self._next_review_id += 1
+        self._reviews.setdefault(pr_number, []).append(review)
+        return review
+
     # --- Protocol implementation ---
 
     def get_pr(self, number: int) -> models.PullRequest:
@@ -176,12 +217,27 @@ class FakeGitHubClient:
             return replace(pr, labels=list(current_labels))
         return pr
 
+    def get_pr_files(self, pr_number: int) -> list[str]:
+        if pr_number not in self._prs:
+            raise KeyError(f"PR #{pr_number} not found in fake")
+        return list(self._prs[pr_number].changed_files)
+
     def get_pr_comments(self, issue_number: int) -> list[models.Comment]:
         return [
             mc.to_model()
             for mc in sorted(self._comments.values(), key=lambda c: c.id)
             if mc.issue_number == issue_number
         ]
+
+    def get_comment(self, comment_id: int) -> models.Comment | None:
+        mc = self._comments.get(comment_id)
+        return mc.to_model() if mc is not None else None
+
+    def reset_request_cache(self) -> None:
+        # The fake serves from in-memory state, so there's no within-tick
+        # request memo to clear. Present for interface parity with the real
+        # client, which the runner calls between poll ticks.
+        return None
 
     def post_comment(self, issue_number: int, body: str) -> models.Comment:
         cid = self._next_comment_id
@@ -234,6 +290,12 @@ class FakeGitHubClient:
 
     def get_check_runs(self, ref: str) -> list[models.CheckRun]:
         return [mcr.to_model() for mcr in self._check_runs.get(ref, [])]
+
+    def get_commit_statuses(self, ref: str) -> list[models.CheckRun]:
+        return list(self._commit_statuses.get(ref, []))
+
+    def get_pull_request_reviews(self, pr_number: int) -> list[models.Review]:
+        return list(self._reviews.get(pr_number, []))
 
     def get_review_threads(self, pr_number: int) -> list[models.ReviewThread]:
         return [mt.to_model() for mt in self._threads.values() if mt.pr_number == pr_number]

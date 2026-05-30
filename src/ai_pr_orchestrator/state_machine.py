@@ -35,6 +35,13 @@ class TransitionSnapshot:
     reviewer_responded: bool = False
     reviewer_timed_out: bool = False
     worktree_changed: bool = False
+    # True when the runner attempted to verify the remote head SHA but the
+    # underlying ``fetch_remote_head`` call failed (network/auth error).
+    # In this case ``remote_head_sha`` is None *not* because the remote is
+    # absent but because we don't know what it is. The handling-state
+    # transition must refuse to commit on this unknown rather than silently
+    # falling back to ``pr.head_sha`` and treating "unverified" as "matches".
+    remote_head_unverified: bool = False
 
 
 def transition(
@@ -180,6 +187,14 @@ def _transition_handling(
     config: Config,
     now: datetime,
 ) -> tuple[RuntimeState, list[PlannedAction]]:
+    # If the runner failed to verify the remote head SHA (auth/network error
+    # from ``fetch_remote_head``), we cannot safely proceed: a stale local
+    # worktree might race a remote-side push. Route to needs_human rather
+    # than fall back to ``pr.head_sha`` and silently assume "remote matches".
+    if snapshot.remote_head_unverified:
+        new_state = _with_status(state, "needs_human", now, last_error="remote_head_unverified")
+        return new_state, _terminal_actions(new_state, config)
+
     remote_head_sha = snapshot.remote_head_sha or snapshot.pr.head_sha
     if remote_head_sha != state.head_sha:
         new_state = _replace_state(
@@ -425,7 +440,11 @@ def _cost_limit_transition(
         (
             PlannedAction(
                 "post_final_summary",
-                {"reason": "cost_limit_reached", "cost": state.cost.to_dict()},
+                {
+                    "reason": "cost_limit_reached",
+                    "cost": state.cost.to_dict(),
+                    "mentions": list(config.notifications.mention_on_needs_human),
+                },
             )
             if action.type == "post_final_summary"
             else action
@@ -471,6 +490,19 @@ def _decision_reply_actions(result: AgentRunResult) -> list[PlannedAction]:
     return actions
 
 
+def terminal_actions(state: RuntimeState, config: Config) -> list[PlannedAction]:
+    """Public alias for :func:`_terminal_actions`.
+
+    Callers that force a terminal status outside the normal ``transition``
+    flow (e.g. the runner's push-recovery and orphaned-coder bailouts) need the
+    same visible side effects — final summary comment and status label — that
+    ``transition`` would have emitted. ``transition`` itself returns no actions
+    for an already-terminal input state, so those callers must source the
+    terminal actions directly from here.
+    """
+    return _terminal_actions(state, config)
+
+
 def _terminal_actions(state: RuntimeState, config: Config) -> list[PlannedAction]:
     if state.status == "done":
         return [
@@ -480,12 +512,24 @@ def _terminal_actions(state: RuntimeState, config: Config) -> list[PlannedAction
         ]
     if state.status == "needs_human":
         return [
-            PlannedAction("post_final_summary", {"reason": state.last_error}),
+            PlannedAction(
+                "post_final_summary",
+                {
+                    "reason": state.last_error,
+                    "mentions": list(config.notifications.mention_on_needs_human),
+                },
+            ),
             PlannedAction("add_label", {"label": config.error_label}),
         ]
     if state.status == "error":
         return [
-            PlannedAction("post_final_summary", {"reason": state.last_error}),
+            PlannedAction(
+                "post_final_summary",
+                {
+                    "reason": state.last_error,
+                    "mentions": list(config.notifications.mention_on_error),
+                },
+            ),
             PlannedAction("add_label", {"label": config.error_label}),
         ]
     return []

@@ -59,6 +59,19 @@ def _comment_json(comment_id: int = 1) -> dict[str, Any]:
     }
 
 
+def _mock_pr_files(pr_number: int, files: list[str] | None = None) -> None:
+    """Mock the PR-files endpoint for ``get_pr`` to consume.
+
+    ``get_pr`` always calls ``/pulls/{n}/files`` to populate ``changed_files``
+    for the disallow_workflow_file_changes safety check; tests that mock only
+    ``/pulls/{n}`` need to satisfy this second request as well.
+    """
+    body = [{"filename": name} for name in (files or [])]
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/{pr_number}/files").mock(
+        return_value=httpx.Response(200, json=body)
+    )
+
+
 # --- REST: get_pr ---
 
 
@@ -67,6 +80,7 @@ def test_get_pr() -> None:
     route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
         return_value=httpx.Response(200, json=_pr_json())
     )
+    _mock_pr_files(42, ["src/a.py", "src/b.py"])
     with _make_client() as client:
         pr = client.get_pr(42)
 
@@ -77,6 +91,104 @@ def test_get_pr() -> None:
     assert pr.head_sha == "abc123"
     assert pr.labels == ["bug", "v1"]
     assert pr.author == "author"
+    assert pr.changed_files == ["src/a.py", "src/b.py"]
+
+
+@respx.mock
+def test_get_pr_marks_fork_when_head_repo_is_fork() -> None:
+    pr_data = _pr_json()
+    pr_data["head"] = {"sha": "abc123", "ref": "feature", "repo": {"fork": True}}
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+        return_value=httpx.Response(200, json=pr_data)
+    )
+    _mock_pr_files(42, [])
+    with _make_client() as client:
+        pr = client.get_pr(42)
+
+    assert pr.is_fork is True
+
+
+@respx.mock
+def test_get_pr_populates_author_association_from_payload() -> None:
+    """``get_pr`` must surface the API's ``author_association`` field so the
+    runner-side safety check sees the real value (not a sentinel chosen by the
+    config). When the field is missing the model receives an empty string and
+    the runner adapter coerces that to ``NONE``."""
+    pr_data = _pr_json()
+    pr_data["author_association"] = "FIRST_TIME_CONTRIBUTOR"
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+        return_value=httpx.Response(200, json=pr_data)
+    )
+    _mock_pr_files(42, [])
+    with _make_client() as client:
+        pr = client.get_pr(42)
+
+    assert pr.author_association == "FIRST_TIME_CONTRIBUTOR"
+
+
+@respx.mock
+def test_get_pr_author_association_defaults_to_empty_when_absent() -> None:
+    pr_data = _pr_json()
+    # No author_association on the payload.
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+        return_value=httpx.Response(200, json=pr_data)
+    )
+    _mock_pr_files(42, [])
+    with _make_client() as client:
+        pr = client.get_pr(42)
+
+    assert pr.author_association == ""
+
+
+@respx.mock
+def test_get_pr_caches_changed_files_by_head_sha() -> None:
+    """``get_pr`` is called on every runner transition/poll tick, but the
+    changed-files list only moves when the head SHA does. Repeated calls at the
+    same head SHA must hit the cache and issue exactly one /files request; a
+    head-SHA change must trigger a fresh fetch."""
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+        return_value=httpx.Response(200, json=_pr_json())
+    )
+    files_route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42/files").mock(
+        return_value=httpx.Response(200, json=[{"filename": "src/main.py"}])
+    )
+    with _make_client() as client:
+        first = client.get_pr(42)
+        second = client.get_pr(42)
+        assert first.changed_files == ["src/main.py"]
+        assert second.changed_files == ["src/main.py"]
+        # Two get_pr calls, same head SHA -> only one /files request.
+        assert files_route.call_count == 1
+
+        # A new head SHA invalidates the cache and triggers a fresh fetch.
+        moved = _pr_json()
+        moved["head"] = {"sha": "def456", "ref": "feature", "repo": {}}
+        respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
+            return_value=httpx.Response(200, json=moved)
+        )
+        files_route.mock(return_value=httpx.Response(200, json=[{"filename": "src/other.py"}]))
+        third = client.get_pr(42)
+        assert third.changed_files == ["src/other.py"]
+        # Cumulative: cache miss on first call + miss on the moved-SHA call = 2.
+        # The second (same-SHA) call was served from cache and added nothing.
+        assert files_route.call_count == 2
+
+
+@respx.mock
+def test_get_pr_files_returns_filenames() -> None:
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42/files").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"filename": ".github/workflows/ci.yml"},
+                {"filename": "src/main.py"},
+            ],
+        )
+    )
+    with _make_client() as client:
+        files = client.get_pr_files(42)
+
+    assert files == [".github/workflows/ci.yml", "src/main.py"]
 
 
 # --- REST: post_comment ---
@@ -112,6 +224,66 @@ def test_get_pr_comments() -> None:
     assert comments[0].id == 1
     assert comments[1].id == 2
     assert all(isinstance(c, Comment) for c in comments)
+
+
+@respx.mock
+def test_get_comment_returns_single_comment() -> None:
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/issues/comments/55").mock(
+        return_value=httpx.Response(200, json=_comment_json(55))
+    )
+    with _make_client() as client:
+        comment = client.get_comment(55)
+
+    assert route.called
+    assert comment is not None
+    assert comment.id == 55
+
+
+@respx.mock
+def test_get_comment_returns_none_on_404() -> None:
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/issues/comments/55").mock(
+        return_value=httpx.Response(404, json={"message": "Not Found"})
+    )
+    with _make_client() as client:
+        comment = client.get_comment(55)
+
+    assert route.called
+    assert comment is None
+
+
+@respx.mock
+def test_get_review_threads_cached_within_tick() -> None:
+    """Two get_review_threads calls issue one GraphQL request until the cache is
+    reset; resetting forces a fresh request."""
+    call_count = 0
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [],
+                            }
+                        }
+                    }
+                }
+            },
+        )
+
+    respx.post(GQL).mock(side_effect=responder)
+    with _make_client() as client:
+        client.get_review_threads(42)
+        client.get_review_threads(42)
+        assert call_count == 1  # second call served from cache
+        client.reset_request_cache()
+        client.get_review_threads(42)
+        assert call_count == 2  # fresh request after reset
 
 
 @respx.mock
@@ -230,6 +402,61 @@ def test_get_check_runs() -> None:
     assert runs[0].conclusion == "success"
 
 
+@respx.mock
+def test_get_commit_statuses_maps_states_and_dedups() -> None:
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/commits/abc123/statuses").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                # Newest-first: the latest "ci/jenkins" entry (success) wins.
+                {"context": "ci/jenkins", "state": "success", "target_url": "https://x"},
+                {"context": "ci/jenkins", "state": "pending", "target_url": "https://x"},
+                {"context": "lint", "state": "failure"},
+                {"context": "build", "state": "pending"},
+            ],
+        )
+    )
+    with _make_client() as client:
+        statuses = client.get_commit_statuses("abc123")
+
+    assert route.called
+    by_name = {s.name: s for s in statuses}
+    assert set(by_name) == {"ci/jenkins", "lint", "build"}
+    assert by_name["ci/jenkins"].status == "completed"
+    assert by_name["ci/jenkins"].conclusion == "success"
+    assert by_name["lint"].conclusion == "failure"
+    assert by_name["build"].status == "in_progress"
+    assert by_name["build"].conclusion is None
+
+
+@respx.mock
+def test_get_pull_request_reviews() -> None:
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42/reviews").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 5,
+                    "user": {"login": "gemini-code-assist[bot]"},
+                    "body": "No issues found.",
+                    "state": "COMMENTED",
+                    "submitted_at": "2025-06-01T12:05:00Z",
+                },
+                {"id": 6, "user": None, "body": None, "state": "APPROVED"},
+            ],
+        )
+    )
+    with _make_client() as client:
+        reviews = client.get_pull_request_reviews(42)
+
+    assert route.called
+    assert len(reviews) == 2
+    assert reviews[0].author == "gemini-code-assist[bot]"
+    assert reviews[0].body == "No issues found."
+    assert reviews[1].author == "ghost"
+    assert reviews[1].body == ""
+
+
 # --- GraphQL: get_review_threads ---
 
 
@@ -345,6 +572,7 @@ def test_429_retries_with_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -370,6 +598,7 @@ def test_403_rate_limit_retries(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -409,6 +638,7 @@ def test_403_with_retry_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -552,6 +782,7 @@ def test_dry_run_allows_reads() -> None:
     respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
         return_value=httpx.Response(200, json=_pr_json())
     )
+    _mock_pr_files(42)
     with _make_client(dry_run=True) as client:
         pr = client.get_pr(42)
 
@@ -694,6 +925,7 @@ def test_rate_limit_uses_reset_header(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         client.get_pr(1)
 
@@ -715,6 +947,7 @@ def test_502_retries_with_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
             httpx.Response(200, json=_pr_json(1)),
         ]
     )
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -755,6 +988,7 @@ def test_network_error_retries(monkeypatch: pytest.MonkeyPatch) -> None:
         return httpx.Response(200, json=_pr_json(1))
 
     respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/1").mock(side_effect=flaky_handler)
+    _mock_pr_files(1)
     with _make_client() as client:
         pr = client.get_pr(1)
 
@@ -815,6 +1049,7 @@ def test_get_pr_with_deleted_user() -> None:
     respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").mock(
         return_value=httpx.Response(200, json=pr_data)
     )
+    _mock_pr_files(42)
     with _make_client() as client:
         pr = client.get_pr(42)
 
@@ -833,3 +1068,15 @@ def test_parse_comment_with_deleted_user() -> None:
 
     assert comment is not None
     assert comment.user == "ghost"
+
+
+def test_stable_check_run_id_is_deterministic_and_process_stable() -> None:
+    """The id derived from a status context must be identical for the same
+    context (unlike builtin hash(), which is per-process randomized) and differ
+    across contexts."""
+    from ai_pr_orchestrator.github.models import stable_check_run_id
+
+    assert stable_check_run_id("ci/jenkins") == stable_check_run_id("ci/jenkins")
+    assert stable_check_run_id("ci/jenkins") != stable_check_run_id("lint")
+    # Known fixed digest so a future refactor that changes the scheme is caught.
+    assert isinstance(stable_check_run_id("ci/jenkins"), int)

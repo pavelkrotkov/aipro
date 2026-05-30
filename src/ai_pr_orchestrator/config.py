@@ -35,7 +35,10 @@ class ReviewerConfig:
 @dataclass(frozen=True)
 class ReviewPhaseConfig:
     max_rounds: int = 1
-    poll_interval_seconds: int = 30
+    # 60s keeps the in-process reviewer poll loop well under GitHub's secondary
+    # rate limits: each tick issues only a couple of API calls, so ~2 requests/
+    # min stays cheap even across the full reviewer_timeout window.
+    poll_interval_seconds: int = 60
     reviewer_timeout_seconds: int = 600
     phase_timeout_seconds: int = 900
 

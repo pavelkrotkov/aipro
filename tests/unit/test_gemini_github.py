@@ -340,6 +340,111 @@ def test_collect_findings_empty_review() -> None:
     assert findings == []
 
 
+# --- has_responded tests ---
+
+
+def test_has_responded_true_with_review_thread_comment_after_trigger() -> None:
+    client = FakeGitHubClient(now=NOW)
+    client.seed_thread(
+        "T_1",
+        pr_number=PR_NUMBER,
+        path="src/main.py",
+        comments=[
+            ReviewComment(
+                id="RC_1",
+                body="A finding",
+                author=BOT_LOGIN,
+                path="src/main.py",
+                created_at="2025-06-01T12:05:00+00:00",
+            ),
+        ],
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
+
+
+def test_has_responded_false_for_top_level_pr_comment_after_trigger() -> None:
+    """A top-level PR comment must NOT count as a response. ``collect_findings``
+    only normalizes review-thread comments into Findings, so if a bare PR
+    comment counted here the runner would complete ``no_findings`` and silently
+    drop feedback the bot posted as a top-level comment. It must instead fall
+    through to the poll timeout (→ needs_human)."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_comment(
+        PR_NUMBER,
+        body="Actually there's a bug on line 10.",
+        user=BOT_LOGIN,
+        created_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
+
+
+def test_has_responded_false_when_no_bot_comments() -> None:
+    client = FakeGitHubClient(now=NOW)
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
+
+
+def test_has_responded_false_when_only_human_comments() -> None:
+    client = FakeGitHubClient(now=NOW)
+    client.seed_comment(
+        PR_NUMBER,
+        body="Hey bot, what do you think?",
+        user="some-human",
+        created_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
+
+
+def test_has_responded_skips_machine_marker_trigger_comments() -> None:
+    """The orchestrator's own machine-marker trigger comments authored by the
+    bot itself must not count as a response."""
+    client = FakeGitHubClient(now=NOW)
+    marker = "<!-- ai-orchestrator:reviewer=gemini_github -->"
+    client.seed_comment(
+        PR_NUMBER,
+        body=f"{marker}\n@gemini-code-assist review",
+        user=BOT_LOGIN,
+        created_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    client.seed_thread(
+        "T_marker",
+        pr_number=PR_NUMBER,
+        path="src/a.py",
+        comments=[
+            ReviewComment(
+                id="RC_marker",
+                body=f"{marker}\ntrigger",
+                author=BOT_LOGIN,
+                path="src/a.py",
+                created_at="2025-06-01T12:05:00+00:00",
+            ),
+        ],
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
+
+
+def test_has_responded_false_when_bot_comment_is_before_trigger() -> None:
+    client = FakeGitHubClient(now=NOW)
+    client.seed_comment(
+        PR_NUMBER,
+        body="Old comment from earlier review",
+        user=BOT_LOGIN,
+        created_at=datetime(2025, 6, 1, 11, 30, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
+
+
 def test_collect_findings_only_first_comment_per_thread() -> None:
     client = FakeGitHubClient(now=NOW)
     client.seed_thread(
@@ -371,3 +476,70 @@ def test_collect_findings_only_first_comment_per_thread() -> None:
     assert len(findings) == 1
     assert findings[0].comment_id == "RC_first"
     assert findings[0].body == "First bot comment"
+
+
+def test_has_responded_false_for_pull_request_review_body() -> None:
+    """A submitted ``pull_request_review`` body must NOT count as a response.
+    ``collect_findings`` never turns review bodies into Findings, so counting
+    one here would let the runner complete ``no_findings`` and drop any
+    actionable feedback the bot put in the review summary. It must fall through
+    to the timeout instead."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author=BOT_LOGIN,
+        body="Please address the issue in the summary.",
+        state="COMMENTED",
+        submitted_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
+
+
+def test_has_responded_true_for_approved_review_after_trigger() -> None:
+    """An APPROVED review after the trigger is an explicit no-issues verdict
+    (no inline feedback to drop), so it is the reachable clean-completion
+    signal that lets the runner finish ``no_findings`` instead of timing out."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author=BOT_LOGIN,
+        body="",
+        state="APPROVED",
+        submitted_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
+
+
+def test_has_responded_false_for_approved_review_before_trigger() -> None:
+    """An APPROVED review that predates the trigger is stale and must not count."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author=BOT_LOGIN,
+        body="",
+        state="APPROVED",
+        submitted_at=datetime(2025, 6, 1, 11, 0, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False
+
+
+def test_has_responded_false_for_approved_review_by_other_author() -> None:
+    """An APPROVED review from a non-bot author must not count as the reviewer
+    bot completing."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author="some-human",
+        body="",
+        state="APPROVED",
+        submitted_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False

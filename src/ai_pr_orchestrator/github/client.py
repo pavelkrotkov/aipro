@@ -60,6 +60,25 @@ class GitHubClient:
             timeout=30.0,
         )
         self._owns_client = http_client is None
+        # Per-(pr_number, head_sha) cache of changed files; see get_pr.
+        self._pr_files_cache: dict[tuple[int, str], list[str]] = {}
+        # Short-lived cache of review threads, keyed by pr_number. Within one
+        # reviewer-poll tick the runner calls get_review_threads twice (once via
+        # the reviewer's collect_findings, once via has_responded); caching
+        # collapses that to a single GraphQL request. The runner calls
+        # reset_request_cache() at the start of every tick so cross-tick
+        # freshness is preserved — this is a within-tick memo, not a TTL cache.
+        self._review_threads_cache: dict[int, list[models.ReviewThread]] = {}
+
+    def reset_request_cache(self) -> None:
+        """Drop within-tick memoized responses (currently review threads).
+
+        Called by the runner between reviewer-poll iterations so each tick sees
+        fresh data while still de-duplicating the repeated reads inside a single
+        tick. The ``_pr_files_cache`` is intentionally NOT cleared: it is keyed
+        by head SHA and only changes when the PR head moves.
+        """
+        self._review_threads_cache.clear()
 
     def close(self) -> None:
         if self._owns_client:
@@ -75,19 +94,48 @@ class GitHubClient:
 
     def get_pr(self, number: int) -> models.PullRequest:
         data = self._get(f"/repos/{self._owner}/{self._repo}/pulls/{number}")
+        # Guard every nested access: a missing or null ``head``/``base`` (from an
+        # unexpected payload shape or a mock) would otherwise raise KeyError/
+        # TypeError mid-construction. Use the same ``.get(...) or {}`` idiom
+        # consistently for both branches.
+        head_data = data.get("head") or {}
+        base_data = data.get("base") or {}
+        head_repo = head_data.get("repo") or {}
+        is_fork = bool(head_repo.get("fork", False))
+        head_sha = head_data.get("sha") or ""
+        # Fetch changed files for safety checks (e.g. disallow_workflow_file_changes).
+        # The runner refetches the PR on every transition/poll iteration, but the
+        # changed-files list only moves when the head SHA does. Cache by
+        # (number, head_sha) so repeated get_pr calls within a run don't issue a
+        # redundant (paginated) /files request on every tick.
+        cache_key = (number, head_sha)
+        changed_files = self._pr_files_cache.get(cache_key)
+        if changed_files is None:
+            changed_files = self.get_pr_files(number)
+            self._pr_files_cache[cache_key] = changed_files
         return models.PullRequest(
             number=data["number"],
             title=data["title"],
             body=data.get("body") or "",
             state=data["state"],
-            head_sha=data["head"]["sha"],
-            head_ref=data["head"]["ref"],
-            base_ref=data["base"]["ref"],
+            head_sha=head_sha,
+            head_ref=head_data.get("ref") or "",
+            base_ref=base_data.get("ref") or "",
             author=(data.get("user") or {}).get("login", "ghost"),
             draft=data.get("draft", False),
             mergeable=data.get("mergeable"),
-            labels=[label["name"] for label in data.get("labels", [])],
+            labels=[label["name"] for label in (data.get("labels") or [])],
+            is_fork=is_fork,
+            changed_files=changed_files,
+            author_association=data.get("author_association") or "",
         )
+
+    def get_pr_files(self, pr_number: int) -> list[str]:
+        data = self._get_paginated(
+            f"/repos/{self._owner}/{self._repo}/pulls/{pr_number}/files",
+            items_key=None,
+        )
+        return [item["filename"] for item in data if isinstance(item, dict) and "filename" in item]
 
     def post_comment(self, issue_number: int, body: str) -> models.Comment:
         data = self._post(
@@ -123,6 +171,21 @@ class GitHubClient:
             f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/labels/{quote(label, safe='')}",
         )
 
+    def get_comment(self, comment_id: int) -> models.Comment | None:
+        """Fetch a single issue comment by id, or None if it no longer exists.
+
+        Lets callers that already know the comment id (e.g. the runner's state
+        comment) avoid paging the entire comment list. A deleted comment yields
+        a 404, which we translate to None rather than propagating.
+        """
+        try:
+            data = self._get(f"/repos/{self._owner}/{self._repo}/issues/comments/{comment_id}")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+        return _parse_comment(data)
+
     def get_pr_comments(self, issue_number: int) -> list[models.Comment]:
         data = self._get_paginated(
             f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/comments",
@@ -146,9 +209,81 @@ class GitHubClient:
             for cr in data
         ]
 
+    def get_commit_statuses(self, ref: str) -> list[models.CheckRun]:
+        """Fetch legacy commit-status contexts and adapt them to CheckRun shape.
+
+        Required checks that report via the Statuses API (rather than the
+        Checks API) never appear in ``get_check_runs``. The orchestrator's CI
+        gate consumes ``CheckRun``s, so each status context is mapped to one:
+        ``state`` becomes the equivalent check ``status``/``conclusion``
+        (``pending`` -> still-running, ``success`` -> passing, ``failure``/
+        ``error`` -> failing). Status contexts have no numeric id, so ``id`` is
+        a process-stable hash of the context name (see
+        ``models.stable_check_run_id``).
+        """
+        data = self._get_paginated(
+            f"/repos/{self._owner}/{self._repo}/commits/{quote(ref, safe='')}/statuses",
+            items_key=None,
+        )
+        # The statuses endpoint returns newest-first and may list the same
+        # context multiple times (one per update). Keep only the first (latest)
+        # entry per context so the CI gate sees each context once.
+        latest_by_context: dict[str, dict[str, Any]] = {}
+        for status in data:
+            if not isinstance(status, dict):
+                continue
+            context = status.get("context")
+            if isinstance(context, str) and context not in latest_by_context:
+                latest_by_context[context] = status
+        runs: list[models.CheckRun] = []
+        for context, status in latest_by_context.items():
+            state = status.get("state")
+            if state in ("success", "failure", "error"):
+                check_status = "completed"
+                conclusion = "success" if state == "success" else "failure"
+            else:
+                # "pending" (or any unknown state) => not yet conclusive.
+                check_status = "in_progress"
+                conclusion = None
+            runs.append(
+                models.CheckRun(
+                    id=models.stable_check_run_id(context),
+                    name=context,
+                    status=check_status,
+                    conclusion=conclusion,
+                    html_url=status.get("target_url") or "",
+                )
+            )
+        return runs
+
+    def get_pull_request_reviews(self, pr_number: int) -> list[models.Review]:
+        data = self._get_paginated(
+            f"/repos/{self._owner}/{self._repo}/pulls/{pr_number}/reviews",
+            items_key=None,
+        )
+        return [
+            models.Review(
+                id=review["id"],
+                author=(review.get("user") or {}).get("login", "ghost"),
+                body=review.get("body") or "",
+                state=review.get("state") or "",
+                submitted_at=review.get("submitted_at") or "",
+            )
+            for review in data
+            if isinstance(review, dict) and "id" in review
+        ]
+
     # --- GraphQL API ---
 
     def get_review_threads(self, pr_number: int) -> list[models.ReviewThread]:
+        cached = self._review_threads_cache.get(pr_number)
+        if cached is not None:
+            return cached
+        threads = self._fetch_review_threads(pr_number)
+        self._review_threads_cache[pr_number] = threads
+        return threads
+
+    def _fetch_review_threads(self, pr_number: int) -> list[models.ReviewThread]:
         threads: list[models.ReviewThread] = []
         cursor: str | None = None
 
@@ -208,6 +343,8 @@ class GitHubClient:
         return threads
 
     def reply_to_review_thread(self, thread_id: str, body: str) -> dict[str, Any] | None:
+        # Mutating a thread invalidates the within-tick threads cache.
+        self._review_threads_cache.clear()
         if self._dry_run:
             logger.info("DRY-RUN: would reply to review thread %s", thread_id)
             return {"comment": {"id": "dry-run"}}
@@ -217,6 +354,8 @@ class GitHubClient:
         )
 
     def resolve_review_thread(self, thread_id: str) -> dict[str, Any] | None:
+        # Mutating a thread invalidates the within-tick threads cache.
+        self._review_threads_cache.clear()
         if self._dry_run:
             logger.info("DRY-RUN: would resolve review thread %s", thread_id)
             return {"thread": {"id": thread_id, "isResolved": True}}

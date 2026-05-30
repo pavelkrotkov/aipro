@@ -105,5 +105,67 @@ def test_run_with_invalid_event_shape_exits_cleanly(tmp_path: Path) -> None:
     event_path = tmp_path / "event.json"
     event_path.write_text("[]", encoding="utf-8")
 
-    with pytest.raises(SystemExit, match=r"pull_request\.number"):
+    with pytest.raises(SystemExit, match=r"Could not determine"):
         cli.main(["run", "--event-path", str(event_path)])
+
+
+def test_run_with_status_event_exits_with_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``status`` webhooks carry a SHA but no PR number. Until SHA -> PR
+    lookup is wired in the CLI, surface a clear actionable error pointing
+    operators at ``--pr`` instead of the generic "could not determine"
+    message."""
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "status")
+    event_path = tmp_path / "status.json"
+    event_path.write_text(
+        '{"sha": "abc123def456", "state": "success"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match=r"status events carry a commit SHA"):
+        cli.main(["run", "--event-path", str(event_path)])
+
+
+def test_run_status_event_with_pr_fallback_forwards_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``status`` webhook carries a SHA but no PR number. Passing ``--pr``
+    alongside ``--event-path`` resolves the PR while still forwarding the event
+    (and its head_sha) into Runner.run, keeping the stale-CI-event guard."""
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "status")
+    event_path = tmp_path / "status.json"
+    event_path.write_text(
+        '{"sha": "abc123def456", "state": "success"}',
+        encoding="utf-8",
+    )
+
+    calls: list[tuple[int, bool, Path | None]] = []
+
+    def fake_run(*, pr_number: int, dry_run: bool, event_path: Path | None) -> int:
+        calls.append((pr_number, dry_run, event_path))
+        return 0
+
+    monkeypatch.setattr(cli.runner, "run", fake_run)
+
+    assert cli.main(["run", "--event-path", str(event_path), "--pr", "789"]) == 0
+    assert calls == [(789, False, event_path)]
+
+
+def test_run_event_pr_number_wins_over_pr_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the event payload contains a PR number, it takes precedence over an
+    explicitly supplied ``--pr``."""
+    event_path = tmp_path / "event.json"
+    event_path.write_text('{"pull_request": {"number": 456}}', encoding="utf-8")
+
+    calls: list[int] = []
+
+    def fake_run(*, pr_number: int, dry_run: bool, event_path: Path | None) -> int:
+        calls.append(pr_number)
+        return 0
+
+    monkeypatch.setattr(cli.runner, "run", fake_run)
+
+    assert cli.main(["run", "--event-path", str(event_path), "--pr", "789"]) == 0
+    assert calls == [456]
