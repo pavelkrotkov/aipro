@@ -1696,9 +1696,7 @@ def test_do_commit_honors_configured_max_commits_per_run() -> None:
         gh=gh,
         git=git,
         config=make_config(
-            safety=SafetyConfig(
-                only_run_on_labeled_prs=False, max_commits_per_run=2
-            )
+            safety=SafetyConfig(only_run_on_labeled_prs=False, max_commits_per_run=2)
         ),
     )
     runner = Runner(ctx)
