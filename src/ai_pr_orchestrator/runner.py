@@ -331,7 +331,23 @@ class Runner:
             state = self._execute_actions(actions, pr_number, gh_pr, next_state)
             self._save_state(pr_number, state)
 
+        # The loop failed to converge within the hard cap. Don't just return:
+        # leaving the persisted state in a non-terminal status means every
+        # subsequent webhook event re-enters this loop and re-exhausts it,
+        # burning CI minutes indefinitely. Drive the state to a terminal
+        # ``error`` (emitting the final-summary/label side effects) and save it
+        # so future events short-circuit on the terminal check at the top.
         logger.error("Runner exceeded max transitions for PR #%s", pr_number)
+        now = ctx.clock()
+        state = replace(
+            state,
+            status="error",
+            last_error="max_transitions_exceeded",
+            updated_at=now,
+        )
+        actions = terminal_actions(state, ctx.config)
+        state = self._execute_actions(actions, pr_number, gh_pr, state)
+        self._save_state(pr_number, state)
         return 1
 
     # ---- State loading / saving ----
@@ -516,6 +532,13 @@ class Runner:
         deadline_phase = earliest_trigger_ts + timedelta(seconds=cfg.phase_timeout_seconds)
 
         for _iteration in range(_MAX_POLL_ITERATIONS):
+            # Refetch the PR each iteration: this loop can span the full
+            # reviewer/phase timeout (potentially over an hour), during which an
+            # operator may remove the orchestrator label, close the PR, or flip
+            # it back to draft. Snapshot consumers (the label-removed safety
+            # check, head_sha comparisons) must see the live PR, not the stale
+            # view captured before the loop started.
+            gh_pr = ctx.github.get_pr(pr_number)
             snapshot = self._build_snapshot(state, gh_pr, event=None)
             if snapshot.findings:
                 next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
@@ -642,7 +665,20 @@ class Runner:
         if kind == "noop":
             return state
         if kind == "post_pr_comment":
-            ctx.github.post_comment(pr_number, str(payload.get("body", "")))
+            # Reviewer trigger actions carry a ``reviewer`` name in the payload
+            # (set by the state machine's triggering transition). For those,
+            # render the body through the adapter's ``build_trigger_comment`` so
+            # the reviewer's machine marker plus round/head metadata are
+            # included — the raw ``ReviewerConfig.trigger_comment`` omits them.
+            # All other post_pr_comment actions (e.g. plain PR replies) keep the
+            # raw-body path.
+            reviewer_name = payload.get("reviewer")
+            adapter = ctx.reviewers.get(reviewer_name) if isinstance(reviewer_name, str) else None
+            if adapter is not None:
+                body = adapter.build_trigger_comment(state.round_index, gh_pr.head_sha)
+            else:
+                body = str(payload.get("body", ""))
+            ctx.github.post_comment(pr_number, body)
             return state
         if kind == "update_status_comment":
             # The save_state call after action execution writes the canonical
@@ -728,14 +764,29 @@ class Runner:
         self._commits_this_run += 1
         # Track the new commit SHA on state so downstream consumers (e.g. the
         # CI gate's get_check_runs(state.head_sha)) see the just-pushed commit
-        # instead of the pre-commit HEAD.
-        return replace(state, head_sha=sha, commits_made=[*state.commits_made, sha])
+        # instead of the pre-commit HEAD. Bump ``updated_at`` too: it doubles as
+        # the optimistic-concurrency lock token in ``_save_state``. Leaving it
+        # unchanged would let a concurrent runner that loaded the pre-commit
+        # state save over this commit without tripping a conflict.
+        return replace(
+            state,
+            head_sha=sha,
+            commits_made=[*state.commits_made, sha],
+            updated_at=ctx.clock(),
+        )
 
     def _do_push(self, gh_pr: gh_models.PullRequest) -> None:
         ctx = self._ctx
         if ctx.git is None:
             return
-        branch = gh_pr.head_ref or ctx.config.git.base_branch
+        # Never fall back to the base branch when head_ref is missing: pushing
+        # the PR's commits directly onto ``main``/``master`` bypasses PR
+        # controls and can corrupt the base branch. Fail loudly instead — the
+        # outer Runner.run handler logs and exits non-zero rather than doing
+        # something destructive.
+        branch = gh_pr.head_ref
+        if not branch:
+            raise ValueError(f"Cannot push: head_ref is empty for PR #{gh_pr.number}")
         ctx.git.push(branch)
 
     def _do_invoke_coder(

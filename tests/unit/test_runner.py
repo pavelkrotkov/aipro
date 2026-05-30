@@ -467,6 +467,38 @@ def test_post_pr_comment_action(monkeypatch: pytest.MonkeyPatch) -> None:
     assert any(b == "hello" for b in bodies)
 
 
+def test_post_pr_comment_uses_adapter_for_reviewer_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ai_pr_orchestrator.models import PlannedAction
+
+    # A reviewer-trigger action carries a ``reviewer`` name. The runner must
+    # render the body through the adapter's build_trigger_comment (which adds
+    # the machine marker / metadata) rather than posting the raw payload body.
+    actions = [PlannedAction("post_pr_comment", {"body": "RAW", "reviewer": "fake"})]
+    gh, _git, _coder, ctx = _setup_action_test(monkeypatch, actions)
+    reviewer = FakeReviewerAdapter(name="fake", trigger_comment="ADAPTER-BUILT-BODY")
+    ctx = replace(ctx, reviewers={"fake": reviewer})
+    Runner(ctx).run(1)
+    bodies = [c.body for c in gh.get_pr_comments(1)]
+    assert any(b == "ADAPTER-BUILT-BODY" for b in bodies)
+    assert all(b != "RAW" for b in bodies)
+
+
+def test_post_pr_comment_uses_raw_body_for_unknown_reviewer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ai_pr_orchestrator.models import PlannedAction
+
+    # A ``reviewer`` that isn't wired into ctx.reviewers falls back to the raw
+    # body rather than crashing.
+    actions = [PlannedAction("post_pr_comment", {"body": "RAW", "reviewer": "ghost"})]
+    gh, _git, _coder, ctx = _setup_action_test(monkeypatch, actions)
+    Runner(ctx).run(1)
+    bodies = [c.body for c in gh.get_pr_comments(1)]
+    assert any(b == "RAW" for b in bodies)
+
+
 def test_update_status_comment_action(monkeypatch: pytest.MonkeyPatch) -> None:
     from ai_pr_orchestrator.models import PlannedAction
 
@@ -564,6 +596,74 @@ def test_push_branch_action_uses_head_ref(monkeypatch: pytest.MonkeyPatch) -> No
     Runner(ctx).run(1)
     assert git.push_count == 1
     assert git.push_calls[0] == "feature/x"
+
+
+def test_push_branch_raises_when_head_ref_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ai_pr_orchestrator.models import PlannedAction
+
+    # An empty head_ref must NOT fall back to the base branch (which would push
+    # PR commits straight onto main). The push raises, Runner.run catches it and
+    # exits non-zero, and no push happens.
+    actions = [PlannedAction("push_branch", {})]
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh, head_ref="")
+    state = initial_state(status="init", round_index=1, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    git = FakeGitRepo(head_sha=pr.head_sha, remote_head_sha=pr.head_sha, clean=False)
+
+    call_count = {"n": 0}
+
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return s, actions
+        return replace(s, status="done", done_reason="completed", updated_at=now), []
+
+    monkeypatch.setattr("ai_pr_orchestrator.runner.transition", fake_transition)
+    ctx = build_ctx(gh=gh, git=git)
+    assert Runner(ctx).run(pr.number) == 1
+    assert git.push_count == 0
+
+
+def test_commit_bumps_updated_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ai_pr_orchestrator.models import PlannedAction
+
+    # _do_commit must advance updated_at (the optimistic-lock token) so a
+    # concurrent runner can't silently clobber the commit.
+    actions = [PlannedAction("commit_changes", {"message": "fix: x"})]
+    gh, _git, _coder, ctx = _setup_action_test(monkeypatch, actions)
+    later = NOW + timedelta(seconds=120)
+    ctx = replace(ctx, clock=FakeClock(start=later))
+    Runner(ctx).run(1)
+    comments = gh.get_pr_comments(1)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.updated_at == later
+
+
+def test_max_transitions_persists_terminal_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A non-converging loop must end in a persisted terminal ``error`` state so
+    # subsequent webhook events short-circuit instead of re-burning CI.
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="init", round_index=1, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    def never_terminal(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
+        return s, []
+
+    monkeypatch.setattr("ai_pr_orchestrator.runner.transition", never_terminal)
+    ctx = build_ctx(gh=gh)
+    assert Runner(ctx).run(pr.number) == 1
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "error"
+    assert sc.state.last_error == "max_transitions_exceeded"
 
 
 def test_add_label_action(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -77,9 +77,15 @@ class GitHubClient:
 
     def get_pr(self, number: int) -> models.PullRequest:
         data = self._get(f"/repos/{self._owner}/{self._repo}/pulls/{number}")
-        head_repo = (data.get("head") or {}).get("repo") or {}
+        # Guard every nested access: a missing or null ``head``/``base`` (from an
+        # unexpected payload shape or a mock) would otherwise raise KeyError/
+        # TypeError mid-construction. Use the same ``.get(...) or {}`` idiom
+        # consistently for both branches.
+        head_data = data.get("head") or {}
+        base_data = data.get("base") or {}
+        head_repo = head_data.get("repo") or {}
         is_fork = bool(head_repo.get("fork", False))
-        head_sha = data["head"]["sha"]
+        head_sha = head_data.get("sha") or ""
         # Fetch changed files for safety checks (e.g. disallow_workflow_file_changes).
         # The runner refetches the PR on every transition/poll iteration, but the
         # changed-files list only moves when the head SHA does. Cache by
@@ -95,9 +101,9 @@ class GitHubClient:
             title=data["title"],
             body=data.get("body") or "",
             state=data["state"],
-            head_sha=data["head"]["sha"],
-            head_ref=data["head"]["ref"],
-            base_ref=data["base"]["ref"],
+            head_sha=head_sha,
+            head_ref=head_data.get("ref") or "",
+            base_ref=base_data.get("ref") or "",
             author=(data.get("user") or {}).get("login", "ghost"),
             draft=data.get("draft", False),
             mergeable=data.get("mergeable"),
