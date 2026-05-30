@@ -14,6 +14,7 @@ from ai_pr_orchestrator.config import (
     Config,
     GitConfig,
     MainCoderConfig,
+    NotificationsConfig,
     ReviewerConfig,
     ReviewPhaseConfig,
     SafetyConfig,
@@ -1046,6 +1047,79 @@ def test_ci_resume_all_green_completes() -> None:
     assert sc.state.status == "done"
 
 
+def test_ci_resume_passes_via_commit_status() -> None:
+    """A required check reported only through the legacy Statuses API (no
+    check-run) must still let the CI gate complete."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    gh.seed_commit_status(pr.head_sha, "ci/jenkins", status="completed", conclusion="success")
+    state = initial_state(
+        status="ci_wait", round_index=1, head_sha=pr.head_sha, ci_wait_started_at=NOW
+    )
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    event = ParsedEvent(event_type="status", pr_number=pr.number, head_sha=pr.head_sha)
+    ctx = build_ctx(gh=gh, config=make_config(ci=CiConfig(require_green_before_done=True)))
+    assert Runner(ctx).run(pr.number, event=event) == 0
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "done"
+
+
+def test_ci_resume_failing_commit_status_needs_human() -> None:
+    """A failing commit-status context must fail the CI gate just like a failing
+    check-run does."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    gh.seed_commit_status(pr.head_sha, "ci/jenkins", status="completed", conclusion="failure")
+    state = initial_state(
+        status="ci_wait", round_index=1, head_sha=pr.head_sha, ci_wait_started_at=NOW
+    )
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    event = ParsedEvent(event_type="status", pr_number=pr.number, head_sha=pr.head_sha)
+    ctx = build_ctx(gh=gh, config=make_config(ci=CiConfig(require_green_before_done=True)))
+    assert Runner(ctx).run(pr.number, event=event) == 0
+
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+
+
+def test_final_summary_mentions_configured_handles_on_needs_human(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """needs_human terminal summaries must cc the configured mention handles."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="init", round_index=1, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    config = make_config(
+        notifications=NotificationsConfig(mention_on_needs_human=["alice", "@bob"])
+    )
+
+    def fake_transition(
+        s: RuntimeState, snap: Any, cfg: Any, now: datetime
+    ) -> tuple[RuntimeState, list[Any]]:
+        new_state = replace(s, status="needs_human", last_error="stuck", updated_at=now)
+        from ai_pr_orchestrator.state_machine import terminal_actions
+
+        return new_state, terminal_actions(new_state, cfg)
+
+    monkeypatch.setattr("ai_pr_orchestrator.runner.transition", fake_transition)
+    ctx = build_ctx(gh=gh, config=config)
+    Runner(ctx).run(pr.number)
+
+    bodies = [c.body for c in gh.get_pr_comments(pr.number)]
+    # The final-summary comment (distinct from the hidden state comment) starts
+    # with "AI PR Orchestrator: status `...`".
+    summary = next(b for b in bodies if b.startswith("AI PR Orchestrator: status"))
+    assert "cc: @alice @bob" in summary
+
+
 def test_ci_resume_failed_check_needs_human() -> None:
     gh = FakeGitHubClient(now=NOW)
     pr = seed_pr(gh)
@@ -1504,6 +1578,31 @@ def test_push_recovery_skips_when_remote_already_matches() -> None:
     Runner(ctx).run(pr.number)
 
     assert git.push_count == 0
+
+
+def test_push_recovery_empty_head_ref_routes_to_needs_human() -> None:
+    """If push-recovery would run but head_ref is empty, the runner must bail to
+    needs_human rather than issuing git commands against a bogus ref."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh, head_sha="prior-sha", head_ref="")
+    state = initial_state(
+        status="ci_wait",
+        round_index=1,
+        head_sha="local-sha",
+        ci_wait_started_at=NOW,
+        commits_made=["local-sha"],
+    )
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    git = FakeGitRepo(head_sha="local-sha", remote_head_sha="prior-sha")
+
+    ctx = build_ctx(gh=gh, git=git)
+    assert Runner(ctx).run(pr.number) == 0
+    assert git.push_count == 0
+    comments = gh.get_pr_comments(pr.number)
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "push_recovery_failed"
 
 
 def test_push_recovery_no_op_when_no_commits_made() -> None:

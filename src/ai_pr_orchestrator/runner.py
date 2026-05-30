@@ -104,30 +104,29 @@ def parse_event(event: Any, *, event_name: str | None = None) -> ParsedEvent:
         return ParsedEvent(event_type=event_name or "unknown", pr_number=None, head_sha=None)
     inferred = event_name or _infer_event_name(event)
     if inferred == "pull_request" or inferred == "pull_request_review":
-        pr = event.get("pull_request") or {}
+        pr = _as_dict(event.get("pull_request"))
+        head = _as_dict(pr.get("head"))
         return ParsedEvent(
             event_type=inferred,
             pr_number=_safe_int(pr.get("number")),
-            head_sha=_safe_str((pr.get("head") or {}).get("sha")),
+            head_sha=_safe_str(head.get("sha")),
         )
     if inferred == "issue_comment":
-        issue = event.get("issue") or {}
+        issue = _as_dict(event.get("issue"))
         pr_link = issue.get("pull_request")
         pr_number = _safe_int(issue.get("number")) if pr_link else None
         return ParsedEvent(event_type=inferred, pr_number=pr_number, head_sha=None)
     if inferred == "check_run":
-        cr = event.get("check_run") or {}
-        prs = cr.get("pull_requests") or []
-        first = prs[0] if prs else {}
+        cr = _as_dict(event.get("check_run"))
+        first = _first_dict(cr.get("pull_requests"))
         return ParsedEvent(
             event_type=inferred,
             pr_number=_safe_int(first.get("number")),
             head_sha=_safe_str(cr.get("head_sha")),
         )
     if inferred == "check_suite":
-        cs = event.get("check_suite") or {}
-        prs = cs.get("pull_requests") or []
-        first = prs[0] if prs else {}
+        cs = _as_dict(event.get("check_suite"))
+        first = _first_dict(cs.get("pull_requests"))
         return ParsedEvent(
             event_type=inferred,
             pr_number=_safe_int(first.get("number")),
@@ -140,7 +139,7 @@ def parse_event(event: Any, *, event_name: str | None = None) -> ParsedEvent:
             head_sha=_safe_str(event.get("sha")),
         )
     if inferred == "workflow_dispatch":
-        inputs = event.get("inputs") or {}
+        inputs = _as_dict(event.get("inputs"))
         raw = inputs.get("pr")
         pr_number: int | None
         try:
@@ -156,9 +155,9 @@ def _infer_event_name(event: dict[str, Any]) -> str:
         return "check_run"
     if "check_suite" in event:
         return "check_suite"
-    if "inputs" in event and (event["inputs"] or {}).get("pr") is not None:
+    if "inputs" in event and _as_dict(event.get("inputs")).get("pr") is not None:
         return "workflow_dispatch"
-    if "issue" in event and "pull_request" in (event.get("issue") or {}):
+    if "issue" in event and "pull_request" in _as_dict(event.get("issue")):
         return "issue_comment"
     if "review" in event and "pull_request" in event:
         return "pull_request_review"
@@ -167,6 +166,26 @@ def _infer_event_name(event: dict[str, Any]) -> str:
     if "sha" in event and "state" in event:
         return "status"
     return "unknown"
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Return ``value`` if it is a dict, else an empty dict.
+
+    GitHub event payloads are normally well-formed, but a malformed or mocked
+    payload could carry a non-dict where we expect a nested object (e.g.
+    ``inputs`` as a string). Coercing to ``{}`` lets the ``.get()`` chains
+    below stay total instead of raising ``AttributeError``.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _first_dict(value: Any) -> dict[str, Any]:
+    """Return the first element of ``value`` if it is a non-empty list of
+    dicts, else an empty dict. Guards the ``pull_requests[0]`` access in
+    ``check_run``/``check_suite`` payloads."""
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        return value[0]
+    return {}
 
 
 def _safe_int(value: Any) -> int | None:
@@ -236,6 +255,12 @@ class Runner:
         # blocker.
         if ctx.git is not None and state.commits_made:
             try:
+                # Guard before touching git: an empty head_ref would make
+                # fetch_remote_head/push operate on a bogus ref. Raise so the
+                # except-clause below routes to a terminal needs_human instead
+                # of issuing git commands against the base branch or "".
+                if not gh_pr.head_ref:
+                    raise ValueError(f"Cannot push: head_ref is empty for PR #{pr_number}")
                 local_head = ctx.git.get_head_sha()
                 if local_head == state.commits_made[-1]:
                     remote_head = ctx.git.fetch_remote_head(gh_pr.head_ref)
@@ -451,8 +476,14 @@ class Runner:
                     remote_head_unverified = True
 
         if state.status == "ci_wait":
+            # Merge the Checks API and the legacy Statuses API: required checks
+            # that report via commit statuses (the same path a ``status``
+            # webhook resumes from) never appear in get_check_runs, so without
+            # this the gate would see an empty check set and sit in ci_wait
+            # until timeout despite the status having reported.
             raw_checks = ctx.github.get_check_runs(state.head_sha)
-            checks = [_convert_check_run(cr, state.head_sha) for cr in raw_checks]
+            raw_statuses = ctx.github.get_commit_statuses(state.head_sha)
+            checks = [_convert_check_run(cr, state.head_sha) for cr in (*raw_checks, *raw_statuses)]
 
         return TransitionSnapshot(
             pr=pr,
@@ -869,12 +900,23 @@ def _convert_check_run(cr: gh_models.CheckRun, head_sha: str) -> CheckRun:
 def _build_final_summary(state: RuntimeState, payload: dict[str, Any]) -> str:
     reason = payload.get("reason") or state.done_reason or state.last_error or "completed"
     cost = state.cost
-    return (
+    summary = (
         f"AI PR Orchestrator: status `{state.status}` — reason: `{reason}`. "
         f"Coder invocations: {cost.coder_invocations}, "
         f"reviewer triggers: {cost.reviewer_triggers}, "
         f"tokens: {cost.input_tokens + cost.output_tokens}."
     )
+    # Notify the configured handles for needs_human/error outcomes. The state
+    # machine resolves the right list (mention_on_needs_human vs
+    # mention_on_error) into the action payload; we just render them. Each
+    # handle is normalized to a leading "@" so a config of either "foo" or
+    # "@foo" produces a valid mention.
+    mentions = payload.get("mentions")
+    if isinstance(mentions, list) and mentions:
+        handles = " ".join(f"@{m.lstrip('@')}" for m in mentions if isinstance(m, str) and m)
+        if handles:
+            summary = f"{summary}\n\ncc: {handles}"
+    return summary
 
 
 # ---- CLI entry points ----

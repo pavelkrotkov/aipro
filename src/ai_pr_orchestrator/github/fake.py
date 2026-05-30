@@ -81,9 +81,12 @@ class FakeGitHubClient:
         self._labels: dict[int, list[str]] = {}
         self._threads: dict[str, _MutableThread] = {}
         self._check_runs: dict[str, list[_MutableCheckRun]] = {}
+        self._commit_statuses: dict[str, list[models.CheckRun]] = {}
+        self._reviews: dict[int, list[models.Review]] = {}
         self._next_comment_id = 1
         self._next_check_run_id = 1
         self._next_review_comment_id = 1
+        self._next_review_id = 1
 
     def _tick(self) -> datetime:
         """Advance internal clock by 1 second and return the new time."""
@@ -165,6 +168,41 @@ class FakeGitHubClient:
         self._check_runs.setdefault(ref, []).append(mcr)
         return mcr.to_model()
 
+    def seed_commit_status(
+        self,
+        ref: str,
+        context: str,
+        status: str,
+        conclusion: str | None = None,
+    ) -> models.CheckRun:
+        """Seed a Statuses-API context already adapted to CheckRun shape, as
+        ``get_commit_statuses`` returns it to the runner."""
+        cr = models.CheckRun(
+            id=abs(hash(context)), name=context, status=status, conclusion=conclusion
+        )
+        self._commit_statuses.setdefault(ref, []).append(cr)
+        return cr
+
+    def seed_review(
+        self,
+        pr_number: int,
+        *,
+        author: str,
+        body: str = "",
+        state: str = "COMMENTED",
+        submitted_at: datetime | None = None,
+    ) -> models.Review:
+        review = models.Review(
+            id=self._next_review_id,
+            author=author,
+            body=body,
+            state=state,
+            submitted_at=(submitted_at or self._now).isoformat(),
+        )
+        self._next_review_id += 1
+        self._reviews.setdefault(pr_number, []).append(review)
+        return review
+
     # --- Protocol implementation ---
 
     def get_pr(self, number: int) -> models.PullRequest:
@@ -239,6 +277,12 @@ class FakeGitHubClient:
 
     def get_check_runs(self, ref: str) -> list[models.CheckRun]:
         return [mcr.to_model() for mcr in self._check_runs.get(ref, [])]
+
+    def get_commit_statuses(self, ref: str) -> list[models.CheckRun]:
+        return list(self._commit_statuses.get(ref, []))
+
+    def get_pull_request_reviews(self, pr_number: int) -> list[models.Review]:
+        return list(self._reviews.get(pr_number, []))
 
     def get_review_threads(self, pr_number: int) -> list[models.ReviewThread]:
         return [mt.to_model() for mt in self._threads.values() if mt.pr_number == pr_number]

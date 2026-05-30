@@ -473,3 +473,50 @@ def test_collect_findings_only_first_comment_per_thread() -> None:
     assert len(findings) == 1
     assert findings[0].comment_id == "RC_first"
     assert findings[0].body == "First bot comment"
+
+
+def test_has_responded_true_for_zero_finding_pull_request_review() -> None:
+    """A reviewer can finish with zero inline findings by submitting a review
+    body (a ``pull_request_review``) with no thread/issue comment. That must
+    count as a response so the runner completes ``no_findings`` instead of
+    timing out."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author=BOT_LOGIN,
+        body="Looks good, no issues found.",
+        state="COMMENTED",
+        submitted_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
+
+
+def test_has_responded_true_for_empty_body_review() -> None:
+    """An APPROVED review with an empty body still counts as a response."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author=BOT_LOGIN,
+        body="",
+        state="APPROVED",
+        submitted_at=datetime(2025, 6, 1, 12, 5, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is True
+
+
+def test_has_responded_false_for_review_before_trigger() -> None:
+    """A review submitted before the trigger must not count."""
+    client = FakeGitHubClient(now=NOW)
+    client.seed_review(
+        PR_NUMBER,
+        author=BOT_LOGIN,
+        body="old review",
+        submitted_at=datetime(2025, 6, 1, 11, 0, 0, tzinfo=UTC),
+    )
+    adapter = _make_adapter(client)
+
+    assert adapter.has_responded(PR_NUMBER, datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)) is False

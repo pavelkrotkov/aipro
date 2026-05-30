@@ -96,3 +96,35 @@ def test_issue_comment_without_pr_link_returns_no_pr_number() -> None:
     event = {"issue": {"number": 99}, "comment": {"body": "hi"}}
     parsed = parse_event(event, event_name="issue_comment")
     assert parsed.pr_number is None
+
+
+# --- Defensive parsing: malformed nested payloads must not raise ---
+
+
+def test_parse_pull_request_with_non_dict_nested_objects() -> None:
+    # ``pull_request``/``head`` arriving as non-dicts must coerce to empty
+    # rather than raising AttributeError.
+    event = {"pull_request": "oops", "head": ["nope"]}
+    parsed = parse_event(event, event_name="pull_request")
+    assert parsed.event_type == "pull_request"
+    assert parsed.pr_number is None
+    assert parsed.head_sha is None
+
+
+def test_parse_check_run_with_non_list_pull_requests() -> None:
+    event = {"check_run": {"head_sha": "deadbeef", "pull_requests": "not-a-list"}}
+    parsed = parse_event(event, event_name="check_run")
+    assert parsed.head_sha == "deadbeef"
+    assert parsed.pr_number is None
+
+
+def test_parse_workflow_dispatch_with_non_dict_inputs_does_not_raise() -> None:
+    event = {"inputs": "not-a-dict"}
+    parsed = parse_event(event, event_name="workflow_dispatch")
+    assert parsed.pr_number is None
+
+
+def test_infer_event_name_with_non_dict_inputs_does_not_raise() -> None:
+    # Inference must not crash on a non-dict ``inputs``/``issue``.
+    parsed = parse_event({"inputs": "x", "issue": 5})
+    assert parsed.event_type == "unknown"

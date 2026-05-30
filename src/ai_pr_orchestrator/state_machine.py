@@ -440,7 +440,11 @@ def _cost_limit_transition(
         (
             PlannedAction(
                 "post_final_summary",
-                {"reason": "cost_limit_reached", "cost": state.cost.to_dict()},
+                {
+                    "reason": "cost_limit_reached",
+                    "cost": state.cost.to_dict(),
+                    "mentions": list(config.notifications.mention_on_needs_human),
+                },
             )
             if action.type == "post_final_summary"
             else action
@@ -508,12 +512,24 @@ def _terminal_actions(state: RuntimeState, config: Config) -> list[PlannedAction
         ]
     if state.status == "needs_human":
         return [
-            PlannedAction("post_final_summary", {"reason": state.last_error}),
+            PlannedAction(
+                "post_final_summary",
+                {
+                    "reason": state.last_error,
+                    "mentions": list(config.notifications.mention_on_needs_human),
+                },
+            ),
             PlannedAction("add_label", {"label": config.error_label}),
         ]
     if state.status == "error":
         return [
-            PlannedAction("post_final_summary", {"reason": state.last_error}),
+            PlannedAction(
+                "post_final_summary",
+                {
+                    "reason": state.last_error,
+                    "mentions": list(config.notifications.mention_on_error),
+                },
+            ),
             PlannedAction("add_label", {"label": config.error_label}),
         ]
     return []

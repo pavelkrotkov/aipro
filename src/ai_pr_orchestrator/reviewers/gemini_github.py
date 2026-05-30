@@ -82,11 +82,15 @@ class GeminiGitHubReviewerAdapter:
         return findings
 
     def has_responded(self, pr_number: int, trigger_timestamp: datetime) -> bool:
-        """Return True if the bot has posted any comment after the trigger.
+        """Return True if the bot has responded after the trigger.
 
-        Looks at both review-thread comments and top-level PR (issue)
-        comments. The orchestrator's own machine-marker comments are skipped
-        so that the trigger itself does not count as a response.
+        Looks at review-thread comments, top-level PR (issue) comments, and
+        submitted PR reviews. The review body matters because a reviewer can
+        finish with zero inline findings by submitting a ``pull_request_review``
+        without creating any thread or issue comment; without counting it the
+        runner would time out instead of completing ``no_findings``. The
+        orchestrator's own machine-marker comments are skipped so that the
+        trigger itself does not count as a response.
         """
         for author, body, created_at_str in self._iter_bot_candidates(pr_number):
             if not self.matches_author(author):
@@ -103,9 +107,13 @@ class GeminiGitHubReviewerAdapter:
         return False
 
     def _iter_bot_candidates(self, pr_number: int) -> Iterable[tuple[str, str, str]]:
-        """Yield (author, body, created_at) tuples from all comment sources."""
+        """Yield (author, body, created_at) tuples from all response sources."""
         for thread in self.github.get_review_threads(pr_number):
             for comment in thread.comments:
                 yield comment.author, comment.body, comment.created_at
         for pr_comment in self.github.get_pr_comments(pr_number):
             yield pr_comment.user, pr_comment.body, pr_comment.created_at
+        for review in self.github.get_pull_request_reviews(pr_number):
+            # A review's body may be empty (e.g. an APPROVED review with no
+            # text); it still counts as the reviewer having responded.
+            yield review.author, review.body, review.submitted_at

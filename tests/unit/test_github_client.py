@@ -342,6 +342,61 @@ def test_get_check_runs() -> None:
     assert runs[0].conclusion == "success"
 
 
+@respx.mock
+def test_get_commit_statuses_maps_states_and_dedups() -> None:
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/commits/abc123/statuses").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                # Newest-first: the latest "ci/jenkins" entry (success) wins.
+                {"context": "ci/jenkins", "state": "success", "target_url": "https://x"},
+                {"context": "ci/jenkins", "state": "pending", "target_url": "https://x"},
+                {"context": "lint", "state": "failure"},
+                {"context": "build", "state": "pending"},
+            ],
+        )
+    )
+    with _make_client() as client:
+        statuses = client.get_commit_statuses("abc123")
+
+    assert route.called
+    by_name = {s.name: s for s in statuses}
+    assert set(by_name) == {"ci/jenkins", "lint", "build"}
+    assert by_name["ci/jenkins"].status == "completed"
+    assert by_name["ci/jenkins"].conclusion == "success"
+    assert by_name["lint"].conclusion == "failure"
+    assert by_name["build"].status == "in_progress"
+    assert by_name["build"].conclusion is None
+
+
+@respx.mock
+def test_get_pull_request_reviews() -> None:
+    route = respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42/reviews").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 5,
+                    "user": {"login": "gemini-code-assist[bot]"},
+                    "body": "No issues found.",
+                    "state": "COMMENTED",
+                    "submitted_at": "2025-06-01T12:05:00Z",
+                },
+                {"id": 6, "user": None, "body": None, "state": "APPROVED"},
+            ],
+        )
+    )
+    with _make_client() as client:
+        reviews = client.get_pull_request_reviews(42)
+
+    assert route.called
+    assert len(reviews) == 2
+    assert reviews[0].author == "gemini-code-assist[bot]"
+    assert reviews[0].body == "No issues found."
+    assert reviews[1].author == "ghost"
+    assert reviews[1].body == ""
+
+
 # --- GraphQL: get_review_threads ---
 
 

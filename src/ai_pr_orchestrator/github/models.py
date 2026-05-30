@@ -57,3 +57,17 @@ class ReviewThread:
     is_outdated: bool
     path: str
     comments: list[ReviewComment] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Review:
+    """A submitted pull request review (the review *summary*, distinct from the
+    inline review-thread comments). A reviewer can finish with zero inline
+    findings by submitting a review body, so this is a first-class response
+    signal alongside comments."""
+
+    id: int
+    author: str
+    body: str
+    state: str
+    submitted_at: str

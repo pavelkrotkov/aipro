@@ -177,6 +177,67 @@ class GitHubClient:
             for cr in data
         ]
 
+    def get_commit_statuses(self, ref: str) -> list[models.CheckRun]:
+        """Fetch legacy commit-status contexts and adapt them to CheckRun shape.
+
+        Required checks that report via the Statuses API (rather than the
+        Checks API) never appear in ``get_check_runs``. The orchestrator's CI
+        gate consumes ``CheckRun``s, so each status context is mapped to one:
+        ``state`` becomes the equivalent check ``status``/``conclusion``
+        (``pending`` -> still-running, ``success`` -> passing, ``failure``/
+        ``error`` -> failing). Status contexts have no numeric id, so ``id`` is
+        a stable hash of the context name.
+        """
+        data = self._get_paginated(
+            f"/repos/{self._owner}/{self._repo}/commits/{quote(ref, safe='')}/statuses",
+            items_key=None,
+        )
+        # The statuses endpoint returns newest-first and may list the same
+        # context multiple times (one per update). Keep only the first (latest)
+        # entry per context so the CI gate sees each context once.
+        latest_by_context: dict[str, dict[str, Any]] = {}
+        for status in data:
+            context = status.get("context")
+            if isinstance(context, str) and context not in latest_by_context:
+                latest_by_context[context] = status
+        runs: list[models.CheckRun] = []
+        for context, status in latest_by_context.items():
+            state = status.get("state")
+            if state in ("success", "failure", "error"):
+                check_status = "completed"
+                conclusion = "success" if state == "success" else "failure"
+            else:
+                # "pending" (or any unknown state) => not yet conclusive.
+                check_status = "in_progress"
+                conclusion = None
+            runs.append(
+                models.CheckRun(
+                    id=abs(hash(context)),
+                    name=context,
+                    status=check_status,
+                    conclusion=conclusion,
+                    html_url=status.get("target_url") or "",
+                )
+            )
+        return runs
+
+    def get_pull_request_reviews(self, pr_number: int) -> list[models.Review]:
+        data = self._get_paginated(
+            f"/repos/{self._owner}/{self._repo}/pulls/{pr_number}/reviews",
+            items_key=None,
+        )
+        return [
+            models.Review(
+                id=review["id"],
+                author=(review.get("user") or {}).get("login", "ghost"),
+                body=review.get("body") or "",
+                state=review.get("state") or "",
+                submitted_at=review.get("submitted_at") or "",
+            )
+            for review in data
+            if isinstance(review, dict) and "id" in review
+        ]
+
     # --- GraphQL API ---
 
     def get_review_threads(self, pr_number: int) -> list[models.ReviewThread]:
