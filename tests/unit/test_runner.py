@@ -486,18 +486,21 @@ def test_post_pr_comment_uses_adapter_for_reviewer_trigger(
     assert all(b != "RAW" for b in bodies)
 
 
-def test_post_pr_comment_uses_raw_body_for_unknown_reviewer(
+def test_post_pr_comment_fails_fast_for_unknown_reviewer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from ai_pr_orchestrator.models import PlannedAction
 
-    # A ``reviewer`` that isn't wired into ctx.reviewers falls back to the raw
-    # body rather than crashing.
+    # A reviewer-trigger action whose ``reviewer`` isn't wired into
+    # ctx.reviewers must NOT post the raw body: doing so would wake the external
+    # reviewer while the next polling phase can't collect its findings. The
+    # handler raises; Runner.run's crash handler returns 1 and no trigger
+    # comment is posted.
     actions = [PlannedAction("post_pr_comment", {"body": "RAW", "reviewer": "ghost"})]
     gh, _git, _coder, ctx = _setup_action_test(monkeypatch, actions)
-    Runner(ctx).run(1)
+    assert Runner(ctx).run(1) == 1
     bodies = [c.body for c in gh.get_pr_comments(1)]
-    assert any(b == "RAW" for b in bodies)
+    assert all(b != "RAW" for b in bodies)
 
 
 def test_update_status_comment_action(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2140,3 +2143,122 @@ def test_save_state_uses_targeted_get_comment(monkeypatch: pytest.MonkeyPatch) -
 
     # The save after the transition must have fetched the state comment by id.
     assert get_comment_calls["n"] >= 1
+
+
+# ----- Round 13: fork-block label gating, post-edit conflict detection, trigger fail-fast -----
+
+
+def test_fork_pr_not_blocked_when_unlabeled_and_labels_required() -> None:
+    """With only_run_on_labeled_prs=True, an unlabeled fork PR must be a no-op:
+    the orchestrator was never enabled for it, so the fork hard-block must not
+    fire (no needs_human summary, no ai-loop-error label)."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = gh_models.PullRequest(
+        number=1,
+        title="Unlabeled fork PR",
+        body="",
+        state="open",
+        head_sha="head-1",
+        head_ref="contributor-branch",
+        base_ref="main",
+        author="outsider",
+        is_fork=True,
+        labels=[],
+        author_association="OWNER",
+    )
+    gh.seed_pr(pr)
+    git = FakeGitRepo(head_sha=pr.head_sha)
+    ctx = build_ctx(
+        gh=gh,
+        git=git,
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=True,
+                disallow_forks=False,
+                disallow_workflow_file_changes=False,
+            )
+        ),
+    )
+    # The label-removed transition handles the unlabeled case (done/label_removed);
+    # crucially the fork block did not fire, so no needs_human/fork error.
+    assert Runner(ctx).run(pr.number) == 0
+    assert git.push_count == 0
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in gh.get_pr_comments(pr.number)])
+    assert sc is not None
+    assert sc.state.last_error != "fork_pr_push_unsupported"
+    assert "ai-loop-error" not in gh.get_pr(pr.number).labels
+
+
+def test_fork_pr_blocked_when_labeled_and_labels_required() -> None:
+    """A *labeled* fork PR with labels required still hits the fork hard-block."""
+    gh = FakeGitHubClient(now=NOW)
+    pr = gh_models.PullRequest(
+        number=1,
+        title="Labeled fork PR",
+        body="",
+        state="open",
+        head_sha="head-1",
+        head_ref="contributor-branch",
+        base_ref="main",
+        author="outsider",
+        is_fork=True,
+        labels=["ai-loop"],
+        author_association="OWNER",
+    )
+    gh.seed_pr(pr)
+    state = initial_state(status="init", round_index=0, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    git = FakeGitRepo(head_sha=pr.head_sha)
+    ctx = build_ctx(
+        gh=gh,
+        git=git,
+        config=make_config(
+            safety=SafetyConfig(
+                only_run_on_labeled_prs=True,
+                disallow_forks=False,
+                disallow_workflow_file_changes=False,
+            )
+        ),
+    )
+    assert Runner(ctx).run(pr.number) == 0
+    assert git.push_count == 0
+    sc = find_state_comment([{"id": c.id, "body": c.body} for c in gh.get_pr_comments(pr.number)])
+    assert sc is not None
+    assert sc.state.status == "needs_human"
+    assert sc.state.last_error == "fork_pr_push_unsupported"
+
+
+def test_save_state_detects_concurrent_overwrite(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If a concurrent runner overwrites the state comment in the window between
+    our pre-edit fetch and our edit, the post-edit re-read must detect that our
+    write didn't land and raise StateConflictError (surfaced as a clean exit)."""
+    from ai_pr_orchestrator.state_storage import StateConflictError
+
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="init", round_index=1, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    runner = Runner(ctx_from := build_ctx(gh=gh))
+    # Prime the runner's cached comment id + lock by loading once.
+    loaded = runner._load_or_init_state(pr.number, gh.get_pr(pr.number))
+
+    # Simulate a foreign edit landing *after* our edit_comment: make get_comment
+    # (used by the post-edit verify) return a comment whose state has a
+    # different updated_at than what we wrote.
+    foreign = replace(loaded, status="waiting", updated_at=NOW + timedelta(hours=1))
+
+    real_edit = gh.edit_comment
+
+    def edit_then_foreign(comment_id: int, body: str) -> Any:
+        result = real_edit(comment_id, body)
+        # After our write, a concurrent runner clobbers it (use the captured
+        # real edit, not the patched gh.edit_comment, to avoid recursing).
+        real_edit(comment_id, serialize_state_comment(foreign))
+        return result
+
+    monkeypatch.setattr(gh, "edit_comment", edit_then_foreign)
+
+    with pytest.raises(StateConflictError):
+        runner._save_state(pr.number, replace(loaded, status="triggering", updated_at=NOW))
+    _ = ctx_from

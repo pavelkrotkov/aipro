@@ -155,9 +155,19 @@ def _state_json(state: RuntimeState) -> str:
     )
 
 
-def _lock_timestamp(dt: datetime) -> datetime:
+def lock_timestamp(dt: datetime) -> datetime:
+    """Normalize an ``updated_at`` to UTC for optimistic-lock comparisons.
+
+    Public so callers performing their own lock checks (e.g. the runner's
+    post-edit re-read verification) compare timestamps the same way
+    ``prepare_state_comment_update`` does.
+    """
     if dt.tzinfo is None or dt.utcoffset() is None:
         # RuntimeState deserialization treats naive timestamps as UTC; keep the lock input
         # contract aligned for callers that pass a previously parsed updated_at value.
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
+
+
+# Backwards-compatible internal alias.
+_lock_timestamp = lock_timestamp

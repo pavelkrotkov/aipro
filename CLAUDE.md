@@ -29,3 +29,28 @@ gh api graphql -f query='
     mutation { resolveReviewThread(input:{threadId:"{}"})
                { thread { id isResolved } } }'
 ```
+
+## RuntimeState concurrency: serialize runner jobs per PR
+
+The orchestrator persists `RuntimeState` in a single hidden PR comment and
+guards concurrent writers with an **optimistic lock** on `updated_at`
+(`_save_state` checks the expected `updated_at` before editing, and re-reads
+after editing to confirm our write landed — raising `StateConflictError` if a
+concurrent runner clobbered it). This is best-effort: GitHub's issue-comment
+`PATCH` has **no conditional/If-Match support**, so the read-then-PATCH window
+cannot be closed at the API level — two runners racing within that window can
+still interleave, and the re-read only *detects* it after the fact.
+
+**The real fix is deployment-level:** run the orchestrator workflow under a
+GitHub Actions [`concurrency:`](https://docs.github.com/actions/using-jobs/using-concurrency)
+group keyed by PR number so only one runner job is in flight per PR at a time,
+e.g.
+
+```yaml
+concurrency:
+  group: ai-pr-orchestrator-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+```
+
+With that group in place the optimistic lock + re-read is a backstop, not the
+primary serialization mechanism.

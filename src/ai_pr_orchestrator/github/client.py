@@ -124,7 +124,7 @@ class GitHubClient:
             author=(data.get("user") or {}).get("login", "ghost"),
             draft=data.get("draft", False),
             mergeable=data.get("mergeable"),
-            labels=[label["name"] for label in data.get("labels", [])],
+            labels=[label["name"] for label in (data.get("labels") or [])],
             is_fork=is_fork,
             changed_files=changed_files,
             author_association=data.get("author_association") or "",

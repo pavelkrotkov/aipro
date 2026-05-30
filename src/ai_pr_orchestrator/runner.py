@@ -44,6 +44,7 @@ from ai_pr_orchestrator.state_storage import (
     StateComment,
     StateConflictError,
     find_state_comment,
+    lock_timestamp,
     prepare_state_comment_update,
     serialize_state_comment,
 )
@@ -263,7 +264,18 @@ class Runner:
         # distinct from ``safety.disallow_forks``, which errors out forks
         # entirely; here forks were explicitly allowed for review but still
         # can't be pushed to.
-        if ctx.git is not None and gh_pr.is_fork:
+        #
+        # Only fire when the orchestrator is actually enabled for this PR. With
+        # the default ``only_run_on_labeled_prs=True``, a webhook for an
+        # *unlabeled* fork PR must be a no-op — posting a ``needs_human`` summary
+        # and adding ``ai-loop-error`` for a PR we were never enabled on would
+        # be noise. When ``only_run_on_labeled_prs`` is False, every PR is in
+        # scope so the gate is vacuously satisfied.
+        orchestrator_enabled = (
+            not ctx.config.safety.only_run_on_labeled_prs
+            or ctx.config.enabled_label in gh_pr.labels
+        )
+        if ctx.git is not None and gh_pr.is_fork and orchestrator_enabled:
             logger.warning(
                 "Fork PR #%s cannot be pushed to (fork remotes unsupported); needs_human",
                 pr_number,
@@ -465,6 +477,29 @@ class Runner:
         expected = self._state_expected_updated_at or existing.state.updated_at
         prepared = prepare_state_comment_update(existing, state, expected_updated_at=expected)
         self._ctx.github.edit_comment(self._state_comment_id, prepared.body)
+
+        # Read-then-PATCH leaves a TOCTOU window: another runner could have
+        # edited the comment between our _fetch_current_state_comment above and
+        # this edit_comment, and GitHub's issue-comment PATCH has no conditional
+        # (If-Match/ETag) support, so the write can't be a true compare-and-swap
+        # at the API level. Re-read and confirm our write actually landed (the
+        # comment now carries the updated_at we just wrote). If it doesn't, a
+        # concurrent runner clobbered us in the window — raise StateConflictError
+        # so the run bails cleanly instead of proceeding on a state GitHub no
+        # longer reflects. Real serialization should come from a GitHub Actions
+        # ``concurrency:`` group keyed by PR number (see CLAUDE.md); this check
+        # is the best-effort detection of the residual window.
+        verify = self._ctx.github.get_comment(self._state_comment_id)
+        if verify is not None:
+            verify_sc = find_state_comment([{"id": verify.id, "body": verify.body}])
+            if verify_sc is not None and lock_timestamp(
+                verify_sc.state.updated_at
+            ) != lock_timestamp(state.updated_at):
+                raise StateConflictError(
+                    "RuntimeState comment was overwritten by another process during save: "
+                    f"expected updated_at {state.updated_at.isoformat()}, "
+                    f"found {verify_sc.state.updated_at.isoformat()}"
+                )
         self._state_expected_updated_at = state.updated_at
 
     def _fetch_current_state_comment(self, pr_number: int) -> StateComment | None:
@@ -807,8 +842,19 @@ class Runner:
             # All other post_pr_comment actions (e.g. plain PR replies) keep the
             # raw-body path.
             reviewer_name = payload.get("reviewer")
-            adapter = ctx.reviewers.get(reviewer_name) if isinstance(reviewer_name, str) else None
-            if adapter is not None:
+            if isinstance(reviewer_name, str):
+                adapter = ctx.reviewers.get(reviewer_name)
+                if adapter is None:
+                    # Fail fast: posting the raw trigger body would still wake
+                    # the external reviewer, but the very next polling phase
+                    # can't collect its findings (no adapter) and would dead-end
+                    # in missing_reviewer_adapter. Refuse to trigger a reviewer
+                    # we can't follow up on, and let the run crash-handler /
+                    # _poll_reviewers surface needs_human consistently.
+                    raise ValueError(
+                        f"Cannot post trigger for reviewer '{reviewer_name}': "
+                        "no adapter registered in ctx.reviewers"
+                    )
                 body = adapter.build_trigger_comment(state.round_index, gh_pr.head_sha)
             else:
                 body = str(payload.get("body", ""))
