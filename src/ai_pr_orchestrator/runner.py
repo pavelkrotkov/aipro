@@ -23,6 +23,13 @@ from ai_pr_orchestrator.config import Config, load_config
 from ai_pr_orchestrator.git.repo import GitRepo
 from ai_pr_orchestrator.github import models as gh_models
 from ai_pr_orchestrator.github.protocol import GitHubClient
+from ai_pr_orchestrator.logging import (
+    collect_secret_values,
+    log_action,
+    log_error,
+    log_state_transition,
+    setup_logging,
+)
 from ai_pr_orchestrator.models import (
     AgentRunResult,
     CheckRun,
@@ -83,6 +90,11 @@ class RunnerContext:
     git: GitRepo | None = None
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
     sleeper: Callable[[float], None] = field(default=time.sleep)
+    # When True the runner plans a single transition and reports the actions it
+    # *would* take without performing any GitHub or git mutation. The GitHub
+    # client should also be constructed in dry-run mode (defense in depth), and
+    # ``git`` should be ``None`` so no commit/push path is reachable.
+    dry_run: bool = False
 
 
 def parse_event(event: Any, *, event_name: str | None = None) -> ParsedEvent:
@@ -235,8 +247,8 @@ class Runner:
                 "State conflict on PR #%s; another runner advanced state first", pr_number
             )
             return 0
-        except Exception:
-            logger.exception("Runner crashed for PR #%s", pr_number)
+        except Exception as exc:
+            log_error(logger, error=f"Runner crashed for PR #{pr_number}: {exc}", pr=pr_number)
             return 1
 
     def _run(self, pr_number: int, event: ParsedEvent | None) -> int:
@@ -250,6 +262,14 @@ class Runner:
         # no-op rather than another full pass with redundant get_pr calls.
         if state.status in TERMINAL_STATUSES:
             return 0
+
+        # Dry-run: plan a single transition from the loaded state and report the
+        # actions that would fire, performing zero mutations. We branch here —
+        # before the fork hard-block, push recovery, and the transition loop —
+        # because those paths exist to *drive* side effects (push, label, final
+        # summary) that dry-run must not perform.
+        if ctx.dry_run:
+            return self._plan_dry_run(pr_number, gh_pr, state, event)
 
         # Fork hard-block: when git is wired (the commit/push path is live) we
         # cannot safely handle a fork PR. ``gh_pr.head_ref`` is just the branch
@@ -396,6 +416,7 @@ class Runner:
                     # check_run/check_suite event wake us back up.
                     self._save_state(pr_number, next_state)
                     return 0
+                self._log_transition(state, next_state)
                 state = self._execute_actions(actions, pr_number, gh_pr, next_state)
                 self._save_state(pr_number, state)
                 continue
@@ -405,6 +426,7 @@ class Runner:
             # Clear the cached coder result once the transition has consumed it
             # so a subsequent transition in the same run doesn't see a stale one.
             self._pending_coder_result = None
+            self._log_transition(state, next_state)
             state = self._execute_actions(actions, pr_number, gh_pr, next_state)
             self._save_state(pr_number, state)
 
@@ -427,6 +449,46 @@ class Runner:
         self._save_state(pr_number, state)
         return 1
 
+    # ---- Dry-run planning ----
+
+    def _plan_dry_run(
+        self,
+        pr_number: int,
+        gh_pr: gh_models.PullRequest,
+        state: RuntimeState,
+        event: ParsedEvent | None,
+    ) -> int:
+        """Plan one transition and print the actions that would fire.
+
+        Reads (PR, threads, checks) happen normally via ``_build_snapshot``;
+        nothing is committed, pushed, posted, edited, labeled, or resolved.
+        Always returns 0 — a dry-run is a successful inspection regardless of
+        what state the PR is in.
+        """
+        ctx = self._ctx
+        snapshot = self._build_snapshot(state, gh_pr, event=event)
+        next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
+        self._log_transition(state, next_state)
+        print(
+            f"DRY-RUN PR #{pr_number}: status {state.status!r} -> {next_state.status!r}; "
+            f"{len(actions)} action(s) planned"
+        )
+        for action in actions:
+            log_action(logger, pr=pr_number, action_type=action.type)
+            print(f"  - {_describe_action(action)}")
+        return 0
+
+    def _log_transition(self, previous: RuntimeState, nxt: RuntimeState) -> None:
+        """Emit a structured ``state_transition`` log when the status changes."""
+        if previous.status != nxt.status:
+            log_state_transition(
+                logger,
+                pr=nxt.pr_number,
+                from_status=previous.status,
+                to_status=nxt.status,
+                head_sha=nxt.head_sha,
+            )
+
     # ---- State loading / saving ----
 
     def _load_or_init_state(self, pr_number: int, gh_pr: gh_models.PullRequest) -> RuntimeState:
@@ -446,12 +508,22 @@ class Runner:
             created_at=now,
             updated_at=now,
         )
+        if self._ctx.dry_run:
+            # Posting the initial state comment is a mutation; in dry-run we
+            # return the in-memory init state without persisting it.
+            self._state_expected_updated_at = state.updated_at
+            return state
         posted = self._ctx.github.post_comment(pr_number, serialize_state_comment(state))
         self._state_comment_id = posted.id
         self._state_expected_updated_at = state.updated_at
         return state
 
     def _save_state(self, pr_number: int, state: RuntimeState) -> None:
+        # Dry-run performs zero mutations: persisting state would post or edit a
+        # PR comment. The single-pass planner never calls this, but guard here
+        # too so any future dry-run code path stays mutation-free.
+        if self._ctx.dry_run:
+            return
         # Fresh PRs without a state comment yet: post once, record id+lock.
         if self._state_comment_id is None:
             body = serialize_state_comment(state)
@@ -817,6 +889,7 @@ class Runner:
         state: RuntimeState,
     ) -> RuntimeState:
         for action in actions:
+            log_action(logger, pr=pr_number, action_type=action.type)
             state = self._execute_action(action, pr_number, gh_pr, state)
         return state
 
@@ -1076,6 +1149,42 @@ def _convert_check_run(cr: gh_models.CheckRun, head_sha: str) -> CheckRun:
     )
 
 
+def _describe_action(action: PlannedAction) -> str:
+    """Render a planned action as a human-readable ``would ...`` line for dry-run."""
+    kind = action.type
+    payload = action.payload
+    if kind == "noop":
+        reason = payload.get("reason")
+        return f"would do nothing (noop: {reason})" if reason else "would do nothing (noop)"
+    if kind == "post_pr_comment":
+        reviewer = payload.get("reviewer")
+        if isinstance(reviewer, str):
+            return f"would post a comment triggering reviewer {reviewer!r}"
+        return "would post a PR comment"
+    if kind == "post_final_summary":
+        return "would post the final summary comment"
+    if kind == "update_status_comment":
+        return "would update the hidden status comment"
+    if kind == "reply_to_thread":
+        return f"would reply to review thread {payload.get('thread_id')}"
+    if kind == "resolve_thread":
+        return f"would resolve review thread {payload.get('thread_id')}"
+    if kind == "add_label":
+        return f"would add label {payload.get('label')!r}"
+    if kind == "remove_label":
+        return f"would remove label {payload.get('label')!r}"
+    if kind == "commit_changes":
+        return "would commit working-tree changes"
+    if kind == "push_branch":
+        return "would push the branch to origin"
+    if kind == "rollback_changes":
+        return "would roll back working-tree changes"
+    if kind == "invoke_coder":
+        finding_ids = payload.get("finding_ids") or []
+        return f"would invoke the coder on {len(finding_ids)} finding(s)"
+    return f"would execute action {kind!r}"
+
+
 def _build_final_summary(state: RuntimeState, payload: dict[str, Any]) -> str:
     reason = payload.get("reason") or state.done_reason or state.last_error or "completed"
     cost = state.cost
@@ -1105,12 +1214,9 @@ def run(*, pr_number: int, dry_run: bool, event_path: Path | None = None) -> int
     """Run the orchestrator for a pull request.
 
     Builds dependencies from configuration and the environment, then delegates
-    to ``Runner.run``. ``dry_run`` short-circuits to a no-op for now (V1).
+    to ``Runner.run``. When ``dry_run`` is set the runner plans a single
+    transition and prints the actions it would take, performing zero mutations.
     """
-    if dry_run:
-        print("Dry-run mode is not yet wired through Runner; exiting cleanly.", file=sys.stderr)
-        return 0
-
     event: ParsedEvent | None = None
     if event_path is not None:
         try:
@@ -1129,7 +1235,15 @@ def run(*, pr_number: int, dry_run: bool, event_path: Path | None = None) -> int
         print(f"Failed to load configuration: {exc}", file=sys.stderr)
         return 1
 
-    ctx = _build_runtime_context(config)
+    # Configure structured JSON logging with secret redaction. The env-var names
+    # the operator allow-listed for the coder (plus GH_TOKEN) are resolved to
+    # their values so they never appear verbatim in the log stream.
+    setup_logging(
+        level=os.environ.get("AIPRO_LOG_LEVEL", "INFO"),
+        secrets=collect_secret_values(config.main_coder.env),
+    )
+
+    ctx = _build_runtime_context(config, dry_run=dry_run)
     if ctx is None:
         return 1
     return Runner(ctx).run(pr_number, event=event)
@@ -1154,9 +1268,12 @@ def inspect(*, pr_number: int) -> int:
     return 0
 
 
-def _build_runtime_context(_config: Config) -> RunnerContext | None:
+def _build_runtime_context(_config: Config, *, dry_run: bool = False) -> RunnerContext | None:
     # Real construction of GitHub client / coder / reviewers from environment
-    # and config is left to a follow-up issue. The Runner itself is fully
-    # exercised by unit tests via injected fakes.
+    # and config is left to a follow-up issue (V1-12). When wired, ``dry_run``
+    # must flow into both the GitHubClient (mutations become no-ops) and the
+    # RunnerContext (``git=None``, single-pass planning). The Runner's dry-run
+    # behavior itself is fully exercised by unit tests via injected fakes.
+    del dry_run
     print(NOT_IMPLEMENTED_MESSAGE, file=sys.stderr)
     return None

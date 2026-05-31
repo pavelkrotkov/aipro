@@ -1,0 +1,290 @@
+"""Structured JSON logging with secret redaction.
+
+The orchestrator runs inside GitHub Actions where logs are world-readable to
+anyone with repo access. Two properties matter:
+
+* **Structured** — every emitted line is a single JSON object so downstream
+  tooling can parse state transitions, action executions, and errors without
+  scraping free-form text.
+* **Redacted** — configured secret values (``GH_TOKEN`` and any env var names
+  the operator lists in ``main_coder.env``) must never appear verbatim in the
+  log stream, even when they leak into an exception message or a multi-line
+  subprocess dump.
+
+``setup_logging`` wires a :class:`JsonFormatter` and a
+:class:`SecretRedactingFilter` (sharing one :class:`SecretRedactor`) onto the
+package logger. The structured ``log_*`` helpers emit the specific event
+shapes the rest of the orchestrator relies on.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import sys
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import TextIO
+
+PACKAGE_LOGGER = "ai_pr_orchestrator"
+REDACTION_PLACEHOLDER = "***"
+
+# Token shapes that should always be redacted even if the operator did not list
+# them explicitly: GitHub personal-access / installation / OAuth tokens. Mirrors
+# the client-side redaction in ``github/client.py`` so a token that slips into a
+# message we did not anticipate is still masked. We keep a short non-secret
+# prefix so a redacted line is still debuggable ("which kind of token leaked").
+_TOKEN_PATTERN = re.compile(r"(gh[pousr]_|github_pat_)[A-Za-z0-9_]+")
+
+# Standard ``LogRecord`` attributes. Anything *not* in this set that ends up on
+# a record is treated as a caller-supplied structured ``extra`` field and is
+# merged into the JSON payload.
+_RESERVED_RECORD_KEYS = frozenset(
+    {
+        "args",
+        "asctime",
+        "created",
+        "exc_info",
+        "exc_text",
+        "filename",
+        "funcName",
+        "levelname",
+        "levelno",
+        "lineno",
+        "module",
+        "msecs",
+        "message",
+        "msg",
+        "name",
+        "pathname",
+        "process",
+        "processName",
+        "relativeCreated",
+        "stack_info",
+        "taskName",
+        "thread",
+        "threadName",
+    }
+)
+
+
+class SecretRedactor:
+    """Replaces known secret values (and token-shaped substrings) with ``***``.
+
+    Secrets are matched longest-first so that a secret which is a substring of
+    another secret does not leave a recognizable tail behind.
+    """
+
+    def __init__(self, secrets: Iterable[str] = ()) -> None:
+        self._secrets: list[str] = []
+        for secret in secrets:
+            self.add(secret)
+
+    def add(self, value: str | None) -> None:
+        """Register a literal secret value to redact. No-ops on empty/blank."""
+        if not value or not value.strip():
+            return
+        if value not in self._secrets:
+            self._secrets.append(value)
+            # Longest-first: a shorter secret must not pre-empt a longer one
+            # that contains it, which would leave the longer secret's tail.
+            self._secrets.sort(key=len, reverse=True)
+
+    def redact(self, text: str) -> str:
+        for secret in self._secrets:
+            if secret in text:
+                text = text.replace(secret, REDACTION_PLACEHOLDER)
+        return _TOKEN_PATTERN.sub(REDACTION_PLACEHOLDER, text)
+
+
+class SecretRedactingFilter(logging.Filter):
+    """Logging filter that redacts secrets from a record before formatting.
+
+    Operates on the rendered message and on any string-valued structured
+    ``extra`` fields. Pairing it with a :class:`JsonFormatter` that shares the
+    same redactor means even handlers without the JSON formatter (e.g. a test's
+    ``caplog``) see redacted text.
+    """
+
+    def __init__(self, redactor: SecretRedactor) -> None:
+        super().__init__()
+        self._redactor = redactor
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Collapse msg+args into a single redacted string so the secret can't
+        # survive inside a deferred ``%`` argument.
+        if record.args:
+            record.msg = record.getMessage()
+            record.args = ()
+        if isinstance(record.msg, str):
+            record.msg = self._redactor.redact(record.msg)
+        for key, value in list(record.__dict__.items()):
+            if key in _RESERVED_RECORD_KEYS:
+                continue
+            if isinstance(value, str):
+                record.__dict__[key] = self._redactor.redact(value)
+        return True
+
+
+class JsonFormatter(logging.Formatter):
+    """Render each log record as a single-line JSON object.
+
+    Always present: ``ts`` (UTC ISO-8601), ``level``, ``logger``, ``message``.
+    Caller-supplied ``extra`` fields (e.g. ``event``, ``pr``, ``from``, ``to``)
+    are merged at the top level. When the record carries exception info a
+    ``traceback`` field is added. If a ``redactor`` is supplied, every string
+    value (including the rendered traceback) is redacted at format time as a
+    backstop in case the filter was not installed.
+    """
+
+    def __init__(self, redactor: SecretRedactor | None = None) -> None:
+        super().__init__()
+        self._redactor = redactor
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key in _RESERVED_RECORD_KEYS or key in payload:
+                continue
+            payload[key] = value
+        if record.exc_info:
+            payload["traceback"] = self.formatException(record.exc_info)
+        if self._redactor is not None:
+            payload = {k: self._redact_value(v) for k, v in payload.items()}
+        return json.dumps(payload, default=str, sort_keys=True)
+
+    def _redact_value(self, value: object) -> object:
+        if self._redactor is None or not isinstance(value, str):
+            return value
+        return self._redactor.redact(value)
+
+
+def collect_secret_values(env_var_names: Iterable[str]) -> list[str]:
+    """Resolve env-var *names* to their current values for redaction.
+
+    ``GH_TOKEN`` is always included (when set) so the GitHub credential is
+    redacted even if the operator did not list it in ``main_coder.env``.
+    Names that are unset in the environment are skipped.
+    """
+    names = ["GH_TOKEN", "GITHUB_TOKEN", *env_var_names]
+    values: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        value = os.environ.get(name)
+        if value and value not in seen:
+            seen.add(value)
+            values.append(value)
+    return values
+
+
+def setup_logging(
+    *,
+    level: int | str = logging.INFO,
+    stream: TextIO | None = None,
+    secrets: Iterable[str] = (),
+    logger_name: str = PACKAGE_LOGGER,
+) -> SecretRedactor:
+    """Configure structured JSON logging for the package logger.
+
+    Returns the :class:`SecretRedactor` so callers can register additional
+    secrets discovered after setup (e.g. a token fetched at runtime). Replaces
+    any handlers previously installed by this function so repeated calls (tests,
+    re-entrant CLI invocations) don't double-emit.
+    """
+    redactor = SecretRedactor(secrets)
+    handler = logging.StreamHandler(stream or sys.stderr)
+    handler.setFormatter(JsonFormatter(redactor=redactor))
+    handler.addFilter(SecretRedactingFilter(redactor))
+
+    pkg_logger = logging.getLogger(logger_name)
+    pkg_logger.handlers.clear()
+    pkg_logger.addHandler(handler)
+    pkg_logger.setLevel(_coerce_level(level))
+    # Don't propagate to the root logger: that would re-emit each line through
+    # any root handler (e.g. pytest's) as unstructured text.
+    pkg_logger.propagate = False
+    return redactor
+
+
+def _coerce_level(level: int | str) -> int:
+    if isinstance(level, int):
+        return level
+    resolved = logging.getLevelName(level.upper())
+    # ``getLevelName`` returns the string "Level X" for unknown names rather
+    # than raising; fall back to INFO so a typo never silences logging.
+    return resolved if isinstance(resolved, int) else logging.INFO
+
+
+# ---- Structured event helpers ----
+#
+# These emit the specific record shapes the orchestrator's observability relies
+# on. Keeping them here (rather than scattering ``extra={...}`` dicts across the
+# runner) means the field names live in one place.
+
+
+def log_state_transition(
+    logger: logging.Logger,
+    *,
+    pr: int,
+    from_status: str,
+    to_status: str,
+    head_sha: str,
+    level: int = logging.INFO,
+) -> None:
+    """Emit a ``state_transition`` event with ``pr``/``from``/``to``/``head_sha``."""
+    logger.log(
+        level,
+        "PR #%s: %s -> %s",
+        pr,
+        from_status,
+        to_status,
+        extra={
+            "event": "state_transition",
+            "pr": pr,
+            "from": from_status,
+            "to": to_status,
+            "head_sha": head_sha,
+        },
+    )
+
+
+def log_action(
+    logger: logging.Logger,
+    *,
+    pr: int,
+    action_type: str,
+    level: int = logging.INFO,
+) -> None:
+    """Emit an ``action`` event with ``action_type`` and ``pr``."""
+    logger.log(
+        level,
+        "PR #%s: executing action %s",
+        pr,
+        action_type,
+        extra={"event": "action", "action_type": action_type, "pr": pr},
+    )
+
+
+def log_error(
+    logger: logging.Logger,
+    *,
+    error: object,
+    pr: int | None = None,
+    exc_info: bool | BaseException = True,
+) -> None:
+    """Emit an ``error`` event carrying the error message and a ``traceback``.
+
+    ``exc_info`` defaults to ``True`` so the active exception's traceback is
+    captured; pass an explicit exception (or ``False``) to override.
+    """
+    extra: dict[str, object] = {"event": "error", "error": str(error)}
+    if pr is not None:
+        extra["pr"] = pr
+    logger.error("error: %s", error, exc_info=exc_info, extra=extra)
