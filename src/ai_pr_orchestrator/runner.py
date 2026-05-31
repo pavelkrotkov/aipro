@@ -1371,6 +1371,22 @@ def run(*, pr_number: int, dry_run: bool, event_path: Path | None = None) -> int
         secrets=collect_secret_values(config.main_coder.env),
     )
 
+    if dry_run:
+        # The Runner's dry-run planner is fully implemented and unit-tested
+        # (it plans a single transition and prints the actions it would take),
+        # but constructing the live GitHub client / coder / reviewers from the
+        # environment is deferred to V1-12 (see ``_build_runtime_context``).
+        # Until that wiring lands the CLI has no PR to plan against, so exit
+        # cleanly (0) rather than failing — ``dry_run`` already threads through
+        # ``_build_runtime_context``/``RunnerContext`` for when it does.
+        print(
+            "Dry-run: runtime wiring (GitHub client / coder / reviewers) is not "
+            "implemented yet (pending V1-12); the dry-run planner is covered by "
+            "unit tests. Exiting cleanly.",
+            file=sys.stderr,
+        )
+        return 0
+
     ctx = _build_runtime_context(config, dry_run=dry_run)
     if ctx is None:
         return 1

@@ -377,3 +377,26 @@ def test_dry_run_reports_missing_reviewer_adapter(capsys: pytest.CaptureFixture[
     assert rc == 0
     assert "-> 'needs_human'" in out
     assert _comment_count(gh, pr.number) == 1  # no mutation
+
+
+# ----- CLI entry point -----
+
+
+def test_cli_run_dry_run_exits_zero_without_runtime_wiring(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Runtime context construction (_build_runtime_context) is deferred to
+    # V1-12; until then `aipro dry-run` must exit 0 (not the generic 1 a missing
+    # context yields for a real run), per the issue acceptance criteria.
+    from ai_pr_orchestrator import runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "load_config", make_config)
+    # Stub setup_logging so the real call doesn't reconfigure the global package
+    # logger (propagate=False) and leak into other tests' caplog capture.
+    monkeypatch.setattr(runner_mod, "setup_logging", lambda **kwargs: None)
+    rc = runner_mod.run(pr_number=1, dry_run=True)
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "Dry-run" in err
+    assert "pending V1-12" in err
