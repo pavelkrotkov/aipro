@@ -233,3 +233,79 @@ def test_collect_secret_values_includes_gh_token_and_skips_unset(
     assert "tok-value" in values
     assert "key-value" in values
     assert all(v for v in values)  # no empty entries for unset vars
+
+
+# ---- Redaction robustness ----
+
+
+class _LeakyObject:
+    """A custom object whose ``str()`` exposes a secret (only via default=str)."""
+
+    def __init__(self, secret: str) -> None:
+        self._secret = secret
+
+    def __str__(self) -> str:
+        return f"<user token={self._secret}>"
+
+
+def test_secret_in_custom_object_str_is_redacted() -> None:
+    # redact_recursive leaves the object as-is; json.dumps(default=str) then
+    # renders its __str__, so the final-string redaction is what masks it.
+    canary = "canary-in-custom-object"
+    stream, logger, _ = _configure("aipro_test_custom_obj", secrets=[canary])
+    logger.info("see obj", extra={"obj": _LeakyObject(canary)})
+    output = stream.getvalue()
+    assert canary not in output
+    assert REDACTION_PLACEHOLDER in output
+
+
+def test_circular_reference_in_extra_does_not_crash() -> None:
+    stream, logger, _ = _configure("aipro_test_circular")
+    cyclic: dict[str, object] = {"name": "node"}
+    cyclic["self"] = cyclic  # circular reference
+    logger.info("cyclic", extra={"detail": cyclic})
+    # Must still emit exactly one valid JSON line (no RecursionError / no
+    # json circular-reference crash); the cycle is replaced with a marker.
+    record = _records(stream)[0]
+    assert record["message"] == "cyclic"
+    assert "<circular>" in json.dumps(record)
+
+
+def test_shared_non_cyclic_reference_is_fully_redacted() -> None:
+    # A container shared between two siblings (a DAG, not a cycle) must be
+    # redacted in *both* places — the cycle guard only skips active ancestors.
+    canary = "canary-shared-ref"
+    shared = {"value": canary}
+    redactor = SecretRedactor([canary])
+    result = redactor.redact_recursive({"a": shared, "b": shared})
+    assert result == {"a": {"value": REDACTION_PLACEHOLDER}, "b": {"value": REDACTION_PLACEHOLDER}}
+
+
+def test_mixed_key_types_in_extra_do_not_crash() -> None:
+    # Without sort_keys, a dict with mixed int/str keys serializes fine instead
+    # of raising TypeError.
+    stream, logger, _ = _configure("aipro_test_mixed_keys")
+    logger.info("mixed", extra={"detail": {1: "a", "b": 2}})
+    record = _records(stream)[0]
+    assert record["message"] == "mixed"
+
+
+# ---- Dry-run tagging ----
+
+
+def test_dry_run_flag_on_action_and_transition() -> None:
+    stream, logger, _ = _configure("aipro_test_dry_flag")
+    log_action(logger, pr=5, action_type="add_label", dry_run=True)
+    log_state_transition(
+        logger, pr=5, from_status="init", to_status="triggering", head_sha="s", dry_run=True
+    )
+    action_record, transition_record = _records(stream)
+    assert action_record["dry_run"] is True
+    assert transition_record["dry_run"] is True
+
+
+def test_no_dry_run_flag_by_default() -> None:
+    stream, logger, _ = _configure("aipro_test_no_dry_flag")
+    log_action(logger, pr=5, action_type="add_label")
+    (record,) = _records(stream)
+    assert "dry_run" not in record

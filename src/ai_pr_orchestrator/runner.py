@@ -468,17 +468,21 @@ class Runner:
         ctx = self._ctx
         snapshot = self._build_snapshot(state, gh_pr, event=event)
         next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
-        self._log_transition(state, next_state)
+        # Tag the planned transition/action logs with ``dry_run`` so downstream
+        # observability tools never read them as real mutations.
+        self._log_transition(state, next_state, dry_run=True)
         print(
             f"DRY-RUN PR #{pr_number}: status {state.status!r} -> {next_state.status!r}; "
             f"{len(actions)} action(s) planned"
         )
         for action in actions:
-            log_action(logger, pr=pr_number, action_type=action.type)
+            log_action(logger, pr=pr_number, action_type=action.type, dry_run=True)
             print(f"  - {_describe_action(action)}")
         return 0
 
-    def _log_transition(self, previous: RuntimeState, nxt: RuntimeState) -> None:
+    def _log_transition(
+        self, previous: RuntimeState, nxt: RuntimeState, *, dry_run: bool = False
+    ) -> None:
         """Emit a structured ``state_transition`` log when the status changes."""
         if previous.status != nxt.status:
             log_state_transition(
@@ -487,6 +491,7 @@ class Runner:
                 from_status=previous.status,
                 to_status=nxt.status,
                 head_sha=nxt.head_sha,
+                dry_run=dry_run,
             )
 
     # ---- State loading / saving ----

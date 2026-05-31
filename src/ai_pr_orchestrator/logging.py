@@ -108,28 +108,46 @@ class SecretRedactor:
         for secret in self._secrets:
             if secret in text:
                 text = text.replace(secret, REDACTION_PLACEHOLDER)
-        # ``\1`` preserves the token-kind prefix (e.g. ``ghp_``) while masking
-        # the secret body — keeping the line debuggable, per _TOKEN_PATTERN.
-        return _TOKEN_PATTERN.sub(rf"\1{REDACTION_PLACEHOLDER}", text)
+        # ``\g<1>`` preserves the token-kind prefix (e.g. ``ghp_``) while masking
+        # the secret body — keeping the line debuggable, per _TOKEN_PATTERN. The
+        # explicit group syntax stays unambiguous even if REDACTION_PLACEHOLDER
+        # ever begins with a digit (``\1***`` is fine, ``\g<1>`` is future-proof).
+        return _TOKEN_PATTERN.sub(rf"\g<1>{REDACTION_PLACEHOLDER}", text)
 
-    def redact_recursive(self, value: object) -> object:
+    def redact_recursive(self, value: object, _active: set[int] | None = None) -> object:
         """Redact secrets from a value, recursing into nested containers.
 
         Strings are redacted; dicts/lists/tuples/sets are rebuilt with each
         element redacted; everything else is returned unchanged. Lets the filter
         and formatter scrub secrets nested inside structured ``extra`` fields
         (e.g. ``extra={"detail": {"token": ...}}``), not just top-level strings.
+
+        ``_active`` tracks the ids of containers on the *current* recursion path
+        so a circular reference is replaced with a marker instead of recursing
+        forever (which would raise ``RecursionError`` here — and leaving the
+        cycle in place would later crash ``json.dumps`` with a circular-reference
+        error). Ids are removed on the way back up, so a container merely *shared*
+        between siblings (a DAG, not a cycle) is still fully redacted.
         """
         if isinstance(value, str):
             return self.redact(value)
-        if isinstance(value, dict):
-            return {k: self.redact_recursive(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [self.redact_recursive(v) for v in value]
-        if isinstance(value, tuple):
-            return tuple(self.redact_recursive(v) for v in value)
-        if isinstance(value, set):
-            return {self.redact_recursive(v) for v in value}
+        if isinstance(value, dict | list | tuple | set):
+            if _active is None:
+                _active = set()
+            marker = id(value)
+            if marker in _active:
+                return "<circular>"
+            _active.add(marker)
+            try:
+                if isinstance(value, dict):
+                    return {k: self.redact_recursive(v, _active) for k, v in value.items()}
+                if isinstance(value, list):
+                    return [self.redact_recursive(v, _active) for v in value]
+                if isinstance(value, tuple):
+                    return tuple(self.redact_recursive(v, _active) for v in value)
+                return {self.redact_recursive(v, _active) for v in value}
+            finally:
+                _active.discard(marker)
         return value
 
 
@@ -193,7 +211,17 @@ class JsonFormatter(logging.Formatter):
             payload["traceback"] = self.formatException(record.exc_info)
         if self._redactor is not None:
             payload = {k: self._redact_value(v) for k, v in payload.items()}
-        return json.dumps(payload, default=str, sort_keys=True)
+        # ``sort_keys`` is intentionally omitted: arbitrary logged ``extra`` data
+        # can carry a dict with mixed key types (e.g. int and str), which makes
+        # sorting raise ``TypeError`` and crash the formatter. Insertion order is
+        # deterministic enough for structured logs, and parsers don't rely on it.
+        formatted = json.dumps(payload, default=str)
+        if self._redactor is not None:
+            # Final catch-all: redact the serialized string too, so secrets that
+            # only surface via a custom object's ``__str__`` (rendered by
+            # ``default=str`` *after* per-value redaction) are still masked.
+            formatted = self._redactor.redact(formatted)
+        return formatted
 
     def _redact_value(self, value: object) -> object:
         if self._redactor is None:
@@ -279,22 +307,24 @@ def log_state_transition(
     to_status: str,
     head_sha: str,
     level: int = logging.INFO,
+    dry_run: bool = False,
 ) -> None:
-    """Emit a ``state_transition`` event with ``pr``/``from``/``to``/``head_sha``."""
-    logger.log(
-        level,
-        "PR #%s: %s -> %s",
-        pr,
-        from_status,
-        to_status,
-        extra={
-            "event": "state_transition",
-            "pr": pr,
-            "from": from_status,
-            "to": to_status,
-            "head_sha": head_sha,
-        },
-    )
+    """Emit a ``state_transition`` event with ``pr``/``from``/``to``/``head_sha``.
+
+    When ``dry_run`` is set the record carries ``dry_run: true`` so downstream
+    observability/auditing tools don't mistake a planned transition for one that
+    actually executed.
+    """
+    extra: dict[str, object] = {
+        "event": "state_transition",
+        "pr": pr,
+        "from": from_status,
+        "to": to_status,
+        "head_sha": head_sha,
+    }
+    if dry_run:
+        extra["dry_run"] = True
+    logger.log(level, "PR #%s: %s -> %s", pr, from_status, to_status, extra=extra)
 
 
 def log_action(
@@ -303,15 +333,17 @@ def log_action(
     pr: int,
     action_type: str,
     level: int = logging.INFO,
+    dry_run: bool = False,
 ) -> None:
-    """Emit an ``action`` event with ``action_type`` and ``pr``."""
-    logger.log(
-        level,
-        "PR #%s: executing action %s",
-        pr,
-        action_type,
-        extra={"event": "action", "action_type": action_type, "pr": pr},
-    )
+    """Emit an ``action`` event with ``action_type`` and ``pr``.
+
+    When ``dry_run`` is set the record carries ``dry_run: true`` so a *planned*
+    action is never mistaken for one that actually ran.
+    """
+    extra: dict[str, object] = {"event": "action", "action_type": action_type, "pr": pr}
+    if dry_run:
+        extra["dry_run"] = True
+    logger.log(level, "PR #%s: executing action %s", pr, action_type, extra=extra)
 
 
 def log_error(
