@@ -34,9 +34,16 @@ REDACTION_PLACEHOLDER = "***"
 # Token shapes that should always be redacted even if the operator did not list
 # them explicitly: GitHub personal-access / installation / OAuth tokens. Mirrors
 # the client-side redaction in ``github/client.py`` so a token that slips into a
-# message we did not anticipate is still masked. We keep a short non-secret
-# prefix so a redacted line is still debuggable ("which kind of token leaked").
+# message we did not anticipate is still masked. The capture group keeps the
+# short non-secret prefix (e.g. ``ghp_``) so a redacted line is still
+# debuggable ("which kind of token leaked") while the secret body is masked.
 _TOKEN_PATTERN = re.compile(r"(gh[pousr]_|github_pat_)[A-Za-z0-9_]+")
+
+# Secrets shorter than this are not registered for redaction. A 1-3 character
+# "secret" (e.g. a misconfigured env var holding "a" or "in") would otherwise
+# replace those common substrings everywhere and corrupt the entire log stream.
+# Real credentials (tokens, keys) are comfortably longer than this floor.
+_MIN_SECRET_LENGTH = 4
 
 # Standard ``LogRecord`` attributes. Anything *not* in this set that ends up on
 # a record is treated as a caller-supplied structured ``extra`` field and is
@@ -83,8 +90,13 @@ class SecretRedactor:
             self.add(secret)
 
     def add(self, value: str | None) -> None:
-        """Register a literal secret value to redact. No-ops on empty/blank."""
-        if not value or not value.strip():
+        """Register a literal secret value to redact.
+
+        No-ops on empty/blank values and on values shorter than
+        ``_MIN_SECRET_LENGTH`` so a misconfigured short secret can't mass-redact
+        common substrings out of every log line.
+        """
+        if not value or not value.strip() or len(value) < _MIN_SECRET_LENGTH:
             return
         if value not in self._secrets:
             self._secrets.append(value)
@@ -96,16 +108,38 @@ class SecretRedactor:
         for secret in self._secrets:
             if secret in text:
                 text = text.replace(secret, REDACTION_PLACEHOLDER)
-        return _TOKEN_PATTERN.sub(REDACTION_PLACEHOLDER, text)
+        # ``\1`` preserves the token-kind prefix (e.g. ``ghp_``) while masking
+        # the secret body — keeping the line debuggable, per _TOKEN_PATTERN.
+        return _TOKEN_PATTERN.sub(rf"\1{REDACTION_PLACEHOLDER}", text)
+
+    def redact_recursive(self, value: object) -> object:
+        """Redact secrets from a value, recursing into nested containers.
+
+        Strings are redacted; dicts/lists/tuples/sets are rebuilt with each
+        element redacted; everything else is returned unchanged. Lets the filter
+        and formatter scrub secrets nested inside structured ``extra`` fields
+        (e.g. ``extra={"detail": {"token": ...}}``), not just top-level strings.
+        """
+        if isinstance(value, str):
+            return self.redact(value)
+        if isinstance(value, dict):
+            return {k: self.redact_recursive(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self.redact_recursive(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self.redact_recursive(v) for v in value)
+        if isinstance(value, set):
+            return {self.redact_recursive(v) for v in value}
+        return value
 
 
 class SecretRedactingFilter(logging.Filter):
     """Logging filter that redacts secrets from a record before formatting.
 
-    Operates on the rendered message and on any string-valued structured
-    ``extra`` fields. Pairing it with a :class:`JsonFormatter` that shares the
-    same redactor means even handlers without the JSON formatter (e.g. a test's
-    ``caplog``) see redacted text.
+    Operates on the rendered message and on structured ``extra`` fields
+    (recursing into nested containers). Pairing it with a :class:`JsonFormatter`
+    that shares the same redactor means even handlers without the JSON formatter
+    (e.g. a test's ``caplog``) see redacted text.
     """
 
     def __init__(self, redactor: SecretRedactor) -> None:
@@ -123,8 +157,9 @@ class SecretRedactingFilter(logging.Filter):
         for key, value in list(record.__dict__.items()):
             if key in _RESERVED_RECORD_KEYS:
                 continue
-            if isinstance(value, str):
-                record.__dict__[key] = self._redactor.redact(value)
+            # Recurse so secrets nested inside structured ``extra`` containers
+            # (dicts/lists/...) are redacted, not just top-level strings.
+            record.__dict__[key] = self._redactor.redact_recursive(value)
         return True
 
 
@@ -134,9 +169,9 @@ class JsonFormatter(logging.Formatter):
     Always present: ``ts`` (UTC ISO-8601), ``level``, ``logger``, ``message``.
     Caller-supplied ``extra`` fields (e.g. ``event``, ``pr``, ``from``, ``to``)
     are merged at the top level. When the record carries exception info a
-    ``traceback`` field is added. If a ``redactor`` is supplied, every string
-    value (including the rendered traceback) is redacted at format time as a
-    backstop in case the filter was not installed.
+    ``traceback`` field is added. If a ``redactor`` is supplied, every value
+    (including the rendered traceback and nested ``extra`` containers) is
+    redacted at format time as a backstop in case the filter was not installed.
     """
 
     def __init__(self, redactor: SecretRedactor | None = None) -> None:
@@ -161,9 +196,9 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, sort_keys=True)
 
     def _redact_value(self, value: object) -> object:
-        if self._redactor is None or not isinstance(value, str):
+        if self._redactor is None:
             return value
-        return self._redactor.redact(value)
+        return self._redactor.redact_recursive(value)
 
 
 def collect_secret_values(env_var_names: Iterable[str]) -> list[str]:
@@ -216,6 +251,13 @@ def setup_logging(
 def _coerce_level(level: int | str) -> int:
     if isinstance(level, int):
         return level
+    # A stringified integer ("30") is a numeric level: ``getLevelName("30")``
+    # would return "Level 30" (a str) and silently fall back to INFO, so parse
+    # it directly first.
+    try:
+        return int(level)
+    except ValueError:
+        pass
     resolved = logging.getLevelName(level.upper())
     # ``getLevelName`` returns the string "Level X" for unknown names rather
     # than raising; fall back to INFO so a typo never silences logging.
