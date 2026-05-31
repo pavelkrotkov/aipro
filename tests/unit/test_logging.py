@@ -6,6 +6,7 @@ import io
 import json
 import logging
 from collections.abc import Iterable
+from typing import Any, cast
 
 import pytest
 
@@ -354,6 +355,43 @@ def test_exc_info_without_active_exception_emits_no_traceback() -> None:
     (record,) = _records(stream)
     assert "traceback" not in record
     assert "NoneType" not in stream.getvalue()
+
+
+def test_token_pattern_redacted_before_overlapping_literal_secret() -> None:
+    # A literal secret that overlaps a token body must not break token masking
+    # and leak the token's tail: the regex runs first.
+    redactor = SecretRedactor(["234567"])
+    out = redactor.redact("auth ghp_1234567890abcdefghij done")
+    assert "7890abcdefghij" not in out
+    assert "890abcdefghij" not in out
+    assert f"ghp_{REDACTION_PLACEHOLDER}" in out
+
+
+def test_redact_recursive_set_returns_list() -> None:
+    # set -> list so json.dumps emits a native array, not a Python set repr.
+    redactor = SecretRedactor(["canary-set-value"])
+    result = redactor.redact_recursive({"canary-set-value", "clean"})
+    assert isinstance(result, list)
+    assert "canary-set-value" not in result
+    assert REDACTION_PLACEHOLDER in result
+
+
+def test_set_in_extra_serializes_as_json_array() -> None:
+    canary = "canary-in-a-set"
+    stream, logger, _ = _configure("aipro_test_set_extra", secrets=[canary])
+    logger.info("set field", extra={"items": {canary, "clean"}})
+    record = _records(stream)[0]
+    assert isinstance(record["items"], list)  # JSON array, not a set-repr string
+    assert canary not in stream.getvalue()
+
+
+def test_coerce_level_handles_non_str_int_gracefully() -> None:
+    from ai_pr_orchestrator.logging import _coerce_level
+
+    # None (or any non-str/int) must fall back to INFO, not raise.
+    assert _coerce_level(cast(Any, None)) == logging.INFO
+    assert _coerce_level(logging.WARNING) == logging.WARNING
+    assert _coerce_level("30") == 30
 
 
 def test_mixed_key_types_in_extra_do_not_crash() -> None:

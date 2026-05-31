@@ -105,20 +105,26 @@ class SecretRedactor:
             self._secrets.sort(key=len, reverse=True)
 
     def redact(self, text: str) -> str:
+        # Mask token-shaped substrings *first*. If a configured literal secret
+        # overlaps a token body (e.g. "12345" inside "ghp_12345abc"), replacing
+        # the literal first would turn the token into "ghp_***abc" — ``*`` isn't
+        # a word char, so _TOKEN_PATTERN would no longer match and the token's
+        # tail would leak. Running the regex first redacts the whole token.
+        # ``\g<1>`` preserves the token-kind prefix (e.g. ``ghp_``) so the line
+        # stays debuggable; the explicit group syntax is unambiguous even if
+        # REDACTION_PLACEHOLDER ever begins with a digit.
+        text = _TOKEN_PATTERN.sub(rf"\g<1>{REDACTION_PLACEHOLDER}", text)
         for secret in self._secrets:
             if secret in text:
                 text = text.replace(secret, REDACTION_PLACEHOLDER)
-        # ``\g<1>`` preserves the token-kind prefix (e.g. ``ghp_``) while masking
-        # the secret body — keeping the line debuggable, per _TOKEN_PATTERN. The
-        # explicit group syntax stays unambiguous even if REDACTION_PLACEHOLDER
-        # ever begins with a digit (``\1***`` is fine, ``\g<1>`` is future-proof).
-        return _TOKEN_PATTERN.sub(rf"\g<1>{REDACTION_PLACEHOLDER}", text)
+        return text
 
     def redact_recursive(self, value: object, _active: set[int] | None = None) -> object:
         """Redact secrets from a value, recursing into nested containers.
 
-        Strings are redacted; dicts/lists/tuples/sets are rebuilt with each
-        element redacted; everything else is returned unchanged. Lets the filter
+        Strings are redacted; dicts/lists/tuples are rebuilt with each element
+        redacted, and sets become lists (so they serialize as a JSON array);
+        everything else is returned unchanged. Lets the filter
         and formatter scrub secrets nested inside structured ``extra`` fields
         (e.g. ``extra={"detail": {"token": ...}}``), not just top-level strings.
 
@@ -145,7 +151,9 @@ class SecretRedactor:
                     return [self.redact_recursive(v, _active) for v in value]
                 if isinstance(value, tuple):
                     return tuple(self.redact_recursive(v, _active) for v in value)
-                return {self.redact_recursive(v, _active) for v in value}
+                # set: return a list so json.dumps serializes it as a native
+                # JSON array rather than falling back to a Python set repr.
+                return [self.redact_recursive(v, _active) for v in value]
             finally:
                 _active.discard(marker)
         return value
@@ -327,15 +335,19 @@ def _coerce_level(level: int | str) -> int:
         return level
     # A stringified integer ("30") is a numeric level: ``getLevelName("30")``
     # would return "Level 30" (a str) and silently fall back to INFO, so parse
-    # it directly first.
+    # it directly first. ``TypeError`` guards a non-str/int sneaking past the
+    # type hint (e.g. None from a misconfigured env), which must not crash
+    # ``setup_logging`` — fall back to INFO.
     try:
         return int(level)
-    except ValueError:
+    except (ValueError, TypeError):
         pass
-    resolved = logging.getLevelName(level.upper())
-    # ``getLevelName`` returns the string "Level X" for unknown names rather
-    # than raising; fall back to INFO so a typo never silences logging.
-    return resolved if isinstance(resolved, int) else logging.INFO
+    if isinstance(level, str):
+        resolved = logging.getLevelName(level.upper())
+        # ``getLevelName`` returns the string "Level X" for unknown names rather
+        # than raising; fall back to INFO so a typo never silences logging.
+        return resolved if isinstance(resolved, int) else logging.INFO
+    return logging.INFO
 
 
 # ---- Structured event helpers ----
