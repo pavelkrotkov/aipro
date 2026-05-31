@@ -385,9 +385,10 @@ def test_dry_run_reports_missing_reviewer_adapter(capsys: pytest.CaptureFixture[
 def test_cli_run_dry_run_exits_zero_without_runtime_wiring(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Runtime context construction (_build_runtime_context) is deferred to
-    # V1-12; until then `aipro dry-run` must exit 0 (not the generic 1 a missing
-    # context yields for a real run), per the issue acceptance criteria.
+    # Runtime context construction (_build_runtime_context) is still a stub
+    # (left to a follow-up issue); until then `aipro dry-run` must exit 0 (not
+    # the generic 1 a missing context yields for a real run), per the issue
+    # acceptance criteria.
     from ai_pr_orchestrator import runner as runner_mod
 
     monkeypatch.setattr(runner_mod, "load_config", make_config)
@@ -399,4 +400,4 @@ def test_cli_run_dry_run_exits_zero_without_runtime_wiring(
 
     assert rc == 0
     assert "Dry-run" in err
-    assert "pending V1-12" in err
+    assert "not\nimplemented yet" in err or "not implemented yet" in err

@@ -1375,14 +1375,15 @@ def run(*, pr_number: int, dry_run: bool, event_path: Path | None = None) -> int
         # The Runner's dry-run planner is fully implemented and unit-tested
         # (it plans a single transition and prints the actions it would take),
         # but constructing the live GitHub client / coder / reviewers from the
-        # environment is deferred to V1-12 (see ``_build_runtime_context``).
-        # Until that wiring lands the CLI has no PR to plan against, so exit
-        # cleanly (0) rather than failing — ``dry_run`` already threads through
-        # ``_build_runtime_context``/``RunnerContext`` for when it does.
+        # environment is still a stub (see ``_build_runtime_context``, left to a
+        # follow-up issue). Until that wiring lands the CLI has no PR to plan
+        # against, so exit cleanly (0) rather than failing — ``dry_run`` already
+        # threads through ``_build_runtime_context``/``RunnerContext`` for when
+        # it does.
         print(
             "Dry-run: runtime wiring (GitHub client / coder / reviewers) is not "
-            "implemented yet (pending V1-12); the dry-run planner is covered by "
-            "unit tests. Exiting cleanly.",
+            "implemented yet; the dry-run planner is covered by unit tests. "
+            "Exiting cleanly.",
             file=sys.stderr,
         )
         return 0
@@ -1414,8 +1415,8 @@ def inspect(*, pr_number: int) -> int:
 
 def _build_runtime_context(_config: Config, *, dry_run: bool = False) -> RunnerContext | None:
     # Real construction of GitHub client / coder / reviewers from environment
-    # and config is left to a follow-up issue (V1-12). When wired, ``dry_run``
-    # must flow into both the GitHubClient (mutations become no-ops) and the
+    # and config is left to a follow-up issue. When wired, ``dry_run`` must flow
+    # into both the GitHubClient (mutations become no-ops) and the
     # RunnerContext (``git=None``, single-pass planning). The Runner's dry-run
     # behavior itself is fully exercised by unit tests via injected fakes.
     del dry_run
