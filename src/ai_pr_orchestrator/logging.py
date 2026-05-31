@@ -24,9 +24,9 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
-from typing import TextIO
+from typing import TextIO, cast
 
 PACKAGE_LOGGER = "ai_pr_orchestrator"
 REDACTION_PLACEHOLDER = "***"
@@ -176,7 +176,15 @@ class SecretRedactingFilter(logging.Filter):
                 record.msg = record.getMessage()
                 record.args = ()
             except Exception:
-                pass
+                # getMessage() failed (malformed %-args). The args survive for
+                # emit() to render, and ``args`` is in _RESERVED_RECORD_KEYS so
+                # the loop below skips it — redact the args here so a secret in
+                # one can't leak via the handler's error path. redact_recursive
+                # preserves the tuple/Mapping shape it was given.
+                record.args = cast(
+                    "tuple[object, ...] | Mapping[str, object]",
+                    self._redactor.redact_recursive(record.args),
+                )
         if isinstance(record.msg, str):
             record.msg = self._redactor.redact(record.msg)
         for key, value in list(record.__dict__.items()):
@@ -186,6 +194,24 @@ class SecretRedactingFilter(logging.Filter):
             # (dicts/lists/...) are redacted, not just top-level strings.
             record.__dict__[key] = self._redactor.redact_recursive(value)
         return True
+
+
+def _safe_message(record: logging.LogRecord) -> str:
+    """Render ``record``'s message without ever raising.
+
+    ``record.getMessage()`` does ``msg % args`` and raises on a malformed log
+    call (mismatched placeholders/args). If the formatter let that propagate,
+    ``emit()`` would drop to ``handleError``'s non-JSON ``Arguments: (...)``
+    stderr fallback — bypassing both JSON structure and (for handlers without
+    the filter) redaction. Falling back to a ``msg % args`` repr keeps the
+    pipeline total; by the time we get here the filter has already redacted
+    ``record.msg``/``record.args``, and the formatter's own redaction pass
+    scrubs this string too.
+    """
+    try:
+        return record.getMessage()
+    except Exception:
+        return f"{record.msg!r} % {record.args!r}"
 
 
 class JsonFormatter(logging.Formatter):
@@ -208,13 +234,17 @@ class JsonFormatter(logging.Formatter):
             "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": _safe_message(record),
         }
         for key, value in record.__dict__.items():
             if key in _RESERVED_RECORD_KEYS or key in payload:
                 continue
             payload[key] = value
-        if record.exc_info:
+        # ``any(...)`` guards against ``exc_info=(None, None, None)`` — what
+        # logging stores when ``exc_info=True`` is passed with no active
+        # exception — which is truthy but would render a bogus "NoneType: None"
+        # traceback.
+        if record.exc_info and any(record.exc_info):
             payload["traceback"] = self.formatException(record.exc_info)
         if self._redactor is not None:
             payload = {k: self._redact_value(v) for k, v in payload.items()}

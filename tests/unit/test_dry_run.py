@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -14,11 +14,12 @@ from ai_pr_orchestrator.config import (
     GitConfig,
     MainCoderConfig,
     ReviewerConfig,
+    ReviewPhaseConfig,
     SafetyConfig,
 )
 from ai_pr_orchestrator.github import models as gh_models
 from ai_pr_orchestrator.github.fake import FakeGitHubClient
-from ai_pr_orchestrator.models import AgentRunResult, Finding, RuntimeState
+from ai_pr_orchestrator.models import AgentRunResult, Finding, ReviewerTrigger, RuntimeState
 from ai_pr_orchestrator.runner import ParsedEvent, Runner, RunnerContext
 from ai_pr_orchestrator.state_storage import find_state_comment, serialize_state_comment
 
@@ -40,6 +41,7 @@ class StubCoder:
 class StubReviewer:
     name: str = "fake"
     findings: list[Finding] = field(default_factory=list)
+    responded: bool = False
 
     def matches_author(self, login: str) -> bool:
         return False
@@ -53,7 +55,7 @@ class StubReviewer:
         return list(self.findings)
 
     def has_responded(self, pr_number: int, trigger_timestamp: datetime) -> bool:
-        return bool(self.findings)
+        return self.responded or bool(self.findings)
 
 
 def make_config(**overrides: Any) -> Config:
@@ -87,14 +89,20 @@ def seed_pr(gh: FakeGitHubClient, *, labels: list[str] | None = None) -> gh_mode
     return pr
 
 
-def build_ctx(gh: FakeGitHubClient, *, config: Config | None = None) -> RunnerContext:
+def build_ctx(
+    gh: FakeGitHubClient,
+    *,
+    config: Config | None = None,
+    reviewers: dict[str, Any] | None = None,
+    clock: Any = None,
+) -> RunnerContext:
     return RunnerContext(
         github=gh,
         coder=StubCoder(),
-        reviewers={"fake": StubReviewer()},
+        reviewers={"fake": StubReviewer()} if reviewers is None else reviewers,
         git=None,
         config=config or make_config(),
-        clock=lambda: NOW,
+        clock=clock or (lambda: NOW),
         dry_run=True,
     )
 
@@ -268,3 +276,104 @@ def test_dry_run_with_stale_event_plans_noop(capsys: pytest.CaptureFixture[str])
 
     assert rc == 0
     assert "would do nothing (noop: stale_ci_event)" in out
+
+
+# ----- Dry-run plan accuracy for runner-only branches -----
+
+
+def _waiting_state(*, trigger_ts: datetime) -> RuntimeState:
+    return RuntimeState(
+        version=1,
+        pr_number=1,
+        head_sha="head-1",
+        status="waiting",
+        round_index=1,
+        created_at=trigger_ts,
+        updated_at=trigger_ts,
+        trigger_history=[
+            ReviewerTrigger(
+                reviewer_name="fake", round_index=1, timestamp=trigger_ts, head_sha="head-1"
+            )
+        ],
+    )
+
+
+def test_dry_run_reports_orphaned_coder_bailout(capsys: pytest.CaptureFixture[str]) -> None:
+    # A persisted handling state whose coder result is lost would bail to
+    # needs_human in a real run; the plan must report that, not noop.
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh, labels=["ai-loop"])
+    state = RuntimeState(
+        version=1,
+        pr_number=pr.number,
+        head_sha=pr.head_sha,
+        status="handling",
+        round_index=1,
+        last_coder_round_index=1,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    rc = Runner(build_ctx(gh)).run(pr.number)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "-> 'needs_human'" in out
+    assert "would post the final summary comment" in out
+    assert "waiting_for_coder" not in out
+    assert _comment_count(gh, pr.number) == 1  # no mutation
+
+
+def test_dry_run_reports_zero_findings_completion(capsys: pytest.CaptureFixture[str]) -> None:
+    # Reviewer responded with no findings -> a real poll completes the phase;
+    # the plan must reflect that instead of the plain waiting transition.
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh, labels=["ai-loop"])
+    state = _waiting_state(trigger_ts=NOW)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    reviewer = StubReviewer(name="fake", responded=True)
+
+    rc = Runner(build_ctx(gh, reviewers={"fake": reviewer})).run(pr.number)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "status 'waiting' ->" in out
+    assert "-> 'waiting'" not in out  # the phase advanced, not a noop
+
+
+def test_dry_run_reports_reviewer_timeout(capsys: pytest.CaptureFixture[str]) -> None:
+    # An already-expired waiting state plans needs_human (reviewer timeout),
+    # anchored to the persisted trigger timestamp — not a noop.
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh, labels=["ai-loop"])
+    state = _waiting_state(trigger_ts=NOW - timedelta(hours=2))
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+    cfg = make_config(
+        review_phase=ReviewPhaseConfig(
+            poll_interval_seconds=10, reviewer_timeout_seconds=60, phase_timeout_seconds=120
+        )
+    )
+
+    rc = Runner(build_ctx(gh, config=cfg, reviewers={"fake": StubReviewer()})).run(pr.number)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "-> 'needs_human'" in out
+    assert _comment_count(gh, pr.number) == 1  # no mutation
+
+
+def test_dry_run_reports_missing_reviewer_adapter(capsys: pytest.CaptureFixture[str]) -> None:
+    # A reviewer triggered this round but absent from ctx.reviewers plans the
+    # needs_human bailout a real poll would reach.
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh, labels=["ai-loop"])
+    state = _waiting_state(trigger_ts=NOW)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    rc = Runner(build_ctx(gh, reviewers={})).run(pr.number)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "-> 'needs_human'" in out
+    assert _comment_count(gh, pr.number) == 1  # no mutation

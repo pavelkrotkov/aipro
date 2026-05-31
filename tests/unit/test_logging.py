@@ -312,6 +312,50 @@ def test_filter_survives_malformed_format_args() -> None:
     assert filt.filter(record) is True
 
 
+def test_malformed_format_args_are_redacted() -> None:
+    # getMessage() fails (mismatched %-args), so args survive; ``args`` is
+    # reserved, so the filter must redact them in the except branch or a secret
+    # in an arg would leak via the handler's error path.
+    canary = "canary-in-bad-args"
+    filt = SecretRedactingFilter(SecretRedactor([canary]))
+    record = logging.LogRecord(
+        name="n",
+        level=logging.INFO,
+        pathname="p",
+        lineno=1,
+        msg="needs %s and %s",
+        args=(canary,),  # one arg, two placeholders -> getMessage raises
+        exc_info=None,
+    )
+    assert filt.filter(record) is True
+    assert record.args == (REDACTION_PLACEHOLDER,)
+
+
+def test_malformed_log_call_end_to_end_redacts_and_stays_json(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # End-to-end through setup_logging: a mismatched-args call must still emit a
+    # single valid JSON line on the handler stream (no drop to handleError's
+    # non-JSON stderr fallback) with the canary redacted.
+    canary = "canary-e2e-bad-args"
+    stream, logger, _ = _configure("aipro_test_bad_e2e", secrets=[canary])
+    logger.info("token %s %s", canary)  # two placeholders, one arg
+    lines = [line for line in stream.getvalue().splitlines() if line.strip()]
+    assert len(lines) == 1
+    json.loads(lines[0])  # valid JSON, formatter never raised
+    assert canary not in stream.getvalue()
+
+
+def test_exc_info_without_active_exception_emits_no_traceback() -> None:
+    # exc_info=True with no active exception becomes (None, None, None): truthy
+    # but must not produce a bogus "NoneType: None" traceback field.
+    stream, logger, _ = _configure("aipro_test_empty_excinfo")
+    logger.info("no real exception", exc_info=True)
+    (record,) = _records(stream)
+    assert "traceback" not in record
+    assert "NoneType" not in stream.getvalue()
+
+
 def test_mixed_key_types_in_extra_do_not_crash() -> None:
     # Without sort_keys, a dict with mixed int/str keys serializes fine instead
     # of raising TypeError.

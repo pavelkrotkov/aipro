@@ -482,9 +482,7 @@ class Runner:
         Always returns 0 — a dry-run is a successful inspection regardless of
         what state the PR is in.
         """
-        ctx = self._ctx
-        snapshot = self._build_snapshot(state, gh_pr, event=event)
-        next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
+        next_state, actions = self._plan_next(state, gh_pr, event)
         # Tag the planned transition/action logs with ``dry_run`` so downstream
         # observability tools never read them as real mutations.
         self._log_transition(state.status, next_state, dry_run=True)
@@ -496,6 +494,100 @@ class Runner:
             log_action(logger, pr=pr_number, action_type=action.type, dry_run=True)
             print(f"  - {_describe_action(action)}")
         return 0
+
+    def _plan_next(
+        self,
+        state: RuntimeState,
+        gh_pr: gh_models.PullRequest,
+        event: ParsedEvent | None,
+    ) -> tuple[RuntimeState, list[PlannedAction]]:
+        """Compute the (next_state, actions) a real run would produce, read-only.
+
+        Mirrors the runner-only planning branches that sit between ``_run``'s
+        terminal check and the plain state-machine transition, so a dry-run plan
+        doesn't under-report terminal actions: the orphaned-coder bailout and
+        the reviewer-poll decision. The git-dependent branches (fork hard-block,
+        push recovery) are unreachable in dry-run (``git`` is ``None``) and are
+        intentionally omitted.
+        """
+        ctx = self._ctx
+        now = ctx.clock()
+
+        # Orphaned coder: a dry-run Runner has no pending coder result, so a
+        # persisted ``handling`` state that already invoked the coder this round
+        # bails to needs_human — not the noop(waiting_for_coder) a plain
+        # transition would report.
+        if (
+            state.status == "handling"
+            and state.last_coder_round_index == state.round_index
+            and self._pending_coder_result is None
+        ):
+            planned = replace(
+                state,
+                status="needs_human",
+                last_error="coder_invocation_orphaned",
+                updated_at=now,
+            )
+            return planned, terminal_actions(planned, ctx.config)
+
+        if state.status in ("waiting", "collecting"):
+            return self._plan_poll_tick(state, gh_pr, now)
+
+        snapshot = self._build_snapshot(state, gh_pr, event=event)
+        return transition(state, snapshot, ctx.config, now)
+
+    def _plan_poll_tick(
+        self,
+        state: RuntimeState,
+        gh_pr: gh_models.PullRequest,
+        now: datetime,
+    ) -> tuple[RuntimeState, list[PlannedAction]]:
+        """Mirror ``_poll_reviewers``' first-tick decision without side effects.
+
+        Reports the terminal/handling action a real poll would reach on its
+        first iteration: missing-adapter bailout, findings-collected ->
+        handling, zero-findings completion, or reviewer/phase timeout. The
+        timeouts use the same persisted-state-anchored deadlines as the live
+        loop, so an already-expired ``waiting`` state plans needs_human rather
+        than noop.
+        """
+        ctx = self._ctx
+        cfg = ctx.config.review_phase
+
+        current_round_triggers = [
+            t for t in state.trigger_history if t.round_index == state.round_index
+        ]
+        for trig in current_round_triggers:
+            if trig.reviewer_name not in ctx.reviewers:
+                planned = replace(
+                    state,
+                    status="needs_human",
+                    last_error=f"missing_reviewer_adapter:{trig.reviewer_name}",
+                    updated_at=now,
+                )
+                return planned, terminal_actions(planned, ctx.config)
+
+        snapshot = self._build_snapshot(state, gh_pr, event=None)
+        if snapshot.findings:
+            return transition(state, snapshot, ctx.config, now)
+
+        if self._all_enabled_reviewers_responded(state, gh_pr):
+            responded = self._build_snapshot(state, gh_pr, event=None, reviewer_responded=True)
+            return transition(state, responded, ctx.config, now)
+
+        if state.trigger_history:
+            latest_trigger_ts = max(t.timestamp for t in state.trigger_history)
+            earliest_trigger_ts = min(t.timestamp for t in state.trigger_history)
+        else:
+            latest_trigger_ts = earliest_trigger_ts = state.created_at
+        deadline_reviewer = latest_trigger_ts + timedelta(seconds=cfg.reviewer_timeout_seconds)
+        deadline_phase = earliest_trigger_ts + timedelta(seconds=cfg.phase_timeout_seconds)
+        if now >= deadline_reviewer or now >= deadline_phase:
+            timed_out = self._build_snapshot(state, gh_pr, event=None, reviewer_timed_out=True)
+            return transition(state, timed_out, ctx.config, now)
+
+        # Still waiting on reviewers this tick.
+        return transition(state, snapshot, ctx.config, now)
 
     def _log_transition(
         self, previous_status: str, nxt: RuntimeState, *, dry_run: bool = False
