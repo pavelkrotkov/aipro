@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -948,6 +949,37 @@ def test_polling_times_out_with_reviewer_timeout() -> None:
     assert sc is not None
     assert sc.state.status == "needs_human"
     assert sc.state.last_error == "reviewer_timeout"
+
+
+def test_reviewer_timeout_emits_structured_transition_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Reviewer-poll transitions happen outside the main loop; ensure the
+    # high-value waiting -> needs_human timeout still emits a state_transition.
+    gh = FakeGitHubClient(now=NOW)
+    pr = seed_pr(gh)
+    state = initial_state(status="waiting", round_index=1, head_sha=pr.head_sha)
+    gh.seed_comment(pr.number, serialize_state_comment(state))
+
+    reviewer = FakeReviewerAdapter(name="fake", findings_by_call=[[]])
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock=clock)
+    cfg = make_config(
+        review_phase=ReviewPhaseConfig(
+            poll_interval_seconds=10,
+            reviewer_timeout_seconds=20,
+            phase_timeout_seconds=120,
+        )
+    )
+    ctx = build_ctx(gh=gh, reviewers={"fake": reviewer}, clock=clock, sleeper=sleeper, config=cfg)
+    with caplog.at_level(logging.INFO, logger="ai_pr_orchestrator.runner"):
+        Runner(ctx).run(pr.number)
+
+    transitions = [r for r in caplog.records if getattr(r, "event", None) == "state_transition"]
+    assert any(
+        getattr(r, "to", None) == "needs_human" and r.__dict__.get("from") == "waiting"
+        for r in transitions
+    )
 
 
 def test_polling_times_out_with_phase_timeout() -> None:

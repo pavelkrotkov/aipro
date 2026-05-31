@@ -250,13 +250,26 @@ class _LeakyObject:
 
 
 def test_secret_in_custom_object_str_is_redacted() -> None:
-    # redact_recursive leaves the object as-is; json.dumps(default=str) then
-    # renders its __str__, so the final-string redaction is what masks it.
+    # redact_recursive leaves the object as-is; the ``default`` conversion
+    # redacts its __str__ before json escaping (and the final-string pass backs
+    # that up).
     canary = "canary-in-custom-object"
     stream, logger, _ = _configure("aipro_test_custom_obj", secrets=[canary])
     logger.info("see obj", extra={"obj": _LeakyObject(canary)})
     output = stream.getvalue()
     assert canary not in output
+    assert REDACTION_PLACEHOLDER in output
+
+
+def test_secret_with_json_special_chars_in_custom_object_is_redacted() -> None:
+    # A secret containing a quote and a newline: json.dumps escapes those
+    # (`"` -> `\"`, newline -> `\n`), so a post-serialization-only pass would
+    # miss the escaped form. Redacting inside ``default`` (pre-escape) closes it.
+    canary = 'ZZ"can\naryZZ'
+    stream, logger, _ = _configure("aipro_test_custom_obj_special", secrets=[canary])
+    logger.info("see obj", extra={"obj": _LeakyObject(canary)})
+    output = stream.getvalue()
+    assert "ZZ" not in output  # neither the raw nor the JSON-escaped form leaks
     assert REDACTION_PLACEHOLDER in output
 
 

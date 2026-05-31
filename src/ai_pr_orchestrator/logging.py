@@ -222,13 +222,22 @@ class JsonFormatter(logging.Formatter):
         # can carry a dict with mixed key types (e.g. int and str), which makes
         # sorting raise ``TypeError`` and crash the formatter. Insertion order is
         # deterministic enough for structured logs, and parsers don't rely on it.
-        formatted = json.dumps(payload, default=str)
+        formatted = json.dumps(payload, default=self._json_default)
         if self._redactor is not None:
-            # Final catch-all: redact the serialized string too, so secrets that
-            # only surface via a custom object's ``__str__`` (rendered by
-            # ``default=str`` *after* per-value redaction) are still masked.
+            # Final catch-all (defense in depth): redact the serialized string
+            # too. ``_json_default`` already masks custom-object ``__str__``
+            # output before escaping; this pass covers anything else.
             formatted = self._redactor.redact(formatted)
         return formatted
+
+    def _json_default(self, obj: object) -> str:
+        # json.dumps calls this only for values it can't natively serialize
+        # (custom objects). Redact the raw ``str(obj)`` *before* JSON escaping:
+        # a secret containing quotes/newlines would be escaped (``"`` -> ``\"``)
+        # by json.dumps, so the post-serialization pass would no longer match it
+        # — masking here, pre-escape, closes that gap.
+        text = str(obj)
+        return self._redactor.redact(text) if self._redactor is not None else text
 
     def _redact_value(self, value: object) -> object:
         if self._redactor is None:

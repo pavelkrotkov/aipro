@@ -301,6 +301,7 @@ class Runner:
                 pr_number,
             )
             now = ctx.clock()
+            previous_status = state.status
             state = replace(
                 state,
                 status="needs_human",
@@ -310,6 +311,7 @@ class Runner:
             actions = terminal_actions(state, ctx.config)
             state = self._execute_actions(actions, pr_number, gh_pr, state)
             self._save_state(pr_number, state)
+            self._log_transition(previous_status, state)
             return 0
 
         # Push recovery: if a previous run committed locally but the process
@@ -343,6 +345,7 @@ class Runner:
             except Exception:
                 logger.exception("Push recovery failed for PR #%s", pr_number)
                 now = ctx.clock()
+                previous_status = state.status
                 state = replace(
                     state,
                     status="needs_human",
@@ -355,6 +358,7 @@ class Runner:
                 actions = terminal_actions(state, ctx.config)
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return 0
 
         # Detect an orphaned coder invocation from a prior process. If the
@@ -370,6 +374,7 @@ class Runner:
             and self._pending_coder_result is None
         ):
             now = ctx.clock()
+            previous_status = state.status
             state = replace(
                 state,
                 status="needs_human",
@@ -382,6 +387,7 @@ class Runner:
             actions = terminal_actions(state, ctx.config)
             state = self._execute_actions(actions, pr_number, gh_pr, state)
             self._save_state(pr_number, state)
+            self._log_transition(previous_status, state)
             return 0
 
         for _ in range(_MAX_TRANSITIONS_PER_RUN):
@@ -447,6 +453,7 @@ class Runner:
         # so future events short-circuit on the terminal check at the top.
         logger.error("Runner exceeded max transitions for PR #%s", pr_number)
         now = ctx.clock()
+        previous_status = state.status
         state = replace(
             state,
             status="error",
@@ -456,6 +463,7 @@ class Runner:
         actions = terminal_actions(state, ctx.config)
         state = self._execute_actions(actions, pr_number, gh_pr, state)
         self._save_state(pr_number, state)
+        self._log_transition(previous_status, state)
         return 1
 
     # ---- Dry-run planning ----
@@ -718,6 +726,10 @@ class Runner:
     ) -> RuntimeState:
         ctx = self._ctx
         cfg = ctx.config.review_phase
+        # Status on entry (waiting/collecting); used as the ``from`` for the
+        # structured transition log emitted when this phase resolves. Polling
+        # leaves this status at most once per call, so a single capture suffices.
+        previous_status = state.status
 
         # Fail fast if any reviewer triggered in the current round is missing
         # from ctx.reviewers (misconfiguration, missing plugin, failed wiring).
@@ -748,6 +760,7 @@ class Runner:
                 actions = terminal_actions(state, ctx.config)
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return state
 
         # Deadlines are anchored to persisted state, NOT to ctx.clock() at
@@ -793,6 +806,7 @@ class Runner:
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return state
 
             # If the reviewer responded but produced zero findings, treat the
@@ -806,6 +820,7 @@ class Runner:
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return state
 
             now = ctx.clock()
@@ -817,6 +832,7 @@ class Runner:
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return state
 
             ctx.sleeper(cfg.poll_interval_seconds)
@@ -835,6 +851,7 @@ class Runner:
         state = next_state
         state = self._execute_actions(actions, pr_number, gh_pr, state)
         self._save_state(pr_number, state)
+        self._log_transition(previous_status, state)
         return state
 
     def _all_enabled_reviewers_responded(
