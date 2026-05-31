@@ -166,10 +166,17 @@ class SecretRedactingFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         # Collapse msg+args into a single redacted string so the secret can't
-        # survive inside a deferred ``%`` argument.
+        # survive inside a deferred ``%`` argument. ``getMessage()`` does
+        # ``msg % args`` and can raise on a malformed log call (mismatched
+        # placeholders/args); a filter that raises is NOT caught by the logging
+        # machinery and would crash the caller, so swallow it and leave msg/args
+        # for the handler's emit() to render under its own error handling.
         if record.args:
-            record.msg = record.getMessage()
-            record.args = ()
+            try:
+                record.msg = record.getMessage()
+                record.args = ()
+            except Exception:
+                pass
         if isinstance(record.msg, str):
             record.msg = self._redactor.redact(record.msg)
         for key, value in list(record.__dict__.items()):

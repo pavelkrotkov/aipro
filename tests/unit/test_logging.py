@@ -11,6 +11,7 @@ import pytest
 
 from ai_pr_orchestrator.logging import (
     REDACTION_PLACEHOLDER,
+    SecretRedactingFilter,
     SecretRedactor,
     collect_secret_values,
     log_action,
@@ -279,6 +280,23 @@ def test_shared_non_cyclic_reference_is_fully_redacted() -> None:
     redactor = SecretRedactor([canary])
     result = redactor.redact_recursive({"a": shared, "b": shared})
     assert result == {"a": {"value": REDACTION_PLACEHOLDER}, "b": {"value": REDACTION_PLACEHOLDER}}
+
+
+def test_filter_survives_malformed_format_args() -> None:
+    # A filter that raises is NOT caught by the logging machinery and would
+    # crash the caller. getMessage() on a record with too few %-args raises;
+    # the filter must swallow that and still return True.
+    filt = SecretRedactingFilter(SecretRedactor())
+    record = logging.LogRecord(
+        name="n",
+        level=logging.INFO,
+        pathname="p",
+        lineno=1,
+        msg="needs %s and %s",
+        args=("one",),
+        exc_info=None,
+    )
+    assert filt.filter(record) is True
 
 
 def test_mixed_key_types_in_extra_do_not_crash() -> None:

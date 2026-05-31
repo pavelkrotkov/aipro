@@ -416,9 +416,15 @@ class Runner:
                     # check_run/check_suite event wake us back up.
                     self._save_state(pr_number, next_state)
                     return 0
-                self._log_transition(state, next_state)
+                # Log the transition only after the side effects ran and the
+                # state was persisted, so the logged ``to`` reflects what
+                # actually landed (e.g. a push failure inside _execute_actions
+                # routes to needs_human; a StateConflictError on save aborts
+                # before we claim a transition that never persisted).
+                previous_status = state.status
                 state = self._execute_actions(actions, pr_number, gh_pr, next_state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 continue
 
             snapshot = self._build_snapshot(state, gh_pr, event=event)
@@ -426,9 +432,12 @@ class Runner:
             # Clear the cached coder result once the transition has consumed it
             # so a subsequent transition in the same run doesn't see a stale one.
             self._pending_coder_result = None
-            self._log_transition(state, next_state)
+            # Log after execute+save so the recorded transition matches the
+            # persisted outcome (see the ci_wait branch for the rationale).
+            previous_status = state.status
             state = self._execute_actions(actions, pr_number, gh_pr, next_state)
             self._save_state(pr_number, state)
+            self._log_transition(previous_status, state)
 
         # The loop failed to converge within the hard cap. Don't just return:
         # leaving the persisted state in a non-terminal status means every
@@ -470,7 +479,7 @@ class Runner:
         next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
         # Tag the planned transition/action logs with ``dry_run`` so downstream
         # observability tools never read them as real mutations.
-        self._log_transition(state, next_state, dry_run=True)
+        self._log_transition(state.status, next_state, dry_run=True)
         print(
             f"DRY-RUN PR #{pr_number}: status {state.status!r} -> {next_state.status!r}; "
             f"{len(actions)} action(s) planned"
@@ -481,14 +490,19 @@ class Runner:
         return 0
 
     def _log_transition(
-        self, previous: RuntimeState, nxt: RuntimeState, *, dry_run: bool = False
+        self, previous_status: str, nxt: RuntimeState, *, dry_run: bool = False
     ) -> None:
-        """Emit a structured ``state_transition`` log when the status changes."""
-        if previous.status != nxt.status:
+        """Emit a structured ``state_transition`` log when the status changes.
+
+        Takes the *previous status string* (captured before side effects run)
+        rather than the prior state object, so callers can compare it against
+        the final, persisted state after ``_execute_actions``/``_save_state``.
+        """
+        if previous_status != nxt.status:
             log_state_transition(
                 logger,
                 pr=nxt.pr_number,
-                from_status=previous.status,
+                from_status=previous_status,
                 to_status=nxt.status,
                 head_sha=nxt.head_sha,
                 dry_run=dry_run,
