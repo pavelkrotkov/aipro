@@ -239,13 +239,13 @@ def test_collect_secret_values_includes_gh_token_and_skips_unset(
 
 
 class _LeakyObject:
-    """A custom object whose ``str()`` exposes a secret (only via default=str)."""
+    """A custom object whose ``str()`` exposes its value (only via default=str)."""
 
-    def __init__(self, secret: str) -> None:
-        self._secret = secret
+    def __init__(self, exposed: str) -> None:
+        self._exposed = exposed
 
     def __str__(self) -> str:
-        return f"<user token={self._secret}>"
+        return f"<user value={self._exposed}>"
 
 
 def test_secret_in_custom_object_str_is_redacted() -> None:
