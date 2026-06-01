@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -27,8 +27,10 @@ from ai_pr_orchestrator.models import (
     FixTask,
     ReviewerTrigger,
     RuntimeState,
+    Status,
     TestResult,
     TokenUsage,
+    Verdict,
 )
 from ai_pr_orchestrator.runner import ParsedEvent, Runner, RunnerContext
 from ai_pr_orchestrator.state_storage import find_state_comment, serialize_state_comment
@@ -84,6 +86,7 @@ class TrackingGitHubClient(FakeGitHubClient):
 @dataclass
 class FakeCoderAdapter:
     result: AgentRunResult
+    name: str = "fake-coder"
     on_run: Callable[[FixTask], None] | None = None
     calls: list[FixTask] = field(default_factory=list)
 
@@ -108,7 +111,9 @@ class FakeReviewerAdapter:
 
     def build_trigger_comment(self, round_index: int, head_sha: str) -> str:
         self.trigger_comments.append((round_index, head_sha))
-        return f"/fake review\n\n<!-- aipro-review-trigger fake round={round_index} sha={head_sha} -->"
+        return (
+            f"/fake review\n\n<!-- aipro-review-trigger fake round={round_index} sha={head_sha} -->"
+        )
 
     def collect_findings(
         self, pr_number: int, head_sha: str, trigger_timestamp: datetime
@@ -128,7 +133,7 @@ class FakeReviewerAdapter:
 class FakeGitRepo:
     head_sha: str = "head-1"
     clean: bool = True
-    remote_heads: list[str | Exception] = field(default_factory=lambda: ["head-1"])
+    remote_heads: list[str | Exception | None] = field(default_factory=lambda: ["head-1"])
     commit_sha: str = "fix-sha"
     commits: list[tuple[str, str, str]] = field(default_factory=list)
     pushes: list[str] = field(default_factory=list)
@@ -152,10 +157,11 @@ class FakeGitRepo:
 
     def fetch_remote_head(self, branch: str) -> str | None:
         del branch
-        if len(self.remote_heads) > 1:
-            value = self.remote_heads.pop(0)
-        else:
-            value = self.remote_heads[0] if self.remote_heads else self.head_sha
+        if not self.remote_heads:
+            return self.head_sha
+        value = self.remote_heads.pop(0) if len(self.remote_heads) > 1 else self.remote_heads[0]
+        if value is None:
+            return self.head_sha
         if isinstance(value, Exception):
             raise value
         return value
@@ -262,14 +268,14 @@ def finding(id_: str = "f1", *, thread_id: str = "thread-1") -> Finding:
 def decision(
     finding_id: str = "f1",
     *,
-    verdict: str = "accepted",
+    verdict: Verdict = "accepted",
     reply: str = "Fixed in the follow-up commit.",
     should_resolve: bool = True,
     thread_id: str = "thread-1",
 ) -> Decision:
     return Decision(
         finding_id=finding_id,
-        verdict=verdict,  # type: ignore[arg-type]
+        verdict=verdict,
         confidence="high",
         reason="valid finding",
         reply=reply,
@@ -303,9 +309,9 @@ def context(
     use_clock = clock or FakeClock()
     return RunnerContext(
         github=gh,
-        coder=coder or FakeCoderAdapter(coder_result(decisions=[])),
+        coder=cast(Any, coder or FakeCoderAdapter(result=coder_result(decisions=[]))),
         reviewers={"fake": reviewer or FakeReviewerAdapter(responded=True)},
-        git=git,
+        git=cast(Any, git),
         config=config or make_config(),
         clock=use_clock,
         sleeper=FakeSleeper(use_clock),
@@ -325,7 +331,7 @@ def seed_state(
     gh: TrackingGitHubClient,
     pr_number: int,
     *,
-    status: str,
+    status: Status,
     head_sha: str = "head-1",
     round_index: int = 1,
     trigger_history: list[ReviewerTrigger] | None = None,
@@ -337,7 +343,7 @@ def seed_state(
         version=1,
         pr_number=pr_number,
         head_sha=head_sha,
-        status=status,  # type: ignore[arg-type]
+        status=status,
         round_index=round_index,
         trigger_history=trigger_history or [],
         cost=cost or CostTracker(),
@@ -379,9 +385,9 @@ def test_full_happy_path_exits_for_ci_then_resumes_to_done() -> None:
     )
     cfg = make_config()
 
-    first_result = Runner(
-        context(gh=gh, reviewer=reviewer, coder=coder, git=git, config=cfg)
-    ).run(pr.number)
+    first_result = Runner(context(gh=gh, reviewer=reviewer, coder=coder, git=git, config=cfg)).run(
+        pr.number
+    )
 
     assert first_result == 0
     assert current_state(gh).status == "ci_wait"
@@ -401,15 +407,17 @@ def test_full_happy_path_exits_for_ci_then_resumes_to_done() -> None:
     assert gh.resolved_threads == ["thread-1"]
     assert git.commits[0][0] == cfg.git.commit_message_prefix
     assert git.pushes == ["feature/integration"]
-    assert not any(body.startswith("AI PR Orchestrator: status `done`") for body in gh.posted_bodies)
+    assert not any(
+        body.startswith("AI PR Orchestrator: status `done`") for body in gh.posted_bodies
+    )
 
     gh.seed_pr(replace(pr, head_sha="fix-sha"))
     gh.seed_check_run("fix-sha", name="tests", status="completed", conclusion="success")
     event = ParsedEvent(event_type="check_run", pr_number=pr.number, head_sha="fix-sha")
 
-    second_result = Runner(
-        context(gh=gh, reviewer=reviewer, coder=coder, git=git, config=cfg)
-    ).run(pr.number, event=event)
+    second_result = Runner(context(gh=gh, reviewer=reviewer, coder=coder, git=git, config=cfg)).run(
+        pr.number, event=event
+    )
 
     assert second_result == 0
     final = current_state(gh)
@@ -441,9 +449,7 @@ def test_coder_needs_human_posts_summary_with_mentions() -> None:
     pr = seed_pr(gh)
     reviewer = FakeReviewerAdapter(findings=[finding()])
     coder = FakeCoderAdapter(coder_result(needs_human=True, decisions=[]))
-    cfg = make_config(
-        notifications=NotificationsConfig(mention_on_needs_human=["alice", "@bob"])
-    )
+    cfg = make_config(notifications=NotificationsConfig(mention_on_needs_human=["alice", "@bob"]))
 
     assert Runner(context(gh=gh, reviewer=reviewer, coder=coder, config=cfg)).run(pr.number) == 0
 
@@ -646,8 +652,7 @@ def test_head_sha_race_discards_coder_output_and_restarts() -> None:
     assert len(coder.calls) == 1
     assert git.commits == []
     assert any(
-        status == "init"
-        for status in gh.state_statuses[gh.state_statuses.index("handling") + 1 :]
+        status == "init" for status in gh.state_statuses[gh.state_statuses.index("handling") + 1 :]
     )
     assert current_state(gh).last_error in {None, "stale_coder_output_discarded"}
 
