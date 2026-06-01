@@ -23,6 +23,13 @@ from ai_pr_orchestrator.config import Config, load_config
 from ai_pr_orchestrator.git.repo import GitRepo
 from ai_pr_orchestrator.github import models as gh_models
 from ai_pr_orchestrator.github.protocol import GitHubClient
+from ai_pr_orchestrator.logging import (
+    collect_secret_values,
+    log_action,
+    log_error,
+    log_state_transition,
+    setup_logging,
+)
 from ai_pr_orchestrator.models import (
     AgentRunResult,
     CheckRun,
@@ -83,6 +90,11 @@ class RunnerContext:
     git: GitRepo | None = None
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
     sleeper: Callable[[float], None] = field(default=time.sleep)
+    # When True the runner plans a single transition and reports the actions it
+    # *would* take without performing any GitHub or git mutation. The GitHub
+    # client should also be constructed in dry-run mode (defense in depth), and
+    # ``git`` should be ``None`` so no commit/push path is reachable.
+    dry_run: bool = False
 
 
 def parse_event(event: Any, *, event_name: str | None = None) -> ParsedEvent:
@@ -235,8 +247,8 @@ class Runner:
                 "State conflict on PR #%s; another runner advanced state first", pr_number
             )
             return 0
-        except Exception:
-            logger.exception("Runner crashed for PR #%s", pr_number)
+        except Exception as exc:
+            log_error(logger, error=f"Runner crashed for PR #{pr_number}: {exc}", pr=pr_number)
             return 1
 
     def _run(self, pr_number: int, event: ParsedEvent | None) -> int:
@@ -250,6 +262,14 @@ class Runner:
         # no-op rather than another full pass with redundant get_pr calls.
         if state.status in TERMINAL_STATUSES:
             return 0
+
+        # Dry-run: plan a single transition from the loaded state and report the
+        # actions that would fire, performing zero mutations. We branch here —
+        # before the fork hard-block, push recovery, and the transition loop —
+        # because those paths exist to *drive* side effects (push, label, final
+        # summary) that dry-run must not perform.
+        if ctx.dry_run:
+            return self._plan_dry_run(pr_number, gh_pr, state, event)
 
         # Fork hard-block: when git is wired (the commit/push path is live) we
         # cannot safely handle a fork PR. ``gh_pr.head_ref`` is just the branch
@@ -281,6 +301,7 @@ class Runner:
                 pr_number,
             )
             now = ctx.clock()
+            previous_status = state.status
             state = replace(
                 state,
                 status="needs_human",
@@ -290,6 +311,7 @@ class Runner:
             actions = terminal_actions(state, ctx.config)
             state = self._execute_actions(actions, pr_number, gh_pr, state)
             self._save_state(pr_number, state)
+            self._log_transition(previous_status, state)
             return 0
 
         # Push recovery: if a previous run committed locally but the process
@@ -323,6 +345,7 @@ class Runner:
             except Exception:
                 logger.exception("Push recovery failed for PR #%s", pr_number)
                 now = ctx.clock()
+                previous_status = state.status
                 state = replace(
                     state,
                     status="needs_human",
@@ -335,6 +358,7 @@ class Runner:
                 actions = terminal_actions(state, ctx.config)
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return 0
 
         # Detect an orphaned coder invocation from a prior process. If the
@@ -350,6 +374,7 @@ class Runner:
             and self._pending_coder_result is None
         ):
             now = ctx.clock()
+            previous_status = state.status
             state = replace(
                 state,
                 status="needs_human",
@@ -362,6 +387,7 @@ class Runner:
             actions = terminal_actions(state, ctx.config)
             state = self._execute_actions(actions, pr_number, gh_pr, state)
             self._save_state(pr_number, state)
+            self._log_transition(previous_status, state)
             return 0
 
         for _ in range(_MAX_TRANSITIONS_PER_RUN):
@@ -396,8 +422,15 @@ class Runner:
                     # check_run/check_suite event wake us back up.
                     self._save_state(pr_number, next_state)
                     return 0
+                # Log the transition only after the side effects ran and the
+                # state was persisted, so the logged ``to`` reflects what
+                # actually landed (e.g. a push failure inside _execute_actions
+                # routes to needs_human; a StateConflictError on save aborts
+                # before we claim a transition that never persisted).
+                previous_status = state.status
                 state = self._execute_actions(actions, pr_number, gh_pr, next_state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 continue
 
             snapshot = self._build_snapshot(state, gh_pr, event=event)
@@ -405,8 +438,12 @@ class Runner:
             # Clear the cached coder result once the transition has consumed it
             # so a subsequent transition in the same run doesn't see a stale one.
             self._pending_coder_result = None
+            # Log after execute+save so the recorded transition matches the
+            # persisted outcome (see the ci_wait branch for the rationale).
+            previous_status = state.status
             state = self._execute_actions(actions, pr_number, gh_pr, next_state)
             self._save_state(pr_number, state)
+            self._log_transition(previous_status, state)
 
         # The loop failed to converge within the hard cap. Don't just return:
         # leaving the persisted state in a non-terminal status means every
@@ -416,6 +453,7 @@ class Runner:
         # so future events short-circuit on the terminal check at the top.
         logger.error("Runner exceeded max transitions for PR #%s", pr_number)
         now = ctx.clock()
+        previous_status = state.status
         state = replace(
             state,
             status="error",
@@ -425,7 +463,150 @@ class Runner:
         actions = terminal_actions(state, ctx.config)
         state = self._execute_actions(actions, pr_number, gh_pr, state)
         self._save_state(pr_number, state)
+        self._log_transition(previous_status, state)
         return 1
+
+    # ---- Dry-run planning ----
+
+    def _plan_dry_run(
+        self,
+        pr_number: int,
+        gh_pr: gh_models.PullRequest,
+        state: RuntimeState,
+        event: ParsedEvent | None,
+    ) -> int:
+        """Plan one transition and print the actions that would fire.
+
+        Reads (PR, threads, checks) happen normally via ``_build_snapshot``;
+        nothing is committed, pushed, posted, edited, labeled, or resolved.
+        Always returns 0 — a dry-run is a successful inspection regardless of
+        what state the PR is in.
+        """
+        next_state, actions = self._plan_next(state, gh_pr, event)
+        # Tag the planned transition/action logs with ``dry_run`` so downstream
+        # observability tools never read them as real mutations.
+        self._log_transition(state.status, next_state, dry_run=True)
+        print(
+            f"DRY-RUN PR #{pr_number}: status {state.status!r} -> {next_state.status!r}; "
+            f"{len(actions)} action(s) planned"
+        )
+        for action in actions:
+            log_action(logger, pr=pr_number, action_type=action.type, dry_run=True)
+            print(f"  - {_describe_action(action)}")
+        return 0
+
+    def _plan_next(
+        self,
+        state: RuntimeState,
+        gh_pr: gh_models.PullRequest,
+        event: ParsedEvent | None,
+    ) -> tuple[RuntimeState, list[PlannedAction]]:
+        """Compute the (next_state, actions) a real run would produce, read-only.
+
+        Mirrors the runner-only planning branches that sit between ``_run``'s
+        terminal check and the plain state-machine transition, so a dry-run plan
+        doesn't under-report terminal actions: the orphaned-coder bailout and
+        the reviewer-poll decision. The git-dependent branches (fork hard-block,
+        push recovery) are unreachable in dry-run (``git`` is ``None``) and are
+        intentionally omitted.
+        """
+        ctx = self._ctx
+        now = ctx.clock()
+
+        # Orphaned coder: a dry-run Runner has no pending coder result, so a
+        # persisted ``handling`` state that already invoked the coder this round
+        # bails to needs_human — not the noop(waiting_for_coder) a plain
+        # transition would report.
+        if (
+            state.status == "handling"
+            and state.last_coder_round_index == state.round_index
+            and self._pending_coder_result is None
+        ):
+            planned = replace(
+                state,
+                status="needs_human",
+                last_error="coder_invocation_orphaned",
+                updated_at=now,
+            )
+            return planned, terminal_actions(planned, ctx.config)
+
+        if state.status in ("waiting", "collecting"):
+            return self._plan_poll_tick(state, gh_pr, now)
+
+        snapshot = self._build_snapshot(state, gh_pr, event=event)
+        return transition(state, snapshot, ctx.config, now)
+
+    def _plan_poll_tick(
+        self,
+        state: RuntimeState,
+        gh_pr: gh_models.PullRequest,
+        now: datetime,
+    ) -> tuple[RuntimeState, list[PlannedAction]]:
+        """Mirror ``_poll_reviewers``' first-tick decision without side effects.
+
+        Reports the terminal/handling action a real poll would reach on its
+        first iteration: missing-adapter bailout, findings-collected ->
+        handling, zero-findings completion, or reviewer/phase timeout. The
+        timeouts use the same persisted-state-anchored deadlines as the live
+        loop, so an already-expired ``waiting`` state plans needs_human rather
+        than noop.
+        """
+        ctx = self._ctx
+        cfg = ctx.config.review_phase
+
+        current_round_triggers = [
+            t for t in state.trigger_history if t.round_index == state.round_index
+        ]
+        for trig in current_round_triggers:
+            if trig.reviewer_name not in ctx.reviewers:
+                planned = replace(
+                    state,
+                    status="needs_human",
+                    last_error=f"missing_reviewer_adapter:{trig.reviewer_name}",
+                    updated_at=now,
+                )
+                return planned, terminal_actions(planned, ctx.config)
+
+        snapshot = self._build_snapshot(state, gh_pr, event=None)
+        if snapshot.findings:
+            return transition(state, snapshot, ctx.config, now)
+
+        if self._all_enabled_reviewers_responded(state, gh_pr):
+            responded = self._build_snapshot(state, gh_pr, event=None, reviewer_responded=True)
+            return transition(state, responded, ctx.config, now)
+
+        if state.trigger_history:
+            latest_trigger_ts = max(t.timestamp for t in state.trigger_history)
+            earliest_trigger_ts = min(t.timestamp for t in state.trigger_history)
+        else:
+            latest_trigger_ts = earliest_trigger_ts = state.created_at
+        deadline_reviewer = latest_trigger_ts + timedelta(seconds=cfg.reviewer_timeout_seconds)
+        deadline_phase = earliest_trigger_ts + timedelta(seconds=cfg.phase_timeout_seconds)
+        if now >= deadline_reviewer or now >= deadline_phase:
+            timed_out = self._build_snapshot(state, gh_pr, event=None, reviewer_timed_out=True)
+            return transition(state, timed_out, ctx.config, now)
+
+        # Still waiting on reviewers this tick.
+        return transition(state, snapshot, ctx.config, now)
+
+    def _log_transition(
+        self, previous_status: str, nxt: RuntimeState, *, dry_run: bool = False
+    ) -> None:
+        """Emit a structured ``state_transition`` log when the status changes.
+
+        Takes the *previous status string* (captured before side effects run)
+        rather than the prior state object, so callers can compare it against
+        the final, persisted state after ``_execute_actions``/``_save_state``.
+        """
+        if previous_status != nxt.status:
+            log_state_transition(
+                logger,
+                pr=nxt.pr_number,
+                from_status=previous_status,
+                to_status=nxt.status,
+                head_sha=nxt.head_sha,
+                dry_run=dry_run,
+            )
 
     # ---- State loading / saving ----
 
@@ -446,12 +627,22 @@ class Runner:
             created_at=now,
             updated_at=now,
         )
+        if self._ctx.dry_run:
+            # Posting the initial state comment is a mutation; in dry-run we
+            # return the in-memory init state without persisting it.
+            self._state_expected_updated_at = state.updated_at
+            return state
         posted = self._ctx.github.post_comment(pr_number, serialize_state_comment(state))
         self._state_comment_id = posted.id
         self._state_expected_updated_at = state.updated_at
         return state
 
     def _save_state(self, pr_number: int, state: RuntimeState) -> None:
+        # Dry-run performs zero mutations: persisting state would post or edit a
+        # PR comment. The single-pass planner never calls this, but guard here
+        # too so any future dry-run code path stays mutation-free.
+        if self._ctx.dry_run:
+            return
         # Fresh PRs without a state comment yet: post once, record id+lock.
         if self._state_comment_id is None:
             body = serialize_state_comment(state)
@@ -627,6 +818,10 @@ class Runner:
     ) -> RuntimeState:
         ctx = self._ctx
         cfg = ctx.config.review_phase
+        # Status on entry (waiting/collecting); used as the ``from`` for the
+        # structured transition log emitted when this phase resolves. Polling
+        # leaves this status at most once per call, so a single capture suffices.
+        previous_status = state.status
 
         # Fail fast if any reviewer triggered in the current round is missing
         # from ctx.reviewers (misconfiguration, missing plugin, failed wiring).
@@ -657,6 +852,7 @@ class Runner:
                 actions = terminal_actions(state, ctx.config)
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return state
 
         # Deadlines are anchored to persisted state, NOT to ctx.clock() at
@@ -702,6 +898,7 @@ class Runner:
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return state
 
             # If the reviewer responded but produced zero findings, treat the
@@ -715,6 +912,7 @@ class Runner:
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return state
 
             now = ctx.clock()
@@ -726,6 +924,7 @@ class Runner:
                 state = next_state
                 state = self._execute_actions(actions, pr_number, gh_pr, state)
                 self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
                 return state
 
             ctx.sleeper(cfg.poll_interval_seconds)
@@ -744,6 +943,7 @@ class Runner:
         state = next_state
         state = self._execute_actions(actions, pr_number, gh_pr, state)
         self._save_state(pr_number, state)
+        self._log_transition(previous_status, state)
         return state
 
     def _all_enabled_reviewers_responded(
@@ -817,6 +1017,7 @@ class Runner:
         state: RuntimeState,
     ) -> RuntimeState:
         for action in actions:
+            log_action(logger, pr=pr_number, action_type=action.type)
             state = self._execute_action(action, pr_number, gh_pr, state)
         return state
 
@@ -1076,6 +1277,42 @@ def _convert_check_run(cr: gh_models.CheckRun, head_sha: str) -> CheckRun:
     )
 
 
+def _describe_action(action: PlannedAction) -> str:
+    """Render a planned action as a human-readable ``would ...`` line for dry-run."""
+    kind = action.type
+    payload = action.payload
+    if kind == "noop":
+        reason = payload.get("reason")
+        return f"would do nothing (noop: {reason})" if reason else "would do nothing (noop)"
+    if kind == "post_pr_comment":
+        reviewer = payload.get("reviewer")
+        if isinstance(reviewer, str):
+            return f"would post a comment triggering reviewer {reviewer!r}"
+        return "would post a PR comment"
+    if kind == "post_final_summary":
+        return "would post the final summary comment"
+    if kind == "update_status_comment":
+        return "would update the hidden status comment"
+    if kind == "reply_to_thread":
+        return f"would reply to review thread {payload.get('thread_id')}"
+    if kind == "resolve_thread":
+        return f"would resolve review thread {payload.get('thread_id')}"
+    if kind == "add_label":
+        return f"would add label {payload.get('label')!r}"
+    if kind == "remove_label":
+        return f"would remove label {payload.get('label')!r}"
+    if kind == "commit_changes":
+        return "would commit working-tree changes"
+    if kind == "push_branch":
+        return "would push the branch to origin"
+    if kind == "rollback_changes":
+        return "would roll back working-tree changes"
+    if kind == "invoke_coder":
+        finding_ids = payload.get("finding_ids") or []
+        return f"would invoke the coder on {len(finding_ids)} finding(s)"
+    return f"would execute action {kind!r}"
+
+
 def _build_final_summary(state: RuntimeState, payload: dict[str, Any]) -> str:
     reason = payload.get("reason") or state.done_reason or state.last_error or "completed"
     cost = state.cost
@@ -1105,12 +1342,9 @@ def run(*, pr_number: int, dry_run: bool, event_path: Path | None = None) -> int
     """Run the orchestrator for a pull request.
 
     Builds dependencies from configuration and the environment, then delegates
-    to ``Runner.run``. ``dry_run`` short-circuits to a no-op for now (V1).
+    to ``Runner.run``. When ``dry_run`` is set the runner plans a single
+    transition and prints the actions it would take, performing zero mutations.
     """
-    if dry_run:
-        print("Dry-run mode is not yet wired through Runner; exiting cleanly.", file=sys.stderr)
-        return 0
-
     event: ParsedEvent | None = None
     if event_path is not None:
         try:
@@ -1129,7 +1363,32 @@ def run(*, pr_number: int, dry_run: bool, event_path: Path | None = None) -> int
         print(f"Failed to load configuration: {exc}", file=sys.stderr)
         return 1
 
-    ctx = _build_runtime_context(config)
+    # Configure structured JSON logging with secret redaction. The env-var names
+    # the operator allow-listed for the coder (plus GH_TOKEN) are resolved to
+    # their values so they never appear verbatim in the log stream.
+    setup_logging(
+        level=os.environ.get("AIPRO_LOG_LEVEL", "INFO"),
+        secrets=collect_secret_values(config.main_coder.env),
+    )
+
+    if dry_run:
+        # The Runner's dry-run planner is fully implemented and unit-tested
+        # (it plans a single transition and prints the actions it would take),
+        # but constructing the live GitHub client / coder / reviewers from the
+        # environment is still a stub (see ``_build_runtime_context``, left to a
+        # follow-up issue). Until that wiring lands the CLI has no PR to plan
+        # against, so exit cleanly (0) rather than failing — ``dry_run`` already
+        # threads through ``_build_runtime_context``/``RunnerContext`` for when
+        # it does.
+        print(
+            "Dry-run: runtime wiring (GitHub client / coder / reviewers) is not "
+            "implemented yet; the dry-run planner is covered by unit tests. "
+            "Exiting cleanly.",
+            file=sys.stderr,
+        )
+        return 0
+
+    ctx = _build_runtime_context(config, dry_run=dry_run)
     if ctx is None:
         return 1
     return Runner(ctx).run(pr_number, event=event)
@@ -1154,9 +1413,12 @@ def inspect(*, pr_number: int) -> int:
     return 0
 
 
-def _build_runtime_context(_config: Config) -> RunnerContext | None:
+def _build_runtime_context(_config: Config, *, dry_run: bool = False) -> RunnerContext | None:
     # Real construction of GitHub client / coder / reviewers from environment
-    # and config is left to a follow-up issue. The Runner itself is fully
-    # exercised by unit tests via injected fakes.
+    # and config is left to a follow-up issue. When wired, ``dry_run`` must flow
+    # into both the GitHubClient (mutations become no-ops) and the
+    # RunnerContext (``git=None``, single-pass planning). The Runner's dry-run
+    # behavior itself is fully exercised by unit tests via injected fakes.
+    del dry_run
     print(NOT_IMPLEMENTED_MESSAGE, file=sys.stderr)
     return None
