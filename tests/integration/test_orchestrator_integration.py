@@ -142,7 +142,7 @@ class FakeGitRepo(GitRepo):
     rollbacks: int = 0
 
     def __post_init__(self) -> None:
-        super().__init__(Path.cwd())
+        super().__init__(Path("/mock/repo"))
 
     def is_clean(self) -> bool:
         return self.clean

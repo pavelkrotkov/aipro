@@ -913,11 +913,11 @@ class Runner:
             # Close the small race where the label is removed while the snapshot
             # is collecting findings. Operator abort still wins over handling
             # newly collected findings.
-            live_pr = ctx.github.get_pr(pr_number)
-            label_removed_snapshot = self._label_removed_snapshot(live_pr)
+            gh_pr = ctx.github.get_pr(pr_number)
+            label_removed_snapshot = self._label_removed_snapshot(gh_pr)
             if label_removed_snapshot is not None:
                 return self._transition_execute_save(
-                    state, label_removed_snapshot, pr_number, live_pr, previous_status
+                    state, label_removed_snapshot, pr_number, gh_pr, previous_status
                 )
 
             if snapshot.findings:
