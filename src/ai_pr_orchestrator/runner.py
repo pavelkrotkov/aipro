@@ -893,6 +893,21 @@ class Runner:
             # view captured before the loop started.
             gh_pr = ctx.github.get_pr(pr_number)
             snapshot = self._build_snapshot(state, gh_pr, event=None)
+
+            # Let label removal short-circuit on the next poll tick instead of
+            # burning the full reviewer/phase timeout before transition() gets
+            # a chance to run its label-removed guard.
+            if (
+                ctx.config.safety.only_run_on_labeled_prs
+                and ctx.config.enabled_label not in snapshot.pr.labels
+            ):
+                next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
+                state = next_state
+                state = self._execute_actions(actions, pr_number, gh_pr, state)
+                self._save_state(pr_number, state)
+                self._log_transition(previous_status, state)
+                return state
+
             if snapshot.findings:
                 next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
                 state = next_state

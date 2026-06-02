@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -17,6 +17,7 @@ from ai_pr_orchestrator.config import (
     ReviewPhaseConfig,
     SafetyConfig,
 )
+from ai_pr_orchestrator.git.repo import GitRepo
 from ai_pr_orchestrator.github import models as gh_models
 from ai_pr_orchestrator.github.fake import FakeGitHubClient
 from ai_pr_orchestrator.models import (
@@ -130,7 +131,7 @@ class FakeReviewerAdapter:
 
 
 @dataclass
-class FakeGitRepo:
+class FakeGitRepo(GitRepo):
     head_sha: str = "head-1"
     clean: bool = True
     remote_heads: list[str | Exception | None] = field(default_factory=lambda: ["head-1"])
@@ -157,6 +158,8 @@ class FakeGitRepo:
 
     def fetch_remote_head(self, branch: str) -> str | None:
         del branch
+        # Queue with a sticky terminal value: consume scripted heads while
+        # more than one remains, then keep returning the last head.
         if not self.remote_heads:
             return self.head_sha
         value = self.remote_heads.pop(0) if len(self.remote_heads) > 1 else self.remote_heads[0]
@@ -309,9 +312,9 @@ def context(
     use_clock = clock or FakeClock()
     return RunnerContext(
         github=gh,
-        coder=cast(Any, coder or FakeCoderAdapter(result=coder_result(decisions=[]))),
+        coder=coder or FakeCoderAdapter(result=coder_result(decisions=[])),
         reviewers={"fake": reviewer or FakeReviewerAdapter(responded=True)},
-        git=cast(Any, git),
+        git=git,
         config=config or make_config(),
         clock=use_clock,
         sleeper=FakeSleeper(use_clock),
@@ -570,17 +573,19 @@ def test_safety_paths_stop_before_coder(
 def test_label_removed_mid_run_completes_with_label_removed_reason() -> None:
     gh = TrackingGitHubClient()
     pr = seed_pr(gh)
+    clock = FakeClock()
     reviewer = FakeReviewerAdapter(
         findings=[],
         responded=False,
         on_collect=lambda: gh.remove_label(pr.number, "ai-loop"),
     )
 
-    assert Runner(context(gh=gh, reviewer=reviewer)).run(pr.number) == 0
+    assert Runner(context(gh=gh, reviewer=reviewer, clock=clock)).run(pr.number) == 0
 
     state = current_state(gh)
     assert state.status == "done"
     assert state.done_reason == "label_removed"
+    assert clock.now == NOW + timedelta(seconds=1)
     assert "ai-loop-done" in gh.get_pr(pr.number).labels
 
 
@@ -654,7 +659,7 @@ def test_head_sha_race_discards_coder_output_and_restarts() -> None:
     assert any(
         status == "init" for status in gh.state_statuses[gh.state_statuses.index("handling") + 1 :]
     )
-    assert current_state(gh).last_error in {None, "stale_coder_output_discarded"}
+    assert current_state(gh).last_error == "stale_coder_output_discarded"
 
 
 def test_ci_wait_exits_process_and_later_check_event_completes() -> None:
