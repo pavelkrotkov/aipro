@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -139,6 +140,9 @@ class FakeGitRepo(GitRepo):
     commits: list[tuple[str, str, str]] = field(default_factory=list)
     pushes: list[str] = field(default_factory=list)
     rollbacks: int = 0
+
+    def __post_init__(self) -> None:
+        super().__init__(Path.cwd())
 
     def is_clean(self) -> bool:
         return self.clean
@@ -585,7 +589,26 @@ def test_label_removed_mid_run_completes_with_label_removed_reason() -> None:
     state = current_state(gh)
     assert state.status == "done"
     assert state.done_reason == "label_removed"
-    assert clock.now == NOW + timedelta(seconds=1)
+    assert clock.now == NOW
+    assert reviewer.collect_calls == 1
+    assert "ai-loop-done" in gh.get_pr(pr.number).labels
+
+
+def test_label_removed_mid_run_wins_over_collected_findings() -> None:
+    gh = TrackingGitHubClient()
+    pr = seed_pr(gh)
+    reviewer = FakeReviewerAdapter(
+        findings=[finding()],
+        on_collect=lambda: gh.remove_label(pr.number, "ai-loop"),
+    )
+    coder = FakeCoderAdapter(coder_result(changed=False))
+
+    assert Runner(context(gh=gh, reviewer=reviewer, coder=coder)).run(pr.number) == 0
+
+    state = current_state(gh)
+    assert state.status == "done"
+    assert state.done_reason == "label_removed"
+    assert coder.calls == []
     assert "ai-loop-done" in gh.get_pr(pr.number).labels
 
 
