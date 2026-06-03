@@ -1,0 +1,78 @@
+# AI PR Review Loop — target repository workflow.
+#
+# Copy this file into your repository as `.github/workflows/ai-review-loop.yml`
+# and copy `examples/sample-config.yml` to `.github/ai-review-loop.yml`.
+#
+# Required repository secrets:
+#   AI_ORCHESTRATOR_GITHUB_TOKEN  (optional) a PAT/app token for the orchestrator.
+#                                 Falls back to the workflow's GITHUB_TOKEN.
+#   CODEX_API_KEY                 credential for the coder (passed only to the
+#                                 coder subprocess, never the orchestrator token).
+name: AI PR Review Loop
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  check_run:
+    types: [completed]
+  check_suite:
+    types: [completed]
+  status:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number"
+        required: true
+        type: string
+
+# Serialize runs per PR. Never cancel an in-flight run: the orchestrator holds an
+# optimistic lock on its state comment, and cancelling mid-write can wedge state.
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event.pull_request.number
+      || github.event.issue.number
+      || github.event.check_run.pull_requests[0].number
+      || github.event.check_suite.pull_requests[0].number
+      || github.event.inputs.pr
+      || github.sha }}
+  cancel-in-progress: false
+
+# Minimal scopes: push commits (contents), manage PR comments/reviews/threads and
+# labels (pull-requests), and read check results (checks).
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.AI_ORCHESTRATOR_GITHUB_TOKEN || github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install orchestrator
+        # Pin to a released tag; replace YOUR_ORG with the org hosting this package.
+        run: pip install git+https://github.com/YOUR_ORG/ai-pr-orchestrator.git@v0.1.0
+      - name: Run orchestrator
+        # The orchestrator token (GH_TOKEN/GITHUB_TOKEN) authenticates GitHub API
+        # calls. It is deliberately NOT listed in `main_coder.env` of the config,
+        # and the coder adapter strips GH_TOKEN/GITHUB_TOKEN before spawning the
+        # coder, so the coder never sees the orchestrator's credentials.
+        env:
+          GH_TOKEN: ${{ secrets.AI_ORCHESTRATOR_GITHUB_TOKEN || github.token }}
+          GITHUB_TOKEN: ${{ secrets.AI_ORCHESTRATOR_GITHUB_TOKEN || github.token }}
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+        run: aipro run --event-path "$GITHUB_EVENT_PATH"
