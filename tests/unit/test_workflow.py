@@ -51,9 +51,11 @@ def test_workflow_has_all_required_event_triggers() -> None:
         "workflow_dispatch",
     }
     assert required <= set(on)
-    # Adding the opt-in `ai-loop` label must start the loop, so `labeled` is a
-    # required pull_request activity type (see README opt-in instructions).
+    # Adding or removing the opt-in `ai-loop` label must drive the loop, so
+    # `labeled` (start) and `unlabeled` (cleanup -> done) are both required
+    # pull_request activity types.
     assert "labeled" in on["pull_request"]["types"]
+    assert "unlabeled" in on["pull_request"]["types"]
 
 
 def test_workflow_dispatch_accepts_pr_input() -> None:
