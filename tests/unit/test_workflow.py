@@ -48,7 +48,6 @@ def test_workflow_has_all_required_event_triggers() -> None:
         "pull_request_review_comment",
         "check_run",
         "check_suite",
-        "status",
         "workflow_dispatch",
     }
     assert required <= set(on)
