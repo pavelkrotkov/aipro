@@ -823,6 +823,12 @@ class Runner:
         # leaves this status at most once per call, so a single capture suffices.
         previous_status = state.status
 
+        label_removed_snapshot = self._label_removed_snapshot(gh_pr)
+        if label_removed_snapshot is not None:
+            return self._transition_execute_save(
+                state, label_removed_snapshot, pr_number, gh_pr, previous_status
+            )
+
         # Fail fast if any reviewer triggered in the current round is missing
         # from ctx.reviewers (misconfiguration, missing plugin, failed wiring).
         # We can neither collect its findings nor confirm its response, so the
@@ -892,14 +898,32 @@ class Runner:
             # check, head_sha comparisons) must see the live PR, not the stale
             # view captured before the loop started.
             gh_pr = ctx.github.get_pr(pr_number)
+
+            # Let label removal short-circuit on the next poll tick instead of
+            # building a waiting-state snapshot, which can collect reviewer
+            # findings and perform API work we already know should be abandoned.
+            label_removed_snapshot = self._label_removed_snapshot(gh_pr)
+            if label_removed_snapshot is not None:
+                return self._transition_execute_save(
+                    state, label_removed_snapshot, pr_number, gh_pr, previous_status
+                )
+
             snapshot = self._build_snapshot(state, gh_pr, event=None)
+
+            # Close the small race where the label is removed while the snapshot
+            # is collecting findings. Operator abort still wins over handling
+            # newly collected findings.
+            gh_pr = ctx.github.get_pr(pr_number)
+            label_removed_snapshot = self._label_removed_snapshot(gh_pr)
+            if label_removed_snapshot is not None:
+                return self._transition_execute_save(
+                    state, label_removed_snapshot, pr_number, gh_pr, previous_status
+                )
+
             if snapshot.findings:
-                next_state, actions = transition(state, snapshot, ctx.config, ctx.clock())
-                state = next_state
-                state = self._execute_actions(actions, pr_number, gh_pr, state)
-                self._save_state(pr_number, state)
-                self._log_transition(previous_status, state)
-                return state
+                return self._transition_execute_save(
+                    state, snapshot, pr_number, gh_pr, previous_status
+                )
 
             # If the reviewer responded but produced zero findings, treat the
             # phase as complete and let the state machine route to
@@ -908,24 +932,18 @@ class Runner:
                 responded_snapshot = self._build_snapshot(
                     state, gh_pr, event=None, reviewer_responded=True
                 )
-                next_state, actions = transition(state, responded_snapshot, ctx.config, ctx.clock())
-                state = next_state
-                state = self._execute_actions(actions, pr_number, gh_pr, state)
-                self._save_state(pr_number, state)
-                self._log_transition(previous_status, state)
-                return state
+                return self._transition_execute_save(
+                    state, responded_snapshot, pr_number, gh_pr, previous_status
+                )
 
             now = ctx.clock()
             if now >= deadline_reviewer or now >= deadline_phase:
                 timed_out_snapshot = self._build_snapshot(
                     state, gh_pr, event=None, reviewer_timed_out=True
                 )
-                next_state, actions = transition(state, timed_out_snapshot, ctx.config, ctx.clock())
-                state = next_state
-                state = self._execute_actions(actions, pr_number, gh_pr, state)
-                self._save_state(pr_number, state)
-                self._log_transition(previous_status, state)
-                return state
+                return self._transition_execute_save(
+                    state, timed_out_snapshot, pr_number, gh_pr, previous_status
+                )
 
             ctx.sleeper(cfg.poll_interval_seconds)
 
@@ -939,12 +957,32 @@ class Runner:
             pr_number,
         )
         timed_out_snapshot = self._build_snapshot(state, gh_pr, event=None, reviewer_timed_out=True)
-        next_state, actions = transition(state, timed_out_snapshot, ctx.config, ctx.clock())
-        state = next_state
-        state = self._execute_actions(actions, pr_number, gh_pr, state)
-        self._save_state(pr_number, state)
-        self._log_transition(previous_status, state)
-        return state
+        return self._transition_execute_save(
+            state, timed_out_snapshot, pr_number, gh_pr, previous_status
+        )
+
+    def _label_removed_snapshot(self, gh_pr: gh_models.PullRequest) -> TransitionSnapshot | None:
+        ctx = self._ctx
+        if (
+            not ctx.config.safety.only_run_on_labeled_prs
+            or ctx.config.enabled_label in gh_pr.labels
+        ):
+            return None
+        return TransitionSnapshot(pr=_convert_pr(gh_pr, ctx.config))
+
+    def _transition_execute_save(
+        self,
+        state: RuntimeState,
+        snapshot: TransitionSnapshot,
+        pr_number: int,
+        gh_pr: gh_models.PullRequest,
+        previous_status: str,
+    ) -> RuntimeState:
+        next_state, actions = transition(state, snapshot, self._ctx.config, self._ctx.clock())
+        next_state = self._execute_actions(actions, pr_number, gh_pr, next_state)
+        self._save_state(pr_number, next_state)
+        self._log_transition(previous_status, next_state)
+        return next_state
 
     def _all_enabled_reviewers_responded(
         self, state: RuntimeState, gh_pr: gh_models.PullRequest
