@@ -32,6 +32,8 @@ on:
 
 # Serialize runs per PR. Never cancel an in-flight run: the orchestrator holds an
 # optimistic lock on its state comment, and cancelling mid-write can wedge state.
+# Every term resolves to the PR number; the job-level `if` below guarantees the
+# job only runs for events that have one, so no SHA fallback is needed.
 concurrency:
   group: >-
     ${{ github.workflow }}-${{
@@ -39,8 +41,7 @@ concurrency:
       || github.event.issue.number
       || github.event.check_run.pull_requests[0].number
       || github.event.check_suite.pull_requests[0].number
-      || github.event.inputs.pr
-      || github.sha }}
+      || github.event.inputs.pr }}
   cancel-in-progress: false
 
 # Minimal scopes: push commits (contents), manage PR comments/reviews/threads and
@@ -52,6 +53,17 @@ permissions:
 
 jobs:
   orchestrate:
+    # Only run for events that map to a pull request. This skips comments on
+    # plain (non-PR) issues and check events on branches without a PR, both of
+    # which would otherwise spin up a runner the orchestrator can't act on (it
+    # can't resolve a PR number and would exit with an error). Opt-in label
+    # gating is enforced inside the orchestrator (safety.only_run_on_labeled_prs).
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.pull_request.number
+      || github.event.issue.pull_request
+      || github.event.check_run.pull_requests[0]
+      || github.event.check_suite.pull_requests[0]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -64,6 +76,8 @@ jobs:
           python-version: "3.12"
       - name: Install orchestrator
         # Pin to a released tag; replace YOUR_ORG with the org hosting this package.
+        # For a PRIVATE orchestrator repo, authenticate the install with a token:
+        #   run: pip install "git+https://x-access-token:${{ secrets.AI_ORCHESTRATOR_GITHUB_TOKEN }}@github.com/YOUR_ORG/ai-pr-orchestrator.git@v0.1.0"
         run: pip install git+https://github.com/YOUR_ORG/ai-pr-orchestrator.git@v0.1.0
       - name: Run orchestrator
         # The orchestrator token (GH_TOKEN/GITHUB_TOKEN) authenticates GitHub API

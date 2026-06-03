@@ -20,7 +20,7 @@ SAMPLE_CONFIG_PATH = REPO_ROOT / "examples" / "sample-config.yml"
 
 
 def _load_workflow() -> dict[Any, Any]:
-    data = yaml.safe_load(WORKFLOW_PATH.read_text())
+    data = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
     assert isinstance(data, dict)
     return data
 
@@ -66,6 +66,17 @@ def test_concurrency_serializes_per_pr_without_cancel() -> None:
     assert concurrency["cancel-in-progress"] is False
     # Group keys off the PR/issue/check/dispatch number so runs serialize per PR.
     assert "github.event.pull_request.number" in concurrency["group"]
+
+
+def test_orchestrate_job_is_guarded_to_pull_request_events() -> None:
+    workflow = _load_workflow()
+    guard = workflow["jobs"]["orchestrate"]["if"]
+    # Comments on non-PR issues are skipped by requiring a PR link, so the
+    # orchestrator never runs (and fails) on plain issues.
+    assert "github.event.issue.pull_request" in guard
+    # Check events on branches without a PR are skipped too.
+    assert "github.event.check_run.pull_requests[0]" in guard
+    assert "github.event.check_suite.pull_requests[0]" in guard
 
 
 def test_permissions_are_minimal() -> None:
