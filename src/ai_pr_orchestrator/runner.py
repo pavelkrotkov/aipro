@@ -116,7 +116,7 @@ def parse_event(event: Any, *, event_name: str | None = None) -> ParsedEvent:
         # Malformed payloads (lists, scalars, null) can't yield a PR; bail safely.
         return ParsedEvent(event_type=event_name or "unknown", pr_number=None, head_sha=None)
     inferred = event_name or _infer_event_name(event)
-    if inferred == "pull_request" or inferred == "pull_request_review":
+    if inferred in ("pull_request", "pull_request_review", "pull_request_review_comment"):
         pr = _as_dict(event.get("pull_request"))
         head = _as_dict(pr.get("head"))
         return ParsedEvent(

@@ -22,8 +22,9 @@ To run the review loop on your own repository:
      orchestrator; falls back to the workflow's `GITHUB_TOKEN`.
 4. Add the `ai-loop` label to a PR to opt it into the loop.
 
-The workflow grants the minimal scopes the orchestrator needs
-(`contents: write`, `pull-requests: write`, `checks: read`) and serializes runs
+The workflow grants the least-privilege scopes the orchestrator needs
+(`contents: write`, `pull-requests: write`, `issues: write`, `checks: read`,
+`statuses: read`) and serializes runs
 per PR via a `concurrency` group with `cancel-in-progress: false`. The
 orchestrator token is never forwarded to the coder: it is not listed in
 `main_coder.env`, and the coder adapter strips `GH_TOKEN`/`GITHUB_TOKEN` from the

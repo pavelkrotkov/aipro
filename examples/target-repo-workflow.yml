@@ -12,7 +12,9 @@ name: AI PR Review Loop
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `labeled` lets adding the opt-in `ai-loop` label start the loop immediately,
+    # rather than waiting for the next push or comment.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   issue_comment:
     types: [created]
   pull_request_review:
@@ -44,12 +46,20 @@ concurrency:
       || github.event.inputs.pr }}
   cancel-in-progress: false
 
-# Minimal scopes: push commits (contents), manage PR comments/reviews/threads and
-# labels (pull-requests), and read check results (checks).
+# Least-privilege scopes the runner actually uses:
+#   contents: write        push commits to the PR branch
+#   pull-requests: write   PR review comments, replies, and thread resolution
+#   issues: write          issue-endpoint label add/remove and PR conversation
+#                          comments (state comment, final summary)
+#   checks: read           read check runs (Checks API) for the CI gate
+#   statuses: read         read legacy commit statuses (CI that reports via the
+#                          Commit Status API) for the CI gate
 permissions:
   contents: write
   pull-requests: write
+  issues: write
   checks: read
+  statuses: read
 
 jobs:
   orchestrate:

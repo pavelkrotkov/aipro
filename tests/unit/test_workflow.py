@@ -51,6 +51,9 @@ def test_workflow_has_all_required_event_triggers() -> None:
         "workflow_dispatch",
     }
     assert required <= set(on)
+    # Adding the opt-in `ai-loop` label must start the loop, so `labeled` is a
+    # required pull_request activity type (see README opt-in instructions).
+    assert "labeled" in on["pull_request"]["types"]
 
 
 def test_workflow_dispatch_accepts_pr_input() -> None:
@@ -81,10 +84,16 @@ def test_orchestrate_job_is_guarded_to_pull_request_events() -> None:
 
 def test_permissions_are_minimal() -> None:
     workflow = _load_workflow()
+    # Least-privilege set the runner actually uses: push commits (contents),
+    # PR review threads (pull-requests), issue-endpoint labels/comments
+    # (issues), and read both check runs and legacy commit statuses for the CI
+    # gate (checks + statuses).
     assert workflow["permissions"] == {
         "contents": "write",
         "pull-requests": "write",
+        "issues": "write",
         "checks": "read",
+        "statuses": "read",
     }
 
 
