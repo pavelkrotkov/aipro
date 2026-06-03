@@ -8,7 +8,15 @@ repo hygiene automation.
 
 ## Installing in a target repository
 
-To run the review loop on your own repository:
+> **Preview:** these artifacts let you *configure* a target repo, but the loop is
+> not yet executable end-to-end. The orchestrator's runtime wiring
+> (`_build_runtime_context` — GitHub client, git, coder, and reviewer adapters)
+> is a tracked follow-up and not implemented yet, so `aipro run` currently exits
+> with "AI PR Orchestrator runner is not implemented yet." You will also need to
+> install your coder CLI in the workflow and keep `PATH` in `main_coder.env`
+> before the coder phase can run.
+
+To set up the review loop on your own repository:
 
 1. Copy [`examples/target-repo-workflow.yml`](examples/target-repo-workflow.yml)
    to `.github/workflows/ai-review-loop.yml` and replace `YOUR_ORG` in the

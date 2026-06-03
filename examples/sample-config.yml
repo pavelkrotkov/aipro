@@ -17,10 +17,13 @@ main_coder:
     - "exec"
     - "{prompt}"
   timeout_seconds: 1800
-  # Environment variable NAMES forwarded to the coder subprocess. List only the
-  # coder's own credentials here. Never add GH_TOKEN / GITHUB_TOKEN: the
-  # orchestrator token must not reach the coder.
+  # Environment variable NAMES forwarded to the coder subprocess. The coder does
+  # NOT inherit the runner environment, so include PATH for `command` lookup
+  # (otherwise an unqualified `command: codex` won't be found). Add the coder's
+  # own credentials too. Never add GH_TOKEN / GITHUB_TOKEN: the orchestrator
+  # token must not reach the coder.
   env:
+    - PATH
     - CODEX_API_KEY
 
 # AI reviewers to trigger and whose bot threads the loop manages.
