@@ -1,0 +1,45 @@
+# Sample AI PR Review Loop configuration.
+#
+# Copy to `.github/ai-review-loop.yml` in your repository. Every section below
+# except `main_coder` is optional and falls back to the defaults baked into the
+# orchestrator; the values shown here are a sensible starting point.
+
+# The label that opts a PR into the review loop.
+enabled_label: "ai-loop"
+done_label: "ai-loop-done"
+error_label: "ai-loop-error"
+
+# The coding agent that addresses review feedback. `provider` is required.
+main_coder:
+  provider: codex_cli
+  command: "codex"
+  args:
+    - "exec"
+    - "{prompt}"
+  timeout_seconds: 1800
+  # Environment variable NAMES forwarded to the coder subprocess. The coder does
+  # NOT inherit the runner environment, so include PATH for `command` lookup
+  # (otherwise an unqualified `command: codex` won't be found). Add the coder's
+  # own credentials too. Never add GH_TOKEN / GITHUB_TOKEN: the orchestrator
+  # token must not reach the coder.
+  env:
+    - PATH
+    - CODEX_API_KEY
+
+# AI reviewers to trigger and whose bot threads the loop manages.
+reviewers:
+  gemini_github:
+    enabled: true
+    bot_logins:
+      - "gemini-code-assist[bot]"
+    trigger_comment: "/gemini review"
+
+review_phase:
+  max_rounds: 1
+  poll_interval_seconds: 60
+
+# Require CI to be green before marking the PR done.
+ci:
+  require_green_before_done: true
+  ignored_checks:
+    - "AI PR Review Loop"

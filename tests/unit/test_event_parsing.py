@@ -34,6 +34,19 @@ def test_parse_pull_request_review_event() -> None:
     assert parsed.head_sha == "sha9"
 
 
+def test_parse_pull_request_review_comment_event() -> None:
+    # The webhook carries the full pull_request object, so an inline review
+    # comment resolves to the PR the same way a review submission does.
+    event = {
+        "pull_request": {"number": 11, "head": {"sha": "sha11"}},
+        "comment": {"id": 7},
+    }
+    parsed = parse_event(event, event_name="pull_request_review_comment")
+    assert parsed.event_type == "pull_request_review_comment"
+    assert parsed.pr_number == 11
+    assert parsed.head_sha == "sha11"
+
+
 def test_parse_check_run_event() -> None:
     event = {
         "check_run": {
