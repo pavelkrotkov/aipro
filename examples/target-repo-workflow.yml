@@ -1,12 +1,4 @@
-# AI PR Review Loop — target repository workflow (PREVIEW).
-#
-# NOT YET EXECUTABLE END-TO-END: the orchestrator's runtime wiring
-# (`_build_runtime_context`: GitHub client, git, coder, reviewer adapters) is a
-# tracked follow-up and not implemented yet, so `aipro run` currently exits with
-# "AI PR Orchestrator runner is not implemented yet." This template is provided so
-# target repos can be configured ahead of that work; before it runs you will also
-# need to install your coder CLI (see the "Set up the coder CLI" step) and keep
-# `PATH` in the config's `main_coder.env`.
+# AI PR Review Loop — target repository workflow.
 #
 # Copy this file into your repository as `.github/workflows/ai-review-loop.yml`
 # and copy `examples/sample-config.yml` to `.github/ai-review-loop.yml`.
@@ -95,19 +87,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install orchestrator
         # Pin to a released tag; replace YOUR_ORG with the org hosting this package.
         # For a PRIVATE orchestrator repo, authenticate the install with a token:
         #   run: pip install "git+https://x-access-token:${{ secrets.AI_ORCHESTRATOR_GITHUB_TOKEN }}@github.com/YOUR_ORG/ai-pr-orchestrator.git@v0.1.0"
         run: pip install git+https://github.com/YOUR_ORG/ai-pr-orchestrator.git@v0.1.0
       - name: Set up the coder CLI
-        # The orchestrator invokes `main_coder.command` (codex in the sample
-        # config) as a subprocess but does NOT install it. Replace this step with
-        # the real install for your coder — e.g. an npm global install or a
-        # release binary placed on PATH — and make sure `PATH` is listed in the
-        # config's `main_coder.env` so the subprocess can find it. Until then the
-        # coder phase fails with "command not found".
-        run: echo "Replace this step with your coder CLI install (see comment)."
+        # The sample config runs `codex`, so install the OpenAI Codex CLI and
+        # keep PATH listed in `main_coder.env`. Bump this package pin
+        # deliberately after validating the new CLI release.
+        run: |
+          npm install -g @openai/codex@0.139.0
+          codex --version
       - name: Run orchestrator
         # The orchestrator token (GH_TOKEN/GITHUB_TOKEN) authenticates GitHub API
         # calls. It is deliberately NOT listed in `main_coder.env` of the config,

@@ -19,9 +19,11 @@ from pathlib import Path
 from typing import Any
 
 from ai_pr_orchestrator.coders.base import CoderAdapter
+from ai_pr_orchestrator.coders.codex_cli import CodexCliCoderAdapter
 from ai_pr_orchestrator.config import Config, load_config
 from ai_pr_orchestrator.git.repo import GitRepo
 from ai_pr_orchestrator.github import models as gh_models
+from ai_pr_orchestrator.github.client import GitHubClient as HttpGitHubClient
 from ai_pr_orchestrator.github.protocol import GitHubClient
 from ai_pr_orchestrator.logging import (
     collect_secret_values,
@@ -41,6 +43,7 @@ from ai_pr_orchestrator.models import (
     RuntimeState,
 )
 from ai_pr_orchestrator.reviewers.base import ReviewerAdapter
+from ai_pr_orchestrator.reviewers.gemini_github import GeminiGitHubReviewerAdapter
 from ai_pr_orchestrator.state_machine import (
     TERMINAL_STATUSES,
     TransitionSnapshot,
@@ -57,8 +60,6 @@ from ai_pr_orchestrator.state_storage import (
 )
 
 logger = logging.getLogger(__name__)
-
-NOT_IMPLEMENTED_MESSAGE = "AI PR Orchestrator runner is not implemented yet."
 
 # Hard cap on transitions per Runner.run to prevent pathological infinite loops
 # if a future state machine bug fails to converge. Real runs should terminate
@@ -95,6 +96,15 @@ class RunnerContext:
     # client should also be constructed in dry-run mode (defense in depth), and
     # ``git`` should be ``None`` so no commit/push path is reachable.
     dry_run: bool = False
+
+
+class NoopCoderAdapter:
+    """Placeholder coder for read-only flows that never invoke the coder."""
+
+    name = "noop"
+
+    def run_fix_task(self, task: FixTask) -> AgentRunResult:
+        raise RuntimeError("NoopCoderAdapter cannot run fix tasks")
 
 
 def parse_event(event: Any, *, event_name: str | None = None) -> ParsedEvent:
@@ -1409,27 +1419,15 @@ def run(*, pr_number: int, dry_run: bool, event_path: Path | None = None) -> int
         secrets=collect_secret_values(config.main_coder.env),
     )
 
-    if dry_run:
-        # The Runner's dry-run planner is fully implemented and unit-tested
-        # (it plans a single transition and prints the actions it would take),
-        # but constructing the live GitHub client / coder / reviewers from the
-        # environment is still a stub (see ``_build_runtime_context``, left to a
-        # follow-up issue). Until that wiring lands the CLI has no PR to plan
-        # against, so exit cleanly (0) rather than failing — ``dry_run`` already
-        # threads through ``_build_runtime_context``/``RunnerContext`` for when
-        # it does.
-        print(
-            "Dry-run: runtime wiring (GitHub client / coder / reviewers) is not "
-            "implemented yet; the dry-run planner is covered by unit tests. "
-            "Exiting cleanly.",
-            file=sys.stderr,
-        )
-        return 0
-
-    ctx = _build_runtime_context(config, dry_run=dry_run)
-    if ctx is None:
+    try:
+        ctx = _build_runtime_context(config, dry_run=dry_run)
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
-    return Runner(ctx).run(pr_number, event=event)
+    try:
+        return Runner(ctx).run(pr_number, event=event)
+    finally:
+        _close_github(ctx.github)
 
 
 def inspect(*, pr_number: int) -> int:
@@ -1439,10 +1437,25 @@ def inspect(*, pr_number: int) -> int:
     except Exception as exc:
         print(f"Failed to load configuration: {exc}", file=sys.stderr)
         return 1
-    ctx = _build_runtime_context(config)
-    if ctx is None:
+    ctx: RunnerContext | None = None
+    try:
+        ctx = _build_runtime_context(
+            config,
+            dry_run=True,
+            require_git=False,
+            require_agents=False,
+        )
+        try:
+            comments = ctx.github.get_pr_comments(pr_number)
+        except Exception as exc:
+            print(f"GitHub API error: {exc}", file=sys.stderr)
+            return 1
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
-    comments = ctx.github.get_pr_comments(pr_number)
+    finally:
+        if ctx is not None:
+            _close_github(ctx.github)
     sc = find_state_comment([{"id": c.id, "body": c.body} for c in comments])
     if sc is None:
         print(json.dumps({"pr_number": pr_number, "status": "uninitialized"}))
@@ -1451,12 +1464,83 @@ def inspect(*, pr_number: int) -> int:
     return 0
 
 
-def _build_runtime_context(_config: Config, *, dry_run: bool = False) -> RunnerContext | None:
-    # Real construction of GitHub client / coder / reviewers from environment
-    # and config is left to a follow-up issue. When wired, ``dry_run`` must flow
-    # into both the GitHubClient (mutations become no-ops) and the
-    # RunnerContext (``git=None``, single-pass planning). The Runner's dry-run
-    # behavior itself is fully exercised by unit tests via injected fakes.
-    del dry_run
-    print(NOT_IMPLEMENTED_MESSAGE, file=sys.stderr)
-    return None
+def _build_runtime_context(
+    config: Config,
+    *,
+    dry_run: bool = False,
+    require_git: bool = True,
+    require_agents: bool = True,
+) -> RunnerContext:
+    """Construct live runtime dependencies from environment and configuration."""
+    token = _github_token_from_env()
+    owner, repo = _github_repository_from_env()
+    github = HttpGitHubClient(token, owner, repo, dry_run=dry_run)
+    coder: CoderAdapter = NoopCoderAdapter()
+    reviewers: dict[str, ReviewerAdapter] = {}
+    if require_agents:
+        coder = _build_coder(config)
+        reviewers = _build_reviewers(config, github)
+    git = None
+    if require_git and not dry_run:
+        try:
+            git = GitRepo(Path.cwd())
+            git.is_clean()
+        except Exception as exc:
+            raise ValueError(f"Failed to initialize git repository: {exc}") from exc
+    return RunnerContext(
+        github=github,
+        coder=coder,
+        reviewers=reviewers,
+        config=config,
+        git=git,
+        dry_run=dry_run,
+    )
+
+
+def _github_token_from_env() -> str:
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        token = os.environ.get(name)
+        stripped = token.strip() if token else ""
+        if stripped:
+            return stripped
+    raise ValueError("GH_TOKEN or GITHUB_TOKEN must be set to authenticate GitHub API calls")
+
+
+def _github_repository_from_env() -> tuple[str, str]:
+    raw = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    parts = raw.split("/")
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        raise ValueError(
+            "GITHUB_REPOSITORY must be set to the target repository in owner/repo format"
+        )
+    return parts[0].strip(), parts[1].strip()
+
+
+def _build_coder(config: Config) -> CoderAdapter:
+    if config.main_coder.provider == "codex_cli":
+        return CodexCliCoderAdapter(config.main_coder, cwd=Path.cwd())
+    raise ValueError(f"Unsupported main_coder.provider: {config.main_coder.provider!r}")
+
+
+def _build_reviewers(config: Config, github: GitHubClient) -> dict[str, ReviewerAdapter]:
+    reviewers: dict[str, ReviewerAdapter] = {}
+    for name, reviewer_config in config.reviewers.items():
+        if not reviewer_config.enabled:
+            continue
+        if name != "gemini_github":
+            raise ValueError(
+                f"Unsupported enabled reviewer {name!r}; V1 supports only 'gemini_github'"
+            )
+        reviewers[name] = GeminiGitHubReviewerAdapter(
+            name=name,
+            bot_logins=reviewer_config.bot_logins,
+            trigger_text=reviewer_config.trigger_comment,
+            github=github,
+        )
+    return reviewers
+
+
+def _close_github(github: GitHubClient) -> None:
+    close = getattr(github, "close", None)
+    if callable(close):
+        close()
