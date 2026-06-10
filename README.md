@@ -3,18 +3,10 @@
 AI PR Orchestrator is a Python-based GitHub PR orchestration tool for coordinating
 AI coding agents and AI reviewers.
 
-The current repository contains the project plan, minimal package scaffolding, and
-repo hygiene automation.
+The current repository contains the orchestrator package, target-repository
+workflow template, sample configuration, and repo hygiene automation.
 
 ## Installing in a target repository
-
-> **Preview:** these artifacts let you *configure* a target repo, but the loop is
-> not yet executable end-to-end. The orchestrator's runtime wiring
-> (`_build_runtime_context` — GitHub client, git, coder, and reviewer adapters)
-> is a tracked follow-up and not implemented yet, so `aipro run` currently exits
-> with "AI PR Orchestrator runner is not implemented yet." You will also need to
-> install your coder CLI in the workflow and keep `PATH` in `main_coder.env`
-> before the coder phase can run.
 
 To set up the review loop on your own repository:
 
@@ -28,7 +20,10 @@ To set up the review loop on your own repository:
    - `CODEX_API_KEY` — credential for the coder.
    - `AI_ORCHESTRATOR_GITHUB_TOKEN` *(optional)* — a PAT or app token for the
      orchestrator; falls back to the workflow's `GITHUB_TOKEN`.
-4. Add the `ai-loop` label to a PR to opt it into the loop.
+4. Keep the workflow's coder setup step aligned with `main_coder.command`. The
+   sample workflow installs the OpenAI Codex CLI with npm and keeps `PATH` in
+   `main_coder.env` so the subprocess can find `codex`.
+5. Add the `ai-loop` label to a PR to opt it into the loop.
 
 The workflow grants the least-privilege scopes the orchestrator needs
 (`contents: write`, `pull-requests: write`, `issues: write`, `checks: read`,
