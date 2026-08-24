@@ -37,6 +37,10 @@ show_missing = true
 
 [dependency-groups]
 dev = [
+    # Declared so Dependabot tracks it; otherwise only a transitive
+    # dependency (pip-api <- pip-audit) and advisories against it need a
+    # manual relock.
+    "pip>=26.2",
     "pip-audit>=2.10.0",
     "pre-commit>=4.6.0",
     "pytest>=9.0.3",
