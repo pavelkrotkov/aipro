@@ -27,7 +27,18 @@ jobs:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - run: uv sync --locked --all-extras --dev
-      - run: uv run pip-audit
+      # pip-audit talks to PyPI; the scheduled run failed four weeks straight
+      # on a transient ConnectionReset, so retry instead of paging a human.
+      - run: |
+          for attempt in 1 2 3; do
+            if uv run pip-audit; then
+              exit 0
+            fi
+            echo "pip-audit attempt $attempt failed; retrying in 30s"
+            sleep 30
+          done
+          echo "pip-audit failed after 3 attempts"
+          exit 1
 
   actionlint:
     name: actionlint
