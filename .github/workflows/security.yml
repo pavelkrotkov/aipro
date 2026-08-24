@@ -30,12 +30,23 @@ jobs:
       # pip-audit talks to PyPI; the scheduled run failed four weeks straight
       # on a transient ConnectionReset, so retry instead of paging a human.
       - run: |
+          # Advisories are a security verdict, not a flake: retry only
+          # transient PyPI/network errors, and never mask a vulnerability.
           for attempt in 1 2 3; do
-            if uv run pip-audit; then
+            if out="$(uv run pip-audit 2>&1)"; then
+              printf '%s\n' "$out"
               exit 0
             fi
-            echo "pip-audit attempt $attempt failed; retrying in 30s"
-            sleep 30
+            status=$?
+            printf '%s\n' "$out"
+            if ! grep -qiE 'connection (aborted|reset|refused)|remote end closed|timed out' <<<"$out"; then
+              echo "pip-audit failed non-transiently; not retrying"
+              exit "$status"
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "transient failure on attempt $attempt; retrying in 30s"
+              sleep 30
+            fi
           done
           echo "pip-audit failed after 3 attempts"
           exit 1
