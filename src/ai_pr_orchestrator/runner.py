@@ -207,6 +207,8 @@ def _infer_event_name(event: dict[str, Any]) -> str:
         return "issue_comment"
     if "review" in event and "pull_request" in event:
         return "pull_request_review"
+    if "comment" in event and "pull_request" in event:
+        return "pull_request_review_comment"
     if "pull_request" in event:
         return "pull_request"
     if "sha" in event and "state" in event:

@@ -91,6 +91,82 @@ def test_runner_run_reparse_preserves_head_sha_under_unrelated_event_name(
     assert event.pr_number == 7
 
 
+def test_cli_review_comment_payload_with_matching_hint(tmp_path: Path, monkeypatch) -> None:
+    """A ``pull_request_review_comment`` payload with the matching ambient
+    GITHUB_EVENT_NAME must parse as pull_request_review_comment (not the
+    coarser ``pull_request``), so the hint is not rejected as contradictory."""
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request_review_comment")
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps(
+            {
+                "pull_request": {"number": 789, "head": {"sha": "sha-rc"}},
+                "comment": {"id": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls: list[tuple[int, Path | None]] = []
+
+    def fake_run(*, pr_number: int, dry_run: bool, event_path: Path | None) -> int:
+        calls.append((pr_number, event_path))
+        return 0
+
+    monkeypatch.setattr(cli.runner, "run", fake_run)
+
+    assert cli.main(["run", "--event-path", str(event_path)]) == 0
+    assert calls == [(789, event_path)]
+
+
+def test_runner_run_reparse_review_comment_payload(tmp_path: Path, monkeypatch) -> None:
+    """The runner-level reparse must likewise accept a matching
+    pull_request_review_comment hint on a review-comment payload."""
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request_review_comment")
+    event_path = tmp_path / "review_comment.json"
+    event_path.write_text(
+        json.dumps(
+            {
+                "pull_request": {"number": 8, "head": {"sha": "sha-rc8"}},
+                "comment": {"id": 9},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured: list[tuple[int, runner.ParsedEvent | None]] = []
+
+    class _FakeRunner:
+        def __init__(self, ctx: object) -> None:
+            self._ctx = ctx
+
+        def run(self, pr_number: int, *, event: runner.ParsedEvent | None = None) -> int:
+            captured.append((pr_number, event))
+            return 0
+
+    monkeypatch.setattr(
+        runner, "load_config", lambda: SimpleNamespace(main_coder=SimpleNamespace(env=[]))
+    )
+    monkeypatch.setattr(runner, "collect_secret_values", lambda _env: [])
+    monkeypatch.setattr(runner, "setup_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "_build_runtime_context",
+        lambda _config, **_kwargs: SimpleNamespace(github=object()),
+    )
+    monkeypatch.setattr(runner, "_close_github", lambda _ctx: None)
+    monkeypatch.setattr(runner, "Runner", _FakeRunner)
+
+    assert runner.run(pr_number=8, dry_run=False, event_path=event_path) == 0
+    assert len(captured) == 1
+    pr_number, event = captured[0]
+    assert pr_number == 8
+    assert event is not None
+    assert event.event_type == "pull_request_review_comment"
+    assert event.head_sha == "sha-rc8"
+    assert event.pr_number == 8
+
+
 def test_runner_run_reparse_honors_hint_when_payload_is_ambiguous(
     tmp_path: Path, monkeypatch
 ) -> None:
