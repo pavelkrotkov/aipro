@@ -68,19 +68,27 @@ class SessionSpec:
     adapter; V3 core never executes them. ``model_lease`` binds the session
     to a model reservation acquired from the model broker, so a lane can
     never run against capacity other than what was reserved for it: the
-    lease's assignment lane must match the session's own lane.
+    lease's assignment lane must match the session's own lane. ``context``
+    is **mandatory** — a spec without typed run/round identity cannot be
+    constructed, so sessions are always attributable to their run/round.
     """
 
     lane: LaneIdentity
     run_id: RunId
     workdir: str
     env: dict[str, str]
+    context: LaneExecutionContext
     image: str | None = None
     command: str | None = None
-    context: LaneExecutionContext | None = None
     model_lease: ModelLease | None = None
 
     def __post_init__(self) -> None:
+        if self.context is None:
+            raise ValueError(
+                "SessionSpec requires a LaneExecutionContext: without typed "
+                "run/round identity, lane findings cannot be attributed "
+                "correctly across overlapping rounds"
+            )
         if self.model_lease is not None and self.model_lease.assignment.lane != self.lane.lane:
             raise ValueError(
                 f"SessionSpec lane {self.lane.lane!r} does not match model lease "
@@ -200,6 +208,9 @@ class LaneExecutor(Protocol):
     typed run/round identity of the work unit so implementations never have
     to recover it from free-form prompt text — findings are attributed to the
     run/round in ``context``, not to whatever the prompt happens to mention.
+    ``context`` is **mandatory** (no default): a conforming implementation is
+    never invoked without run/round identity, which closes the
+    misattribution-across-overlapping-rounds hole.
     """
 
     def execute(
@@ -207,8 +218,8 @@ class LaneExecutor(Protocol):
         lane: LaneIdentity,
         task_prompt: str,
         workdir: str,
+        context: LaneExecutionContext,
         lease: ModelLease | None = None,
-        context: LaneExecutionContext | None = None,
     ) -> LaneResult: ...
 
 

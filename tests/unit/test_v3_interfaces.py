@@ -35,6 +35,10 @@ from ai_pr_orchestrator.v3.interfaces import (
 )
 
 
+def _ctx(run_id: str = "run-1") -> LaneExecutionContext:
+    return LaneExecutionContext(run_id=run_id)
+
+
 class FakeGitHubStateStore:
     """In-memory stand-in for GitHub workflow state, with optimistic
     concurrency: save_state refuses to overwrite a newer version."""
@@ -96,15 +100,15 @@ class FakeModelBroker:
 class FakeLaneExecutor:
     def __init__(self) -> None:
         self.leases: list[ModelLease | None] = []
-        self.contexts: list[LaneExecutionContext | None] = []
+        self.contexts: list[LaneExecutionContext] = []
 
     def execute(
         self,
         lane: LaneIdentity,
         task_prompt: str,
         workdir: str,
+        context: LaneExecutionContext,
         lease: ModelLease | None = None,
-        context: LaneExecutionContext | None = None,
     ) -> LaneResult:
         self.leases.append(lease)
         self.contexts.append(context)
@@ -121,15 +125,15 @@ class FakeReviewerLaneExecutor:
 
     def __init__(self) -> None:
         self.leases: list[ModelLease | None] = []
-        self.contexts: list[LaneExecutionContext | None] = []
+        self.contexts: list[LaneExecutionContext] = []
 
     def execute(
         self,
         lane: LaneIdentity,
         task_prompt: str,
         workdir: str,
+        context: LaneExecutionContext,
         lease: ModelLease | None = None,
-        context: LaneExecutionContext | None = None,
     ) -> LaneResult:
         self.leases.append(lease)
         self.contexts.append(context)
@@ -138,8 +142,8 @@ class FakeReviewerLaneExecutor:
             lane=lane.lane,
             body="Unhandled error path",
             severity="major",
-            run_id=context.run_id if context is not None else "run-1",
-            round_id=context.round_id if context is not None and context.round_id else "r1",
+            run_id=context.run_id,
+            round_id=context.round_id if context.round_id else "r1",
         )
         return LaneResult(
             session=SessionHandle(session_id="fake", lane=lane.lane),
@@ -179,6 +183,7 @@ def _run_fakes() -> dict[str, Any]:
             run_id="run-1",
             workdir="/tmp/x",
             env={},
+            context=_ctx(),
         )
     )
     result = cao.poll_session(handle)
@@ -306,6 +311,7 @@ class TestSessionSpecLeaseLaneBinding:
                 run_id="run-1",
                 workdir="/tmp/x",
                 env={},
+                context=_ctx(),
                 model_lease=lease,
             )
 
@@ -318,6 +324,7 @@ class TestSessionSpecLeaseLaneBinding:
             run_id="run-1",
             workdir="/tmp/x",
             env={},
+            context=_ctx(),
             model_lease=lease,
         )
         assert spec.model_lease is lease
@@ -332,13 +339,16 @@ class TestModelBinding:
             run_id="run-1",
             workdir="/tmp/x",
             env={},
+            context=_ctx(),
             model_lease=lease,
         )
         assert spec.model_lease is not None
         assert spec.model_lease.assignment.model_ref == "coder-main"
         # Default remains None so specs without a reservation stay valid.
         assert (
-            SessionSpec(lane=spec.lane, run_id="run-1", workdir="/tmp/x", env={}).model_lease
+            SessionSpec(
+                lane=spec.lane, run_id="run-1", workdir="/tmp/x", env={}, context=_ctx()
+            ).model_lease
             is None
         )
 
@@ -346,13 +356,15 @@ class TestModelBinding:
         out = _run_fakes()
         executor = FakeLaneExecutor()
         lane = LaneIdentity(lane="worker-1", role="worker", profile_template="p")
-        executor.execute(lane, "task", "/tmp/x", lease=out["lease"])
+        executor.execute(
+            lane, "task", "/tmp/x", LaneExecutionContext(run_id="run-1"), lease=out["lease"]
+        )
         assert executor.leases == [out["lease"]]
 
     def test_reviewer_lane_returns_structured_findings(self) -> None:
         executor = FakeReviewerLaneExecutor()
         lane = LaneIdentity(lane="rev-1", role="reviewer", profile_template="p")
-        result = executor.execute(lane, "review", "/tmp/x")
+        result = executor.execute(lane, "review", "/tmp/x", LaneExecutionContext(run_id="run-1"))
         assert len(result.findings) == 1
         finding = result.findings[0]
         assert finding.lane == "rev-1"
@@ -387,7 +399,7 @@ class TestGateDecisionImmutability:
 
 class TestLaneExecutionContext:
     def test_executor_receives_typed_run_round_context(self) -> None:
-        seen: list[LaneExecutionContext | None] = []
+        seen: list[LaneExecutionContext] = []
 
         class RecordingExecutor:
             def execute(
@@ -395,8 +407,8 @@ class TestLaneExecutionContext:
                 lane: LaneIdentity,
                 task_prompt: str,
                 workdir: str,
+                context: LaneExecutionContext,
                 lease: ModelLease | None = None,
-                context: LaneExecutionContext | None = None,
             ) -> LaneResult:
                 seen.append(context)
                 return LaneResult(
@@ -408,14 +420,38 @@ class TestLaneExecutionContext:
 
         lane = LaneIdentity(lane="rev-1", role="reviewer", profile_template="p")
         ctx = LaneExecutionContext(run_id="run-9", round_id="r3", work_item_id="wi-1")
-        RecordingExecutor().execute(lane, "review", "/tmp/x", context=ctx)
+        RecordingExecutor().execute(lane, "review", "/tmp/x", ctx)
         assert seen == [ctx]
 
-    def test_context_defaults_to_none(self) -> None:
+    def test_context_has_no_default(self) -> None:
         out = _run_fakes()
         assert out["executor"] is not None
         sig = inspect.signature(LaneExecutor.execute)
-        assert sig.parameters["context"].default is None
+        assert sig.parameters["context"].default is inspect.Parameter.empty
+
+    def test_execute_requires_context(self) -> None:
+        executor = FakeLaneExecutor()
+        lane = LaneIdentity(lane="rev-1", role="reviewer", profile_template="p")
+        with pytest.raises(TypeError):
+            executor.execute(lane, "review", "/tmp/x")  # ty: ignore[missing-argument]
+
+    def test_session_spec_rejects_missing_context(self) -> None:
+        lane = LaneIdentity(lane="worker-a", role="worker", profile_template="p")
+        with pytest.raises((TypeError, ValueError), match="context"):
+            SessionSpec(  # ty: ignore[missing-argument]
+                lane=lane, run_id="run-1", workdir="/tmp/x", env={}
+            )
+
+    def test_session_spec_rejects_none_context(self) -> None:
+        lane = LaneIdentity(lane="worker-a", role="worker", profile_template="p")
+        with pytest.raises(ValueError, match="requires a LaneExecutionContext"):
+            SessionSpec(
+                lane=lane,
+                run_id="run-1",
+                workdir="/tmp/x",
+                env={},
+                context=None,  # ty: ignore[invalid-argument-type]
+            )
 
 
 class TestSessionSpecPolicyStrings:
@@ -425,13 +461,24 @@ class TestSessionSpecPolicyStrings:
             run_id="run-1",
             workdir="/tmp/x",
             env={},
+            context=_ctx(),
             image="repo/image:tag",
             command="run-lane",
         )
         assert spec.image == "repo/image:tag"
         assert spec.command == "run-lane"
-        assert SessionSpec(lane=spec.lane, run_id="run-1", workdir="/tmp/x", env={}).image is None
-        assert SessionSpec(lane=spec.lane, run_id="run-1", workdir="/tmp/x", env={}).command is None
+        assert (
+            SessionSpec(
+                lane=spec.lane, run_id="run-1", workdir="/tmp/x", env={}, context=_ctx()
+            ).image
+            is None
+        )
+        assert (
+            SessionSpec(
+                lane=spec.lane, run_id="run-1", workdir="/tmp/x", env={}, context=_ctx()
+            ).command
+            is None
+        )
 
     def test_session_spec_carries_execution_context(self) -> None:
         ctx = LaneExecutionContext(run_id="run-1", round_id="r1")
