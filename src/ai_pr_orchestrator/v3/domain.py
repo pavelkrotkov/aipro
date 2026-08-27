@@ -210,6 +210,12 @@ class WorkflowState:
     round_id: RoundId | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     terminal_reason: str | None = None
+    #: Structured reviewer findings from the lane(s) of the current round,
+    #: persisted so a supervisor stop never loses reviewer output (GitHub
+    #: remains the authoritative store).
+    findings: list[ReviewerFinding] = field(default_factory=list)
+    #: Policy decisions applied to ``findings``; persisted alongside them.
+    dispositions: list[FindingDisposition] = field(default_factory=list)
     #: Unknown fields from a newer writer, preserved for lossless round trips.
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -244,6 +250,8 @@ class WorkflowState:
             round_id=round_id if round_id is not None else self.round_id,
             updated_at=datetime.now(UTC),
             terminal_reason=terminal_reason,
+            findings=list(self.findings),
+            dispositions=list(self.dispositions),
             extras=dict(self.extras),
         )
 
@@ -268,6 +276,16 @@ class WorkflowState:
         data = dict(data)
         if isinstance(data.get("updated_at"), str):
             data["updated_at"] = _str_to_dt(data["updated_at"])
+        if isinstance(data.get("findings"), list):
+            data["findings"] = [
+                f if isinstance(f, ReviewerFinding) else ReviewerFinding.from_dict(f)
+                for f in data["findings"]
+            ]
+        if isinstance(data.get("dispositions"), list):
+            data["dispositions"] = [
+                d if isinstance(d, FindingDisposition) else FindingDisposition.from_dict(d)
+                for d in data["dispositions"]
+            ]
         known = {f.name for f in fields(cls)} - {"extras"}
         kwargs: dict[str, Any] = {}
         extras: dict[str, Any] = {}

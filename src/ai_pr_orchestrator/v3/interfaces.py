@@ -23,9 +23,11 @@ from .domain import (
     LaneIdentity,
     ModelAssignment,
     ReviewerFinding,
+    RoundId,
     RunId,
     WorkflowState,
     WorkItem,
+    WorkItemId,
 )
 
 
@@ -44,6 +46,21 @@ class ModelLease:
 
 
 @dataclass(frozen=True)
+class LaneExecutionContext:
+    """Typed run/round context for one lane execution.
+
+    Carried explicitly through :meth:`LaneExecutor.execute` (and mirrored on
+    :class:`SessionSpec`) so implementations never have to recover run or
+    round identity from free-form prompt text or ambient state — which is
+    what makes misattribution across overlapping rounds possible.
+    """
+
+    run_id: RunId
+    round_id: RoundId | None = None
+    work_item_id: WorkItemId | None = None
+
+
+@dataclass(frozen=True)
 class SessionSpec:
     """Declarative description of a session to start on the CAO fabric.
 
@@ -58,6 +75,9 @@ class SessionSpec:
     run_id: RunId
     workdir: str
     env: dict[str, str]
+    image: str | None = None
+    command: str | None = None
+    context: LaneExecutionContext | None = None
     model_lease: ModelLease | None = None
 
     def __post_init__(self) -> None:
@@ -103,11 +123,17 @@ class GateDecision:
     """
 
     passed: bool
-    pending_checks: list[str]
-    failed_checks: list[str]
+    pending_checks: tuple[str, ...]
+    failed_checks: tuple[str, ...]
     detail: str = ""
 
     def __post_init__(self) -> None:
+        # Accept list-typed callers but store immutable tuples, so the
+        # decision cannot be contradicted after construction.
+        if isinstance(self.pending_checks, list):
+            object.__setattr__(self, "pending_checks", tuple(self.pending_checks))
+        if isinstance(self.failed_checks, list):
+            object.__setattr__(self, "failed_checks", tuple(self.failed_checks))
         if self.passed and (self.failed_checks or self.pending_checks):
             raise ValueError(
                 "GateDecision cannot be passed=True with failed or pending checks: "
@@ -170,7 +196,10 @@ class LaneExecutor(Protocol):
 
     ``lease`` is the model reservation for this execution (from
     :class:`ModelBroker`); passing it makes the lane-to-model binding part of
-    the execution contract rather than ambient state.
+    the execution contract rather than ambient state. ``context`` carries the
+    typed run/round identity of the work unit so implementations never have
+    to recover it from free-form prompt text — findings are attributed to the
+    run/round in ``context``, not to whatever the prompt happens to mention.
     """
 
     def execute(
@@ -179,6 +208,7 @@ class LaneExecutor(Protocol):
         task_prompt: str,
         workdir: str,
         lease: ModelLease | None = None,
+        context: LaneExecutionContext | None = None,
     ) -> LaneResult: ...
 
 

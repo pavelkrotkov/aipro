@@ -106,6 +106,34 @@ class ModelRouterConfig:
 
 
 @dataclass(frozen=True)
+class SafetyPolicyConfig:
+    """Safety rails carried over from the V1 safety surface.
+
+    These controls bound what the engine is allowed to touch and how much
+    work one run may do; they must survive the V1→V3 cutover, so they are
+    declared here as first-class policy rather than left implicit.
+
+    ``disallow_forks`` restricts runs to same-repo PRs; ``disallow_workflow_
+    file_changes`` rejects edits under ``.github/workflows/``; the
+    ``max_*`` budgets cap iterations, commits, lane invocations, and prompt
+    tokens per run; ``allowed_pr_author_associations`` whitelists PR authors.
+    """
+
+    disallow_forks: bool = True
+    disallow_workflow_file_changes: bool = True
+    max_total_iterations: int = 3
+    max_commits_per_run: int = 1
+    max_coder_invocations_per_run: int = 1
+    max_reviewer_triggers_per_run: int = 3
+    max_prompt_tokens: int = 100000
+    allowed_pr_author_associations: list[str] = field(
+        default_factory=lambda: ["OWNER", "MEMBER", "COLLABORATOR"]
+    )
+    #: Unknown keys from a newer writer, preserved for forward compatibility.
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ReviewPolicyConfig:
     """Review roles and limits."""
 
@@ -150,6 +178,7 @@ _SECTION_TYPES: dict[str, type] = {
     "model_router": ModelRouterConfig,
     "review_policy": ReviewPolicyConfig,
     "ci_policy": CIPolicyConfig,
+    "safety": SafetyPolicyConfig,
     "escalation": EscalationPolicyConfig,
 }
 
@@ -172,6 +201,7 @@ class V3Config:
     model_router: ModelRouterConfig = field(default_factory=ModelRouterConfig)
     review_policy: ReviewPolicyConfig = field(default_factory=ReviewPolicyConfig)
     ci_policy: CIPolicyConfig = field(default_factory=CIPolicyConfig)
+    safety: SafetyPolicyConfig = field(default_factory=SafetyPolicyConfig)
     escalation: EscalationPolicyConfig = field(default_factory=EscalationPolicyConfig)
     #: Unknown top-level keys, preserved for forward compatibility.
     extras: dict[str, Any] = field(default_factory=dict)
@@ -196,6 +226,20 @@ class V3Config:
         lane_names = [lane.name for lane in self.hermes_lanes.lanes]
         if len(lane_names) != len(set(lane_names)):
             raise V3ConfigError(f"Duplicate lane names in hermes_lanes: {lane_names}")
+
+        for lane in self.hermes_lanes.lanes:
+            if not lane.name:
+                raise V3ConfigError("lane name must be non-empty")
+            if not lane.profile_template:
+                raise V3ConfigError(f"lane {lane.name!r} profile_template must be non-empty")
+
+        q = self.github_queue
+        labels = (q.enabled_label, q.done_label, q.error_label)
+        if len(labels) != len(set(labels)):
+            raise V3ConfigError(
+                "github_queue lifecycle labels must be distinct: "
+                f"enabled={q.enabled_label!r} done={q.done_label!r} error={q.error_label!r}"
+            )
 
         foremen = [lane for lane in self.hermes_lanes.lanes if lane.role == "foreman"]
         if len(foremen) > 1:
@@ -246,6 +290,17 @@ class V3Config:
 
         if self.ci_policy.ci_wait_timeout_seconds < 1:
             raise V3ConfigError("ci_policy.ci_wait_timeout_seconds must be >= 1")
+
+        for budget in (
+            "max_total_iterations",
+            "max_commits_per_run",
+            "max_coder_invocations_per_run",
+            "max_reviewer_triggers_per_run",
+        ):
+            if getattr(self.safety, budget) < 1:
+                raise V3ConfigError(f"safety.{budget} must be >= 1")
+        if self.safety.max_prompt_tokens < 1:
+            raise V3ConfigError("safety.max_prompt_tokens must be >= 1")
 
         for entry in self.model_router.catalog:
             if entry.max_context_tokens is not None and entry.max_context_tokens < 1:
@@ -338,6 +393,14 @@ def _section_from_dict(section: str, value: Any) -> Any:
     return section_type(**kwargs)
 
 
+def _is_optional(hint: Any) -> bool:
+    """True when ``hint`` explicitly allows ``None`` (``X | None``)."""
+    origin = get_origin(hint)
+    if origin is Union or origin is types.UnionType:
+        return type(None) in get_args(hint)
+    return False
+
+
 def _value_matches_type(hint: Any, value: Any) -> bool:
     """True when ``value`` conforms to the declared type ``hint``."""
     origin = get_origin(hint)
@@ -345,9 +408,23 @@ def _value_matches_type(hint: Any, value: Any) -> bool:
         non_none = [arg for arg in get_args(hint) if arg is not type(None)]
         return any(_value_matches_type(arg, value) for arg in non_none)
     if origin in (list, tuple, set, frozenset) or hint in (list, tuple, set, frozenset):
-        return isinstance(value, (list, tuple, set, frozenset))
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            return False
+        args = get_args(hint)
+        if not args:  # bare list/dict: container type only.
+            return True
+        return all(_value_matches_type(args[0], item) for item in value)
     if origin is dict or hint is dict:
-        return isinstance(value, dict)
+        if not isinstance(value, dict):
+            return False
+        args = get_args(hint)
+        if not args:
+            return True
+        key_hint, value_hint = args
+        return all(
+            _value_matches_type(key_hint, k) and _value_matches_type(value_hint, v)
+            for k, v in value.items()
+        )
     if hint is bool:
         return isinstance(value, bool)
     if hint is int:
@@ -367,10 +444,19 @@ def _validate_declared_shapes(cls: type, data: dict[str, Any], where: str) -> No
     Runs before dataclass construction so a malformed nested value (e.g. a
     list field given a scalar, or an int field given a string) is reported
     as a config error instead of surfacing later as an AttributeError.
+    ``None`` is rejected for any field whose annotation does not explicitly
+    allow it (no ``| None``), so a null never silently bypasses validation.
     """
     hints = get_type_hints(cls)
     for name, hint in hints.items():
-        if name == "extras" or name not in data or data[name] is None:
+        if name == "extras" or name not in data:
+            continue
+        if data[name] is None:
+            if not _is_optional(hint):
+                raise V3ConfigError(
+                    f"config {where}: field {name!r} expects {hint}, got null "
+                    "(None is only valid for Optional fields)"
+                )
             continue
         if not _value_matches_type(hint, data[name]):
             raise V3ConfigError(

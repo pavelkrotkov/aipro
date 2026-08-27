@@ -24,6 +24,7 @@ from ai_pr_orchestrator.v3.interfaces import (
     CIPRGate,
     GateDecision,
     GitHubWorkflowStateStore,
+    LaneExecutionContext,
     LaneExecutor,
     LaneResult,
     ModelBroker,
@@ -95,6 +96,7 @@ class FakeModelBroker:
 class FakeLaneExecutor:
     def __init__(self) -> None:
         self.leases: list[ModelLease | None] = []
+        self.contexts: list[LaneExecutionContext | None] = []
 
     def execute(
         self,
@@ -102,8 +104,10 @@ class FakeLaneExecutor:
         task_prompt: str,
         workdir: str,
         lease: ModelLease | None = None,
+        context: LaneExecutionContext | None = None,
     ) -> LaneResult:
         self.leases.append(lease)
+        self.contexts.append(context)
         return LaneResult(
             session=SessionHandle(session_id="fake", lane=lane.lane),
             exit_code=0,
@@ -117,6 +121,7 @@ class FakeReviewerLaneExecutor:
 
     def __init__(self) -> None:
         self.leases: list[ModelLease | None] = []
+        self.contexts: list[LaneExecutionContext | None] = []
 
     def execute(
         self,
@@ -124,15 +129,17 @@ class FakeReviewerLaneExecutor:
         task_prompt: str,
         workdir: str,
         lease: ModelLease | None = None,
+        context: LaneExecutionContext | None = None,
     ) -> LaneResult:
         self.leases.append(lease)
+        self.contexts.append(context)
         finding = ReviewerFinding(
             id="f1",
             lane=lane.lane,
             body="Unhandled error path",
             severity="major",
-            run_id="run-1",
-            round_id="r1",
+            run_id=context.run_id if context is not None else "run-1",
+            round_id=context.round_id if context is not None and context.round_id else "r1",
         )
         return LaneResult(
             session=SessionHandle(session_id="fake", lane=lane.lane),
@@ -154,7 +161,7 @@ class FakeCIPRGate:
 
     def evaluate(self, issue: GitHubIssueRef, pr: GitHubPullRequestRef) -> GateDecision:
         self.seen.append((issue, pr))
-        return GateDecision(passed=True, pending_checks=[], failed_checks=[])
+        return GateDecision(passed=True, pending_checks=(), failed_checks=())
 
 
 def _run_fakes() -> dict[str, Any]:
@@ -277,15 +284,15 @@ class TestOptimisticConcurrency:
 class TestGateDecisionInvariants:
     def test_passed_with_failed_checks_is_invalid(self) -> None:
         with pytest.raises(ValueError, match="failed or pending"):
-            GateDecision(passed=True, pending_checks=[], failed_checks=["tests"])
+            GateDecision(passed=True, pending_checks=(), failed_checks=("tests",))
 
     def test_passed_with_pending_checks_is_invalid(self) -> None:
         with pytest.raises(ValueError, match="failed or pending"):
-            GateDecision(passed=True, pending_checks=["lint"], failed_checks=[])
+            GateDecision(passed=True, pending_checks=("lint",), failed_checks=())
 
     def test_consistent_decisions_are_valid(self) -> None:
-        assert GateDecision(passed=True, pending_checks=[], failed_checks=[]).passed
-        assert GateDecision(passed=False, pending_checks=[], failed_checks=["tests"]).failed_checks
+        assert GateDecision(passed=True, pending_checks=(), failed_checks=()).passed
+        assert GateDecision(passed=False, pending_checks=(), failed_checks=("tests",)).failed_checks
 
 
 class TestSessionSpecLeaseLaneBinding:
@@ -362,3 +369,77 @@ class TestCIPRGateIdentity:
         assert pr == out["pr"]
         assert pr.head_sha == "abc123"
         assert pr.number == 9
+
+
+class TestGateDecisionImmutability:
+    def test_failed_checks_cannot_be_mutated_after_construction(self) -> None:
+        decision = GateDecision(passed=False, pending_checks=(), failed_checks=("lint",))
+        with pytest.raises(AttributeError):
+            decision.failed_checks.append("tests")  # ty: ignore[unresolved-attribute]
+
+    def test_checks_are_stored_as_immutable_tuples(self) -> None:
+        decision = GateDecision(passed=False, pending_checks=("ci",), failed_checks=("tests",))
+        assert isinstance(decision.failed_checks, tuple)
+        assert isinstance(decision.pending_checks, tuple)
+        assert decision.failed_checks == ("tests",)
+        assert decision.pending_checks == ("ci",)
+
+
+class TestLaneExecutionContext:
+    def test_executor_receives_typed_run_round_context(self) -> None:
+        seen: list[LaneExecutionContext | None] = []
+
+        class RecordingExecutor:
+            def execute(
+                self,
+                lane: LaneIdentity,
+                task_prompt: str,
+                workdir: str,
+                lease: ModelLease | None = None,
+                context: LaneExecutionContext | None = None,
+            ) -> LaneResult:
+                seen.append(context)
+                return LaneResult(
+                    session=SessionHandle(session_id="s", lane=lane.lane),
+                    exit_code=0,
+                    output_summary="",
+                    changed_files=[],
+                )
+
+        lane = LaneIdentity(lane="rev-1", role="reviewer", profile_template="p")
+        ctx = LaneExecutionContext(run_id="run-9", round_id="r3", work_item_id="wi-1")
+        RecordingExecutor().execute(lane, "review", "/tmp/x", context=ctx)
+        assert seen == [ctx]
+
+    def test_context_defaults_to_none(self) -> None:
+        out = _run_fakes()
+        assert out["executor"] is not None
+        sig = inspect.signature(LaneExecutor.execute)
+        assert sig.parameters["context"].default is None
+
+
+class TestSessionSpecPolicyStrings:
+    def test_image_and_command_are_declared_optional_fields(self) -> None:
+        spec = SessionSpec(
+            lane=LaneIdentity(lane="worker-a", role="worker", profile_template="p"),
+            run_id="run-1",
+            workdir="/tmp/x",
+            env={},
+            image="repo/image:tag",
+            command="run-lane",
+        )
+        assert spec.image == "repo/image:tag"
+        assert spec.command == "run-lane"
+        assert SessionSpec(lane=spec.lane, run_id="run-1", workdir="/tmp/x", env={}).image is None
+        assert SessionSpec(lane=spec.lane, run_id="run-1", workdir="/tmp/x", env={}).command is None
+
+    def test_session_spec_carries_execution_context(self) -> None:
+        ctx = LaneExecutionContext(run_id="run-1", round_id="r1")
+        spec = SessionSpec(
+            lane=LaneIdentity(lane="worker-a", role="worker", profile_template="p"),
+            run_id="run-1",
+            workdir="/tmp/x",
+            env={},
+            context=ctx,
+        )
+        assert spec.context is ctx

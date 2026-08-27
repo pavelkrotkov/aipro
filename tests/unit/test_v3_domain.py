@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from ai_pr_orchestrator.v3.domain import (
@@ -312,3 +314,54 @@ class TestFailureAndStagnation:
     def test_stagnation_invalid(self) -> None:
         with pytest.raises(DomainError):
             StagnationSummary(run_id="r", work_item_id="w", rounds_without_progress=0)
+
+
+class TestWorkflowStateFindingsPersistence:
+    def _finding(self) -> ReviewerFinding:
+        return ReviewerFinding(
+            id="f1",
+            lane="rev-1",
+            body="Unhandled error path",
+            severity="major",
+            run_id="run-1",
+            round_id="r1",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            path="src/x.py",
+            line=12,
+        )
+
+    def _disposition(self) -> FindingDisposition:
+        return FindingDisposition(
+            finding_id="f1", action="fix", rationale="real bug", decided_by="foreman"
+        )
+
+    def test_findings_and_dispositions_round_trip_through_persistence(self) -> None:
+        state = WorkflowState(
+            work_item_id="wi-1",
+            run_id="run-1",
+            phase="reviewing",
+            round_id="r1",
+            findings=[self._finding()],
+            dispositions=[self._disposition()],
+        )
+        restored = WorkflowState.from_dict(state.to_dict())
+        assert restored.findings == [self._finding()]
+        assert restored.dispositions == [self._disposition()]
+
+    def test_transition_preserves_findings(self) -> None:
+        state = WorkflowState(
+            work_item_id="wi-1",
+            run_id="run-1",
+            phase="reviewing",
+            round_id="r1",
+            findings=[self._finding()],
+            dispositions=[self._disposition()],
+        )
+        nxt = state.transition("ci_gating")
+        assert nxt.findings == state.findings
+        assert nxt.dispositions == state.dispositions
+
+    def test_default_state_has_no_findings(self) -> None:
+        state = WorkflowState(work_item_id="wi-1", run_id="run-1", phase="queued")
+        assert state.findings == []
+        assert state.dispositions == []

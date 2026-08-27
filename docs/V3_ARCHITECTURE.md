@@ -54,8 +54,11 @@ runtime until cutover:
   `FailureSummary`, `StagnationSummary`).
 - `v3.config` — the V3 policy schema (`V3Config` and sections: GitHub queue,
   CAO control plane, Hermes lanes/profile templates, model catalog/router,
-  review roles/limits, CI/PR policy, human escalation). Unknown keys are
-  preserved as `extras` for forward compatibility.
+  review roles/limits, CI/PR policy, safety rails, human escalation). The
+  `safety` section carries the V1 safety surface across the cutover: fork
+  and workflow-file restrictions, per-run budgets (iterations, commits,
+  lane invocations, prompt tokens), and PR-author association allowlists.
+  Unknown keys are preserved as `extras` for forward compatibility.
 - `v3.interfaces` — protocols for `GitHubWorkflowStateStore`,
   `CAOSessionController`, `ModelBroker`, `LaneExecutor`, and `CIPRGate`.
   All are structural and fakeable in tests without CAO, Hermes, or GitHub.

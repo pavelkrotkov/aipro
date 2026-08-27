@@ -259,3 +259,104 @@ class TestDeclaredShapeValidation:
             }
         )
         assert config.model_router.catalog[0].max_context_tokens is None
+
+
+class TestSafetyPolicySection:
+    def test_safety_defaults_mirror_v1_safety_surface(self) -> None:
+        config = V3Config.from_dict({})
+        safety = config.safety
+        assert safety.disallow_forks is True
+        assert safety.disallow_workflow_file_changes is True
+        assert safety.max_total_iterations == 3
+        assert safety.max_commits_per_run == 1
+        assert safety.max_coder_invocations_per_run == 1
+        assert safety.max_reviewer_triggers_per_run == 3
+        assert safety.max_prompt_tokens == 100000
+        assert safety.allowed_pr_author_associations == ["OWNER", "MEMBER", "COLLABORATOR"]
+
+    def test_safety_section_round_trips(self) -> None:
+        config = V3Config.from_dict(
+            {
+                "safety": {
+                    "max_total_iterations": 5,
+                    "max_prompt_tokens": 200000,
+                    "allowed_pr_author_associations": ["OWNER"],
+                }
+            }
+        )
+        assert config.safety.max_total_iterations == 5
+        assert config.to_dict()["safety"]["max_prompt_tokens"] == 200000
+        assert config.to_dict()["safety"]["disallow_forks"] is True
+
+    def test_safety_budgets_must_be_positive(self) -> None:
+        for field, value in (
+            ("max_total_iterations", 0),
+            ("max_commits_per_run", 0),
+            ("max_coder_invocations_per_run", 0),
+            ("max_reviewer_triggers_per_run", -1),
+            ("max_prompt_tokens", 0),
+        ):
+            with pytest.raises(V3ConfigError, match=field):
+                V3Config.from_dict({"safety": {field: value}}).validate()
+
+
+class TestNoneBypassesShapeValidation:
+    def test_none_for_non_optional_field_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="required_checks"):
+            V3Config.from_dict({"ci_policy": {"required_checks": None}})
+
+    def test_none_for_int_field_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="ci_wait_timeout_seconds"):
+            V3Config.from_dict({"ci_policy": {"ci_wait_timeout_seconds": None}})
+
+
+class TestElementTypeValidation:
+    def test_int_element_in_string_list_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="required_checks"):
+            V3Config.from_dict({"ci_policy": {"required_checks": [7]}})
+
+    def test_int_value_in_str_dict_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="lane_assignments"):
+            V3Config.from_dict({"model_router": {"lane_assignments": {"coder-1": 7}}})
+
+    def test_valid_string_elements_accepted(self) -> None:
+        config = V3Config.from_dict({"ci_policy": {"required_checks": ["lint", "tests"]}})
+        assert config.ci_policy.required_checks == ["lint", "tests"]
+
+
+class TestLaneNonEmptyValidation:
+    def test_empty_lane_name_rejected_at_config_load(self) -> None:
+        with pytest.raises(V3ConfigError, match="lane name"):
+            V3Config.from_dict(
+                {
+                    "hermes_lanes": {
+                        "lanes": [{"name": "", "role": "worker", "profile_template": "p"}]
+                    }
+                }
+            )
+
+    def test_empty_profile_template_rejected_at_config_load(self) -> None:
+        with pytest.raises(V3ConfigError, match="profile_template"):
+            V3Config.from_dict(
+                {
+                    "hermes_lanes": {
+                        "lanes": [{"name": "l1", "role": "worker", "profile_template": ""}]
+                    }
+                }
+            )
+
+
+class TestQueueLabelDistinctness:
+    def test_enabled_label_equal_to_done_label_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="distinct"):
+            V3Config.from_dict(
+                {"github_queue": {"enabled_label": "v3-work", "done_label": "v3-work"}}
+            )
+
+    def test_done_label_equal_to_error_label_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="distinct"):
+            V3Config.from_dict({"github_queue": {"done_label": "v3-work-error"}})
+
+    def test_distinct_labels_accepted(self) -> None:
+        config = V3Config.from_dict({})
+        config.validate()
