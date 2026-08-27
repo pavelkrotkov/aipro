@@ -95,8 +95,26 @@ def test_parse_unknown_event_returns_empty() -> None:
     assert parsed.head_sha is None
 
 
+def test_infer_review_comment_payload_without_hint() -> None:
+    # A pull_request_review_comment payload (a ``comment`` key alongside the
+    # full ``pull_request`` object) must infer as pull_request_review_comment,
+    # not the coarser ``pull_request`` — otherwise the payload-first helper
+    # rejects the correct ambient GITHUB_EVENT_NAME hint as contradictory.
+    event = {
+        "pull_request": {"number": 12, "head": {"sha": "sha12"}},
+        "comment": {"id": 3},
+    }
+    parsed = parse_event(event)
+    assert parsed.event_type == "pull_request_review_comment"
+    assert parsed.pr_number == 12
+    assert parsed.head_sha == "sha12"
+
+    # With the matching ambient hint, the hint is honored (not rejected).
+    hinted = parse_event(event, event_name="pull_request_review_comment")
+    assert hinted.event_type == "pull_request_review_comment"
+
+
 def test_infer_event_type_without_hint() -> None:
-    # No event_name hint: infer from payload keys.
     pr_event = {"pull_request": {"number": 5}}
     cr_event = {"check_run": {"head_sha": "s", "pull_requests": [{"number": 6}]}}
     assert parse_event(pr_event).pr_number == 5

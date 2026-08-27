@@ -173,6 +173,29 @@ def parse_event(event: Any, *, event_name: str | None = None) -> ParsedEvent:
     return ParsedEvent(event_type=inferred or "unknown", pr_number=None, head_sha=None)
 
 
+def parse_event_payload_first(payload: Any, *, event_name: str | None = None) -> ParsedEvent:
+    """Parse a payload trusting its keys over an ambient ``GITHUB_EVENT_NAME``.
+
+    Both the CLI (``_pr_number_from_event``) and ``run()`` (which reparses the
+    forwarded event file) use this so the payload-first policy is applied
+    consistently: the ``event_name`` hint is honored only when it *agrees*
+    with the type inferred from the payload's keys, or when the payload's keys
+    do not identify an event type at all. A contradicting ambient name (e.g.
+    ``GITHUB_EVENT_NAME=issue_comment`` on a ``pull_request`` payload, or an
+    unrelated name inherited from the workflow trigger on an explicitly
+    supplied ``check_run`` payload) must not mask what the payload clearly is
+    — doing so drops ``head_sha`` and silently disables the stale-CI-event
+    guard.
+    """
+    parsed = parse_event(payload)
+    if event_name is None:
+        return parsed
+    hinted = parse_event(payload, event_name=event_name)
+    if hinted.event_type == parsed.event_type or parsed.event_type == "unknown":
+        return hinted
+    return parsed
+
+
 def _infer_event_name(event: dict[str, Any]) -> str:
     if "check_run" in event:
         return "check_run"
@@ -184,6 +207,8 @@ def _infer_event_name(event: dict[str, Any]) -> str:
         return "issue_comment"
     if "review" in event and "pull_request" in event:
         return "pull_request_review"
+    if "comment" in event and "pull_request" in event:
+        return "pull_request_review_comment"
     if "pull_request" in event:
         return "pull_request"
     if "sha" in event and "state" in event:
@@ -1403,7 +1428,7 @@ def run(*, pr_number: int, dry_run: bool, event_path: Path | None = None) -> int
         except json.JSONDecodeError as exc:
             print(f"Event file {event_path} is not valid JSON: {exc}", file=sys.stderr)
             return 1
-        event = parse_event(payload, event_name=os.environ.get("GITHUB_EVENT_NAME"))
+        event = parse_event_payload_first(payload, event_name=os.environ.get("GITHUB_EVENT_NAME"))
 
     try:
         config = load_config()

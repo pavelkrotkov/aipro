@@ -64,6 +64,9 @@ def test_inspect_pr_invokes_inspect(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_run_with_event_path_reads_event_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Pin the ambient event name so this test is deterministic regardless of
+    # the CI runner context that executes it (e.g. push-to-main vs PR).
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     event_path = tmp_path / "event.json"
     event_path.write_text('{"pull_request": {"number": 456}}', encoding="utf-8")
     calls: list[tuple[int, bool, Path | None]] = []
@@ -78,7 +81,10 @@ def test_run_with_event_path_reads_event_file(
     assert calls == [(456, False, event_path)]
 
 
-def test_run_with_non_positive_event_pr_exits_cleanly(tmp_path: Path) -> None:
+def test_run_with_non_positive_event_pr_exits_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     event_path = tmp_path / "event.json"
     event_path.write_text('{"pull_request": {"number": 0}}', encoding="utf-8")
 
@@ -156,6 +162,7 @@ def test_run_event_pr_number_wins_over_pr_flag(
 ) -> None:
     """When the event payload contains a PR number, it takes precedence over an
     explicitly supplied ``--pr``."""
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     event_path = tmp_path / "event.json"
     event_path.write_text('{"pull_request": {"number": 456}}', encoding="utf-8")
 
