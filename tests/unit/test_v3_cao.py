@@ -8,10 +8,12 @@ import pytest
 
 from ai_pr_orchestrator.v3 import cao as cao_module
 from ai_pr_orchestrator.v3.cao import (
+    CaoAdoptionMismatchError,
     CaoControlPlaneError,
     CaoSessionController,
     CaoSessionMetadata,
     CaoSessionNotFoundError,
+    CaoSessionNotReadyError,
     CaoUnavailableError,
     SessionBusyError,
     SessionIdentityUncertainError,
@@ -304,11 +306,24 @@ def test_observe_normalizes_cao_status(respx_mock, cao_status, expected):
 def test_idle_becomes_completed_only_once_the_reading_settles(respx_mock):
     controller = make_controller(idle_settle_polls=3)
     handle = launch(controller, respx_mock)
-    status_route(respx_mock, "idle", "idle", "idle")
+    status_route(respx_mock, "processing", "idle", "idle", "idle")
 
     assert controller.observe(handle).state == "running"
     assert controller.observe(handle).state == "running"
+    assert controller.observe(handle).state == "running"
     assert controller.observe(handle).state == "completed"
+
+
+def test_idle_on_a_session_that_never_ran_does_not_complete_it(respx_mock):
+    controller = make_controller(idle_settle_polls=2)
+    handle = launch(controller, respx_mock)
+    status_route(respx_mock, "idle", "idle", "idle", "idle", "idle")
+
+    states = [controller.observe(handle).state for _ in range(5)]
+
+    # A freshly created terminal is idle before it picks work up; idle alone
+    # must never complete the lane while no activity has been observed.
+    assert states == ["running", "running", "running", "running", "running"]
 
 
 def test_activity_restarts_the_idle_streak(respx_mock):
@@ -431,6 +446,27 @@ def test_poll_session_reports_a_disappeared_session_without_reading_output(respx
 
     assert result is not None
     assert result.exit_code == 1
+    assert not output_route.called
+
+
+def test_poll_session_reports_a_timeout_without_reading_output(respx_mock):
+    controller = CaoSessionController(
+        CAOControlPlaneConfig(base_url=BASE, session_timeout_seconds=0),
+        LaneRegistry.default(),
+    )
+    handle = launch(controller, respx_mock)
+    respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
+        return_value=httpx.Response(200, json=terminal_payload(status="processing"))
+    )
+    output_route = respx_mock.get(f"{BASE}/terminals/{TERMINAL}/output").mock(
+        side_effect=httpx.ConnectError("extraction endpoint gone")
+    )
+
+    result = controller.poll_session(handle)
+
+    assert result is not None
+    assert result.exit_code == 1
+    assert "exceeded" in result.output_summary
     assert not output_route.called
 
 
@@ -565,6 +601,86 @@ def test_session_metadata_round_trips_through_its_serialized_form():
     original = CaoSessionMetadata.from_dict(attribution_payload())
 
     assert CaoSessionMetadata.from_dict(original.to_dict()) == original
+
+
+@pytest.mark.parametrize("missing", ["lane", "workdir", "run_id"])
+def test_incomplete_attribution_metadata_is_a_controlled_error(missing):
+    payload = attribution_payload()
+    del payload[missing]
+
+    with pytest.raises(CaoControlPlaneError, match=missing) as excinfo:
+        CaoSessionMetadata.from_dict(payload)
+
+    assert not isinstance(excinfo.value, KeyError)
+
+
+def test_an_adopted_session_is_refused_when_attribution_disagrees(respx_mock):
+    controller = make_controller()
+    spec = make_spec()
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
+    )
+    foreign = attribution_payload()
+    foreign["workdir"] = "/worktrees/someone-elses-issue"
+    respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
+        return_value=httpx.Response(200, json=terminal_payload(metadata=foreign))
+    )
+
+    with pytest.raises(CaoAdoptionMismatchError, match="workdir"):
+        controller.adopt_session(SESSION, spec)
+
+    assert SESSION not in controller._sessions
+
+
+def test_start_session_refuses_to_adopt_a_session_attributed_to_another_run(respx_mock):
+    controller = make_controller()
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
+    )
+    foreign = attribution_payload()
+    foreign["run_id"] = "run-999"
+    respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
+        return_value=httpx.Response(200, json=terminal_payload(metadata=foreign))
+    )
+    launch_route = respx_mock.post(f"{BASE}/sessions")
+
+    with pytest.raises(CaoAdoptionMismatchError, match="run_id"):
+        controller.start_session(make_spec())
+
+    assert not launch_route.called
+
+
+def test_a_provisioning_session_is_not_treated_as_absent(respx_mock):
+    controller = make_controller()
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": []})
+    )
+    launch_route = respx_mock.post(f"{BASE}/sessions")
+
+    with pytest.raises(CaoSessionNotReadyError, match="reconcile again"):
+        controller.start_session(make_spec())
+
+    assert not launch_route.called
+
+
+def test_adopting_a_session_whose_terminal_is_still_provisioning_is_not_found(respx_mock):
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": []})
+    )
+
+    with pytest.raises(CaoSessionNotReadyError):
+        make_controller().adopt_session(SESSION)
+
+
+def test_sanitized_names_carry_a_digest_so_lossy_names_stay_distinct():
+    a = session_name_for("owner/foo/bar", DEVELOPER_LANE)
+    b = session_name_for("owner:foo:bar", DEVELOPER_LANE)
+
+    assert a != b
+    assert a.startswith("cao-aipro-owner-foo-bar-")
+    assert len(a) <= 64
+    # A name that needed no sanitization stays digest-free.
+    assert session_name_for(RUN_ID, DEVELOPER_LANE) == SESSION
 
 
 # --- Teardown --------------------------------------------------------------

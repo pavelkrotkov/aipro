@@ -131,6 +131,28 @@ class SessionNotRegisteredError(CaoControlPlaneError):
     """The handle names a session this controller has not launched or adopted."""
 
 
+class CaoMetadataError(CaoControlPlaneError):
+    """Durable CAO metadata is incomplete, so it cannot be trusted."""
+
+
+class CaoSessionNotReadyError(CaoControlPlaneError):
+    """The session exists in CAO but has no usable terminal yet.
+
+    A session whose terminal is still provisioning must never be treated as
+    absent: creating a same-named session on top of it would race the one
+    CAO is already starting. Callers should re-reconcile shortly.
+    """
+
+
+class CaoAdoptionMismatchError(CaoControlPlaneError):
+    """The durable attribution on an existing session does not match the spec.
+
+    Adopting a session attributed to a different run, lane, profile,
+    workdir, or model would misattribute its findings; refusing is safer
+    than reconciling onto the wrong identity.
+    """
+
+
 @dataclass(frozen=True)
 class CaoSessionMetadata:
     """Everything needed to find, attribute, and audit one CAO session.
@@ -175,6 +197,12 @@ class CaoSessionMetadata:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CaoSessionMetadata:
+        missing = [key for key in ("lane", "workdir", "run_id") if data.get(key) is None]
+        if missing:
+            raise CaoMetadataError(
+                f"CAO session metadata is missing attribution field(s) {missing}; "
+                "incomplete attribution is treated as corruption, not as a default"
+            )
         assignment = data.get("model_assignment")
         launched_at = data.get("launched_at")
         return cls(
@@ -225,6 +253,12 @@ def session_name_for(run_id: RunId, lane: LaneName) -> str:
     """
     raw = f"{_CAO_SESSION_PREFIX}aipro-{run_id}-{lane}"
     sanitized = _UNSAFE_NAME_CHARS.sub("-", raw)
+    if sanitized != raw:
+        # Substitution is lossy (``foo/bar`` and ``foo:bar`` collide), so any
+        # sanitized name carries a digest of the raw one to stay collision-free.
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+        budget = _MAX_SESSION_NAME_LEN - 9
+        sanitized = f"{sanitized[:budget]}-{digest}"
     if len(sanitized) <= _MAX_SESSION_NAME_LEN:
         return sanitized
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
@@ -260,6 +294,7 @@ class CaoSessionController:
         self._client = client if client is not None else self._build_client(config)
         self._sessions: dict[str, CaoSessionMetadata] = {}
         self._idle_readings: dict[str, int] = {}
+        self._active_seen: set[str] = set()
 
     @staticmethod
     def _build_client(config: CAOControlPlaneConfig) -> httpx.Client:
@@ -293,6 +328,7 @@ class CaoSessionController:
 
         adopted = self._lookup_session(name)
         if adopted is not None:
+            self._validate_attribution(adopted, spec)
             self._register(adopted)
             return SessionHandle(session_id=adopted.session_name, lane=lane.lane)
 
@@ -358,8 +394,10 @@ class CaoSessionController:
             params={"message": message},
         )
         self._raise_for_status(response, f"submit work to session {metadata.session_name!r}")
-        # New work invalidates any idle streak accumulated by the previous turn.
+        # New work invalidates any idle streak accumulated by the previous turn,
+        # and is itself authoritative evidence the session has taken on activity.
         self._idle_readings[metadata.session_name] = 0
+        self._active_seen.add(metadata.session_name)
 
     # --- Observation -------------------------------------------------------
 
@@ -369,6 +407,7 @@ class CaoSessionController:
         response = self._request("GET", f"/terminals/{metadata.terminal_id}")
         if response.status_code == 404:
             self._idle_readings.pop(metadata.session_name, None)
+            self._active_seen.discard(metadata.session_name)
             return SessionObservation(
                 metadata=metadata,
                 state="disappeared",
@@ -394,7 +433,10 @@ class CaoSessionController:
         observation = self.observe(handle)
         if not observation.is_terminal:
             return None
-        if observation.state == "disappeared":
+        if observation.state in ("disappeared", "timed_out"):
+            # Report the lifecycle detail instead of probing for a final
+            # response: extraction may fail (raising out of a timeout) or
+            # return stale text that would overwrite the timeout itself.
             output = observation.detail
         else:
             output = self.final_output(handle) or observation.detail
@@ -422,16 +464,22 @@ class CaoSessionController:
 
     # --- Reconcile / teardown ----------------------------------------------
 
-    def adopt_session(self, session_name: str) -> SessionObservation:
+    def adopt_session(
+        self, session_name: str, spec: SessionSpec | None = None
+    ) -> SessionObservation:
         """Re-attach to an existing session by its durable name.
 
         This is the restart path: given only the name a previous process
         recorded, rebuild the full session metadata from CAO and report the
-        current lifecycle state, without launching anything.
+        current lifecycle state, without launching anything. When ``spec`` is
+        supplied, the durable attribution must match its identity-bearing
+        fields or adoption is refused.
         """
         metadata = self._lookup_session(session_name)
         if metadata is None:
             raise CaoSessionNotFoundError(f"CAO has no session named {session_name!r}")
+        if spec is not None:
+            self._validate_attribution(metadata, spec)
         self._register(metadata)
         return self.observe(
             SessionHandle(session_id=metadata.session_name, lane=metadata.lane.lane)
@@ -462,7 +510,13 @@ class CaoSessionController:
         return registered
 
     def _lookup_session(self, session_name: str) -> CaoSessionMetadata | None:
-        """Rebuild session metadata from CAO, or ``None`` if it does not exist."""
+        """Rebuild session metadata from CAO, or ``None`` if it does not exist.
+
+        ``None`` means only one thing: CAO has no session under this name, so
+        creation is authorized. An existing session whose terminal is still
+        provisioning raises :class:`CaoSessionNotReadyError` instead — the
+        caller must reconcile again, never launch over it.
+        """
         response = self._request("GET", f"/sessions/{session_name}")
         if response.status_code == 404:
             return None
@@ -470,12 +524,18 @@ class CaoSessionController:
 
         terminals = response.json().get("terminals") or []
         if not terminals:
-            return None
+            raise CaoSessionNotReadyError(
+                f"CAO session {session_name!r} exists but has no terminal yet "
+                "(still provisioning); reconcile again instead of creating it"
+            )
         terminal_id = terminals[0]["id"]
 
         detail = self._request("GET", f"/terminals/{terminal_id}")
         if detail.status_code == 404:
-            return None
+            raise CaoSessionNotReadyError(
+                f"CAO session {session_name!r} names terminal {terminal_id!r}, "
+                "which does not exist yet; reconcile again instead of creating it"
+            )
         self._raise_for_status(detail, f"look up terminal {terminal_id!r}")
 
         attribution = detail.json().get("metadata")
@@ -494,6 +554,38 @@ class CaoSessionController:
         self._sessions[metadata.session_name] = metadata
         self._idle_readings.setdefault(metadata.session_name, 0)
 
+    @staticmethod
+    def _validate_attribution(metadata: CaoSessionMetadata, spec: SessionSpec) -> None:
+        """Refuse adoption unless durable attribution matches the spec's identity.
+
+        A session name can be reconstructed by anything; the metadata CAO
+        stored is what actually attributes the session's work. If it does not
+        agree with the run, lane, workdir, or model the caller is asking
+        about, adopting would misattribute findings across runs.
+        """
+        mismatches: list[str] = []
+        if metadata.parent_run_id != spec.context.run_id:
+            mismatches.append(
+                f"run_id {metadata.parent_run_id!r} != requested {spec.context.run_id!r}"
+            )
+        if metadata.lane != spec.lane:
+            mismatches.append(f"lane {metadata.lane} != requested {spec.lane}")
+        if metadata.workdir != spec.workdir:
+            mismatches.append(f"workdir {metadata.workdir!r} != requested {spec.workdir!r}")
+        expected_model = (
+            spec.model_lease.assignment.model_ref if spec.model_lease is not None else None
+        )
+        actual_model = (
+            metadata.model_assignment.model_ref if metadata.model_assignment is not None else None
+        )
+        if actual_model != expected_model:
+            mismatches.append(f"model_ref {actual_model!r} != requested {expected_model!r}")
+        if mismatches:
+            raise CaoAdoptionMismatchError(
+                f"Session {metadata.session_name!r} attribution does not match the "
+                f"requested spec: {'; '.join(mismatches)}. It will not be adopted."
+            )
+
     def _metadata_for(self, handle: SessionHandle) -> CaoSessionMetadata:
         metadata = self._sessions.get(handle.session_id)
         if metadata is None:
@@ -506,7 +598,15 @@ class CaoSessionController:
     def _lifecycle(self, session_name: str, status: str | None) -> SessionLifecycle:
         if status != "idle":
             self._idle_readings[session_name] = 0
-            return _STATUS_LIFECYCLE.get(status or "", "started")
+            mapped = _STATUS_LIFECYCLE.get(status or "", "started")
+            # Only statuses proving the agent picked work up count as activity:
+            # a fresh terminal is idle before it starts, and treating that idle
+            # as "settled" would complete a lane that never ran its message.
+            if mapped in ("running", "blocked"):
+                self._active_seen.add(session_name)
+            return mapped
+        if session_name not in self._active_seen:
+            return "running"
         readings = self._idle_readings.get(session_name, 0) + 1
         self._idle_readings[session_name] = readings
         return "completed" if readings >= self._idle_settle_polls else "running"

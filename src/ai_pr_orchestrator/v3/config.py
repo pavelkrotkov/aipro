@@ -231,11 +231,30 @@ class V3Config:
 
     def validate(self) -> None:
         """Validate cross-section invariants; raises :class:`V3ConfigError`."""
-        lane_names = [lane.name for lane in self.hermes_lanes.lanes]
+        # A hermes_lanes section that declares nothing yields the default lane
+        # set at registry-build time, so references must be validated against
+        # that effective set — not the raw empty list, which would make it
+        # impossible for a defaults-relying config to set lane_assignments
+        # or reviewer_lanes.
+        from .lanes import DEFAULT_LANES
+
+        declared_lanes = list(self.hermes_lanes.lanes)
+        if declared_lanes:
+            lanes = declared_lanes
+        else:
+            lanes = [
+                LaneProfileConfig(
+                    name=lane.lane,
+                    role=lane.role,
+                    profile_template=lane.profile_template,
+                )
+                for lane in DEFAULT_LANES
+            ]
+        lane_names = [lane.name for lane in lanes]
         if len(lane_names) != len(set(lane_names)):
             raise V3ConfigError(f"Duplicate lane names in hermes_lanes: {lane_names}")
 
-        for lane in self.hermes_lanes.lanes:
+        for lane in lanes:
             if not lane.name:
                 raise V3ConfigError("lane name must be non-empty")
             if not lane.profile_template:
@@ -249,11 +268,11 @@ class V3Config:
                 f"enabled={q.enabled_label!r} done={q.done_label!r} error={q.error_label!r}"
             )
 
-        foremen = [lane for lane in self.hermes_lanes.lanes if lane.role == "foreman"]
+        foremen = [lane for lane in lanes if lane.role == "foreman"]
         if len(foremen) > 1:
             raise V3ConfigError("At most one foreman lane is allowed")
 
-        for lane in self.hermes_lanes.lanes:
+        for lane in lanes:
             if lane.role not in VALID_LANE_ROLES:
                 raise V3ConfigError(f"Invalid role {lane.role!r} for lane {lane.name!r}")
             if lane.max_concurrent < 1:
@@ -272,10 +291,7 @@ class V3Config:
                 )
 
         for reviewer in self.review_policy.reviewer_lanes:
-            lane = next(
-                (c for c in self.hermes_lanes.lanes if c.name == reviewer),
-                None,
-            )
+            lane = next((c for c in lanes if c.name == reviewer), None)
             if lane is None:
                 raise V3ConfigError(f"review_policy references unknown reviewer lane {reviewer!r}")
             if lane.role != "reviewer":
