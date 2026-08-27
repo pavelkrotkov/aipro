@@ -16,8 +16,14 @@ V3 is intentionally narrow:
   decouple the policy engine from GitHub, CAO, Hermes, and CI systems. Every
   protocol can be faked in unit tests without shelling out to any external
   tool.
+- **Lanes** (:mod:`ai_pr_orchestrator.v3.lanes`) is the registry binding each
+  lane to its own isolated agent profile.
+- **CAO adapter** (:mod:`ai_pr_orchestrator.v3.cao`) drives agent sessions over
+  CAO's HTTP control plane. It is the only V3 module that performs I/O.
 
-Nothing here executes processes, calls providers, or talks to GitHub. The V1
+Apart from that adapter, nothing here executes processes, calls providers, or
+talks to GitHub — and even the adapter never spawns a process itself. The V1
 runtime remains fully functional and untouched until cutover; see
-``docs/V3_ARCHITECTURE.md`` for the ownership map and migration table.
+``docs/V3_ARCHITECTURE.md`` for the ownership map and migration table, and
+``docs/V3_CAO.md`` for the CAO version floor and profile provisioning.
 """

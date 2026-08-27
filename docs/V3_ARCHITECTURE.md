@@ -62,6 +62,13 @@ runtime until cutover:
 - `v3.interfaces` — protocols for `GitHubWorkflowStateStore`,
   `CAOSessionController`, `ModelBroker`, `LaneExecutor`, and `CIPRGate`.
   All are structural and fakeable in tests without CAO, Hermes, or GitHub.
+- `v3.lanes` — the lane registry, sole authority on the lane-to-profile
+  binding. Lane names *and* profile templates are unique: every concurrent
+  lane owns an independent agent profile/home.
+- `v3.cao` — the CAO control-plane adapter, and the only V3 module that
+  performs I/O. It never spawns a process, parses a terminal, or picks a
+  model. See `docs/V3_CAO.md` for the CAO version floor, the endpoints it
+  relies on, and Hermes lane profile provisioning.
 
 No V3 core type or interface names a specific vendor or model. `ModelRef`
 points into the catalog; catalog `descriptor` strings are opaque to the core
@@ -83,8 +90,9 @@ and interpreted only by the model broker adapter.
 | `github/` (API client) | **KEEP** (adapted) | Transport for the `GitHubWorkflowStateStore` adapter. |
 | `git/` (branch/commit helpers) | **KEEP** (adapted) | Invoked by lanes/foreman rather than the runner. |
 
-## 5. Non-goals of the seam (this issue)
+## 5. Non-goals of the seam (issue #41)
 
-- No CAO calls, model routing logic, or foreman loop are implemented here.
+- No model routing logic or foreman loop is implemented here. (The CAO
+  adapter arrived separately in issue #42; see `docs/V3_CAO.md`.)
 - No V1 behavior is deleted yet.
 - CAO and Hermes internals are not redesigned.
