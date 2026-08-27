@@ -184,7 +184,7 @@ class WorkItem:
     def from_dict(cls, data: dict[str, Any]) -> WorkItem:
         data = dict(data)
         if isinstance(data.get("issue"), dict):
-            data["issue"] = GitHubIssueRef(**data["issue"])
+            data["issue"] = GitHubIssueRef.from_dict(data["issue"])
         if isinstance(data.get("created_at"), str):
             data["created_at"] = _str_to_dt(data["created_at"])
         known = {f.name for f in fields(cls)}
@@ -250,7 +250,15 @@ class WorkflowState:
     def to_dict(self) -> dict[str, Any]:
         data = _serialize_dataclass(self)
         # The extras bucket itself is not part of the persisted payload;
-        # its contents are merged at the top level.
+        # its contents are merged at the top level. Reserved keys (validated
+        # state fields) may never be overridden by extras — reject rather
+        # than silently corrupting invariants at serialization time.
+        reserved = {f.name for f in fields(self)} - {"extras"}
+        collisions = sorted(reserved & set(self.extras))
+        if collisions:
+            raise DomainError(
+                f"WorkflowState.extras may not override validated fields: {collisions}"
+            )
         data.pop("extras", None)
         data.update(self.extras)
         return data
@@ -349,6 +357,8 @@ class ReviewerFinding:
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     path: str | None = None
     line: int | None = None
+    #: GitHub review-thread identifier this finding was filed on, if any.
+    thread_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.severity not in VALID_SEVERITIES:
@@ -374,12 +384,20 @@ class ReviewerFinding:
 
 @dataclass
 class FindingDisposition:
-    """The policy decision applied to one reviewer finding."""
+    """The policy decision applied to one reviewer finding.
+
+    ``thread_id`` identifies the GitHub review thread carrying the finding,
+    and ``reply_body`` is the reply posted on that thread (needed for
+    reply-before-resolve style policies); both are ``None`` when the
+    disposition did not involve a GitHub thread or a reply.
+    """
 
     finding_id: str
     action: DispositionAction
     rationale: str
     decided_by: LaneName
+    thread_id: str | None = None
+    reply_body: str | None = None
 
     def __post_init__(self) -> None:
         if self.action not in VALID_DISPOSITION_ACTIONS:

@@ -3,6 +3,7 @@ Hermes, or GitHub, and implementable with plain in-memory classes."""
 
 from __future__ import annotations
 
+import inspect
 from datetime import datetime
 from typing import Any
 
@@ -48,13 +49,15 @@ class FakeGitHubStateStore:
     def load_state(self, work_item_id: str) -> WorkflowState | None:
         return self.states.get(work_item_id)
 
-    def save_state(self, state: WorkflowState, expected_updated_at: datetime | None = None) -> None:
+    def save_state(self, state: WorkflowState, expected_updated_at: datetime | None) -> None:
         current = self.states.get(state.work_item_id)
-        if (
-            expected_updated_at is not None
-            and current is not None
-            and current.updated_at > expected_updated_at
-        ):
+        if expected_updated_at is None:
+            # None means create-only: refuse to overwrite an existing state.
+            if current is not None:
+                raise StateConflictError(
+                    f"state for {state.work_item_id} already exists; create-only save refused"
+                )
+        elif current is not None and current.updated_at > expected_updated_at:
             raise StateConflictError(f"state for {state.work_item_id} was updated concurrently")
         self.saved.append(state)
         self.states[state.work_item_id] = state
@@ -159,7 +162,7 @@ def _run_fakes() -> dict[str, Any]:
     store = FakeGitHubStateStore()
     item = WorkItem(id="wi-1", issue=issue)
     store.items[issue.slug()] = item
-    store.save_state(WorkflowState(work_item_id="wi-1", run_id="run-1", phase="queued"))
+    store.save_state(WorkflowState(work_item_id="wi-1", run_id="run-1", phase="queued"), None)
     assert store.load_state("wi-1") is not None
 
     cao = FakeCAOSessionController()
@@ -229,7 +232,7 @@ class TestOptimisticConcurrency:
     def test_stale_save_raises_conflict(self) -> None:
         store = FakeGitHubStateStore()
         first = WorkflowState(work_item_id="wi-1", run_id="run-1", phase="queued")
-        store.save_state(first)
+        store.save_state(first, None)
 
         reader_a = store.load_state("wi-1")
         assert reader_a is not None
@@ -245,10 +248,72 @@ class TestOptimisticConcurrency:
     def test_fresh_save_succeeds(self) -> None:
         store = FakeGitHubStateStore()
         state = WorkflowState(work_item_id="wi-1", run_id="run-1", phase="queued")
-        store.save_state(state)
+        store.save_state(state, None)
         updated = state.transition("planning")
         store.save_state(updated, expected_updated_at=state.updated_at)
         assert store.load_state("wi-1") == updated
+
+    def test_none_means_create_only(self) -> None:
+        store = FakeGitHubStateStore()
+        first = WorkflowState(work_item_id="wi-1", run_id="run-1", phase="queued")
+        store.save_state(first, None)
+        # A second writer also observing "no state" (or accepting a default)
+        # must not silently last-write-win over the first.
+        with pytest.raises(StateConflictError, match="create-only"):
+            store.save_state(
+                WorkflowState(work_item_id="wi-1", run_id="run-1", phase="claiming"), None
+            )
+        # And the first write must still be intact.
+        assert store.load_state("wi-1") == first
+
+    def test_protocol_save_state_takes_no_default(self) -> None:
+        # The precondition is mandatory: there is no default to accept.
+        param = inspect.signature(GitHubWorkflowStateStore.save_state).parameters[
+            "expected_updated_at"
+        ]
+        assert param.default is inspect.Parameter.empty
+
+
+class TestGateDecisionInvariants:
+    def test_passed_with_failed_checks_is_invalid(self) -> None:
+        with pytest.raises(ValueError, match="failed or pending"):
+            GateDecision(passed=True, pending_checks=[], failed_checks=["tests"])
+
+    def test_passed_with_pending_checks_is_invalid(self) -> None:
+        with pytest.raises(ValueError, match="failed or pending"):
+            GateDecision(passed=True, pending_checks=["lint"], failed_checks=[])
+
+    def test_consistent_decisions_are_valid(self) -> None:
+        assert GateDecision(passed=True, pending_checks=[], failed_checks=[]).passed
+        assert GateDecision(passed=False, pending_checks=[], failed_checks=["tests"]).failed_checks
+
+
+class TestSessionSpecLeaseLaneBinding:
+    def test_mismatched_lease_lane_is_rejected(self) -> None:
+        lease = ModelLease(
+            lease_id="lease-1", assignment=ModelAssignment(lane="reviewer-b", model_ref="rev")
+        )
+        with pytest.raises(ValueError, match="does not match model lease"):
+            SessionSpec(
+                lane=LaneIdentity(lane="worker-a", role="worker", profile_template="p"),
+                run_id="run-1",
+                workdir="/tmp/x",
+                env={},
+                model_lease=lease,
+            )
+
+    def test_matching_lease_lane_is_accepted(self) -> None:
+        lease = ModelLease(
+            lease_id="lease-1", assignment=ModelAssignment(lane="worker-a", model_ref="coder")
+        )
+        spec = SessionSpec(
+            lane=LaneIdentity(lane="worker-a", role="worker", profile_template="p"),
+            run_id="run-1",
+            workdir="/tmp/x",
+            env={},
+            model_lease=lease,
+        )
+        assert spec.model_lease is lease
 
 
 class TestModelBinding:

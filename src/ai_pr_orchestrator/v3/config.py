@@ -14,9 +14,10 @@ tests stay terse.
 from __future__ import annotations
 
 import dataclasses
+import types
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -329,6 +330,7 @@ def _section_from_dict(section: str, value: Any) -> Any:
             f"config section {section!r} must be a mapping, got {type(value).__name__}"
         )
     kwargs, extras = _typed_kwargs(section_type, value)
+    _validate_declared_shapes(section_type, kwargs, repr(section))
     for (section_name, f_name), nested in _NESTED_LIST_FIELDS.items():
         if section_name == section and f_name in kwargs and isinstance(kwargs[f_name], list):
             kwargs[f_name] = [_build_dataclass(nested, item) for item in kwargs[f_name]]
@@ -336,10 +338,52 @@ def _section_from_dict(section: str, value: Any) -> Any:
     return section_type(**kwargs)
 
 
+def _value_matches_type(hint: Any, value: Any) -> bool:
+    """True when ``value`` conforms to the declared type ``hint``."""
+    origin = get_origin(hint)
+    if origin is Union or origin is types.UnionType:
+        non_none = [arg for arg in get_args(hint) if arg is not type(None)]
+        return any(_value_matches_type(arg, value) for arg in non_none)
+    if origin in (list, tuple, set, frozenset) or hint in (list, tuple, set, frozenset):
+        return isinstance(value, (list, tuple, set, frozenset))
+    if origin is dict or hint is dict:
+        return isinstance(value, dict)
+    if hint is bool:
+        return isinstance(value, bool)
+    if hint is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if hint is float:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if hint is str:
+        return isinstance(value, str)
+    if dataclasses.is_dataclass(hint) and isinstance(hint, type):
+        return isinstance(value, dict)
+    return True  # Any / unhandled annotations: do not over-constrain.
+
+
+def _validate_declared_shapes(cls: type, data: dict[str, Any], where: str) -> None:
+    """Check declared field shapes in a raw mapping, raising V3ConfigError.
+
+    Runs before dataclass construction so a malformed nested value (e.g. a
+    list field given a scalar, or an int field given a string) is reported
+    as a config error instead of surfacing later as an AttributeError.
+    """
+    hints = get_type_hints(cls)
+    for name, hint in hints.items():
+        if name == "extras" or name not in data or data[name] is None:
+            continue
+        if not _value_matches_type(hint, data[name]):
+            raise V3ConfigError(
+                f"config {where}: field {name!r} expects {hint}, "
+                f"got {type(data[name]).__name__} ({data[name]!r})"
+            )
+
+
 def _build_dataclass(cls: type, data: Any) -> Any:
     if not isinstance(data, dict):
         raise V3ConfigError(f"expected a mapping for {cls.__name__}, got {type(data).__name__}")
     kwargs, extras = _typed_kwargs(cls, data)
+    _validate_declared_shapes(cls, kwargs, cls.__name__)
     kwargs["extras"] = extras
     return cls(**kwargs)
 

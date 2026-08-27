@@ -144,6 +144,22 @@ class TestWorkflowState:
         moved = state.transition("reviewing")
         assert moved.extras == {"future": 1}
 
+    def test_extras_cannot_override_validated_fields_at_serialization(self) -> None:
+        state = WorkflowState(work_item_id="wi-1", run_id="run-1", phase="coding")
+        # Even mutating the (mutable) extras dict cannot smuggle a bogus
+        # validated value through serialization: to_dict rejects it.
+        state.extras["phase"] = "done"
+        with pytest.raises(DomainError, match="may not override validated fields"):
+            state.to_dict()
+
+    def test_extras_cannot_override_terminal_reason(self) -> None:
+        state = WorkflowState.from_dict(
+            {"work_item_id": "wi-1", "run_id": "run-1", "phase": "coding"}
+        )
+        state.extras["terminal_reason"] = "merged"
+        with pytest.raises(DomainError, match="may not override validated fields"):
+            state.to_dict()
+
 
 class TestWorkItem:
     def test_round_trip(self) -> None:
@@ -154,6 +170,13 @@ class TestWorkItem:
             labels=["v3-work"],
         )
         assert WorkItem.from_dict(item.to_dict()) == item
+
+    def test_round_trip_tolerates_unknown_issue_ref_fields(self) -> None:
+        item = WorkItem(id="wi-1", issue=GitHubIssueRef(owner="o", repo="r", number=7))
+        data = item.to_dict()
+        data["issue"]["future_field_added_by_newer_version"] = 42
+        parsed = WorkItem.from_dict(data)
+        assert parsed.issue == GitHubIssueRef(owner="o", repo="r", number=7)
 
 
 class TestLaneAndModel:
@@ -224,6 +247,32 @@ class TestFindings:
             finding_id="f1", action="fix", rationale="real bug", decided_by="foreman"
         )
         assert FindingDisposition.from_dict(d.to_dict()) == d
+
+    def test_disposition_with_thread_and_reply_round_trip(self) -> None:
+        d = FindingDisposition(
+            finding_id="f1",
+            action="reply_deferred",
+            rationale="needs a coder reply first",
+            decided_by="foreman",
+            thread_id="PRRT_kwDO1234",
+            reply_body="Deferred to next round.",
+        )
+        assert d.thread_id == "PRRT_kwDO1234"
+        assert d.reply_body == "Deferred to next round."
+        assert FindingDisposition.from_dict(d.to_dict()) == d
+
+    def test_finding_thread_id_round_trip(self) -> None:
+        finding = ReviewerFinding(
+            id="f1",
+            lane="rev-1",
+            body="Bug",
+            severity="major",
+            run_id="run-1",
+            round_id="r1",
+            thread_id="PRRT_kwDO1234",
+        )
+        assert finding.thread_id == "PRRT_kwDO1234"
+        assert ReviewerFinding.from_dict(finding.to_dict()) == finding
 
     def test_disposition_invalid_action(self) -> None:
         with pytest.raises(DomainError):

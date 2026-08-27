@@ -50,7 +50,8 @@ class SessionSpec:
     ``image``/``command`` are opaque policy strings interpreted by the CAO
     adapter; V3 core never executes them. ``model_lease`` binds the session
     to a model reservation acquired from the model broker, so a lane can
-    never run against capacity other than what was reserved for it.
+    never run against capacity other than what was reserved for it: the
+    lease's assignment lane must match the session's own lane.
     """
 
     lane: LaneIdentity
@@ -58,6 +59,13 @@ class SessionSpec:
     workdir: str
     env: dict[str, str]
     model_lease: ModelLease | None = None
+
+    def __post_init__(self) -> None:
+        if self.model_lease is not None and self.model_lease.assignment.lane != self.lane.lane:
+            raise ValueError(
+                f"SessionSpec lane {self.lane.lane!r} does not match model lease "
+                f"reserved for lane {self.model_lease.assignment.lane!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -88,31 +96,50 @@ class LaneResult:
 
 @dataclass(frozen=True)
 class GateDecision:
-    """Result of a CI/PR gate evaluation."""
+    """Result of a CI/PR gate evaluation.
+
+    Invariant: ``passed=True`` is only valid when no checks are failed or
+    pending; a gate cannot pass with outstanding checks.
+    """
 
     passed: bool
     pending_checks: list[str]
     failed_checks: list[str]
     detail: str = ""
 
+    def __post_init__(self) -> None:
+        if self.passed and (self.failed_checks or self.pending_checks):
+            raise ValueError(
+                "GateDecision cannot be passed=True with failed or pending checks: "
+                f"failed={self.failed_checks} pending={self.pending_checks}"
+            )
+
 
 @runtime_checkable
 class GitHubWorkflowStateStore(Protocol):
     """Reads/writes the authoritative workflow state in GitHub.
 
-    ``save_state`` uses optimistic concurrency: pass the ``updated_at`` of
-    the state you loaded, and the store must raise :class:`StateConflictError`
-    instead of saving if another writer persisted a newer version in the
-    meantime. Two processes cannot silently last-write-win over each other.
+    ``save_state`` uses optimistic concurrency, and a precondition is
+    **mandatory on every write** — there is no default:
+
+    - ``expected_updated_at=None`` means *create-only*: the store must save
+      only if no state exists yet for the work item, and raise
+      :class:`StateConflictError` otherwise. Use it for the initial claim.
+    - ``expected_updated_at=<datetime>`` means *expect-that-version*: pass
+      the ``updated_at`` of the state you loaded, and the store must raise
+      :class:`StateConflictError` instead of saving if another writer
+      persisted a newer version in the meantime.
+
+    Two processes therefore cannot silently last-write-win over each other,
+    and an update caller cannot accidentally skip the precondition by
+    omitting it.
     """
 
     def load_work_item(self, issue: GitHubIssueRef) -> WorkItem: ...
 
     def load_state(self, work_item_id: str) -> WorkflowState | None: ...
 
-    def save_state(
-        self, state: WorkflowState, expected_updated_at: datetime | None = None
-    ) -> None: ...
+    def save_state(self, state: WorkflowState, expected_updated_at: datetime | None) -> None: ...
 
 
 @runtime_checkable

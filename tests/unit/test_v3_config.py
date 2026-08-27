@@ -206,3 +206,56 @@ class TestForwardCompatibility:
             {"model_router": {"catalog": [{"ref": "coder-main", "descriptor": "anything-at-all"}]}}
         )
         assert config.model_router.catalog[0].descriptor == "anything-at-all"
+
+
+class TestDeclaredShapeValidation:
+    """Declared container and primitive fields are validated during loading,
+    raising V3ConfigError instead of AttributeError deep in validation."""
+
+    def test_non_list_lanes_raises_config_error(self) -> None:
+        with pytest.raises(V3ConfigError, match=r"expects.*list"):
+            V3Config.from_dict({"hermes_lanes": {"lanes": "bad"}})
+
+    def test_non_list_required_checks_raises_config_error(self) -> None:
+        with pytest.raises(V3ConfigError, match=r"expects.*list"):
+            V3Config.from_dict({"ci_policy": {"required_checks": 7}})
+
+    def test_non_list_reviewer_lanes_raises_config_error(self) -> None:
+        with pytest.raises(V3ConfigError, match=r"expects.*list"):
+            V3Config.from_dict({"review_policy": {"reviewer_lanes": {"a": 1}}})
+
+    def test_string_int_field_raises_config_error(self) -> None:
+        with pytest.raises(V3ConfigError, match="max_review_rounds"):
+            V3Config.from_dict({"review_policy": {"max_review_rounds": "three"}})
+
+    def test_bool_rejected_for_int_field(self) -> None:
+        with pytest.raises(V3ConfigError, match="max_review_rounds"):
+            V3Config.from_dict({"review_policy": {"max_review_rounds": True}})
+
+    def test_bad_nested_lane_entry_raises_config_error(self) -> None:
+        with pytest.raises(V3ConfigError, match="LaneProfileConfig"):
+            V3Config.from_dict({"hermes_lanes": {"lanes": ["not-a-mapping"]}})
+
+    def test_bad_nested_entry_field_type_raises_config_error(self) -> None:
+        with pytest.raises(V3ConfigError, match="name"):
+            V3Config.from_dict(
+                {
+                    "hermes_lanes": {
+                        "lanes": [{"name": 7, "role": "worker", "profile_template": "p"}]
+                    }
+                }
+            )
+
+    def test_non_dict_lane_assignments_raises_config_error(self) -> None:
+        with pytest.raises(V3ConfigError, match="lane_assignments"):
+            V3Config.from_dict({"model_router": {"lane_assignments": ["a"]}})
+
+    def test_none_still_allowed_for_optional_fields(self) -> None:
+        config = V3Config.from_dict(
+            {
+                "model_router": {
+                    "catalog": [{"ref": "m", "descriptor": "d", "max_context_tokens": None}]
+                }
+            }
+        )
+        assert config.model_router.catalog[0].max_context_tokens is None
