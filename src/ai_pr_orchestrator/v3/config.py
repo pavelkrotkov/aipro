@@ -54,6 +54,14 @@ class CAOControlPlaneConfig:
     control_dir: str = ".cao"
     session_poll_interval_seconds: int = 30
     session_timeout_seconds: int = 3600
+    #: Root URL of CAO's HTTP control plane. It is the only supported way V3
+    #: talks to the session fabric — no terminal scraping, no CLI shelling.
+    base_url: str = "http://localhost:9889"
+    #: Per-HTTP-request budget. Distinct from ``session_timeout_seconds``,
+    #: which bounds how long an agent session may run: a session legitimately
+    #: runs for an hour while every individual control-plane call is expected
+    #: to answer in seconds.
+    request_timeout_seconds: float = 30.0
     #: Unknown keys from a newer writer, preserved for forward compatibility.
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -282,6 +290,10 @@ class V3Config:
             raise V3ConfigError("cao.session_poll_interval_seconds must be >= 1")
         if self.cao.session_timeout_seconds < 1:
             raise V3ConfigError("cao.session_timeout_seconds must be >= 1")
+        if not self.cao.base_url:
+            raise V3ConfigError("cao.base_url must be non-empty")
+        if self.cao.request_timeout_seconds <= 0:
+            raise V3ConfigError("cao.request_timeout_seconds must be > 0")
 
         if self.escalation.max_consecutive_coder_failures < 1:
             raise V3ConfigError("max_consecutive_coder_failures must be >= 1")
