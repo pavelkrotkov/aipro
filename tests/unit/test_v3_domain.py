@@ -9,6 +9,7 @@ from ai_pr_orchestrator.v3.domain import (
     FailureSummary,
     FindingDisposition,
     GitHubIssueRef,
+    GitHubPullRequestRef,
     LaneIdentity,
     ModelAssignment,
     ReviewerFinding,
@@ -35,6 +36,38 @@ class TestGitHubIssueRef:
     def test_invalid(self, owner: str, repo: str, number: int) -> None:
         with pytest.raises(DomainError):
             GitHubIssueRef(owner=owner, repo=repo, number=number)
+
+    def test_round_trip(self) -> None:
+        ref = GitHubIssueRef(owner="o", repo="r", number=7)
+        assert GitHubIssueRef.from_dict(ref.to_dict()) == ref
+
+    def test_round_trip_ignores_unknown_keys(self) -> None:
+        ref = GitHubIssueRef.from_dict({"owner": "o", "repo": "r", "number": 7, "extra": 1})
+        assert ref == GitHubIssueRef(owner="o", repo="r", number=7)
+
+
+class TestGitHubPullRequestRef:
+    def test_valid(self) -> None:
+        pr = GitHubPullRequestRef(owner="o", repo="r", number=9, head_sha="abc123")
+        assert pr.slug() == "o/r#9"
+        assert pr.head_sha == "abc123"
+
+    @pytest.mark.parametrize(
+        "owner,repo,number,head_sha",
+        [
+            ("", "r", 1, "abc"),
+            ("o", "", 1, "abc"),
+            ("o", "r", 0, "abc"),
+            ("o", "r", 1, ""),
+        ],
+    )
+    def test_invalid(self, owner: str, repo: str, number: int, head_sha: str) -> None:
+        with pytest.raises(DomainError):
+            GitHubPullRequestRef(owner=owner, repo=repo, number=number, head_sha=head_sha)
+
+    def test_round_trip(self) -> None:
+        pr = GitHubPullRequestRef(owner="o", repo="r", number=9, head_sha="abc123")
+        assert GitHubPullRequestRef.from_dict(pr.to_dict()) == pr
 
 
 class TestWorkflowState:
@@ -67,7 +100,7 @@ class TestWorkflowState:
         data = state.to_dict()
         assert WorkflowState.from_dict(data) == state
 
-    def test_from_dict_drops_unknown_fields(self) -> None:
+    def test_from_dict_preserves_unknown_fields(self) -> None:
         data = {
             "work_item_id": "wi-1",
             "run_id": "run-1",
@@ -76,6 +109,40 @@ class TestWorkflowState:
         }
         state = WorkflowState.from_dict(data)
         assert state.phase == "queued"
+        assert state.extras["future_field_added_by_newer_version"] == 42
+        # Unknown fields survive the round trip (lossless mixed-version rollout).
+        round_tripped = WorkflowState.from_dict(state.to_dict())
+        assert round_tripped == state
+        assert round_tripped.to_dict()["future_field_added_by_newer_version"] == 42
+
+    def test_state_is_frozen(self) -> None:
+        import dataclasses
+
+        state = WorkflowState(work_item_id="wi-1", run_id="run-1", phase="coding")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            state.phase = "done"  # type: ignore[misc]  # ty: ignore[invalid-assignment]
+
+    def test_transition_validates_and_carries_fields(self) -> None:
+        state = WorkflowState(work_item_id="wi-1", run_id="run-1", phase="coding", round_id="r1")
+        done = state.transition("done", terminal_reason="merged")
+        assert done.phase == "done"
+        assert done.terminal_reason == "merged"
+        assert done.round_id == "r1"
+        assert done.extras == {}
+        assert done.updated_at >= state.updated_at
+        # Transition to a terminal phase without a reason is rejected.
+        with pytest.raises(DomainError, match="terminal_reason"):
+            state.transition("failed")
+        # Invalid target phase is rejected.
+        with pytest.raises(DomainError, match="Invalid phase"):
+            state.transition("teleporting")  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+
+    def test_transition_preserves_extras(self) -> None:
+        state = WorkflowState.from_dict(
+            {"work_item_id": "wi-1", "run_id": "run-1", "phase": "coding", "future": 1}
+        )
+        moved = state.transition("reviewing")
+        assert moved.extras == {"future": 1}
 
 
 class TestWorkItem:
@@ -101,6 +168,14 @@ class TestLaneAndModel:
     def test_model_assignment(self) -> None:
         assignment = ModelAssignment(lane="worker-1", model_ref="coder-main")
         assert assignment.model_ref == "coder-main"
+
+    def test_lane_identity_round_trip(self) -> None:
+        lane = LaneIdentity(lane="rev-1", role="reviewer", profile_template="aipro-reviewer")
+        assert LaneIdentity.from_dict(lane.to_dict()) == lane
+
+    def test_model_assignment_round_trip(self) -> None:
+        assignment = ModelAssignment(lane="worker-1", model_ref="coder-main")
+        assert ModelAssignment.from_dict(assignment.to_dict()) == assignment
 
     @pytest.mark.parametrize("lane,model_ref", [("", "m"), ("lane", "")])
     def test_model_assignment_invalid(self, lane: str, model_ref: str) -> None:

@@ -3,12 +3,18 @@ Hermes, or GitHub, and implementable with plain in-memory classes."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
+import pytest
+
 from ai_pr_orchestrator.v3.domain import (
+    FindingDisposition,
     GitHubIssueRef,
+    GitHubPullRequestRef,
     LaneIdentity,
     ModelAssignment,
+    ReviewerFinding,
     WorkflowState,
     WorkItem,
 )
@@ -23,11 +29,13 @@ from ai_pr_orchestrator.v3.interfaces import (
     ModelLease,
     SessionHandle,
     SessionSpec,
+    StateConflictError,
 )
 
 
 class FakeGitHubStateStore:
-    """In-memory stand-in for GitHub workflow state."""
+    """In-memory stand-in for GitHub workflow state, with optimistic
+    concurrency: save_state refuses to overwrite a newer version."""
 
     def __init__(self) -> None:
         self.items: dict[str, WorkItem] = {}
@@ -40,7 +48,14 @@ class FakeGitHubStateStore:
     def load_state(self, work_item_id: str) -> WorkflowState | None:
         return self.states.get(work_item_id)
 
-    def save_state(self, state: WorkflowState) -> None:
+    def save_state(self, state: WorkflowState, expected_updated_at: datetime | None = None) -> None:
+        current = self.states.get(state.work_item_id)
+        if (
+            expected_updated_at is not None
+            and current is not None
+            and current.updated_at > expected_updated_at
+        ):
+            raise StateConflictError(f"state for {state.work_item_id} was updated concurrently")
         self.saved.append(state)
         self.states[state.work_item_id] = state
 
@@ -75,7 +90,17 @@ class FakeModelBroker:
 
 
 class FakeLaneExecutor:
-    def execute(self, lane: LaneIdentity, task_prompt: str, workdir: str) -> LaneResult:
+    def __init__(self) -> None:
+        self.leases: list[ModelLease | None] = []
+
+    def execute(
+        self,
+        lane: LaneIdentity,
+        task_prompt: str,
+        workdir: str,
+        lease: ModelLease | None = None,
+    ) -> LaneResult:
+        self.leases.append(lease)
         return LaneResult(
             session=SessionHandle(session_id="fake", lane=lane.lane),
             exit_code=0,
@@ -84,8 +109,48 @@ class FakeLaneExecutor:
         )
 
 
+class FakeReviewerLaneExecutor:
+    """A reviewer lane executor returning structured findings."""
+
+    def __init__(self) -> None:
+        self.leases: list[ModelLease | None] = []
+
+    def execute(
+        self,
+        lane: LaneIdentity,
+        task_prompt: str,
+        workdir: str,
+        lease: ModelLease | None = None,
+    ) -> LaneResult:
+        self.leases.append(lease)
+        finding = ReviewerFinding(
+            id="f1",
+            lane=lane.lane,
+            body="Unhandled error path",
+            severity="major",
+            run_id="run-1",
+            round_id="r1",
+        )
+        return LaneResult(
+            session=SessionHandle(session_id="fake", lane=lane.lane),
+            exit_code=0,
+            output_summary=task_prompt,
+            changed_files=[],
+            findings=[finding],
+            dispositions=[
+                FindingDisposition(
+                    finding_id="f1", action="fix", rationale="real bug", decided_by="foreman"
+                )
+            ],
+        )
+
+
 class FakeCIPRGate:
-    def evaluate(self, issue: GitHubIssueRef, head_sha: str) -> GateDecision:
+    def __init__(self) -> None:
+        self.seen: list[tuple[GitHubIssueRef, GitHubPullRequestRef]] = []
+
+    def evaluate(self, issue: GitHubIssueRef, pr: GitHubPullRequestRef) -> GateDecision:
+        self.seen.append((issue, pr))
         return GateDecision(passed=True, pending_checks=[], failed_checks=[])
 
 
@@ -116,7 +181,8 @@ def _run_fakes() -> dict[str, Any]:
 
     executor = FakeLaneExecutor()
     gate = FakeCIPRGate()
-    decision = gate.evaluate(issue, "abc123")
+    pr = GitHubPullRequestRef(owner="o", repo="r", number=9, head_sha="abc123")
+    decision = gate.evaluate(issue, pr)
     return {
         "store": store,
         "cao": cao,
@@ -124,6 +190,9 @@ def _run_fakes() -> dict[str, Any]:
         "executor": executor,
         "gate": gate,
         "decision": decision,
+        "lease": lease,
+        "issue": issue,
+        "pr": pr,
     }
 
 
@@ -154,3 +223,77 @@ class TestProtocolsAreFakeable:
         out = _run_fakes()
         broker: FakeModelBroker = out["broker"]
         assert [lease.lease_id for lease in broker.released] == ["lease-worker-1"]
+
+
+class TestOptimisticConcurrency:
+    def test_stale_save_raises_conflict(self) -> None:
+        store = FakeGitHubStateStore()
+        first = WorkflowState(work_item_id="wi-1", run_id="run-1", phase="queued")
+        store.save_state(first)
+
+        reader_a = store.load_state("wi-1")
+        assert reader_a is not None
+        # Process B saves a newer version in the meantime.
+        newer = reader_a.transition("planning")
+        store.save_state(newer, expected_updated_at=reader_a.updated_at)
+
+        # Process A's save is based on the version it loaded; it must fail.
+        stale = reader_a.transition("coding")
+        with pytest.raises(StateConflictError, match="concurrently"):
+            store.save_state(stale, expected_updated_at=reader_a.updated_at)
+
+    def test_fresh_save_succeeds(self) -> None:
+        store = FakeGitHubStateStore()
+        state = WorkflowState(work_item_id="wi-1", run_id="run-1", phase="queued")
+        store.save_state(state)
+        updated = state.transition("planning")
+        store.save_state(updated, expected_updated_at=state.updated_at)
+        assert store.load_state("wi-1") == updated
+
+
+class TestModelBinding:
+    def test_session_spec_carries_lease(self) -> None:
+        out = _run_fakes()
+        lease: ModelLease = out["lease"]
+        spec = SessionSpec(
+            lane=LaneIdentity(lane="worker-1", role="worker", profile_template="p"),
+            run_id="run-1",
+            workdir="/tmp/x",
+            env={},
+            model_lease=lease,
+        )
+        assert spec.model_lease is not None
+        assert spec.model_lease.assignment.model_ref == "coder-main"
+        # Default remains None so specs without a reservation stay valid.
+        assert (
+            SessionSpec(lane=spec.lane, run_id="run-1", workdir="/tmp/x", env={}).model_lease
+            is None
+        )
+
+    def test_executor_receives_lease(self) -> None:
+        out = _run_fakes()
+        executor = FakeLaneExecutor()
+        lane = LaneIdentity(lane="worker-1", role="worker", profile_template="p")
+        executor.execute(lane, "task", "/tmp/x", lease=out["lease"])
+        assert executor.leases == [out["lease"]]
+
+    def test_reviewer_lane_returns_structured_findings(self) -> None:
+        executor = FakeReviewerLaneExecutor()
+        lane = LaneIdentity(lane="rev-1", role="reviewer", profile_template="p")
+        result = executor.execute(lane, "review", "/tmp/x")
+        assert len(result.findings) == 1
+        finding = result.findings[0]
+        assert finding.lane == "rev-1"
+        assert finding.severity == "major"
+        assert [d.finding_id for d in result.dispositions] == ["f1"]
+
+
+class TestCIPRGateIdentity:
+    def test_gate_receives_pr_identity(self) -> None:
+        out = _run_fakes()
+        gate: FakeCIPRGate = out["gate"]
+        issue, pr = gate.seen[0]
+        assert issue == out["issue"]
+        assert pr == out["pr"]
+        assert pr.head_sha == "abc123"
+        assert pr.number == 9

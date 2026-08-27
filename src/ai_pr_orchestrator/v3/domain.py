@@ -3,8 +3,9 @@
 Pure, provider-independent value types for the thin policy engine. Everything
 in this module is plain data: no I/O, no subprocesses, no GitHub/CAO/Hermes
 imports. Types that may be persisted carry ``to_dict``/``from_dict`` round
-trips; unknown fields in persisted payloads are dropped on load, which keeps
-older readers forward compatible with newer writers.
+trips; unknown fields in persisted payloads are preserved as an ``extras``
+mapping and written back on serialization, so configs and state produced by
+newer versions round-trip losslessly through older readers.
 
 Identifiers (``RunId``, ``RoundId``, ``WorkItemId``, ``LaneName``,
 ``ModelRef``) are typed aliases rather than opaque strings, so signatures
@@ -114,6 +115,54 @@ class GitHubIssueRef:
     def slug(self) -> str:
         return f"{self.owner}/{self.repo}#{self.number}"
 
+    def to_dict(self) -> dict[str, Any]:
+        return {"owner": self.owner, "repo": self.repo, "number": self.number}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> GitHubIssueRef:
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestRef:
+    """Authoritative GitHub identity of one pull request.
+
+    A head SHA alone does not identify a PR (the same SHA can back several
+    open PRs), so CI/PR gating requires the PR number explicitly. The
+    ``head_sha`` is carried alongside the number so the pair is always
+    consistent.
+    """
+
+    owner: str
+    repo: str
+    number: int
+    head_sha: str
+
+    def __post_init__(self) -> None:
+        if not self.owner or not self.repo:
+            raise DomainError("GitHubPullRequestRef requires non-empty owner and repo")
+        if self.number <= 0:
+            raise DomainError(f"GitHubPullRequestRef.number must be positive, got {self.number}")
+        if not self.head_sha:
+            raise DomainError("GitHubPullRequestRef.head_sha must be non-empty")
+
+    def slug(self) -> str:
+        return f"{self.owner}/{self.repo}#{self.number}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "owner": self.owner,
+            "repo": self.repo,
+            "number": self.number,
+            "head_sha": self.head_sha,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> GitHubPullRequestRef:
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
 
 # --- Work item -------------------------------------------------------------
 
@@ -145,9 +194,15 @@ class WorkItem:
 # --- Workflow state --------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class WorkflowState:
-    """Workflow phase/state of one work item in one run."""
+    """Workflow phase/state of one work item in one run.
+
+    Immutable: phase changes go through :meth:`transition`, which re-runs the
+    ``__post_init__`` invariants on the new instance. Unknown fields read from
+    a persisted payload are preserved in ``extras`` and written back by
+    ``to_dict`` so mixed-version rollouts never silently drop newer fields.
+    """
 
     work_item_id: WorkItemId
     run_id: RunId
@@ -155,6 +210,8 @@ class WorkflowState:
     round_id: RoundId | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     terminal_reason: str | None = None
+    #: Unknown fields from a newer writer, preserved for lossless round trips.
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.phase not in VALID_PHASES:
@@ -168,16 +225,50 @@ class WorkflowState:
                 f"terminal_reason is only valid in terminal phases, phase is {self.phase!r}"
             )
 
+    def transition(
+        self,
+        phase: WorkItemPhase,
+        *,
+        round_id: RoundId | None = None,
+        terminal_reason: str | None = None,
+    ) -> WorkflowState:
+        """Return a new state in ``phase``, re-validating all invariants.
+
+        Terminal phases require ``terminal_reason``; leaving a terminal phase
+        clears it. ``updated_at`` is refreshed on every transition.
+        """
+        return WorkflowState(
+            work_item_id=self.work_item_id,
+            run_id=self.run_id,
+            phase=phase,
+            round_id=round_id if round_id is not None else self.round_id,
+            updated_at=datetime.now(UTC),
+            terminal_reason=terminal_reason,
+            extras=dict(self.extras),
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return _serialize_dataclass(self)
+        data = _serialize_dataclass(self)
+        # The extras bucket itself is not part of the persisted payload;
+        # its contents are merged at the top level.
+        data.pop("extras", None)
+        data.update(self.extras)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkflowState:
         data = dict(data)
         if isinstance(data.get("updated_at"), str):
             data["updated_at"] = _str_to_dt(data["updated_at"])
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        known = {f.name for f in fields(cls)} - {"extras"}
+        kwargs: dict[str, Any] = {}
+        extras: dict[str, Any] = {}
+        for key, value in data.items():
+            if key in known:
+                kwargs[key] = value
+            else:
+                extras[key] = value
+        return cls(**kwargs, extras=extras)
 
 
 # --- Agent lanes -----------------------------------------------------------
@@ -203,6 +294,18 @@ class LaneIdentity:
         if not self.profile_template:
             raise DomainError("LaneIdentity.profile_template must be non-empty")
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lane": self.lane,
+            "role": self.role,
+            "profile_template": self.profile_template,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LaneIdentity:
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
 
 @dataclass(frozen=True)
 class ModelAssignment:
@@ -220,6 +323,14 @@ class ModelAssignment:
             raise DomainError("ModelAssignment.lane must be non-empty")
         if not self.model_ref:
             raise DomainError("ModelAssignment.model_ref must be non-empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"lane": self.lane, "model_ref": self.model_ref}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ModelAssignment:
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 # --- Reviewer findings -----------------------------------------------------

@@ -88,6 +88,60 @@ class TestValidation:
         with pytest.raises(V3ConfigError, match="poll_interval"):
             V3Config(cao={"session_poll_interval_seconds": 0}).validate()  # ty: ignore[invalid-argument-type]
 
+    def test_remaining_positive_limits_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="stagnation_rounds_threshold"):
+            V3Config(escalation={"stagnation_rounds_threshold": 0}).validate()  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        with pytest.raises(V3ConfigError, match="session_timeout_seconds"):
+            V3Config(cao={"session_timeout_seconds": 0}).validate()  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        with pytest.raises(V3ConfigError, match="ci_wait_timeout_seconds"):
+            V3Config(ci_policy={"ci_wait_timeout_seconds": 0}).validate()  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        with pytest.raises(V3ConfigError, match="max_concurrent"):
+            V3Config(
+                hermes_lanes=HermesLanesConfig(
+                    lanes=[
+                        LaneProfileConfig(
+                            name="l", role="worker", profile_template="p", max_concurrent=0
+                        )
+                    ]
+                )
+            ).validate()
+
+    def test_catalog_max_context_tokens_must_be_positive(self) -> None:
+        config = make_valid_config()
+        config.model_router.catalog.append(
+            ModelCatalogEntry(ref="cheap", descriptor="opaque", max_context_tokens=0)
+        )
+        with pytest.raises(V3ConfigError, match="max_context_tokens"):
+            config.validate()
+        # None means "unset" and is allowed.
+        make_valid_config().model_router.catalog.append(
+            ModelCatalogEntry(ref="unset", descriptor="opaque", max_context_tokens=None)
+        )
+        make_valid_config().validate()
+
+    def test_malformed_section_shape_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="review_policy"):
+            V3Config.from_dict({"review_policy": "bad"})
+        with pytest.raises(V3ConfigError, match="model_router"):
+            V3Config.from_dict({"model_router": ["bad"]})
+        with pytest.raises(V3ConfigError, match="hermes_lanes"):
+            V3Config(hermes_lanes="nope")  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        # A null section loads as defaults (YAML `review_policy:` with no value).
+        config = V3Config.from_dict({"review_policy": None})
+        assert config.review_policy.max_review_rounds == 3
+
+    def test_malformed_nested_item_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="ModelCatalogEntry"):
+            V3Config.from_dict(
+                {"model_router": {"catalog": [{"ref": "m", "descriptor": "d"}, "bad-item"]}}
+            )
+
+    def test_unknown_reviewer_lane_reports_config_error_not_stopiteration(self) -> None:
+        config = make_valid_config()
+        config.review_policy.reviewer_lanes.append("ghost")
+        with pytest.raises(V3ConfigError, match="unknown reviewer lane"):
+            config.validate()
+
 
 class TestSerializationRoundTrip:
     def test_round_trip(self) -> None:
@@ -128,12 +182,23 @@ class TestForwardCompatibility:
         # Extras survive the round trip.
         assert V3Config.from_dict(config.to_dict()) == config
 
-    def test_unknown_keys_inside_sections_ignored(self) -> None:
+    def test_unknown_keys_inside_sections_preserved(self) -> None:
         config = V3Config.from_dict(
             {"review_policy": {"max_review_rounds": 5, "future_option": "z"}}
         )
         assert config.review_policy.max_review_rounds == 5
-        assert config == V3Config(review_policy={"max_review_rounds": 5})  # ty: ignore[invalid-argument-type]
+        assert config.review_policy.extras == {"future_option": "z"}
+        # Unknown section keys survive the round trip.
+        assert V3Config.from_dict(config.to_dict()) == config
+        assert config.to_dict()["review_policy"]["future_option"] == "z"
+
+    def test_unknown_keys_inside_nested_items_preserved(self) -> None:
+        config = V3Config.from_dict(
+            {"model_router": {"catalog": [{"ref": "m", "descriptor": "d", "future_flag": True}]}}
+        )
+        entry = config.model_router.catalog[0]
+        assert entry.extras == {"future_flag": True}
+        assert V3Config.from_dict(config.to_dict()) == config
 
     def test_no_vendor_names_in_schema(self) -> None:
         """The catalog descriptor is opaque and never parsed by the core."""

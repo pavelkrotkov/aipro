@@ -74,7 +74,7 @@ and interpreted only by the model broker adapter.
 | `state_storage.py` | **WRAP** | The GitHub hidden-comment persistence mechanics survive behind `GitHubWorkflowStateStore`; the V1 `RuntimeState` payload is replaced by V3 state at cutover. |
 | `state_machine.py` | **WRAP then REPLACE** | Transition guard logic is absorbed into the V3 phase model (`WorkflowState` validation) and foreman policy; the V1 status enum retires at cutover. |
 | `models.py` (V1 domain types) | **REPLACE** (progressively) | V3 types in `v3.domain` supersede `Finding`/`HandledFinding`/`RuntimeState`; kept until the last V1 consumer is gone. |
-| GitHub Actions execution template (`.github/` workflow that shells out to the coder CLI) | **DELETE** | Execution moves to CAO/Hermes; GitHub Actions remains only for CI checks and the thin trigger/queue listener. |
+| V1 execution template (`examples/target-repo-workflow.yml`, the GitHub Actions workflow that shells out to the coder CLI) | **DELETE** | Execution moves to CAO/Hermes; GitHub Actions remains only for CI checks and the thin trigger/queue listener. |
 | `config.py` (V1 schema) | **WRAP** until cutover, then **REPLACE** by `v3.config` | V1 and V3 configs coexist; V3 loader is independent. |
 | `decision_application.py`, `logging.py` | **KEEP** | Deterministic helpers with no process management; reused by V3. |
 | `github/` (API client) | **KEEP** (adapted) | Transport for the `GitHubWorkflowStateStore` adapter. |

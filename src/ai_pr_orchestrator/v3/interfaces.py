@@ -12,17 +12,35 @@ depends on a specific implementation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from .domain import (
+    FindingDisposition,
     GitHubIssueRef,
+    GitHubPullRequestRef,
     LaneIdentity,
     ModelAssignment,
+    ReviewerFinding,
     RunId,
     WorkflowState,
     WorkItem,
 )
+
+
+class StateConflictError(RuntimeError):
+    """Raised by :meth:`GitHubWorkflowStateStore.save_state` when the
+    optimistic-concurrency precondition fails (another writer updated the
+    state between our load and our save)."""
+
+
+@dataclass(frozen=True)
+class ModelLease:
+    """A reservation of model capacity returned by the model broker."""
+
+    lease_id: str
+    assignment: ModelAssignment
 
 
 @dataclass(frozen=True)
@@ -30,13 +48,16 @@ class SessionSpec:
     """Declarative description of a session to start on the CAO fabric.
 
     ``image``/``command`` are opaque policy strings interpreted by the CAO
-    adapter; V3 core never executes them.
+    adapter; V3 core never executes them. ``model_lease`` binds the session
+    to a model reservation acquired from the model broker, so a lane can
+    never run against capacity other than what was reserved for it.
     """
 
     lane: LaneIdentity
     run_id: RunId
     workdir: str
     env: dict[str, str]
+    model_lease: ModelLease | None = None
 
 
 @dataclass(frozen=True)
@@ -49,20 +70,20 @@ class SessionHandle:
 
 @dataclass(frozen=True)
 class LaneResult:
-    """Outcome of one lane execution."""
+    """Outcome of one lane execution.
+
+    Reviewer lanes return their observations as structured
+    :class:`~ai_pr_orchestrator.v3.domain.ReviewerFinding` values so they can
+    flow into the policy engine unchanged; dispositions record the policy
+    decisions applied to those findings.
+    """
 
     session: SessionHandle
     exit_code: int
     output_summary: str
     changed_files: list[str]
-
-
-@dataclass(frozen=True)
-class ModelLease:
-    """A reservation of model capacity returned by the model broker."""
-
-    lease_id: str
-    assignment: ModelAssignment
+    findings: list[ReviewerFinding] = field(default_factory=list)
+    dispositions: list[FindingDisposition] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -77,13 +98,21 @@ class GateDecision:
 
 @runtime_checkable
 class GitHubWorkflowStateStore(Protocol):
-    """Reads/writes the authoritative workflow state in GitHub."""
+    """Reads/writes the authoritative workflow state in GitHub.
+
+    ``save_state`` uses optimistic concurrency: pass the ``updated_at`` of
+    the state you loaded, and the store must raise :class:`StateConflictError`
+    instead of saving if another writer persisted a newer version in the
+    meantime. Two processes cannot silently last-write-win over each other.
+    """
 
     def load_work_item(self, issue: GitHubIssueRef) -> WorkItem: ...
 
     def load_state(self, work_item_id: str) -> WorkflowState | None: ...
 
-    def save_state(self, state: WorkflowState) -> None: ...
+    def save_state(
+        self, state: WorkflowState, expected_updated_at: datetime | None = None
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -110,13 +139,29 @@ class ModelBroker(Protocol):
 
 @runtime_checkable
 class LaneExecutor(Protocol):
-    """Executes one unit of work on an agent lane (a Hermes profile)."""
+    """Executes one unit of work on an agent lane (a Hermes profile).
 
-    def execute(self, lane: LaneIdentity, task_prompt: str, workdir: str) -> LaneResult: ...
+    ``lease`` is the model reservation for this execution (from
+    :class:`ModelBroker`); passing it makes the lane-to-model binding part of
+    the execution contract rather than ambient state.
+    """
+
+    def execute(
+        self,
+        lane: LaneIdentity,
+        task_prompt: str,
+        workdir: str,
+        lease: ModelLease | None = None,
+    ) -> LaneResult: ...
 
 
 @runtime_checkable
 class CIPRGate(Protocol):
-    """Evaluates CI/PR gating policy for a head SHA."""
+    """Evaluates CI/PR gating policy for one pull request.
 
-    def evaluate(self, issue: GitHubIssueRef, head_sha: str) -> GateDecision: ...
+    The PR is identified by :class:`~ai_pr_orchestrator.v3.domain.GitHubPullRequestRef`
+    (number + head SHA); a head SHA alone does not identify a PR because the
+    same SHA can back several open pull requests.
+    """
+
+    def evaluate(self, issue: GitHubIssueRef, pr: GitHubPullRequestRef) -> GateDecision: ...
