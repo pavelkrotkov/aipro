@@ -85,14 +85,10 @@ def _pr_number_from_event(event_path: Path, *, fallback_pr: int | None = None) -
     # The caller's payload is explicit; infer the event type from its keys
     # rather than an ambient GITHUB_EVENT_NAME, which may describe a different
     # trigger (e.g. "push" on push-to-main CI runs) and would mask a payload
-    # that clearly carries ``pull_request``.
-    parsed = runner.parse_event(event)
+    # that clearly carries ``pull_request``. The hint is honored only when it
+    # agrees with the inferred type or nothing could be inferred.
+    parsed = runner.parse_event_payload_first(event, event_name=os.environ.get("GITHUB_EVENT_NAME"))
     pr_number = parsed.pr_number
-    if pr_number is None:
-        hinted = runner.parse_event(event, event_name=os.environ.get("GITHUB_EVENT_NAME"))
-        if hinted.event_type != parsed.event_type and hinted.pr_number is not None:
-            pr_number = hinted.pr_number
-            parsed = hinted
     if pr_number is None:
         # ``status`` webhooks carry a commit SHA but no PR number. Mapping SHA →
         # PR requires a live GitHub client the CLI doesn't construct yet, so the
