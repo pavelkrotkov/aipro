@@ -144,7 +144,7 @@ def _run_telemetry(args: argparse.Namespace) -> int:
     print(f"{'RESOURCE':<20} {'AVAILABILITY':<13} {'CLASS':<13} {'AGE':>8}  SOURCE")
     for snap in snapshots:
         stale = "" if snap.is_stale(now) is not True else "  [STALE]"
-        age = f"{int(snap.age(now).total_seconds())}s"
+        age = _format_age(snap.age(now))
         print(
             f"{snap.resource:<20} {snap.availability:<13} {snap.resource_class:<13} "
             f"{age:>8}  {snap.source or '-'}{stale}"
@@ -178,6 +178,16 @@ def _format_duration(delta: timedelta) -> str:
     total = int(delta.total_seconds())
     hours, remainder = divmod(total, 3600)
     return f"{hours}h{remainder // 60:02d}m" if hours else f"{remainder // 60}m"
+
+
+def _format_age(delta: timedelta) -> str:
+    """Age at the scale a reader can act on: a probe is seconds old, a catalog
+    declaration can be months."""
+    total = int(delta.total_seconds())
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if total >= size:
+            return f"{total // size}{unit}"
+    return f"{total}s"
 
 
 def _run_catalog(args: argparse.Namespace) -> int:

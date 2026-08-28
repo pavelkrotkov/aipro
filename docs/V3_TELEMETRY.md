@@ -121,6 +121,22 @@ entry whose promotion window has already closed reports `expires_at=None` with
 detail `promotion inactive`, rather than a timestamp in the past that reads as
 "expires soon" to anything sorting on that column.
 
+A catalog snapshot's `observed_at` is the entry's declared `source_updated_at`,
+not the query time. The *verdict* is computed now, but the declaration it rests
+on is only as fresh as the last time an operator confirmed it — stamping the
+query time gave a months-old promotion age zero and `is_stale()` false forever,
+attaching a live measurement's freshness to a hand-written file. Where an entry
+declares no provenance the snapshot carries **no TTL**, so `is_stale()` is
+`None`: unanswerable, not false. §3 again.
+
+In the assembled wiring the catalog source gets **no TTL at all**.
+`snapshot_ttl_seconds` budgets how long a *measurement* may be reused before it
+is taken again; nothing re-measures a hand-written entry, so applying it there
+can only ever be exceeded — every provenanced entry would read `[STALE]`
+forever, a warning no operator action could clear. The reported `age` still
+tells the truth about how old the declaration is; whether that is *too* old is
+a judgement the config never expressed, so it is left unanswered.
+
 `snapshot_all()` evaluates the whole fan-out at **one timestamp**, so two rows
 cannot disagree about whether a window has reset mid-scan.
 
@@ -152,6 +168,17 @@ The subprocess runs with `cwd` set to `hermes_home` when that directory exists.
 `python -c` puts the working directory on `sys.path`, so inheriting the
 orchestrator's cwd would let a local file named e.g. `agent.py` shadow Hermes'
 own package.
+
+When only `hermes_python` is configured there is no checkout to point `cwd` at,
+and the subprocess would inherit ours — the same hazard, one level down. There
+`PYTHONSAFEPATH=1` drops the cwd entry instead, leaving the interpreter's own
+environment to supply `agent`. It is deliberately **not** set when a checkout
+*is* known, because there the entry is load-bearing: a checkout never installed
+into its venv is importable only via `cwd`.
+
+Paths are made absolute **lexically** (`os.path.abspath`), never `resolve()`d.
+A venv's `bin/python` is a symlink to the base interpreter, and following it
+lands outside the venv where `sys.prefix` no longer finds its `site-packages`.
 
 ### Our failures are not the provider's failures
 
@@ -192,6 +219,26 @@ Non-finite delays are dropped at both ends: `float()` accepts `"NaN"` and
 `"Infinity"`, `json.dumps` emits those literals verbatim and `json.loads`
 accepts them back, and `timedelta()` then raises — turning a rate limit into a
 generic source failure.
+
+The deadline is anchored **past the probe's own duration**. `Retry-After`
+counts from when the provider answered, but the query timestamp is read before
+the subprocess starts and the bridge walks providers sequentially, so on a slow
+probe the whole delay can elapse in transit and leave `is_throttled()` false
+against a provider still refusing us. Adding the measured elapsed time
+over-waits by the gap between the rate-limited reply and the subprocess
+exiting, which is the safe direction; being exact would need the bridge to
+report an absolute deadline.
+
+### Caching
+
+One probe serves every resource, refreshed at the strictest configured TTL. A
+**spent window's reset also expires the cache**, ahead of that TTL: the
+provider tells us exactly when the allowance returns, and holding a 100%-used
+reading past that moment keeps the resource out of rotation for the rest of the
+TTL after it became usable — five minutes, by default, for a window that reset
+in thirty seconds. Only *spent* windows do this; an ordinary rollover does not
+make a cached reading wrong, and re-probing on one would just spend a
+rate-limited request to learn nothing.
 
 ### The private-function deviation
 
@@ -244,6 +291,14 @@ free-text field (`reason`, `detail`, `details`) is passed through
 `redact_secrets()` on the way in — bearer tokens, `sk-`/`gh*_` keys, and
 userinfo in URLs become `«REDACTED»`. Snapshots have no field that holds a
 credential, so the `telemetry` command cannot print one.
+
+Values are also masked by the **key** they sit under, and the key matcher
+allows namespace prefixes, because that is how these names actually arrive:
+`OPENAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `client_secret`. A leading `\b`
+fails on every one of them — `_` is a word character, so there is no boundary
+before `API` or `secret`. Each prefix segment must end in a separator, so
+`notatoken` is not read as a namespaced `token`, and the trailing boundary
+keeps `max_tokens=4096` and `token_count = 12` intact.
 
 ## 8. Configuration
 
@@ -307,10 +362,14 @@ openrouter           unknown       metered             0s  hermes:credits_api
     health 1 recent request(s), 0% failed, 0 consecutive
     reason Hermes reported account usage for 'openrouter' with no measured quota
            window or structured balance, so remaining capacity cannot be determined
-promo-free-generalist available     metered             0s  catalog
+promo-free-generalist available     metered            90d  catalog
     expires 2027-09-30T00:00:00+00:00
     detail promotion active
 ```
+
+`AGE` is rendered at the largest scale that fits, because the column carries two
+very different quantities: a probe is seconds old, while a catalog declaration
+is as old as the last operator edit. No `[STALE]` on that last row — see §4.
 
 `--json` emits the same data machine-readably, under a single `evaluated_at`.
 

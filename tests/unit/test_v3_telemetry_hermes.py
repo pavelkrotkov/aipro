@@ -8,6 +8,8 @@ against shapes Hermes actually emits rather than shapes we wish it emitted.
 from __future__ import annotations
 
 import subprocess
+import time
+import types
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from pathlib import Path
@@ -15,6 +17,8 @@ from typing import Any, ClassVar
 
 import pytest
 
+from ai_pr_orchestrator.v3.catalog import ModelCatalog, ModelCatalogEntry
+from ai_pr_orchestrator.v3.config import TelemetryConfig, TelemetryResourceConfig
 from ai_pr_orchestrator.v3.telemetry import (
     ProviderHealthLedger,
     TelemetryError,
@@ -25,6 +29,7 @@ from ai_pr_orchestrator.v3.telemetry_hermes import (
     HermesResource,
     HermesSubprocessProbe,
     HermesTelemetrySource,
+    build_telemetry,
     normalize_probe_result,
     probe_outcome,
 )
@@ -512,6 +517,98 @@ class TestHermesTelemetrySource:
         snap = TelemetryRegistry(sources=[source], ledger=ledger).snapshot("codex-sub", at=NOW)
         assert snap.health.outcomes == {"auth_failure": 1}
 
+    def test_a_spent_windows_reset_expires_the_cache_before_the_ttl(self):
+        # The provider says exactly when the allowance returns. Holding a
+        # 100%-used reading past that keeps the resource out of rotation for
+        # the rest of the TTL -- five minutes, by default, for a window that
+        # reset in thirty seconds. Cycle 2 made this worse by giving a single
+        # spent window the power to stop the whole resource.
+        reset = NOW + timedelta(seconds=30)
+
+        def payload(used):
+            return {
+                "ok": True,
+                "provider": "anthropic",
+                "fidelity": "private",
+                "snapshot": {
+                    **_anthropic_snapshot(),
+                    "fetched_at": NOW.isoformat(),
+                    "windows": [
+                        {
+                            "label": "Current week",
+                            "used_percent": used,
+                            "reset_at": reset.isoformat(),
+                            "detail": None,
+                        }
+                    ],
+                },
+            }
+
+        class Recovering:
+            calls = 0
+
+            def probe(self, providers):
+                Recovering.calls += 1
+                return {"anthropic": payload(100.0 if Recovering.calls == 1 else 4.0)}
+
+        source = HermesTelemetrySource(
+            resources=[HermesResource(name="anthropic-sub", provider="anthropic")],
+            probe=Recovering(),
+            ttl_seconds=300.0,
+        )
+        assert source.snapshot("anthropic-sub", at=NOW).availability == "exhausted"
+        # Still cached right up to the reset: the allowance has not returned.
+        assert source.snapshot("anthropic-sub", at=reset - timedelta(seconds=1)).availability == (
+            "exhausted"
+        )
+        assert Recovering.calls == 1
+        # Past it, re-probed rather than served a reading we know is stale.
+        assert source.snapshot("anthropic-sub", at=reset).availability == "available"
+        assert Recovering.calls == 2
+
+    def test_a_live_windows_reset_does_not_expire_the_cache(self):
+        # Only a spent window makes a cached reading wrong. Expiring on every
+        # rollover would re-probe a rate-limited endpoint for no new answer.
+        source = HermesTelemetrySource(
+            resources=[HermesResource(name="codex-sub", provider="openai-codex")],
+            probe=_StaticProbe({"openai-codex": CODEX_OK}),
+            ttl_seconds=300.0,
+        )
+        first = require(_normalize(CODEX_OK).window("Session")).reset_at
+        assert first is not None
+        source.snapshot("codex-sub", at=NOW)
+        snap = source.snapshot("codex-sub", at=first + timedelta(seconds=1))
+        assert snap.availability == "available"
+
+    def test_a_retry_after_deadline_survives_a_slow_probe(self):
+        # Retry-After counts from when the provider answered, but `at` is read
+        # before the subprocess starts. On a slow probe the whole delay could
+        # elapse in transit, leaving is_throttled() false against a provider
+        # that is still refusing us.
+        class Slow:
+            def probe(self, providers):
+                time.sleep(0.3)
+                return {
+                    "anthropic": {
+                        "ok": False,
+                        "provider": "anthropic",
+                        "kind": "rate_limited",
+                        "message": "429",
+                        "retry_after_seconds": 0.1,
+                    }
+                }
+
+        ledger = ProviderHealthLedger()
+        source = HermesTelemetrySource(
+            resources=[HermesResource(name="anthropic-sub", provider="anthropic")],
+            probe=Slow(),
+            ledger=ledger,
+        )
+        snap = TelemetryRegistry(sources=[source], ledger=ledger).snapshot("anthropic-sub", at=NOW)
+        assert snap.health.retry_after is not None
+        assert snap.health.retry_after > NOW + timedelta(seconds=0.3)
+        assert snap.health.is_throttled(NOW) is True
+
     def test_per_resource_ttl_overrides_the_source_default(self):
         source = HermesTelemetrySource(
             resources=[HermesResource(name="codex-sub", provider="openai-codex", ttl_seconds=30.0)],
@@ -584,6 +681,63 @@ class TestSubprocessProbe:
         HermesSubprocessProbe(hermes_home=Path(tmp_path.name)).probe(["anthropic"])
         assert calls["argv"][0] == str(interpreter)
         assert calls["cwd"] == str(tmp_path)
+
+    @pytest.mark.parametrize("payload", ['{"results": null}', '{"results": 1}'])
+    def test_a_non_iterable_results_field_is_a_local_error(self, payload, tmp_path, monkeypatch):
+        # Structurally valid JSON in the wrong shape. Iterating it raised a
+        # TypeError past the local-error path, and the source's blanket handler
+        # then filed *our* corrupt output as a provider transport_error --
+        # exactly the misattribution the local_error kind exists to prevent.
+        interpreter = tmp_path / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("")
+
+        def fake_run(argv, **kwargs):
+            return types.SimpleNamespace(returncode=0, stdout=payload, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = HermesSubprocessProbe(hermes_home=tmp_path).probe(["anthropic"])["anthropic"]
+        assert result["kind"] == "local_error"
+        assert "must be a list" in result["message"]
+        assert probe_outcome(result) is None
+
+    def test_the_bridge_gets_a_neutral_sys_path_when_no_checkout_is_known(
+        self, tmp_path, monkeypatch
+    ):
+        # `python -c` puts the cwd on sys.path. With `hermes_python` set but no
+        # `hermes_home` there is no Hermes directory to point cwd at, so the
+        # subprocess inherited *ours* and any local `agent.py` shadowed Hermes'
+        # real package. Verified against the live install: without this the
+        # bridge imported a decoy; with it, the real agent package.
+        calls: dict[str, Any] = {}
+
+        def fake_run(argv, **kwargs):
+            calls.update(kwargs)
+            raise OSError("not actually running it")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        python = tmp_path / "python"
+        python.write_text("")
+        HermesSubprocessProbe(python_executable=python).probe(["anthropic"])
+        assert calls["cwd"] is None
+        assert calls["env"]["PYTHONSAFEPATH"] == "1"
+
+    def test_a_known_checkout_keeps_its_cwd_on_sys_path(self, tmp_path, monkeypatch):
+        # The mirror image: a checkout never installed into its venv is
+        # importable *only* via cwd, so isolating there would break it.
+        interpreter = tmp_path / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("")
+        calls: dict[str, Any] = {}
+
+        def fake_run(argv, **kwargs):
+            calls.update(kwargs)
+            raise OSError("not actually running it")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        HermesSubprocessProbe(hermes_home=tmp_path).probe(["anthropic"])
+        assert calls["cwd"] == str(tmp_path)
+        assert "PYTHONSAFEPATH" not in calls["env"]
 
     def test_a_venv_interpreter_symlink_is_not_followed(self, tmp_path, monkeypatch):
         # Making the path absolute must stay lexical. A venv's `bin/python` is
@@ -697,3 +851,48 @@ def _with_window_field(payload, label, key, value):
         {**w, key: value} if w["label"] == label else w for w in payload["snapshot"]["windows"]
     ]
     return {**payload, "snapshot": {**payload["snapshot"], "windows": windows}}
+
+
+class TestBuildTelemetryWiring:
+    def _catalog(self) -> ModelCatalog:
+        return ModelCatalog(
+            entries=(
+                ModelCatalogEntry(
+                    ref="promo-free-generalist",
+                    descriptor="vendor/promo",
+                    resource_class="metered",
+                    cost_class="low",
+                    promotional=True,
+                    promo_ends_at=NOW + timedelta(days=30),
+                    input_price_per_mtok=1.0,
+                    output_price_per_mtok=2.0,
+                    source_updated_at=NOW - timedelta(days=90),
+                ),
+            )
+        )
+
+    def test_catalog_declarations_are_not_held_to_the_probe_freshness_budget(self):
+        # snapshot_ttl_seconds says how long a *measurement* may be reused
+        # before it is taken again. Nothing re-measures a hand-written catalog
+        # entry, so handing it that budget marked every provenanced entry
+        # permanently stale -- a warning no operator action could ever clear.
+        registry, _ledger = build_telemetry(
+            TelemetryConfig(snapshot_ttl_seconds=300.0), catalog=self._catalog()
+        )
+        snap = registry.snapshot("promo-free-generalist", at=NOW)
+        assert snap.source == "catalog"
+        assert snap.is_stale(NOW) is None
+        # The age is still reported truthfully, so a reader can judge for itself.
+        assert snap.age(NOW) == timedelta(days=90)
+
+    def test_probe_snapshots_still_carry_the_configured_budget(self):
+        registry, _ledger = build_telemetry(
+            TelemetryConfig(
+                snapshot_ttl_seconds=300.0,
+                resources=[TelemetryResourceConfig(name="codex-sub", provider="codex")],
+                hermes_home="/nonexistent/hermes",
+            )
+        )
+        snap = registry.snapshot("codex-sub", at=NOW)
+        assert snap.source == "hermes"
+        assert snap.ttl_seconds == 300.0

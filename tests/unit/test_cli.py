@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import timedelta
 from pathlib import Path
 
@@ -413,6 +414,28 @@ def test_telemetry_includes_catalog_perishable_capacity(
     refs = {row["resource"] for row in json.loads(capsys.readouterr().out)["resources"]}
     # Only perishable capacity is a telemetry resource; a paid entry is not.
     assert refs == {"free-model"}
+
+
+def test_telemetry_reports_a_stale_declarations_age_at_a_readable_scale(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A catalog snapshot's age is the declaration's age, which can be months.
+    # Rendering that as a raw second count ("7813654s") overflows the column
+    # and tells the reader nothing they can act on.
+    (tmp_path / "catalog.yml").write_text(
+        "models: [{ref: free-model, descriptor: d, cost_class: free,"
+        " source_updated_at: 2026-05-30T09:00:00Z}]\n",
+        encoding="utf-8",
+    )
+    config_path = _telemetry_config(tmp_path, "model_router:\n  catalog_path: catalog.yml\n")
+
+    assert cli.main(["telemetry", "--config", str(config_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert re.search(r"free-model\s+\S+\s+\S+\s+\d+d\s+catalog", out), out
+    # ...and it is not flagged stale: nothing re-probes a declaration, so the
+    # probe freshness budget is not its budget.
+    assert "[STALE]" not in out
 
 
 def test_telemetry_opting_out_drops_catalog_resources(

@@ -106,8 +106,16 @@ _REDACTED = "«REDACTED»"
 #: Key names whose value is credential material wherever it appears.
 _SECRET_KEYS = (
     r"bearer|(?:api|access|refresh|private|secret|auth)[_-]?(?:key|token)|"
-    r"api[_-]?key|token|secret|password|passwd|credential"
+    r"token|secrets?|passwords?|passwd|credentials?"
 )
+
+#: Namespace prefixes, which is how these names actually arrive. The vendor
+#: form of an API key is ``OPENAI_API_KEY``/``ANTHROPIC_API_KEY``, and OAuth
+#: calls its shared secret ``client_secret`` — in every one of those a leading
+#: ``\b`` fails, because ``_`` is a word character so there is no boundary
+#: before ``API`` or ``secret``. Each prefix segment must end in a separator,
+#: so ``notatoken`` is not treated as a namespaced ``token``.
+_SECRET_KEY = rf"(?:[A-Za-z0-9]+[_.-])*(?:{_SECRET_KEYS})"
 
 #: Key/value form. The separator must allow punctuation, not just whitespace:
 #: a provider that echoes ``?api_key=plainsecret``, ``access_token: abc``, or a
@@ -115,7 +123,7 @@ _SECRET_KEYS = (
 #: through to an operator's terminal. The key name is kept and only the value
 #: masked, so the message stays useful.
 _SECRET_KEY_VALUE = re.compile(
-    rf"(?i)\b({_SECRET_KEYS})\b([\"']?\s*[:=]\s*|\s+)([\"']?)[^\s\"'&,;)\]}}]+"
+    rf"(?i)\b({_SECRET_KEY})\b([\"']?\s*[:=]\s*|\s+)([\"']?)[^\s\"'&,;)\]}}]+"
 )
 
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -682,9 +690,16 @@ class CatalogTelemetrySource:
             details.append(
                 "promotion active" if entry.promotion_active(now) else "promotion inactive"
             )
+        # The verdict is computed at `now`, but the *declaration* it rests on is
+        # only as fresh as the last time an operator confirmed it. Stamping
+        # `now` here made a months-old promotion report age zero and
+        # `is_stale() is False` forever — a live measurement's freshness
+        # attached to a hand-written file. Where the entry declares no
+        # provenance, staleness is unanswerable rather than false, so the
+        # snapshot carries no TTL (§3: unknown is not zero).
         return ProviderResourceSnapshot(
             resource=entry.ref,
-            observed_at=now,
+            observed_at=entry.source_updated_at or now,
             availability=availability,
             resource_class=entry.resource_class,
             # Only a *live* promotion is perishable. Carrying promo_ends_at for
@@ -692,7 +707,7 @@ class CatalogTelemetrySource:
             # would show the broker ordinary paid capacity as something to
             # spend before it evaporates.
             expires_at=entry.promo_ends_at if entry.promotion_active(now) else None,
-            ttl_seconds=self._ttl_seconds,
+            ttl_seconds=self._ttl_seconds if entry.source_updated_at is not None else None,
             source="catalog",
             details=tuple(details),
             reason=reason,

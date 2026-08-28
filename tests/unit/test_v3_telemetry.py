@@ -368,6 +368,36 @@ class TestCatalogTelemetrySource:
         source = CatalogTelemetrySource(self._catalog())
         assert source.resources() == ("free-tier-helper", "promo-generalist")
 
+    def test_freshness_is_the_declarations_age_not_the_query_time(self):
+        # A hand-written entry is only as fresh as the last time an operator
+        # confirmed it. Stamping the query time made a months-old promotion
+        # report age zero and is_stale() False forever, so a long-lived broker
+        # could never notice that declared capacity had gone stale.
+        catalog = ModelCatalog(
+            entries=(
+                ModelCatalogEntry(
+                    ref="stale-free",
+                    descriptor="vendor/free",
+                    resource_class="free_tier",
+                    cost_class="free",
+                    source_updated_at=NOW - timedelta(days=240),
+                ),
+            )
+        )
+        snap = CatalogTelemetrySource(catalog, ttl_seconds=300.0).snapshot("stale-free", at=NOW)
+        assert snap.observed_at == NOW - timedelta(days=240)
+        assert snap.age(NOW) == timedelta(days=240)
+        assert snap.is_stale(NOW) is True
+
+    def test_an_entry_without_declared_provenance_has_unanswerable_freshness(self):
+        # Not False, which would read as "confirmed fresh" -- the same rule
+        # that keeps an unmeasured window from reporting full headroom.
+        snap = CatalogTelemetrySource(self._catalog(), ttl_seconds=300.0).snapshot(
+            "free-tier-helper", at=NOW
+        )
+        assert snap.ttl_seconds is None
+        assert snap.is_stale(NOW) is None
+
     def test_a_promotion_end_is_an_expiry_not_a_quota_reset(self):
         snap = CatalogTelemetrySource(self._catalog()).snapshot("promo-generalist", at=NOW)
         assert snap.availability == "available"
@@ -491,9 +521,44 @@ class TestRedaction:
         assert secret not in cleaned
         assert "REDACTED" in cleaned
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "OPENAI_API_KEY=plainsecret",
+            "ANTHROPIC_API_KEY=plainsecret",
+            "OPENROUTER_API_KEY: plainsecret",
+            "ANTHROPIC_AUTH_TOKEN=plainsecret",
+            "client_secret=plainsecret",
+            "my.service.credentials = plainsecret",
+        ],
+    )
+    def test_namespaced_key_names_are_caught_too(self, text):
+        # How these names actually arrive: the vendor form of an API key is
+        # OPENAI_API_KEY, and OAuth calls its shared secret client_secret. A
+        # leading \b fails on all of them, because `_` is a word character so
+        # there is no boundary before `API` or `secret`.
+        cleaned = redact_secrets(text)
+        assert "plainsecret" not in cleaned
+        assert "REDACTED" in cleaned
+
     def test_ordinary_text_is_left_alone(self):
         assert redact_secrets("Current week 71% used") == "Current week 71% used"
         assert redact_secrets("Credits balance: $7.19") == "Credits balance: $7.19"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "max_tokens=4096",
+            "token_count = 12",
+            "client_id=public-abc",
+            "notatoken = 5",
+        ],
+    )
+    def test_allowing_namespace_prefixes_does_not_swallow_ordinary_settings(self, text):
+        # The prefix must end in a separator, so `notatoken` is not a
+        # namespaced `token`; and the trailing boundary keeps `max_tokens`
+        # and `token_count` from reading as a key name.
+        assert redact_secrets(text) == text
 
 
 def test_unknown_snapshot_is_never_mistaken_for_an_empty_quota():

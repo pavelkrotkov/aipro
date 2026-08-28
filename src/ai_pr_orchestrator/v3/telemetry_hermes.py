@@ -40,7 +40,8 @@ import json
 import math
 import os
 import subprocess
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -335,6 +336,7 @@ class HermesSubprocessProbe:
             )
         if not interpreter.exists():
             return self._all_failed(providers, f"Hermes interpreter {interpreter} does not exist")
+        working_directory = self._working_directory()
         try:
             # No shell: a constant script plus provider names as argv, so a
             # configured provider string cannot become a command.
@@ -343,13 +345,15 @@ class HermesSubprocessProbe:
             # working directory on sys.path, so inheriting aipro's would both
             # miss `agent` in a checkout that was never installed into the venv
             # and let any stray directory named `agent` shadow the real one.
+            # When we have no checkout to point at, there is nothing to inherit
+            # safely either, so the path entry is dropped instead.
             completed = subprocess.run(
                 [str(interpreter), "-c", BRIDGE_SCRIPT, *providers],
                 capture_output=True,
                 text=True,
                 timeout=self._timeout_seconds,
-                env=_bridge_env(),
-                cwd=self._working_directory(),
+                env=_bridge_env(isolate_sys_path=working_directory is None),
+                cwd=working_directory,
                 check=False,
             )
         except subprocess.TimeoutExpired:
@@ -376,6 +380,16 @@ class HermesSubprocessProbe:
             return self._all_failed(
                 providers, f"Hermes usage probe returned unreadable output: {exc}"
             )
+        # Structurally valid JSON can still be the wrong shape — `{"results":
+        # null}` from a half-written bridge. Iterating it outside this check
+        # raises past the local-error path, and the caller's blanket handler
+        # then files our own corrupt output as a provider transport_error.
+        if not isinstance(results, list):
+            return self._all_failed(
+                providers,
+                "Hermes usage probe returned unreadable output: 'results' must be a list, "
+                f"got {type(results).__name__}",
+            )
         return {
             str(result.get("provider")): result
             for result in results
@@ -394,16 +408,28 @@ class HermesSubprocessProbe:
         }
 
 
-def _bridge_env() -> dict[str, str]:
+def _bridge_env(*, isolate_sys_path: bool) -> dict[str, str]:
     """Environment for the bridge, scrubbed of our own interpreter's paths.
 
     ``PYTHONPATH``/``PYTHONHOME``/``VIRTUAL_ENV`` inherited from aipro's venv
     would let our dependencies shadow Hermes' pinned ones inside its own
     interpreter, which is the failure this adapter exists to avoid.
+
+    ``isolate_sys_path`` covers the case where we know the interpreter but not
+    the checkout, so there is no Hermes directory to point ``cwd`` at. The
+    subprocess would then inherit *ours*, and ``python -c`` puts the working
+    directory on ``sys.path`` — any ``agent.py`` lying in it shadows Hermes'
+    real package. ``PYTHONSAFEPATH`` (3.11+, and ignored by older interpreters)
+    drops that entry, leaving the interpreter's own environment to supply
+    ``agent``. It is *not* set when we do have a checkout, because there the
+    entry is load-bearing: a checkout never installed into its venv is
+    importable only via ``cwd``.
     """
     env = dict(os.environ)
     for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
         env.pop(key, None)
+    if isolate_sys_path:
+        env["PYTHONSAFEPATH"] = "1"
     return env
 
 
@@ -583,6 +609,37 @@ def _unknown_for(resource: HermesResource, *, at: datetime, ttl: float | None):
     return degrade
 
 
+def _earliest_spent_reset(results: Iterable[Mapping[str, Any]]) -> datetime | None:
+    """When the first spent window in these results comes back, if it says.
+
+    Read from the raw payload rather than a normalized snapshot because the
+    cache is keyed by provider and normalization needs a resource. Only spent
+    windows count: a window with headroom left does not make a cached reading
+    wrong when it rolls over.
+    """
+    resets: list[datetime] = []
+    for result in results:
+        snapshot = result.get("snapshot")
+        if not isinstance(snapshot, Mapping):
+            continue
+        windows = snapshot.get("windows")
+        if not isinstance(windows, list):
+            continue
+        for window in windows:
+            if not isinstance(window, Mapping):
+                continue
+            used = window.get("used_percent")
+            if not isinstance(used, (int, float)) or used < 100.0:
+                continue
+            try:
+                reset = coerce_aware(window.get("reset_at"), "account usage reset_at")
+            except TelemetryError:
+                continue
+            if reset is not None:
+                resets.append(reset)
+    return min(resets) if resets else None
+
+
 def probe_outcome(result: Mapping[str, Any] | None) -> tuple[str, float | None] | None:
     """The health outcome implied by a probe result, if a request was made.
 
@@ -660,6 +717,7 @@ class HermesTelemetrySource:
         self._ledger = ledger
         self._cache: Mapping[str, dict[str, Any]] = {}
         self._probed_at: datetime | None = None
+        self._expires_at: datetime | None = None
 
     def resources(self) -> tuple[str, ...]:
         return tuple(self._resources)
@@ -689,10 +747,21 @@ class HermesTelemetrySource:
         costs one subprocess and one round of provider calls, not one per
         resource. The refresh interval is the *strictest* configured TTL, so
         no resource is ever served data older than it asked for.
+
+        A spent window's reset also expires the cache, ahead of the TTL. The
+        provider tells us exactly when the allowance returns, and holding a
+        100%-used reading past that moment keeps a resource out of rotation
+        for the remainder of the TTL after it became usable again — five
+        minutes, by default, for a window that reset in thirty seconds.
         """
-        if self._probed_at is not None and now - self._probed_at <= self._refresh_interval():
+        if (
+            self._probed_at is not None
+            and now - self._probed_at <= self._refresh_interval()
+            and not (self._expires_at is not None and now >= self._expires_at)
+        ):
             return self._cache
         providers = tuple(dict.fromkeys(r.provider for r in self._resources.values()))
+        started = time.monotonic()
         try:
             results = dict(self._probe.probe(providers))
         except Exception as exc:
@@ -705,9 +774,11 @@ class HermesTelemetrySource:
                 }
                 for provider in providers
             }
+        elapsed = timedelta(seconds=max(0.0, time.monotonic() - started))
         self._cache = results
         self._probed_at = now
-        self._record_health(results, now)
+        self._expires_at = _earliest_spent_reset(results.values())
+        self._record_health(results, now, elapsed=elapsed)
         return results
 
     def _refresh_interval(self) -> timedelta:
@@ -718,13 +789,28 @@ class HermesTelemetrySource:
         known = [ttl for ttl in ttls if ttl is not None]
         return timedelta(seconds=min(known)) if known else timedelta(0)
 
-    def _record_health(self, results: Mapping[str, dict[str, Any]], now: datetime) -> None:
+    def _record_health(
+        self,
+        results: Mapping[str, dict[str, Any]],
+        now: datetime,
+        *,
+        elapsed: timedelta = timedelta(0),
+    ) -> None:
         """Feed probe outcomes into the health ledger.
 
         The usage endpoint is a real request against the provider, so its
         outcome is genuine health evidence. It is recorded against the health
         ledger only — quota windows are rebuilt from the payload and are never
         touched by an outcome.
+
+        ``Retry-After`` counts from when the provider answered, but ``now`` was
+        read before the subprocess even started, and the bridge walks providers
+        sequentially. On a slow probe the whole delay could elapse in transit,
+        leaving ``is_throttled()`` false against a provider still refusing us.
+        The probe's own duration is therefore added back. That over-waits by
+        the gap between the rate-limited reply and the subprocess exiting,
+        which is the safe direction to be wrong; being exact would mean the
+        bridge reporting an absolute deadline.
         """
         if self._ledger is None:
             return
@@ -738,7 +824,7 @@ class HermesTelemetrySource:
                 name,
                 at=now,
                 retry_after=(
-                    now + timedelta(seconds=retry_after_seconds)
+                    now + elapsed + timedelta(seconds=retry_after_seconds)
                     if retry_after_seconds is not None
                     else None
                 ),
@@ -780,5 +866,11 @@ def build_telemetry(
             )
         )
     if catalog is not None and telemetry.include_catalog_resources:
-        sources.append(CatalogTelemetrySource(catalog, ttl_seconds=telemetry.snapshot_ttl_seconds))
+        # Deliberately untimed. `snapshot_ttl_seconds` budgets how long a *probe*
+        # may be served before it is re-measured; a catalog entry is a declaration
+        # that no probe will ever refresh, so that budget can only ever be blown.
+        # Handing it over marked every provenanced entry permanently stale — noise,
+        # not signal. The snapshot's `age` still reports the declaration's real
+        # age; staleness stays unanswerable rather than being answered wrongly.
+        sources.append(CatalogTelemetrySource(catalog))
     return TelemetryRegistry(sources=sources, ledger=ledger), ledger
