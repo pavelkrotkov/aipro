@@ -1,0 +1,135 @@
+# Shared V3 model catalog (machine-level).
+#
+# This is the single source of truth about which models/resources the
+# developer, reviewer, and adjudicator lanes may run on. It lives outside any
+# individual Hermes profile so vendor/model choices change here, once, rather
+# than in every CAO profile and role prompt.
+#
+# It is POLICY METADATA, not Hermes fallback configuration. Nothing here says
+# "if this provider 429s, try that one next" — that ordered runtime chain is
+# Hermes' operational concern. The broker derives a fallback chain from this
+# metadata; the catalog does not store one.
+#
+# `descriptor` is opaque: only the broker/execution adapter interprets it, so
+# no routing code ever matches on a model name. Point a V3 config at this file
+# with:
+#
+#     model_router:
+#       catalog_path: model-catalog.yml    # relative to the config file
+#
+# Inspect what is currently eligible with:
+#
+#     aipro catalog --catalog examples/model-catalog.yml --role worker --difficulty 3
+#
+# Volatile fields (pricing, promotions) carry `source_updated_at` so an
+# operator can see when they were last confirmed. Promotions expire quietly:
+# an expired promotion with no list price falls out of the eligible set,
+# because an unknown cash price is not the same thing as a free one.
+
+models:
+  # --- Promotional capacity -------------------------------------------------
+  # A metered model offered free for a window, with no published list price.
+  # While the window is open it prices at zero. When it closes, its cost is
+  # unknown rather than free, so it drops out of the eligible set instead of
+  # silently starting to bill.
+  #
+  # Note what this entry deliberately does NOT say: `cost_class: free` or
+  # `resource_class: free_tier`. Those mean *permanently* free and would
+  # outlive the window, leaving a "temporary" offer free forever. Declaring
+  # both is rejected at load time.
+  - ref: promo-free-generalist
+    descriptor: promo-generalist-descriptor
+    provider: promo-gateway
+    resource_class: metered
+    cost_class: low
+    promotional: true
+    promo_ends_at: 2027-09-30T00:00:00Z
+    capabilities: [tools, coding]
+    roles: [worker, reviewer]
+    quality_by_role: {worker: 3, reviewer: 3}
+    family: generalist-a
+    vendor: vendor-a
+    max_context_tokens: 131072
+    notes: >-
+      Promotional free access, no published list price. Re-confirm before the
+      window closes; after it, this entry is ineligible until a price is
+      declared.
+    source_updated_at: 2026-05-30T09:00:00Z
+
+  # --- Metered capacity behind a custom/aggregator endpoint ---------------
+  # Reached at a non-default base URL, which is why `endpoint` exists.
+  - ref: gateway-cheap-reviewer
+    descriptor: gateway-cheap-descriptor
+    provider: custom-gateway
+    endpoint: https://gateway.example/v1
+    resource_class: metered
+    cost_class: low
+    input_price_per_mtok: 0.35
+    output_price_per_mtok: 1.10
+    capabilities: [tools, coding, long_context]
+    roles: [reviewer]
+    quality_by_role: {reviewer: 3}
+    family: generalist-b
+    vendor: vendor-b
+    max_context_tokens: 262144
+    max_concurrency: 4
+    source_updated_at: 2026-05-30T09:00:00Z
+
+  # --- Subscription-backed capacity ---------------------------------------
+  # A normal PRIMARY candidate for any role, not a fallback-only resource.
+  # Its allowance is already bought, which is what makes it perishable; the
+  # broker decides what that surplus is worth, using live quota telemetry.
+  # The difficulty floor keeps it off trivial work.
+  - ref: subscription-primary
+    descriptor: subscription-primary-descriptor
+    provider: subscription-provider-a
+    resource_class: subscription
+    cost_class: high
+    input_price_per_mtok: 3.0
+    output_price_per_mtok: 15.0
+    capabilities: [tools, coding, reasoning]
+    roles: [worker, reviewer, foreman]
+    quality_by_role: {worker: 5, reviewer: 5, foreman: 4}
+    min_task_difficulty: 2
+    family: frontier-c
+    vendor: vendor-c
+    max_context_tokens: 200000
+    max_concurrency: 2
+    data_policy: no-training
+    source_updated_at: 2026-05-30T09:00:00Z
+
+  # A second subscription from a different vendor/family. Independent lineage
+  # is what lets the broker avoid handing every adversarial reviewer the same
+  # blind spots.
+  - ref: subscription-secondary
+    descriptor: subscription-secondary-descriptor
+    provider: subscription-provider-b
+    resource_class: subscription
+    cost_class: high
+    input_price_per_mtok: 2.5
+    output_price_per_mtok: 10.0
+    capabilities: [tools, coding, reasoning]
+    roles: [worker, reviewer]
+    quality_by_role: {worker: 4, reviewer: 5}
+    min_task_difficulty: 2
+    family: frontier-d
+    vendor: vendor-d
+    max_context_tokens: 400000
+    max_concurrency: 2
+    data_policy: no-training
+    source_updated_at: 2026-05-30T09:00:00Z
+
+  # --- Held in reserve ------------------------------------------------------
+  # Disabled entries stay documented but never dispatch, so taking a resource
+  # out of rotation does not mean losing its metadata.
+  - ref: retired-candidate
+    descriptor: retired-descriptor
+    provider: subscription-provider-a
+    resource_class: metered
+    cost_class: medium
+    input_price_per_mtok: 1.0
+    output_price_per_mtok: 3.0
+    capabilities: [tools]
+    enabled: false
+    notes: Superseded; kept for provenance.
+    source_updated_at: 2026-05-30T09:00:00Z

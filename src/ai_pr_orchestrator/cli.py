@@ -6,16 +6,29 @@ import argparse
 import json
 import os
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from json import JSONDecodeError
 from pathlib import Path
 
 from ai_pr_orchestrator import runner
+from ai_pr_orchestrator.v3._schema import SchemaError
+from ai_pr_orchestrator.v3.catalog import (
+    MAX_TASK_DIFFICULTY,
+    MIN_TASK_DIFFICULTY,
+    ModelCatalogEntry,
+    load_model_catalog,
+)
+from ai_pr_orchestrator.v3.config import load_v3_config, resolve_model_catalog
+from ai_pr_orchestrator.v3.domain import VALID_LANE_ROLES
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "catalog":
+        return _run_catalog(args)
 
     if args.command == "inspect":
         return runner.inspect(pr_number=args.pr)
@@ -51,7 +64,110 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pr", type=_positive_int, required=True, help="Pull request number"
     )
 
+    catalog_parser = subparsers.add_parser(
+        "catalog", help="List currently eligible model catalog candidates"
+    )
+    source = catalog_parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--catalog", help="Path to a shared model catalog file")
+    source.add_argument(
+        "--config", help="Path to a V3 config whose model_router catalog should be resolved"
+    )
+    catalog_parser.add_argument(
+        "--role", choices=sorted(VALID_LANE_ROLES), help="Only candidates suitable for this role"
+    )
+    catalog_parser.add_argument(
+        "--difficulty",
+        type=_difficulty,
+        default=MIN_TASK_DIFFICULTY,
+        help=f"Task difficulty ({MIN_TASK_DIFFICULTY}-{MAX_TASK_DIFFICULTY})",
+    )
+    catalog_parser.add_argument(
+        "--all", action="store_true", help="List every entry, not just eligible ones"
+    )
+    catalog_parser.add_argument("--json", action="store_true", help="Emit JSON instead of a table")
+
     return parser
+
+
+def _run_catalog(args: argparse.Namespace) -> int:
+    """Print catalog candidates with normalized effective price/resource class."""
+    # One timestamp for the whole listing. Reading the clock per entry would
+    # let a promotion expire mid-scan, so the filter and the row it produces
+    # could disagree about whether the same entry is eligible.
+    now = datetime.now(UTC)
+    try:
+        if args.catalog:
+            catalog = load_model_catalog(args.catalog)
+        else:
+            config_path = Path(args.config)
+            catalog = resolve_model_catalog(
+                load_v3_config(config_path), base_dir=config_path.parent
+            )
+        entries = (
+            list(catalog.entries)
+            if args.all
+            else catalog.eligible(role=args.role, difficulty=args.difficulty, at=now)
+        )
+    except SchemaError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    rows = [
+        {
+            "ref": entry.ref,
+            "resource_class": entry.resource_class,
+            "cost_class": entry.cost_class,
+            # Distinguish the three cases the broker must not conflate:
+            # priced, free, and simply unknown.
+            "effective_input_price_per_mtok": _price(entry, now, index=0),
+            "effective_output_price_per_mtok": _price(entry, now, index=1),
+            "promotion_active": entry.promotion_active(now),
+            "eligible": entry.is_eligible(role=args.role, difficulty=args.difficulty, at=now),
+            "provider": entry.provider,
+            "family": entry.family,
+            "vendor": entry.vendor,
+            "enabled": entry.enabled,
+        }
+        for entry in entries
+    ]
+
+    if args.json:
+        print(json.dumps({"evaluated_at": now.isoformat(), "candidates": rows}, indent=2))
+        return 0
+
+    if not rows:
+        print("Catalog is empty." if args.all else "No eligible catalog candidates.")
+        return 0
+
+    # Under --all the table mixes dispatchable and undispatchable entries, so
+    # it has to say which is which or an operator reads an unusable resource
+    # as available.
+    header = f"{'REF':<24} {'RESOURCE':<13} {'COST':<7} {'IN/MTOK':>9} {'OUT/MTOK':>9}  "
+    header += f"{'PROMO':<5}  ELIGIBLE" if args.all else "PROMO"
+    print(header)
+    for row in rows:
+        in_price = (
+            "unknown"
+            if row["effective_input_price_per_mtok"] is None
+            else f"{row['effective_input_price_per_mtok']:.4f}"
+        )
+        out_price = (
+            "unknown"
+            if row["effective_output_price_per_mtok"] is None
+            else f"{row['effective_output_price_per_mtok']:.4f}"
+        )
+        promo = "yes" if row["promotion_active"] else "-"
+        line = (
+            f"{row['ref']:<24} {row['resource_class']:<13} {row['cost_class']:<7} "
+            f"{in_price:>9} {out_price:>9}  "
+        )
+        line += f"{promo:<5}  {'yes' if row['eligible'] else 'no'}" if args.all else promo
+        print(line)
+    return 0
+
+
+def _price(entry: ModelCatalogEntry, now: datetime, *, index: int) -> float | None:
+    prices = entry.effective_prices(now)
+    return None if prices is None else prices[index]
 
 
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
@@ -61,6 +177,20 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     # ``--pr`` (to identify the PR). main() requires at least one of the two.
     parser.add_argument("--pr", type=_positive_int, help="Pull request number")
     parser.add_argument("--event-path", help="Path to a GitHub event JSON file")
+
+
+def _difficulty(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"must be an integer within {MIN_TASK_DIFFICULTY}-{MAX_TASK_DIFFICULTY}"
+        ) from exc
+    if not MIN_TASK_DIFFICULTY <= parsed <= MAX_TASK_DIFFICULTY:
+        raise argparse.ArgumentTypeError(
+            f"must be an integer within {MIN_TASK_DIFFICULTY}-{MAX_TASK_DIFFICULTY}"
+        )
+    return parsed
 
 
 def _positive_int(value: str) -> int:

@@ -13,18 +13,19 @@ tests stay terse.
 
 from __future__ import annotations
 
-import dataclasses
-import types
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import Any
 
 import yaml
 
+from ._schema import SchemaError, build_dataclass, to_mapping, typed_kwargs
+from ._schema import validate_declared_shapes as _validate_shapes
+from .catalog import ModelCatalog, ModelCatalogEntry, load_model_catalog
 from .domain import VALID_LANE_ROLES
 
 
-class V3ConfigError(ValueError):
+class V3ConfigError(SchemaError):
     """Raised when the V3 configuration is invalid."""
 
 
@@ -88,26 +89,23 @@ class HermesLanesConfig:
 
 
 @dataclass(frozen=True)
-class ModelCatalogEntry:
-    """One model catalog entry.
+class ModelRouterConfig:
+    """Model catalog plus lane-to-model routing.
 
-    ``ref`` is the policy-level key; ``descriptor`` is an opaque,
-    provider-owned string that only the model broker interprets. V3 core
-    never parses it.
+    The catalog is a *machine-level* artifact shared by every lane, so the
+    normal deployment declares ``catalog_path`` and keeps one file per
+    machine rather than repeating entries in each repo's policy config.
+    Inline ``catalog`` entries remain supported for tests and single-repo
+    setups. Declaring both is rejected: it would leave the effective catalog
+    ambiguous, and a stale inline entry silently shadowing the shared file is
+    exactly the failure this section exists to prevent.
     """
 
-    ref: str
-    descriptor: str
-    max_context_tokens: int | None = None
-    #: Unknown keys from a newer writer, preserved for forward compatibility.
-    extras: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class ModelRouterConfig:
-    """Model catalog plus lane-to-model routing."""
-
     catalog: list[ModelCatalogEntry] = field(default_factory=list)
+    #: Path to the shared catalog file, resolved relative to the config file
+    #: that declares it. Loaded by :func:`load_v3_config`, which is where V3
+    #: config I/O lives; ``from_dict`` stays pure and never touches the disk.
+    catalog_path: str | None = None
     lane_assignments: dict[str, str] = field(default_factory=dict)  # lane -> model ref
     #: Unknown keys from a newer writer, preserved for forward compatibility.
     extras: dict[str, Any] = field(default_factory=dict)
@@ -278,14 +276,25 @@ class V3Config:
             if lane.max_concurrent < 1:
                 raise V3ConfigError(f"lane {lane.name!r} max_concurrent must be >= 1")
 
-        catalog_refs = [entry.ref for entry in self.model_router.catalog]
-        if len(catalog_refs) != len(set(catalog_refs)):
-            raise V3ConfigError(f"Duplicate model catalog refs: {catalog_refs}")
+        if self.model_router.catalog and self.model_router.catalog_path:
+            raise V3ConfigError(
+                "model_router declares both an inline catalog and a catalog_path; "
+                "the effective catalog would be ambiguous. Use one or the other."
+            )
+
+        # Catalog invariants live on the catalog itself, so an inline catalog
+        # and a shared catalog file are held to identical rules and report
+        # identical errors. Those surface as ModelCatalogError, which shares
+        # the SchemaError base with V3ConfigError.
+        catalog_refs = ModelCatalog(entries=tuple(self.model_router.catalog)).refs()
 
         for lane_name, model_ref in self.model_router.lane_assignments.items():
             if lane_name not in lane_names:
                 raise V3ConfigError(f"lane_assignments references unknown lane {lane_name!r}")
-            if model_ref not in catalog_refs:
+            # With a catalog_path the refs live in a file this pure validator
+            # must not read. load_v3_config re-checks them once the shared
+            # catalog is resolved.
+            if not self.model_router.catalog_path and model_ref not in catalog_refs:
                 raise V3ConfigError(
                     f"lane {lane_name!r} references unknown model ref {model_ref!r}"
                 )
@@ -330,19 +339,13 @@ class V3Config:
         if self.safety.max_prompt_tokens < 1:
             raise V3ConfigError("safety.max_prompt_tokens must be >= 1")
 
-        for entry in self.model_router.catalog:
-            if entry.max_context_tokens is not None and entry.max_context_tokens < 1:
-                raise V3ConfigError(
-                    f"model catalog entry {entry.ref!r} max_context_tokens must be >= 1"
-                )
-
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for f in fields(self):
             if f.name == "extras":
                 out.update(self.extras)
                 continue
-            out[f.name] = _section_to_dict(getattr(self, f.name))
+            out[f.name] = to_mapping(getattr(self, f.name))
         return out
 
     @classmethod
@@ -364,7 +367,13 @@ class V3Config:
 
 
 def load_v3_config(path: str | Path) -> V3Config:
-    """Load and validate a V3 config from a YAML file path."""
+    """Load and validate a V3 config from a YAML file path.
+
+    When the config declares ``model_router.catalog_path``, the shared
+    catalog is loaded here (config I/O belongs in this function, not in the
+    pure ``from_dict`` validator) so lane assignments are checked against the
+    refs that will actually be dispatched.
+    """
     config_path = Path(path)
     try:
         content = config_path.read_text(encoding="utf-8")
@@ -378,30 +387,40 @@ def load_v3_config(path: str | Path) -> V3Config:
         raw = {}
     if not isinstance(raw, dict):
         raise V3ConfigError("V3 configuration must be a YAML mapping at the top level")
-    return V3Config.from_dict(raw)
+    config = V3Config.from_dict(raw)
+
+    if config.model_router.catalog_path:
+        catalog = resolve_model_catalog(config, base_dir=config_path.parent)
+        refs = catalog.refs()
+        for lane_name, model_ref in config.model_router.lane_assignments.items():
+            if model_ref not in refs:
+                raise V3ConfigError(
+                    f"lane {lane_name!r} references unknown model ref {model_ref!r} "
+                    f"(not in shared catalog {config.model_router.catalog_path})"
+                )
+    return config
+
+
+def resolve_model_catalog(config: V3Config, *, base_dir: Path | None = None) -> ModelCatalog:
+    """Return the effective model catalog for ``config``.
+
+    Either the inline entries or the shared catalog file named by
+    ``model_router.catalog_path``, which is resolved relative to ``base_dir``
+    (normally the directory holding the config file) when it is not already
+    absolute. The config is never mutated, and each call re-reads the file,
+    so an operator can edit the shared catalog and pick the change up for
+    future assignments without restarting.
+    """
+    catalog_path = config.model_router.catalog_path
+    if not catalog_path:
+        return ModelCatalog(entries=tuple(config.model_router.catalog))
+    resolved = Path(catalog_path)
+    if not resolved.is_absolute() and base_dir is not None:
+        resolved = base_dir / resolved
+    return load_model_catalog(resolved)
 
 
 # --- Serialization helpers -------------------------------------------------
-
-
-def _section_to_dict(value: Any) -> Any:
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        out = {
-            f.name: _section_to_dict(getattr(value, f.name))
-            for f in dataclasses.fields(value)
-            if f.name != "extras"
-        }
-        # Merge preserved unknown keys back into the emitted mapping.
-        out.update(getattr(value, "extras", {}))
-        return out
-    to_dict = getattr(value, "to_dict", None)
-    if callable(to_dict):
-        return to_dict()
-    if isinstance(value, list):
-        return [_section_to_dict(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _section_to_dict(v) for k, v in value.items()}
-    return value
 
 
 def _section_from_dict(section: str, value: Any) -> Any:
@@ -412,104 +431,12 @@ def _section_from_dict(section: str, value: Any) -> Any:
         raise V3ConfigError(
             f"config section {section!r} must be a mapping, got {type(value).__name__}"
         )
-    kwargs, extras = _typed_kwargs(section_type, value)
-    _validate_declared_shapes(section_type, kwargs, repr(section))
+    kwargs, extras = typed_kwargs(section_type, value)
+    _validate_shapes(section_type, kwargs, repr(section), V3ConfigError)
     for (section_name, f_name), nested in _NESTED_LIST_FIELDS.items():
         if section_name == section and f_name in kwargs and isinstance(kwargs[f_name], list):
-            kwargs[f_name] = [_build_dataclass(nested, item) for item in kwargs[f_name]]
+            kwargs[f_name] = [
+                build_dataclass(nested, item, V3ConfigError) for item in kwargs[f_name]
+            ]
     kwargs["extras"] = extras
     return section_type(**kwargs)
-
-
-def _is_optional(hint: Any) -> bool:
-    """True when ``hint`` explicitly allows ``None`` (``X | None``)."""
-    origin = get_origin(hint)
-    if origin is Union or origin is types.UnionType:
-        return type(None) in get_args(hint)
-    return False
-
-
-def _value_matches_type(hint: Any, value: Any) -> bool:
-    """True when ``value`` conforms to the declared type ``hint``."""
-    origin = get_origin(hint)
-    if origin is Union or origin is types.UnionType:
-        non_none = [arg for arg in get_args(hint) if arg is not type(None)]
-        return any(_value_matches_type(arg, value) for arg in non_none)
-    if origin in (list, tuple, set, frozenset) or hint in (list, tuple, set, frozenset):
-        if not isinstance(value, (list, tuple, set, frozenset)):
-            return False
-        args = get_args(hint)
-        if not args:  # bare list/dict: container type only.
-            return True
-        return all(_value_matches_type(args[0], item) for item in value)
-    if origin is dict or hint is dict:
-        if not isinstance(value, dict):
-            return False
-        args = get_args(hint)
-        if not args:
-            return True
-        key_hint, value_hint = args
-        return all(
-            _value_matches_type(key_hint, k) and _value_matches_type(value_hint, v)
-            for k, v in value.items()
-        )
-    if hint is bool:
-        return isinstance(value, bool)
-    if hint is int:
-        return isinstance(value, int) and not isinstance(value, bool)
-    if hint is float:
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if hint is str:
-        return isinstance(value, str)
-    if dataclasses.is_dataclass(hint) and isinstance(hint, type):
-        return isinstance(value, dict)
-    return True  # Any / unhandled annotations: do not over-constrain.
-
-
-def _validate_declared_shapes(cls: type, data: dict[str, Any], where: str) -> None:
-    """Check declared field shapes in a raw mapping, raising V3ConfigError.
-
-    Runs before dataclass construction so a malformed nested value (e.g. a
-    list field given a scalar, or an int field given a string) is reported
-    as a config error instead of surfacing later as an AttributeError.
-    ``None`` is rejected for any field whose annotation does not explicitly
-    allow it (no ``| None``), so a null never silently bypasses validation.
-    """
-    hints = get_type_hints(cls)
-    for name, hint in hints.items():
-        if name == "extras" or name not in data:
-            continue
-        if data[name] is None:
-            if not _is_optional(hint):
-                raise V3ConfigError(
-                    f"config {where}: field {name!r} expects {hint}, got null "
-                    "(None is only valid for Optional fields)"
-                )
-            continue
-        if not _value_matches_type(hint, data[name]):
-            raise V3ConfigError(
-                f"config {where}: field {name!r} expects {hint}, "
-                f"got {type(data[name]).__name__} ({data[name]!r})"
-            )
-
-
-def _build_dataclass(cls: type, data: Any) -> Any:
-    if not isinstance(data, dict):
-        raise V3ConfigError(f"expected a mapping for {cls.__name__}, got {type(data).__name__}")
-    kwargs, extras = _typed_kwargs(cls, data)
-    _validate_declared_shapes(cls, kwargs, cls.__name__)
-    kwargs["extras"] = extras
-    return cls(**kwargs)
-
-
-def _typed_kwargs(cls: type, data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Split a raw mapping into known-field kwargs and unknown-key extras."""
-    known = {f.name for f in fields(cls)} - {"extras"}
-    kwargs: dict[str, Any] = {}
-    extras: dict[str, Any] = {}
-    for key, value in data.items():
-        if key in known:
-            kwargs[key] = value
-        else:
-            extras[key] = value
-    return kwargs, extras

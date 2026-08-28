@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from ai_pr_orchestrator.v3.catalog import ModelCatalogError
 from ai_pr_orchestrator.v3.config import (
     HermesLanesConfig,
     LaneProfileConfig,
@@ -13,6 +16,7 @@ from ai_pr_orchestrator.v3.config import (
     V3Config,
     V3ConfigError,
     load_v3_config,
+    resolve_model_catalog,
 )
 
 
@@ -107,12 +111,11 @@ class TestValidation:
             ).validate()
 
     def test_catalog_max_context_tokens_must_be_positive(self) -> None:
-        config = make_valid_config()
-        config.model_router.catalog.append(
+        # Entry invariants are enforced by the catalog entry itself, so an
+        # invalid entry cannot be constructed at all — an inline catalog and a
+        # shared catalog file are held to exactly the same rules.
+        with pytest.raises(ModelCatalogError, match="max_context_tokens"):
             ModelCatalogEntry(ref="cheap", descriptor="opaque", max_context_tokens=0)
-        )
-        with pytest.raises(V3ConfigError, match="max_context_tokens"):
-            config.validate()
         # None means "unset" and is allowed.
         make_valid_config().model_router.catalog.append(
             ModelCatalogEntry(ref="unset", descriptor="opaque", max_context_tokens=None)
@@ -379,3 +382,81 @@ class TestDefaultLaneValidation:
 
         with pytest.raises(V3ConfigError, match="nonexistent"):
             config.validate()
+
+
+class TestSharedCatalogPath:
+    """A machine-level catalog file, referenced instead of inlined."""
+
+    def _write(self, tmp_path: Path, config_body: str, catalog_body: str) -> Path:
+        (tmp_path / "catalog.yml").write_text(catalog_body, encoding="utf-8")
+        config_path = tmp_path / "config.yml"
+        config_path.write_text(config_body, encoding="utf-8")
+        return config_path
+
+    def test_catalog_path_is_resolved_relative_to_the_config_file(self, tmp_path: Path) -> None:
+        config_path = self._write(
+            tmp_path,
+            "model_router:\n  catalog_path: catalog.yml\n",
+            "models: [{ref: shared-a, descriptor: d}]\n",
+        )
+        config = load_v3_config(config_path)
+        assert config.model_router.catalog_path == "catalog.yml"
+        # The config is not mutated: provenance survives the load.
+        assert config.model_router.catalog == []
+        assert resolve_model_catalog(config, base_dir=tmp_path).refs() == ["shared-a"]
+
+    def test_lane_assignments_are_checked_against_the_shared_catalog(self, tmp_path: Path) -> None:
+        config_path = self._write(
+            tmp_path,
+            "model_router:\n"
+            "  catalog_path: catalog.yml\n"
+            "  lane_assignments: {developer: missing-ref}\n",
+            "models: [{ref: shared-a, descriptor: d}]\n",
+        )
+        with pytest.raises(V3ConfigError, match="missing-ref"):
+            load_v3_config(config_path)
+
+    def test_lane_assignments_satisfied_by_the_shared_catalog(self, tmp_path: Path) -> None:
+        config_path = self._write(
+            tmp_path,
+            "model_router:\n"
+            "  catalog_path: catalog.yml\n"
+            "  lane_assignments: {developer: shared-a}\n",
+            "models: [{ref: shared-a, descriptor: d}]\n",
+        )
+        assert load_v3_config(config_path).model_router.lane_assignments == {
+            "developer": "shared-a"
+        }
+
+    def test_declaring_both_inline_catalog_and_path_is_ambiguous(self) -> None:
+        with pytest.raises(V3ConfigError, match="ambiguous"):
+            V3Config.from_dict(
+                {
+                    "model_router": {
+                        "catalog": [{"ref": "inline", "descriptor": "d"}],
+                        "catalog_path": "catalog.yml",
+                    }
+                }
+            )
+
+    def test_a_broken_shared_catalog_fails_the_config_load(self, tmp_path: Path) -> None:
+        config_path = self._write(
+            tmp_path,
+            "model_router:\n  catalog_path: catalog.yml\n",
+            "models: [{ref: a, descriptor: d}, {ref: a, descriptor: e}]\n",
+        )
+        with pytest.raises(ModelCatalogError, match="Duplicate"):
+            load_v3_config(config_path)
+
+    def test_absolute_catalog_path_is_honored(self, tmp_path: Path) -> None:
+        catalog_path = tmp_path / "elsewhere.yml"
+        catalog_path.write_text("models: [{ref: abs-a, descriptor: d}]\n", encoding="utf-8")
+        config_path = tmp_path / "config.yml"
+        config_path.write_text(f"model_router:\n  catalog_path: {catalog_path}\n", encoding="utf-8")
+        assert resolve_model_catalog(load_v3_config(config_path)).refs() == ["abs-a"]
+
+    def test_inline_catalog_resolves_without_touching_the_disk(self) -> None:
+        config = V3Config.from_dict(
+            {"model_router": {"catalog": [{"ref": "inline-a", "descriptor": "d"}]}}
+        )
+        assert resolve_model_catalog(config).refs() == ["inline-a"]

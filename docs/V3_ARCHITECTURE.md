@@ -59,6 +59,14 @@ runtime until cutover:
   and workflow-file restrictions, per-run budgets (iterations, commits,
   lane invocations, prompt tokens), and PR-author association allowlists.
   Unknown keys are preserved as `extras` for forward compatibility.
+- `v3.catalog` — the shared machine-level model catalog: candidate metadata
+  (price, promotion window, capability, role suitability, quality tier,
+  lineage, limits) plus eligibility queries. It states facts and never ranks;
+  quota, health, and diversity belong to the broker. See
+  `docs/V3_MODEL_CATALOG.md`.
+- `v3._schema` — the mapping/dataclass coercion rules shared by `v3.config`
+  and `v3.catalog`: shape validation before construction, rejection of `None`
+  for non-optional fields, and `extras` preservation.
 - `v3.interfaces` — protocols for `GitHubWorkflowStateStore`,
   `CAOSessionController`, `ModelBroker`, `LaneExecutor`, and `CIPRGate`.
   All are structural and fakeable in tests without CAO, Hermes, or GitHub.
@@ -73,6 +81,10 @@ runtime until cutover:
 No V3 core type or interface names a specific vendor or model. `ModelRef`
 points into the catalog; catalog `descriptor` strings are opaque to the core
 and interpreted only by the model broker adapter.
+
+The catalog is normally a machine-level file shared by every lane, referenced
+from `model_router.catalog_path`; inline entries remain available for tests
+and single-repo setups. Declaring both is rejected as ambiguous.
 
 ## 4. Migration table (V1 → V3 cutover)
 
