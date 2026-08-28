@@ -539,11 +539,36 @@ class TestTelemetrySection:
         with pytest.raises(V3ConfigError, match=key):
             V3Config.from_dict({"telemetry": {key: value}})
 
+    @pytest.mark.parametrize("key", ["snapshot_ttl_seconds", "probe_timeout_seconds"])
+    @pytest.mark.parametrize("literal", [".nan", ".inf"])
+    def test_non_finite_tuning_values_rejected(self, tmp_path: Path, key, literal) -> None:
+        # YAML's `.nan` and `.inf` slip past a bare `> 0` check — every
+        # comparison with NaN is false, and infinity really is > 0 — which
+        # would make freshness unevaluable.
+        path = tmp_path / "config.yml"
+        path.write_text(f"telemetry:\n  {key}: {literal}\n", encoding="utf-8")
+        with pytest.raises(V3ConfigError, match="finite"):
+            load_v3_config(path)
+
     def test_per_resource_ttl_must_be_positive(self) -> None:
-        with pytest.raises(V3ConfigError, match="ttl_seconds must be > 0"):
+        with pytest.raises(V3ConfigError, match="ttl_seconds must be"):
             V3Config.from_dict(
                 {"telemetry": {"resources": [{"name": "r", "provider": "p", "ttl_seconds": 0}]}}
             )
+
+    @pytest.mark.parametrize("literal", [".nan", ".inf"])
+    def test_per_resource_ttl_must_be_finite(self, tmp_path: Path, literal) -> None:
+        path = tmp_path / "config.yml"
+        path.write_text(
+            "telemetry:\n"
+            "  resources:\n"
+            "    - name: r\n"
+            "      provider: p\n"
+            f"      ttl_seconds: {literal}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(V3ConfigError, match="finite"):
+            load_v3_config(path)
 
     def test_unknown_keys_are_preserved_as_extras(self) -> None:
         config = V3Config.from_dict(

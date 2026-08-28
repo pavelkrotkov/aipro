@@ -37,6 +37,7 @@ it properly needs an upstream change that surfaces the number.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -57,6 +58,7 @@ from .telemetry import (
     coerce_aware,
     redact_secrets,
     unknown_snapshot,
+    windows_fully_spent,
 )
 
 #: Default freshness budget for a Hermes-sourced snapshot. Usage endpoints are
@@ -65,6 +67,7 @@ from .telemetry import (
 DEFAULT_TELEMETRY_TTL_SECONDS = 300.0
 
 #: How the bridge's failure classification maps onto a health outcome.
+#: ``local_error`` is deliberately absent: see :data:`_LOCAL_FAILURE_KINDS`.
 _KIND_TO_OUTCOME: Mapping[str, str] = {
     "auth_failure": "auth_failure",
     "rate_limited": "rate_limited",
@@ -73,6 +76,13 @@ _KIND_TO_OUTCOME: Mapping[str, str] = {
     "client_error": "client_error",
     "error": "transport_error",
 }
+
+#: Failures that happened on our side of the wire — no interpreter, the bridge
+#: could not import Hermes, the subprocess died, the output was unparseable.
+#: No request reached the provider, so recording these as health would give a
+#: never-contacted provider a 100% failure rate and slander it for our own
+#: misconfiguration. They still degrade telemetry to ``unknown``.
+_LOCAL_FAILURE_KINDS: frozenset[str] = frozenset(("local_error",))
 
 #: Failure kinds that tell us the resource is genuinely unusable rather than
 #: merely unmeasured. An auth failure is durable and needs a human; everything
@@ -84,6 +94,8 @@ BRIDGE_SCRIPT = '''\
 """Emit Hermes account-usage snapshots as JSON. Run under Hermes' interpreter."""
 import json
 import sys
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 
 def _iso(value):
@@ -113,9 +125,22 @@ def _retry_after(exc):
     headers = getattr(getattr(exc, "response", None), "headers", None)
     if headers is None:
         return None
+    raw = headers.get("Retry-After")
+    if raw is None:
+        return None
     try:
-        return float(headers.get("Retry-After"))
+        return float(raw)
     except (TypeError, ValueError):
+        pass
+    # RFC 9110 allows an HTTP-date instead of delay-seconds. Dropping that
+    # form would leave is_throttled() false while the provider is still
+    # refusing us, so the broker would retry straight into the backoff.
+    try:
+        when = parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
         return None
 
 
@@ -130,7 +155,9 @@ def probe(provider):
     try:
         from agent import account_usage as mod
     except Exception as exc:
-        return {"ok": False, "provider": provider, "kind": "error", "message": repr(exc)}
+        # Local: we never reached the provider, so this must not be filed as
+        # provider health.
+        return {"ok": False, "provider": provider, "kind": "local_error", "message": repr(exc)}
 
     key = provider.strip().lower()
     fn = getattr(mod, PRIVATE.get(key, ""), None)
@@ -193,9 +220,12 @@ class HermesResource:
     """One configured subscription resource served by the Hermes data path.
 
     ``name`` is the policy-level id the broker and the operator use;
-    ``provider`` is Hermes' own provider key. Keeping them separate means a
-    machine can expose two accounts on the same provider, and means renaming a
-    provider upstream does not rewrite every routing decision.
+    ``provider`` is Hermes' own provider key. Keeping them separate means
+    renaming a provider upstream does not rewrite every routing decision.
+
+    Two resources may not share a ``provider``; :class:`HermesTelemetrySource`
+    rejects that, because Hermes cannot select between two accounts on one
+    provider.
     """
 
     name: str
@@ -216,9 +246,12 @@ class HermesResource:
                 f"telemetry resource {self.name!r} has unknown resource_class "
                 f"{self.resource_class!r}, must be one of {sorted(VALID_RESOURCE_CLASSES)}"
             )
-        if self.ttl_seconds is not None and self.ttl_seconds <= 0:
+        if self.ttl_seconds is not None and (
+            not math.isfinite(self.ttl_seconds) or self.ttl_seconds <= 0
+        ):
             raise TelemetryError(
-                f"telemetry resource {self.name!r} ttl_seconds must be > 0, got {self.ttl_seconds}"
+                f"telemetry resource {self.name!r} ttl_seconds must be a finite number > 0, "
+                f"got {self.ttl_seconds}"
             )
 
 
@@ -261,6 +294,12 @@ class HermesSubprocessProbe:
             return self._hermes_home / "venv" / "bin" / "python"
         return None
 
+    def _working_directory(self) -> str | None:
+        """The Hermes checkout, when we know it and it exists."""
+        if self._hermes_home is not None and self._hermes_home.is_dir():
+            return str(self._hermes_home)
+        return None
+
     def probe(self, providers: Sequence[str]) -> Mapping[str, dict[str, Any]]:
         interpreter = self.interpreter()
         if interpreter is None:
@@ -274,12 +313,18 @@ class HermesSubprocessProbe:
         try:
             # No shell: a constant script plus provider names as argv, so a
             # configured provider string cannot become a command.
+            #
+            # cwd is the Hermes checkout, not ours. `python -c` puts the
+            # working directory on sys.path, so inheriting aipro's would both
+            # miss `agent` in a checkout that was never installed into the venv
+            # and let any stray directory named `agent` shadow the real one.
             completed = subprocess.run(
                 [str(interpreter), "-c", BRIDGE_SCRIPT, *providers],
                 capture_output=True,
                 text=True,
                 timeout=self._timeout_seconds,
                 env=_bridge_env(),
+                cwd=self._working_directory(),
                 check=False,
             )
         except subprocess.TimeoutExpired:
@@ -311,8 +356,10 @@ class HermesSubprocessProbe:
 
     @staticmethod
     def _all_failed(
-        providers: Sequence[str], message: str, *, kind: str = "error"
+        providers: Sequence[str], message: str, *, kind: str = "local_error"
     ) -> dict[str, dict[str, Any]]:
+        # Defaults to ``local_error``: everything this helper reports went
+        # wrong before or around the request, not inside it.
         return {
             provider: {"ok": False, "provider": provider, "kind": kind, "message": message}
             for provider in providers
@@ -358,9 +405,21 @@ def normalize_probe_result(
 
     raw = result.get("snapshot")
     if raw is None:
-        # Hermes returns no snapshot when the provider has no credentials
-        # configured or is not one it supports. Both are durable conditions a
-        # human has to fix, so this is 'unavailable', not 'unknown'.
+        if str(result.get("fidelity") or "") != "private":
+            # The public entry point buries every failure in a blanket
+            # ``except Exception: return None``, so its None is ambiguous: a
+            # timeout and a missing credential are indistinguishable. Calling
+            # that 'unavailable' would turn a transient blip into a durable
+            # verdict and suppress the resource indefinitely.
+            return degrade(
+                f"Hermes returned no account-usage data for {resource.provider!r} via its "
+                "public entry point, which reports every failure identically; the cause "
+                "cannot be determined"
+            )
+        # Through the private entry point a failure raises, so reaching here
+        # with no snapshot means Hermes genuinely has nothing for this
+        # provider: no credentials configured, or not supported. Both are
+        # durable conditions a human has to fix.
         return ProviderResourceSnapshot(
             resource=resource.name,
             observed_at=at,
@@ -400,7 +459,11 @@ def _normalize_snapshot(
 
     if unavailable_reason:
         availability, reason = "unavailable", str(unavailable_reason)
-    elif any(w.is_exhausted for w in windows):
+    elif windows_fully_spent(windows):
+        # Every measured window, not any: an account reporting "Opus week" at
+        # 100% next to "Sonnet week" with headroom is still usable for Sonnet
+        # work. Which window binds depends on the model, so that call belongs
+        # to the broker, which reads `windows`/`spent_windows()`.
         availability, reason = "exhausted", ""
     elif windows or details:
         availability, reason = "available", ""
@@ -494,6 +557,8 @@ def probe_outcome(result: Mapping[str, Any] | None) -> tuple[str, float | None] 
             return None
         return ("success", None)
     kind = str(result.get("kind") or "error")
+    if kind in _LOCAL_FAILURE_KINDS:
+        return None
     retry_after = result.get("retry_after_seconds")
     seconds = float(retry_after) if isinstance(retry_after, (int, float)) else None
     return (_KIND_TO_OUTCOME.get(kind, "transport_error"), seconds)
@@ -520,12 +585,28 @@ class HermesTelemetrySource:
         ledger: ProviderHealthLedger | None = None,
     ) -> None:
         self._resources: dict[str, HermesResource] = {}
+        by_provider: dict[str, str] = {}
         for resource in resources:
             if resource.name in self._resources:
                 raise TelemetryError(
                     f"duplicate telemetry resource name {resource.name!r}; "
                     "resource names must be unique"
                 )
+            # Hermes' account-usage API is keyed by provider and resolves that
+            # provider's credentials globally, so it cannot distinguish two
+            # accounts on one provider. Serving both from a single result would
+            # report one account's allowance for the other — and the broker
+            # would route work at an exhausted account on the strength of it.
+            # Refusing is the only honest option until Hermes takes an account
+            # identity.
+            if resource.provider in by_provider:
+                raise TelemetryError(
+                    f"telemetry resources {by_provider[resource.provider]!r} and "
+                    f"{resource.name!r} both use provider {resource.provider!r}, but "
+                    "Hermes resolves credentials per provider and cannot tell two "
+                    "accounts apart; both rows would report the same account"
+                )
+            by_provider[resource.provider] = resource.name
             self._resources[resource.name] = resource
         self._probe = probe
         self._ttl_seconds = ttl_seconds

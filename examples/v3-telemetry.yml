@@ -42,8 +42,11 @@ telemetry:
   resources:
     # `name` is the policy-level id the broker and operator use; `provider` is
     # the upstream key Hermes resolves credentials for. Keeping them separate
-    # lets one machine expose two accounts on the same provider, and means
-    # renaming a provider upstream does not rewrite routing decisions.
+    # means renaming a provider upstream does not rewrite routing decisions.
+    #
+    # Two resources may not share a `provider`: Hermes resolves credentials per
+    # provider from ambient machine state and cannot select between two accounts
+    # on one provider, so both rows would report the same allowance.
     - name: anthropic-sub
       provider: anthropic
       resource_class: subscription

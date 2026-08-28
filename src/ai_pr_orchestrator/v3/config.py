@@ -13,6 +13,7 @@ tests stay terse.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -122,8 +123,12 @@ class TelemetryResourceConfig:
 
     ``name`` is the policy-level id the broker and operator use; ``provider``
     is the upstream key Hermes resolves credentials for. They are separate so
-    one machine can expose two accounts on the same provider, and so renaming
-    a provider upstream does not rewrite routing decisions.
+    renaming a provider upstream does not rewrite routing decisions.
+
+    Two resources may not share a ``provider``: Hermes resolves credentials
+    per provider from ambient machine state, so it cannot distinguish two
+    accounts on one provider and both rows would report the same allowance.
+    The Hermes telemetry source rejects that at construction.
 
     There is deliberately no credential field: Hermes owns credential
     resolution, so a secret never has to be written into V3 policy config.
@@ -410,8 +415,8 @@ class V3Config:
             ("snapshot_ttl_seconds", telemetry.snapshot_ttl_seconds),
             ("probe_timeout_seconds", telemetry.probe_timeout_seconds),
         ):
-            if value <= 0:
-                raise V3ConfigError(f"telemetry.{name} must be > 0, got {value}")
+            if not math.isfinite(value) or value <= 0:
+                raise V3ConfigError(f"telemetry.{name} must be a finite number > 0, got {value}")
         if telemetry.health_window_size < 1:
             raise V3ConfigError(
                 f"telemetry.health_window_size must be >= 1, got {telemetry.health_window_size}"
@@ -435,10 +440,12 @@ class V3Config:
                     f"{resource.resource_class!r}, must be one of "
                     f"{sorted(VALID_RESOURCE_CLASSES)}"
                 )
-            if resource.ttl_seconds is not None and resource.ttl_seconds <= 0:
+            if resource.ttl_seconds is not None and (
+                not math.isfinite(resource.ttl_seconds) or resource.ttl_seconds <= 0
+            ):
                 raise V3ConfigError(
-                    f"telemetry resource {resource.name!r} ttl_seconds must be > 0, "
-                    f"got {resource.ttl_seconds}"
+                    f"telemetry resource {resource.name!r} ttl_seconds must be a finite "
+                    f"number > 0, got {resource.ttl_seconds}"
                 )
 
         # Two sources claiming one resource would make its telemetry ambiguous.

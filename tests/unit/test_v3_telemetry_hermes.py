@@ -7,8 +7,10 @@ against shapes Hermes actually emits rather than shapes we wish it emitted.
 
 from __future__ import annotations
 
+import subprocess
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from email.utils import format_datetime
+from typing import Any, ClassVar
 
 import pytest
 
@@ -20,8 +22,10 @@ from ai_pr_orchestrator.v3.telemetry import (
 from ai_pr_orchestrator.v3.telemetry_hermes import (
     BRIDGE_SCRIPT,
     HermesResource,
+    HermesSubprocessProbe,
     HermesTelemetrySource,
     normalize_probe_result,
+    probe_outcome,
 )
 
 NOW = datetime(2026, 8, 28, 14, 0, tzinfo=UTC)
@@ -135,7 +139,9 @@ CODEX_AUTH_FAILURE = {
     "status_code": 401,
 }
 
-NO_DATA = {"ok": True, "provider": "nope-provider", "fidelity": "public", "snapshot": None}
+NO_DATA_PRIVATE = {"ok": True, "provider": "nope-provider", "fidelity": "private", "snapshot": None}
+
+NO_DATA_PUBLIC = {"ok": True, "provider": "nope-provider", "fidelity": "public", "snapshot": None}
 
 
 def _anthropic_snapshot() -> dict[str, Any]:
@@ -214,13 +220,23 @@ class TestNormalizingRecordedPayloads:
 
 
 class TestFailureModesStayDistinguishable:
-    def test_a_full_window_is_exhausted_not_merely_unavailable(self):
-        payload = _with_window_usage(CODEX_OK, "Weekly", 100.0)
+    def test_every_window_spent_is_exhausted_not_merely_unavailable(self):
+        payload = _with_window_usage(
+            _with_window_usage(CODEX_OK, "Weekly", 100.0), "Session", 100.0
+        )
         snap = _normalize(payload)
         assert snap.availability == "exhausted"
         assert require(snap.window("Weekly")).is_exhausted is True
         # Still recoverable, and the snapshot says exactly when.
         assert require(snap.window("Weekly")).reset_at is not None
+
+    def test_a_spent_session_beside_a_live_week_is_still_available(self):
+        # The 5-hour session resets long before the week does. Reporting this
+        # as 'exhausted' would idle a resource that has hours of headroom.
+        payload = _with_window_usage(CODEX_OK, "Session", 100.0)
+        snap = _normalize(payload)
+        assert snap.availability == "available"
+        assert [w.label for w in snap.spent_windows()] == ["Session"]
 
     def test_an_auth_failure_is_unavailable_not_unknown(self):
         # It is durable and needs a human; a retry will not fix it.
@@ -239,9 +255,18 @@ class TestFailureModesStayDistinguishable:
         assert snap.availability == "unknown"
         assert "boom" in snap.reason
 
-    def test_no_credentials_is_unavailable_with_an_actionable_reason(self):
-        snap = _normalize(NO_DATA)
+    def test_no_data_from_the_private_path_is_unavailable_with_an_actionable_reason(self):
+        snap = _normalize(NO_DATA_PRIVATE)
         assert snap.availability == "unavailable"
+        assert "no account-usage data" in snap.reason
+
+    def test_no_data_from_the_public_fallback_is_only_unknown(self):
+        # The public `fetch_account_usage` ends in a blanket
+        # `except Exception: return None`, so a bare None there cannot
+        # distinguish an expired credential from a network blip. Calling it
+        # 'unavailable' would manufacture certainty the payload does not carry.
+        snap = _normalize(NO_DATA_PUBLIC)
+        assert snap.availability == "unknown"
         assert "no account-usage data" in snap.reason
 
     def test_hermes_own_unavailable_reason_is_carried_through(self):
@@ -375,6 +400,54 @@ class TestHermesTelemetrySource:
                 probe=_StaticProbe({}),
             )
 
+    def test_two_resources_on_one_provider_are_rejected(self):
+        # Hermes resolves credentials per provider from ambient machine state,
+        # so it cannot select between two accounts on one provider: both rows
+        # would report the same allowance under different names, and a broker
+        # summing them would see twice the capacity that exists.
+        with pytest.raises(TelemetryError, match="anthropic"):
+            HermesTelemetrySource(
+                resources=[
+                    HermesResource(name="work-sub", provider="anthropic"),
+                    HermesResource(name="personal-sub", provider="anthropic"),
+                ],
+                probe=_StaticProbe({}),
+            )
+
+    def test_a_broken_install_is_not_recorded_as_a_provider_failure(self):
+        # An unrunnable probe says nothing about the provider. Recording it as
+        # a failure would drive the broker away from a healthy account because
+        # *our* install is broken.
+        ledger = ProviderHealthLedger()
+        source = HermesTelemetrySource(
+            resources=[HermesResource(name="codex-sub", provider="openai-codex")],
+            probe=_StaticProbe(
+                {
+                    "openai-codex": {
+                        "ok": False,
+                        "provider": "openai-codex",
+                        "kind": "local_error",
+                        "message": "Hermes interpreter /opt/hermes/venv/bin/python does not exist",
+                    }
+                }
+            ),
+            ledger=ledger,
+        )
+        snap = TelemetryRegistry(sources=[source], ledger=ledger).snapshot("codex-sub", at=NOW)
+        assert snap.availability == "unknown"
+        assert snap.health.outcomes == {}
+        assert snap.health.consecutive_failures == 0
+
+    def test_a_provider_failure_is_still_recorded(self):
+        ledger = ProviderHealthLedger()
+        source = HermesTelemetrySource(
+            resources=[HermesResource(name="codex-sub", provider="openai-codex")],
+            probe=_StaticProbe({"openai-codex": CODEX_AUTH_FAILURE}),
+            ledger=ledger,
+        )
+        snap = TelemetryRegistry(sources=[source], ledger=ledger).snapshot("codex-sub", at=NOW)
+        assert snap.health.outcomes == {"auth_failure": 1}
+
     def test_per_resource_ttl_overrides_the_source_default(self):
         source = HermesTelemetrySource(
             resources=[HermesResource(name="codex-sub", provider="openai-codex", ttl_seconds=30.0)],
@@ -396,6 +469,83 @@ def test_bridge_script_is_syntactically_valid_python():
     # It is shipped as source text executed by a foreign interpreter, so a
     # syntax error would only surface as a confusing subprocess failure.
     compile(BRIDGE_SCRIPT, "<bridge>", "exec")
+
+
+class TestSubprocessProbe:
+    def test_it_runs_in_the_hermes_checkout_not_ours(self, tmp_path, monkeypatch):
+        # `python -c` puts cwd on sys.path. Inheriting aipro's would let a
+        # stray local directory named `agent` shadow Hermes' own package.
+        interpreter = tmp_path / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("")
+        calls: dict[str, Any] = {}
+
+        def fake_run(argv, **kwargs):
+            calls.update(kwargs)
+            raise OSError("not actually running it")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        HermesSubprocessProbe(hermes_home=tmp_path).probe(["anthropic"])
+        assert calls["cwd"] == str(tmp_path)
+
+    def test_an_unknown_checkout_leaves_cwd_unset_rather_than_guessing(self, tmp_path, monkeypatch):
+        calls: dict[str, Any] = {}
+
+        def fake_run(argv, **kwargs):
+            calls.update(kwargs)
+            raise OSError("not actually running it")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        python = tmp_path / "python"
+        python.write_text("")
+        HermesSubprocessProbe(python_executable=python).probe(["anthropic"])
+        assert calls["cwd"] is None
+
+    @pytest.mark.parametrize(
+        "reason",
+        ["no Hermes interpreter configured", "does not exist"],
+    )
+    def test_an_unrunnable_probe_reports_a_local_error(self, reason, tmp_path):
+        probes = {
+            "no Hermes interpreter configured": HermesSubprocessProbe(),
+            "does not exist": HermesSubprocessProbe(hermes_home=tmp_path / "absent"),
+        }
+        result = probes[reason].probe(["anthropic"])["anthropic"]
+        assert result["kind"] == "local_error"
+        assert reason in result["message"]
+        assert probe_outcome(result) is None
+
+
+class TestBridgeRetryAfter:
+    def _retry_after(self, raw):
+        namespace: dict[str, Any] = {}
+        exec(BRIDGE_SCRIPT.split("\nprint(json.dumps")[0], namespace)
+
+        class Response:
+            headers: ClassVar[dict[str, str]] = {"Retry-After": raw}
+
+        class Failure(Exception):
+            response = Response()
+
+        return namespace["_retry_after"](Failure())
+
+    def test_delay_seconds_are_read_directly(self):
+        assert self._retry_after("30") == 30.0
+
+    def test_an_http_date_is_converted_to_seconds_from_now(self):
+        # RFC 9110 permits either form. Dropping the date form would leave
+        # is_throttled() false while the provider is still refusing us.
+        soon = datetime.now(UTC) + timedelta(seconds=120)
+        seconds = self._retry_after(format_datetime(soon, usegmt=True))
+        assert seconds is not None
+        assert 60 < seconds <= 120
+
+    def test_an_http_date_in_the_past_floors_at_zero(self):
+        past = datetime.now(UTC) - timedelta(hours=1)
+        assert self._retry_after(format_datetime(past, usegmt=True)) == 0.0
+
+    def test_garbage_is_dropped_rather_than_raising(self):
+        assert self._retry_after("whenever") is None
 
 
 def _with_window_usage(payload, label, used_percent):

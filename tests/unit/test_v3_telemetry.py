@@ -18,6 +18,7 @@ from ai_pr_orchestrator.v3.telemetry import (
     TelemetryRegistry,
     redact_secrets,
     unknown_snapshot,
+    windows_fully_spent,
 )
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
@@ -107,6 +108,45 @@ class TestSnapshotInvariants:
                 windows=(QuotaWindow(label="Weekly", used_fraction=1.0),),
             )
 
+    def test_one_spent_window_among_several_is_not_exhaustion(self):
+        # A spent 5-hour session alongside a 74% week is normal operation: the
+        # session returns within hours. Calling that 'exhausted' would take a
+        # resource with real headroom out of rotation until the weekly reset.
+        snap = snapshot(
+            availability="available",
+            windows=(
+                QuotaWindow(label="Current session", used_fraction=1.0),
+                QuotaWindow(label="Current week", used_fraction=0.74),
+            ),
+        )
+        assert snap.availability == "available"
+        assert [w.label for w in snap.spent_windows()] == ["Current session"]
+
+    def test_exhausted_needs_every_measured_window_spent(self):
+        with pytest.raises(TelemetryError, match="evidence"):
+            snapshot(
+                availability="exhausted",
+                windows=(
+                    QuotaWindow(label="Current session", used_fraction=1.0),
+                    QuotaWindow(label="Current week", used_fraction=0.74),
+                ),
+            )
+
+    def test_unmeasured_windows_are_ignored_not_assumed_spent(self):
+        snap = snapshot(
+            availability="exhausted",
+            windows=(
+                QuotaWindow(label="Current week", used_fraction=1.0),
+                QuotaWindow(label="Opus week"),
+            ),
+        )
+        assert snap.availability == "exhausted"
+
+    def test_windows_alone_cannot_be_evidence_when_none_are_measured(self):
+        assert windows_fully_spent(()) is False
+        assert windows_fully_spent((QuotaWindow(label="Opus week"),)) is False
+        assert windows_fully_spent((QuotaWindow(label="W", used_fraction=1.0),)) is True
+
     @pytest.mark.parametrize("availability", ["unavailable", "unknown"])
     def test_non_usable_states_must_say_why(self, availability):
         with pytest.raises(TelemetryError, match="reason"):
@@ -195,6 +235,30 @@ class TestSnapshotQueries:
         data = snap.to_dict()
         assert data["windows"][0]["reset_at"] == NOW.isoformat()
         assert data["availability"] == "available"
+
+    def test_serialization_keeps_the_derived_answers_the_types_compute(self):
+        # A consumer reading --json must not have to re-derive what the domain
+        # already knows; a generic dataclass walk drops these silently.
+        ledger = ProviderHealthLedger()
+        ledger.record("anthropic-sub", "success", at=NOW, latency_ms=12.0)
+        snap = snapshot(
+            windows=(
+                QuotaWindow(label="Current session", used_fraction=1.0, reset_at=NOW),
+                QuotaWindow(label="Current week", used_fraction=0.74),
+            ),
+        ).with_health(ledger.health("anthropic-sub"))
+        data = snap.to_dict()
+
+        assert data["windows"][0]["remaining_fraction"] == 0.0
+        assert data["windows"][0]["is_exhausted"] is True
+        assert data["windows"][1]["remaining_fraction"] == pytest.approx(0.26)
+        assert data["health"]["total"] == 1
+        assert data["health"]["failure_rate"] == 0.0
+        assert data["health"]["mean_latency_ms"] == 12.0
+        assert data["health"]["p50_latency_ms"] == 12.0
+        assert data["tightest_window"] == "Current session"
+        assert data["next_reset_at"] == NOW.isoformat()
+        assert data["spent_windows"] == ["Current session"]
 
 
 class TestHealthDoesNotCorruptQuota:
@@ -308,6 +372,26 @@ class TestCatalogTelemetrySource:
         assert snap.availability == "unavailable"
         assert snap.reason
 
+    def test_a_closed_promotion_reports_no_expiry_rather_than_a_past_one(self):
+        # expires_at means "capacity disappears then". A timestamp in the past
+        # reads as "expiring soon" to anything sorting on the column.
+        catalog = ModelCatalog(
+            entries=(
+                ModelCatalogEntry(
+                    ref="lapsed-promo",
+                    descriptor="vendor/lapsed",
+                    cost_class="low",
+                    promotional=True,
+                    promo_ends_at=NOW - timedelta(days=1),
+                    input_price_per_mtok=1.0,
+                    output_price_per_mtok=2.0,
+                ),
+            )
+        )
+        snap = CatalogTelemetrySource(catalog).snapshot("lapsed-promo", at=NOW)
+        assert snap.expires_at is None
+        assert "promotion inactive" in snap.details
+
     def test_an_unknown_ref_degrades_to_unknown_rather_than_raising(self):
         snap = CatalogTelemetrySource(self._catalog()).snapshot("not-here", at=NOW)
         assert snap.availability == "unknown"
@@ -373,8 +457,26 @@ class TestRedaction:
             assert secret not in cleaned
         assert "REDACTED" in cleaned
 
+    @pytest.mark.parametrize(
+        ("text", "secret"),
+        [
+            ("api_key=9f8e7d6c5b4a3210 rejected", "9f8e7d6c5b4a3210"),
+            ('{"access_token": "eyJhbGciOiJIUzI1NiJ9"}', "eyJhbGciOiJIUzI1NiJ9"),
+            ("X-Api-Key: ZmFrZS1zZWNyZXQtdmFsdWU", "ZmFrZS1zZWNyZXQtdmFsdWU"),
+            ("password: hunter2 was refused", "hunter2"),
+            ("refresh_token 1//0gAbCdEfGhIjKl", "1//0gAbCdEfGhIjKl"),
+        ],
+    )
+    def test_credentials_are_caught_by_key_name_not_only_by_vendor_prefix(self, text, secret):
+        # Provider error text quotes whole requests; a value is credential
+        # material because of the key it sits under, whatever its shape.
+        cleaned = redact_secrets(text)
+        assert secret not in cleaned
+        assert "REDACTED" in cleaned
+
     def test_ordinary_text_is_left_alone(self):
         assert redact_secrets("Current week 71% used") == "Current week 71% used"
+        assert redact_secrets("Credits balance: $7.19") == "Credits balance: $7.19"
 
 
 def test_unknown_snapshot_is_never_mistaken_for_an_empty_quota():

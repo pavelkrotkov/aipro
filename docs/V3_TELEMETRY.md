@@ -46,13 +46,22 @@ So they are different types with different lifetimes:
 | A 429 affects | Nothing | `retry_after`, `is_throttled`, `failure_rate` |
 
 This is enforced, not merely documented. `ProviderResourceSnapshot.__post_init__`
-refuses `availability="exhausted"` unless there is positive evidence — a window
-at `used_fraction >= 1.0`, or a `cash_balance` of exactly zero:
+refuses `availability="exhausted"` unless there is positive evidence — a
+`cash_balance` of exactly zero, or `windows_fully_spent()`:
 
 > A failed or empty probe is 'unknown', not 'exhausted'.
 
+`windows_fully_spent()` requires **every measured window** to be at
+`used_fraction >= 1.0`, and requires at least one to be measured. One spent
+window is not exhaustion: a subscription whose 5-hour session is used up but
+whose weekly allowance is at 74% still has capacity that returns within hours,
+and taking it out of rotation for the week would be wrong. Unmeasured windows
+are ignored rather than assumed spent — §1 again.
+
 It symmetrically refuses `available` when the evidence says the resource is
 spent, so a snapshot cannot contradict itself in either direction.
+`spent_windows()` exposes the individual spent windows for a broker that wants
+to defer a lane until the tightest one resets.
 
 ## 3. Unknown is not zero, at every level
 
@@ -91,6 +100,11 @@ makes the seam real rather than hypothetical, and it is what motivates
 `expires_at` (a promotion *ends*, permanently) being distinct from a window's
 `reset_at` (an allowance *returns*, periodically).
 
+`expires_at` is set only while the promotion is actually running. A catalog
+entry whose promotion window has already closed reports `expires_at=None` with
+detail `promotion inactive`, rather than a timestamp in the past that reads as
+"expires soon" to anything sorting on that column.
+
 `snapshot_all()` evaluates the whole fan-out at **one timestamp**, so two rows
 cannot disagree about whether a window has reset mid-scan.
 
@@ -117,6 +131,41 @@ appear in V3 config.
 `HermesSubprocessProbe.probe()` never raises. A missing checkout, a broken
 venv, a timeout, or unparseable output all return per-provider error entries,
 so a machine without Hermes yields `unknown` telemetry rather than a crash.
+
+The subprocess runs with `cwd` set to `hermes_home` when that directory exists.
+`python -c` puts the working directory on `sys.path`, so inheriting the
+orchestrator's cwd would let a local file named e.g. `agent.py` shadow Hermes'
+own package.
+
+### Our failures are not the provider's failures
+
+A probe can fail for two unrelated reasons, and only one of them is evidence
+about the provider:
+
+| Failure | Example | Health ledger |
+| --- | --- | --- |
+| The provider answered badly | `401`, `429`, `5xx`, timeout | Recorded |
+| We never reached the provider | no interpreter, import error, unparseable output | **Not recorded** (`local_error`) |
+
+Recording a local error as a provider failure would drive `failure_rate` and
+`consecutive_failures` up for an endpoint that was never contacted, and the
+broker would route away from a healthy account because *our* install is broken.
+`local_error` kinds map to no `RequestOutcome` at all; the resource is simply
+`unknown`.
+
+### Fidelity gates the verdict
+
+When a provider returns no usage payload, what that means depends on which path
+produced it. Through the **private** path (`fidelity == "private"`) a bare
+`None` is a real negative answer, so the resource is `unavailable`. Through the
+**public** fallback it is not: `fetch_account_usage` ends in a blanket
+`except Exception: return None`, so `None` there is indistinguishable from a
+network blip. That case degrades to `unknown` instead — asserting `unavailable`
+from a value that cannot distinguish "expired credential" from "transient
+error" would manufacture the exact certainty §1 forbids.
+
+`Retry-After` is parsed as either delta-seconds or an HTTP-date (RFC 9110
+permits both); an HTTP-date is converted to seconds from now and floored at 0.
 
 ### The private-function deviation
 
@@ -182,9 +231,20 @@ telemetry:
 ```
 
 `name` is the policy-level id the broker and operator use; `provider` is the
-upstream key Hermes resolves credentials for. They are separate so one machine
-can expose two accounts on the same provider, and so renaming a provider
-upstream does not rewrite routing decisions.
+upstream key Hermes resolves credentials for. They are separate so renaming a
+provider upstream does not rewrite routing decisions.
+
+Two resources may **not** share a `provider`. Hermes resolves credentials per
+provider from ambient machine state and has no way to select between two
+accounts on one provider, so both rows would report the same allowance twice —
+and a broker summing them would see double the capacity that exists. The Hermes
+source rejects the duplicate at construction rather than reporting one account's
+numbers under another account's name.
+
+`snapshot_ttl_seconds`, `probe_timeout_seconds`, and per-resource `ttl_seconds`
+must be finite. YAML's `.nan` and `.inf` otherwise slip past a bare `> 0` check
+— `.nan` because every comparison with it is false, `.inf` because it is
+genuinely greater than zero — and would make freshness unevaluable.
 
 `hermes_home`/`hermes_python` are intentionally **optional**: a config must
 validate identically in CI, where no Hermes install exists. A missing

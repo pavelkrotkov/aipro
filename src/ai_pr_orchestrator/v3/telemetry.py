@@ -101,15 +101,30 @@ class TelemetryError(SchemaError):
 
 # --- Redaction -------------------------------------------------------------
 
+_REDACTED = "«REDACTED»"
+
+#: Key names whose value is credential material wherever it appears.
+_SECRET_KEYS = (
+    r"bearer|(?:api|access|refresh|private|secret|auth)[_-]?(?:key|token)|"
+    r"api[_-]?key|token|secret|password|passwd|credential"
+)
+
+#: Key/value form. The separator must allow punctuation, not just whitespace:
+#: a provider that echoes ``?api_key=plainsecret``, ``access_token: abc``, or a
+#: JSON body where the key itself is quoted would otherwise sail straight
+#: through to an operator's terminal. The key name is kept and only the value
+#: masked, so the message stays useful.
+_SECRET_KEY_VALUE = re.compile(
+    rf"(?i)\b({_SECRET_KEYS})\b([\"']?\s*[:=]\s*|\s+)([\"']?)[^\s\"'&,;)\]}}]+"
+)
+
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)\b(bearer|token|api[_-]?key)\s+\S+"),
+    # Recognizable token shapes, which carry no key name to anchor on.
     re.compile(r"\bsk-[A-Za-z0-9._-]{6,}"),
     re.compile(r"\b(gh[pousr]|github_pat)_[A-Za-z0-9_]{6,}"),
     # userinfo in a URL, e.g. https://user:secret@host/path
     re.compile(r"(?<=//)[^/\s:@]+:[^/\s@]+(?=@)"),
 )
-
-_REDACTED = "«REDACTED»"
 
 
 def redact_secrets(text: str) -> str:
@@ -117,9 +132,10 @@ def redact_secrets(text: str) -> str:
 
     Snapshots have no field that holds a credential, so the only way one can
     reach an operator's terminal is inside a provider error string that echoed
-    a header or a URL. This is that last filter, applied where such strings
-    enter the telemetry types.
+    a header, a query string, or a URL. This is that last filter, applied where
+    such strings enter the telemetry types.
     """
+    text = _SECRET_KEY_VALUE.sub(rf"\1\2\3{_REDACTED}", text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub(_REDACTED, text)
     return text
@@ -204,11 +220,30 @@ class QuotaWindow:
             "label": self.label,
             "used_fraction": self.used_fraction,
             "remaining_fraction": self.remaining_fraction,
+            "is_exhausted": self.is_exhausted,
             "reset_at": self.reset_at.isoformat() if self.reset_at else None,
             "detail": self.detail,
         }
         out.update(self.extras)
         return out
+
+
+def windows_fully_spent(windows: Sequence[QuotaWindow]) -> bool:
+    """True only when *every* measured window is spent.
+
+    A subscription commonly exposes per-model windows side by side: Anthropic
+    reports "Opus week" and "Sonnet week" independently. Spending the Opus
+    allowance says nothing about Sonnet work, so treating *any* full window as
+    exhaustion of the whole resource would strand capacity the account still
+    has. Which window actually binds depends on the model being scheduled, and
+    only the broker knows that — so the resource stays usable while any
+    measured window has headroom, and the per-window detail is preserved for
+    the broker to filter on.
+
+    Unmeasured windows are ignored rather than assumed empty or full.
+    """
+    measured = [w for w in windows if w.used_fraction is not None]
+    return bool(measured) and all(w.is_exhausted for w in measured)
 
 
 # --- Health ----------------------------------------------------------------
@@ -458,20 +493,24 @@ class ProviderResourceSnapshot:
         if self.expires_at is not None:
             _require_aware(self.expires_at, f"snapshot {self.resource!r} expires_at")
 
-        spent = any(w.is_exhausted for w in self.windows) or self.cash_balance == 0.0
+        # Exhaustion is a property of the whole resource, so it needs *every*
+        # measured window to be spent. One full per-model window still leaves
+        # the account usable for other models — see :func:`windows_fully_spent`.
+        spent = windows_fully_spent(self.windows) or self.cash_balance == 0.0
         # The invariant this whole module exists for: a probe that failed can
         # never present as an exhausted quota, because 'exhausted' demands a
         # window the provider itself reported as spent.
         if self.availability == "exhausted" and not spent:
             raise TelemetryError(
                 f"snapshot {self.resource!r} claims availability 'exhausted' without "
-                "evidence: no quota window reports full usage and no zero cash balance. "
-                "A failed or empty probe is 'unknown', not 'exhausted'."
+                "evidence: not every measured quota window reports full usage and there "
+                "is no zero cash balance. A failed or empty probe is 'unknown', not "
+                "'exhausted'."
             )
         if self.availability == "available" and spent:
             raise TelemetryError(
-                f"snapshot {self.resource!r} claims availability 'available' but a quota "
-                "window reports full usage; the snapshot contradicts itself"
+                f"snapshot {self.resource!r} claims availability 'available' but every "
+                "measured quota window reports full usage; the snapshot contradicts itself"
             )
         if self.availability in ("unavailable", "unknown") and not self.reason:
             raise TelemetryError(
@@ -509,6 +548,15 @@ class ProviderResourceSnapshot:
         resets = [w.reset_at for w in self.windows if w.reset_at is not None]
         return min(resets) if resets else None
 
+    def spent_windows(self) -> tuple[QuotaWindow, ...]:
+        """Windows the provider reports as fully used.
+
+        A resource stays ``available`` while any measured window has headroom,
+        so a model-aware caller must check whether the window *it* depends on
+        is in here rather than reading availability alone.
+        """
+        return tuple(w for w in self.windows if w.is_exhausted)
+
     def with_health(self, health: ProviderHealth) -> ProviderResourceSnapshot:
         """Return a copy carrying ``health``, with quota data untouched.
 
@@ -527,10 +575,17 @@ class ProviderResourceSnapshot:
             if f.name == "extras":
                 continue
             out[f.name] = to_mapping(getattr(self, f.name))
+        # `to_mapping` walks dataclasses field-by-field, which would silently
+        # drop the derived values these two publish (remaining_fraction,
+        # failure_rate, latency percentiles). The JSON output is the machine
+        # contract, so route them through their own serializers.
+        out["windows"] = [w.to_dict() for w in self.windows]
+        out["health"] = self.health.to_dict()
         tightest = self.tightest_window()
         next_reset = self.next_reset_at()
         out["tightest_window"] = tightest.label if tightest is not None else None
         out["next_reset_at"] = next_reset.isoformat() if next_reset is not None else None
+        out["spent_windows"] = [w.label for w in self.spent_windows()]
         out.update(self.extras)
         return out
 
@@ -615,14 +670,18 @@ class CatalogTelemetrySource:
             availability = "available"
         if entry.promotional:
             details.append(
-                "promotion active" if entry.promotion_active(now) else "promotion lapsed"
+                "promotion active" if entry.promotion_active(now) else "promotion inactive"
             )
         return ProviderResourceSnapshot(
             resource=entry.ref,
             observed_at=now,
             availability=availability,
             resource_class=entry.resource_class,
-            expires_at=entry.promo_ends_at if entry.promotional else None,
+            # Only a *live* promotion is perishable. Carrying promo_ends_at for
+            # one that has not started, or that lapsed back to a list price,
+            # would show the broker ordinary paid capacity as something to
+            # spend before it evaporates.
+            expires_at=entry.promo_ends_at if entry.promotion_active(now) else None,
             ttl_seconds=self._ttl_seconds,
             source="catalog",
             details=tuple(details),
