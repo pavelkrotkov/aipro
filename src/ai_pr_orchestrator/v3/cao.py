@@ -25,6 +25,7 @@ See ``docs/V3_CAO.md`` for the minimum CAO version and profile provisioning.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import re
@@ -169,6 +170,11 @@ class CaoSessionMetadata:
     workdir: str
     context: LaneExecutionContext
     model_assignment: ModelAssignment | None = None
+    # Durable activity evidence: set once a status response has shown a
+    # post-start state (processing/blocked) and pushed back into CAO's
+    # metadata, so a restarted process restores the idle-settle guard
+    # instead of treating a finished session as one that never ran.
+    activity_seen: bool = False
     launched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @property
@@ -192,6 +198,7 @@ class CaoSessionMetadata:
             "model_assignment": (
                 self.model_assignment.to_dict() if self.model_assignment is not None else None
             ),
+            "activity_seen": self.activity_seen,
             "launched_at": self.launched_at.isoformat(),
         }
 
@@ -218,6 +225,7 @@ class CaoSessionMetadata:
             model_assignment=(
                 ModelAssignment.from_dict(assignment) if assignment is not None else None
             ),
+            activity_seen=bool(data.get("activity_seen", False)),
             launched_at=(
                 datetime.fromisoformat(launched_at)
                 if isinstance(launched_at, str)
@@ -250,18 +258,16 @@ def session_name_for(run_id: RunId, lane: LaneName) -> str:
     Determinism is the whole reconcile story: the same run and lane always
     resolve to the same session, so a restarted process can look the session
     up instead of launching a second one.
+
+    The trailing digest is taken over both identifiers joined by a delimiter
+    that cannot appear in either, so the run/lane boundary is unambiguous:
+    two different (run, lane) pairs can never produce the same name, even
+    when the identifiers are built from the same safe character set
+    (``run-1`` + ``dev`` vs ``run`` + ``1-dev``).
     """
+    digest = hashlib.sha256(f"{run_id}\x1f{lane}".encode()).hexdigest()[:8]
     raw = f"{_CAO_SESSION_PREFIX}aipro-{run_id}-{lane}"
     sanitized = _UNSAFE_NAME_CHARS.sub("-", raw)
-    if sanitized != raw:
-        # Substitution is lossy (``foo/bar`` and ``foo:bar`` collide), so any
-        # sanitized name carries a digest of the raw one to stay collision-free.
-        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
-        budget = _MAX_SESSION_NAME_LEN - 9
-        sanitized = f"{sanitized[:budget]}-{digest}"
-    if len(sanitized) <= _MAX_SESSION_NAME_LEN:
-        return sanitized
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
     return f"{sanitized[: _MAX_SESSION_NAME_LEN - 9]}-{digest}"
 
 
@@ -322,7 +328,18 @@ class CaoSessionController:
         :meth:`submit_work`. ``spec.env`` is forwarded to the session verbatim
         — it is how the broker's resolved model reaches the agent's startup
         without this module interpreting it.
+
+        ``spec.image`` is rejected: CAO's ``POST /sessions`` launch parameters
+        expose no image override, so the adapter cannot forward it and will
+        not silently drop a contract field — see ``docs/V3_CAO.md``.
         """
+        if spec.image is not None:
+            raise ValueError(
+                "SessionSpec.image cannot be honored: CAO's POST /sessions "
+                "launch parameters expose no image override, so the session "
+                "would silently run somewhere other than the requested image. "
+                "Remove the image or extend the control plane first."
+            )
         lane = self._registered_lane(spec.lane)
         name = session_name_for(spec.run_id, lane.lane)
 
@@ -394,10 +411,11 @@ class CaoSessionController:
             params={"message": message},
         )
         self._raise_for_status(response, f"submit work to session {metadata.session_name!r}")
-        # New work invalidates any idle streak accumulated by the previous turn,
-        # and is itself authoritative evidence the session has taken on activity.
+        # New work invalidates any idle streak accumulated by the previous
+        # turn. Acceptance is not activity, though: the control plane accepts
+        # input while the provider is still starting, so only a status
+        # response showing a post-start state (see observe) may count.
         self._idle_readings[metadata.session_name] = 0
-        self._active_seen.add(metadata.session_name)
 
     # --- Observation -------------------------------------------------------
 
@@ -418,6 +436,10 @@ class CaoSessionController:
         status = response.json().get("status")
         state = self._lifecycle(metadata.session_name, status)
         if state not in TERMINAL_LIFECYCLE_STATES and self._is_expired(metadata, now):
+            # A session past its budget is stopped remotely, not just
+            # reported: otherwise the poller keeps polling a dead session and
+            # reconciliation could adopt it as if it were live work.
+            self._stop_session(metadata)
             return SessionObservation(
                 metadata=metadata,
                 state="timed_out",
@@ -492,11 +514,7 @@ class CaoSessionController:
         is idempotent so a crash between kill and record-keeping is recoverable.
         """
         metadata = self._metadata_for(handle)
-        response = self._request("DELETE", f"/sessions/{metadata.session_name}")
-        if response.status_code != 404:
-            self._raise_for_status(response, f"terminate session {metadata.session_name!r}")
-        self._sessions.pop(metadata.session_name, None)
-        self._idle_readings.pop(metadata.session_name, None)
+        self._stop_session(metadata)
 
     # --- Internals ---------------------------------------------------------
 
@@ -553,6 +571,45 @@ class CaoSessionController:
     def _register(self, metadata: CaoSessionMetadata) -> None:
         self._sessions[metadata.session_name] = metadata
         self._idle_readings.setdefault(metadata.session_name, 0)
+        # Activity evidence recorded durably by a previous process restores
+        # the idle-settle guard on adoption; without it, a session that
+        # already ran would look like one that never picked work up.
+        if metadata.activity_seen:
+            self._active_seen.add(metadata.session_name)
+
+    def _mark_active(self, session_name: str) -> None:
+        """Record observed post-start activity, in memory and durably.
+
+        The durable half is what makes restart reconcile honest: the flag
+        travels in CAO's per-terminal metadata (whole-dict replace), so a
+        fresh process adopting the session restores the idle-settle guard
+        even if it never sees a processing reading itself.
+        """
+        self._active_seen.add(session_name)
+        metadata = self._sessions.get(session_name)
+        if metadata is None or metadata.activity_seen:
+            return
+        updated = dataclasses.replace(metadata, activity_seen=True)
+        self._sessions[metadata.session_name] = updated
+        with contextlib.suppress(CaoControlPlaneError):
+            self._request(
+                "PATCH",
+                f"/terminals/{metadata.terminal_id}/metadata",
+                json={"metadata": updated.to_dict()},
+            )
+            # Best-effort persistence: the in-memory signal already holds and
+            # the next observed post-start reading re-attempts the write.
+
+    def _stop_session(self, metadata: CaoSessionMetadata) -> None:
+        """Delete the remote session and drop every piece of local per-name
+        state, so a later session under the same deterministic name starts
+        with no inherited idle streak or activity evidence."""
+        response = self._request("DELETE", f"/sessions/{metadata.session_name}")
+        if response.status_code != 404:
+            self._raise_for_status(response, f"stop session {metadata.session_name!r}")
+        self._sessions.pop(metadata.session_name, None)
+        self._idle_readings.pop(metadata.session_name, None)
+        self._active_seen.discard(metadata.session_name)
 
     @staticmethod
     def _validate_attribution(metadata: CaoSessionMetadata, spec: SessionSpec) -> None:
@@ -560,8 +617,9 @@ class CaoSessionController:
 
         A session name can be reconstructed by anything; the metadata CAO
         stored is what actually attributes the session's work. If it does not
-        agree with the run, lane, workdir, or model the caller is asking
-        about, adopting would misattribute findings across runs.
+        agree with the run, lane, workdir, model assignment, or round/work-item
+        context the caller is asking about, adopting would misattribute
+        findings across runs or across review rounds of the same run.
         """
         mismatches: list[str] = []
         if metadata.parent_run_id != spec.context.run_id:
@@ -572,14 +630,26 @@ class CaoSessionController:
             mismatches.append(f"lane {metadata.lane} != requested {spec.lane}")
         if metadata.workdir != spec.workdir:
             mismatches.append(f"workdir {metadata.workdir!r} != requested {spec.workdir!r}")
-        expected_model = (
-            spec.model_lease.assignment.model_ref if spec.model_lease is not None else None
-        )
-        actual_model = (
-            metadata.model_assignment.model_ref if metadata.model_assignment is not None else None
-        )
-        if actual_model != expected_model:
-            mismatches.append(f"model_ref {actual_model!r} != requested {expected_model!r}")
+        expected_model = spec.model_lease.assignment if spec.model_lease is not None else None
+        # The full assignment (lane and model_ref together), not just the
+        # model_ref: two lanes can share a model_ref, and a session whose
+        # recorded assignment belongs to another lane is not this lane's.
+        if metadata.model_assignment != expected_model:
+            mismatches.append(
+                f"model assignment {metadata.model_assignment!r} != requested {expected_model!r}"
+            )
+        if spec.context.round_id is not None and metadata.context.round_id != spec.context.round_id:
+            mismatches.append(
+                f"round_id {metadata.context.round_id!r} != requested {spec.context.round_id!r}"
+            )
+        if (
+            spec.context.work_item_id is not None
+            and metadata.context.work_item_id != spec.context.work_item_id
+        ):
+            mismatches.append(
+                f"work_item_id {metadata.context.work_item_id!r} != requested "
+                f"{spec.context.work_item_id!r}"
+            )
         if mismatches:
             raise CaoAdoptionMismatchError(
                 f"Session {metadata.session_name!r} attribution does not match the "
@@ -603,7 +673,7 @@ class CaoSessionController:
             # a fresh terminal is idle before it starts, and treating that idle
             # as "settled" would complete a lane that never ran its message.
             if mapped in ("running", "blocked"):
-                self._active_seen.add(session_name)
+                self._mark_active(session_name)
             return mapped
         if session_name not in self._active_seen:
             return "running"

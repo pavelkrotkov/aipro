@@ -1,5 +1,6 @@
 """Tests for the V3 CAO control-plane adapter, against a faked HTTP transport."""
 
+import dataclasses
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -32,7 +33,8 @@ from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
 
 BASE = "http://cao.test:9889"
 RUN_ID = "run-1"
-SESSION = "cao-aipro-run-1-developer"
+# Digest over the unambiguously delimited run/lane pair (see session_name_for).
+SESSION = "cao-aipro-run-1-developer-b9d7cf8e"
 TERMINAL = "a1b2c3d4"
 WORKDIR = "/worktrees/issue-1"
 
@@ -45,13 +47,14 @@ def make_controller(**kwargs):
     return CaoSessionController(make_config(), LaneRegistry.default(), **kwargs)
 
 
-def make_spec(*, command="implement the change", env=None, lane=None):
+def make_spec(*, command="implement the change", env=None, lane=None, image=None):
     lane = lane if lane is not None else LaneRegistry.default().get(DEVELOPER_LANE)
     return SessionSpec(
         lane=lane,
         run_id=RUN_ID,
         workdir=WORKDIR,
         env=env if env is not None else {},
+        image=image,
         context=LaneExecutionContext(run_id=RUN_ID, round_id="round-2", work_item_id="wi-9"),
         command=command,
         model_lease=ModelLease(
@@ -91,6 +94,11 @@ def launch(controller, respx_mock, **spec_kwargs):
     respx_mock.post(f"{BASE}/sessions").mock(
         return_value=httpx.Response(201, json=terminal_payload())
     )
+    # Activity observed during a poll is persisted to the durable metadata;
+    # tests that assert on it re-mock this route to inspect the call.
+    respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+        return_value=httpx.Response(200, json=terminal_payload())
+    )
     return controller.start_session(make_spec(**spec_kwargs))
 
 
@@ -121,6 +129,21 @@ def test_long_names_stay_distinct_after_truncation():
     b = session_name_for("x" * 100 + "-beta", DEVELOPER_LANE)
 
     assert a != b
+
+
+def test_the_run_lane_boundary_is_unambiguous():
+    # Identifiers drawn from the same safe charset must not be able to shift
+    # across the run/lane delimiter and collide.
+    assert session_name_for("run-1", "developer") != session_name_for("run", "1-developer")
+
+
+def test_specs_requesting_an_image_are_rejected_not_silently_dropped(respx_mock):
+    controller = make_controller()
+
+    with pytest.raises(ValueError, match="image"):
+        controller.start_session(make_spec(image="registry.example/agent:latest"))
+
+    assert not respx_mock.routes
 
 
 def test_controller_satisfies_the_v3_session_protocol():
@@ -336,19 +359,87 @@ def test_activity_restarts_the_idle_streak(respx_mock):
     assert states == ["running", "running", "running", "completed"]
 
 
-def test_new_work_restarts_the_idle_streak(respx_mock):
+def test_accepted_input_alone_does_not_count_as_activity(respx_mock):
+    # The control plane accepts input while the provider is still starting,
+    # so acceptance must never arm the idle-settle completion on its own.
     controller = make_controller(idle_settle_polls=2)
     handle = launch(controller, respx_mock)
     respx_mock.post(f"{BASE}/terminals/{TERMINAL}/input").mock(
         return_value=httpx.Response(200, json={"success": True})
     )
-    status_route(respx_mock, "idle", "idle", "idle")
+    status_route(respx_mock, "idle", "idle")
 
     assert controller.observe(handle).state == "running"
     controller.submit_work(handle, "one more thing")
 
     assert controller.observe(handle).state == "running"
-    assert controller.observe(handle).state == "completed"
+
+
+def test_new_work_restarts_the_idle_streak_once_execution_is_observed(respx_mock):
+    controller = make_controller(idle_settle_polls=2)
+    handle = launch(controller, respx_mock)
+    respx_mock.post(f"{BASE}/terminals/{TERMINAL}/input").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+    status_route(respx_mock, "idle", "processing", "idle", "idle")
+
+    controller.submit_work(handle, "one more thing")
+
+    states = [controller.observe(handle).state for _ in range(4)]
+
+    assert states == ["running", "running", "running", "completed"]
+
+
+def test_observed_activity_is_persisted_to_the_durable_metadata(respx_mock):
+    controller = make_controller()
+    handle = launch(controller, respx_mock)
+    route = respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+        return_value=httpx.Response(200, json=terminal_payload())
+    )
+    status_route(respx_mock, "processing")
+
+    controller.observe(handle)
+
+    assert route.called
+    import json
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["metadata"]["activity_seen"] is True
+
+
+def test_durable_activity_evidence_survives_a_restart(respx_mock):
+    # The first process observed execution and recorded it in CAO's metadata;
+    # a restarted process adopting the session must honor that evidence even
+    # though it never saw a processing reading itself.
+    durable = attribution_payload()
+    durable["activity_seen"] = True
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
+    )
+    respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
+        return_value=httpx.Response(200, json=terminal_payload(status="idle", metadata=durable))
+    )
+
+    controller = make_controller(idle_settle_polls=1)
+    observation = controller.adopt_session(SESSION)
+
+    assert observation.state == "completed"
+
+
+def test_activity_evidence_absent_from_durable_metadata_keeps_idle_unsettled(respx_mock):
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
+    )
+    respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
+        return_value=httpx.Response(
+            200, json=terminal_payload(status="idle", metadata=attribution_payload())
+        )
+    )
+
+    controller = make_controller(idle_settle_polls=1)
+    observation = controller.adopt_session(SESSION)
+
+    assert observation.state == "running"
 
 
 def test_a_session_cao_forgot_is_reported_as_disappeared(respx_mock):
@@ -365,6 +456,9 @@ def test_a_session_cao_forgot_is_reported_as_disappeared(respx_mock):
 def test_a_session_past_its_budget_is_reported_as_timed_out(respx_mock):
     controller = make_controller()
     handle = launch(controller, respx_mock)
+    respx_mock.delete(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
     status_route(respx_mock, "processing")
 
     observation = controller.observe(handle, now=datetime.now(UTC) + timedelta(seconds=61))
@@ -455,6 +549,9 @@ def test_poll_session_reports_a_timeout_without_reading_output(respx_mock):
         LaneRegistry.default(),
     )
     handle = launch(controller, respx_mock)
+    respx_mock.delete(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
     respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
         return_value=httpx.Response(200, json=terminal_payload(status="processing"))
     )
@@ -522,6 +619,9 @@ def test_a_restarted_process_adopts_the_session_from_its_durable_name(respx_mock
             200,
             json=terminal_payload(status="processing", metadata=attribution_payload()),
         )
+    )
+    respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+        return_value=httpx.Response(200, json=terminal_payload())
     )
     launch_route = respx_mock.post(f"{BASE}/sessions")
 
@@ -650,6 +750,47 @@ def test_start_session_refuses_to_adopt_a_session_attributed_to_another_run(resp
     assert not launch_route.called
 
 
+def test_a_session_whose_model_assignment_belongs_to_another_lane_is_not_adopted(respx_mock):
+    controller = make_controller()
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
+    )
+    foreign = attribution_payload()
+    # Same model_ref, different lane: the ref alone must not satisfy the check.
+    foreign["model_assignment"] = {"lane": "breaker-reviewer", "model_ref": "high-capability"}
+    respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
+        return_value=httpx.Response(200, json=terminal_payload(metadata=foreign))
+    )
+
+    with pytest.raises(CaoAdoptionMismatchError, match="model assignment"):
+        controller.adopt_session(SESSION, make_spec())
+
+    assert SESSION not in controller._sessions
+
+
+def test_a_session_from_an_earlier_review_round_is_not_adopted(respx_mock):
+    controller = make_controller()
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
+    )
+    earlier = attribution_payload()  # round-2 / wi-9
+    respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
+        return_value=httpx.Response(200, json=terminal_payload(metadata=earlier))
+    )
+    spec = make_spec()
+    later_round = dataclasses.replace(
+        spec, context=LaneExecutionContext(run_id=RUN_ID, round_id="round-3", work_item_id="wi-9")
+    )
+    later_item = dataclasses.replace(
+        spec, context=LaneExecutionContext(run_id=RUN_ID, round_id="round-2", work_item_id="wi-10")
+    )
+
+    with pytest.raises(CaoAdoptionMismatchError, match="round_id"):
+        controller.adopt_session(SESSION, later_round)
+    with pytest.raises(CaoAdoptionMismatchError, match="work_item_id"):
+        controller.adopt_session(SESSION, later_item)
+
+
 def test_a_provisioning_session_is_not_treated_as_absent(respx_mock):
     controller = make_controller()
     respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
@@ -679,7 +820,8 @@ def test_sanitized_names_carry_a_digest_so_lossy_names_stay_distinct():
     assert a != b
     assert a.startswith("cao-aipro-owner-foo-bar-")
     assert len(a) <= 64
-    # A name that needed no sanitization stays digest-free.
+    # Digests cover every name now, so the run/lane boundary is always
+    # unambiguous — not only when sanitization was needed.
     assert session_name_for(RUN_ID, DEVELOPER_LANE) == SESSION
 
 
@@ -696,6 +838,42 @@ def test_terminate_deletes_the_session_and_forgets_it(respx_mock):
     controller.terminate_session(handle)
 
     assert route.called
+    with pytest.raises(SessionNotRegisteredError):
+        controller.observe(handle)
+
+
+def test_terminate_clears_all_per_session_state(respx_mock):
+    controller = make_controller(idle_settle_polls=1)
+    handle = launch(controller, respx_mock)
+    respx_mock.delete(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+    status_route(respx_mock, "processing")
+    controller.observe(handle)  # arms in-memory activity evidence
+
+    controller.terminate_session(handle)
+
+    assert SESSION not in controller._sessions
+    assert SESSION not in controller._idle_readings
+    assert SESSION not in controller._active_seen
+
+
+def test_a_timed_out_session_is_stopped_remotely(respx_mock):
+    controller = CaoSessionController(
+        CAOControlPlaneConfig(base_url=BASE, session_timeout_seconds=0),
+        LaneRegistry.default(),
+    )
+    handle = launch(controller, respx_mock)
+    delete_route = respx_mock.delete(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+    status_route(respx_mock, "processing")
+
+    observation = controller.observe(handle, now=datetime.now(UTC) + timedelta(seconds=61))
+
+    assert observation.state == "timed_out"
+    assert delete_route.called
+    # Nothing is left to poll or re-adopt under the same deterministic name.
     with pytest.raises(SessionNotRegisteredError):
         controller.observe(handle)
 

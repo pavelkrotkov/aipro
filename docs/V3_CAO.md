@@ -23,6 +23,7 @@ to do so over HTTP, and it reads back only typed fields:
 | Launch a named session in a working directory | `POST /sessions` |
 | Reconcile a session by durable name | `GET /sessions/{session_name}` |
 | Observe lifecycle, read attribution metadata | `GET /terminals/{terminal_id}` |
+| Record activity evidence in durable metadata | `PATCH /terminals/{terminal_id}/metadata` |
 | Submit work / follow-up to a live session | `POST /terminals/{terminal_id}/input` |
 | Read the agent's final answer | `GET /terminals/{terminal_id}/output?mode=last` |
 | Stop and clean up | `DELETE /sessions/{session_name}` |
@@ -56,9 +57,13 @@ individual control-plane call is expected to answer in seconds.
 ## 3. Session identity and restart recovery
 
 A session's name is a pure function of its run and lane —
-`session_name_for(run_id, lane)` yields `cao-aipro-{run_id}-{lane}`, sanitized
-to tmux's charset and 64-character cap (long names keep a SHA-256 suffix so
-they stay collision-resistant). The `cao-` prefix is supplied by aipro because
+`session_name_for(run_id, lane)` yields
+`cao-aipro-{run_id}-{lane}-{digest}`, sanitized to tmux's charset and
+64-character cap. The digest is a SHA-256 over the run id and lane joined by
+a delimiter that cannot occur in either, so the run/lane boundary is
+unambiguous and two distinct (run, lane) pairs can never produce the same
+name — even when the identifiers are built from the same safe character set.
+The `cao-` prefix is supplied by aipro because
 CAO adds it otherwise, and a lookup under the unprefixed name would miss and
 launch a duplicate.
 
@@ -68,6 +73,18 @@ launch time. That makes CAO the single source of truth for session state — a
 restarted aipro that knows only the session *name* can call
 `adopt_session(name)` and rebuild everything else. A session carrying no aipro
 attribution is refused rather than adopted.
+
+Activity evidence is durable too. The first status response that shows a
+post-start state (`processing`/`waiting_user_answer`) is recorded as
+`activity_seen: true` in the terminal's metadata via the PATCH route above;
+on adoption a restarted process restores that flag and the idle-settle rule
+applies as before. Accepted input is deliberately *not* evidence: the control
+plane accepts input while a provider is still starting, so only an observed
+post-start state may let an idle reading complete a session.
+
+`SessionSpec.image` is rejected by the adapter: CAO's `POST /sessions` launch
+parameters expose no image override, so the adapter cannot forward it and
+refuses rather than silently running the session somewhere else.
 
 ### Never blind-retry a launch
 
