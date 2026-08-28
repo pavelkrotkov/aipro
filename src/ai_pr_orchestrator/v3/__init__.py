@@ -19,11 +19,19 @@ V3 is intentionally narrow:
 - **Lanes** (:mod:`ai_pr_orchestrator.v3.lanes`) is the registry binding each
   lane to its own isolated agent profile.
 - **CAO adapter** (:mod:`ai_pr_orchestrator.v3.cao`) drives agent sessions over
-  CAO's HTTP control plane. It is the only V3 module that performs I/O.
+  CAO's HTTP control plane. It never spawns a process itself.
+- **Telemetry** (:mod:`ai_pr_orchestrator.v3.telemetry`) reports live quota,
+  provider health, and freshness per resource. It is pure domain; missing
+  telemetry yields *unknown*, never *zero*.
 
-Apart from that adapter, nothing here executes processes, calls providers, or
-talks to GitHub — and even the adapter never spawns a process itself. The V1
-runtime remains fully functional and untouched until cutover; see
-``docs/V3_ARCHITECTURE.md`` for the ownership map and migration table, and
-``docs/V3_CAO.md`` for the CAO version floor and profile provisioning.
+Only two modules reach outside the process: the CAO adapter, and the Hermes
+account-usage probe (:mod:`ai_pr_orchestrator.v3.telemetry_hermes`), which runs
+a constant bridge script under Hermes' own interpreter so its pinned dependency
+tree and credential side effects stay out of ours. Nothing else here executes
+processes, calls providers, or talks to GitHub.
+
+The V1 runtime remains fully functional and untouched until cutover; see
+``docs/V3_ARCHITECTURE.md`` for the ownership map and migration table,
+``docs/V3_CAO.md`` for the CAO version floor and profile provisioning, and
+``docs/V3_TELEMETRY.md`` for the telemetry contract.
 """

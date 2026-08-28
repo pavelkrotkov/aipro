@@ -21,7 +21,12 @@ import yaml
 
 from ._schema import SchemaError, build_dataclass, to_mapping, typed_kwargs
 from ._schema import validate_declared_shapes as _validate_shapes
-from .catalog import ModelCatalog, ModelCatalogEntry, load_model_catalog
+from .catalog import (
+    VALID_RESOURCE_CLASSES,
+    ModelCatalog,
+    ModelCatalogEntry,
+    load_model_catalog,
+)
 from .domain import VALID_LANE_ROLES
 
 
@@ -112,6 +117,58 @@ class ModelRouterConfig:
 
 
 @dataclass(frozen=True)
+class TelemetryResourceConfig:
+    """One subscription/gateway account to collect live telemetry for.
+
+    ``name`` is the policy-level id the broker and operator use; ``provider``
+    is the upstream key Hermes resolves credentials for. They are separate so
+    one machine can expose two accounts on the same provider, and so renaming
+    a provider upstream does not rewrite routing decisions.
+
+    There is deliberately no credential field: Hermes owns credential
+    resolution, so a secret never has to be written into V3 policy config.
+    """
+
+    name: str
+    provider: str
+    resource_class: str = "subscription"
+    #: Overrides ``telemetry.snapshot_ttl_seconds`` for this resource only.
+    ttl_seconds: float | None = None
+    #: Unknown keys from a newer writer, preserved for forward compatibility.
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TelemetryConfig:
+    """Live provider telemetry: which resources to poll, and how freshly.
+
+    ``hermes_home``/``hermes_python`` locate the interpreter the account-usage
+    bridge runs under. They are intentionally *not* required: a config must
+    validate identically in CI, where no Hermes install exists. A missing
+    interpreter degrades every resource to ``unknown`` at collection time,
+    which is the correct answer, rather than failing to load the policy.
+    """
+
+    resources: list[TelemetryResourceConfig] = field(default_factory=list)
+    #: Default freshness budget. Beyond it a snapshot is marked stale and
+    #: re-probed, rather than being served as if it were current.
+    snapshot_ttl_seconds: float = 300.0
+    #: Root of the Hermes checkout; the bridge runs ``<home>/venv/bin/python``.
+    hermes_home: str | None = None
+    #: Explicit interpreter path, taking precedence over ``hermes_home``.
+    hermes_python: str | None = None
+    probe_timeout_seconds: float = 30.0
+    #: How many recent request outcomes feed the health statistics.
+    health_window_size: int = 50
+    #: Also report free-tier/promotional entries from the model catalog as
+    #: telemetry resources, so perishable capacity shows up in one listing
+    #: alongside the subscriptions.
+    include_catalog_resources: bool = True
+    #: Unknown keys from a newer writer, preserved for forward compatibility.
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class SafetyPolicyConfig:
     """Safety rails carried over from the V1 safety surface.
 
@@ -182,6 +239,7 @@ _SECTION_TYPES: dict[str, type] = {
     "cao": CAOControlPlaneConfig,
     "hermes_lanes": HermesLanesConfig,
     "model_router": ModelRouterConfig,
+    "telemetry": TelemetryConfig,
     "review_policy": ReviewPolicyConfig,
     "ci_policy": CIPolicyConfig,
     "safety": SafetyPolicyConfig,
@@ -191,6 +249,7 @@ _SECTION_TYPES: dict[str, type] = {
 _NESTED_LIST_FIELDS: dict[tuple[str, str], type] = {
     ("hermes_lanes", "lanes"): LaneProfileConfig,
     ("model_router", "catalog"): ModelCatalogEntry,
+    ("telemetry", "resources"): TelemetryResourceConfig,
 }
 
 
@@ -205,6 +264,7 @@ class V3Config:
     cao: CAOControlPlaneConfig = field(default_factory=CAOControlPlaneConfig)
     hermes_lanes: HermesLanesConfig = field(default_factory=HermesLanesConfig)
     model_router: ModelRouterConfig = field(default_factory=ModelRouterConfig)
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     review_policy: ReviewPolicyConfig = field(default_factory=ReviewPolicyConfig)
     ci_policy: CIPolicyConfig = field(default_factory=CIPolicyConfig)
     safety: SafetyPolicyConfig = field(default_factory=SafetyPolicyConfig)
@@ -299,6 +359,8 @@ class V3Config:
                     f"lane {lane_name!r} references unknown model ref {model_ref!r}"
                 )
 
+        self._validate_telemetry()
+
         for reviewer in self.review_policy.reviewer_lanes:
             lane = next((c for c in lanes if c.name == reviewer), None)
             if lane is None:
@@ -338,6 +400,66 @@ class V3Config:
                 raise V3ConfigError(f"safety.{budget} must be >= 1")
         if self.safety.max_prompt_tokens < 1:
             raise V3ConfigError("safety.max_prompt_tokens must be >= 1")
+
+    def _validate_telemetry(self) -> None:
+        """Validate the telemetry section and its overlap with the catalog."""
+        from .telemetry import CatalogTelemetrySource
+
+        telemetry = self.telemetry
+        for name, value in (
+            ("snapshot_ttl_seconds", telemetry.snapshot_ttl_seconds),
+            ("probe_timeout_seconds", telemetry.probe_timeout_seconds),
+        ):
+            if value <= 0:
+                raise V3ConfigError(f"telemetry.{name} must be > 0, got {value}")
+        if telemetry.health_window_size < 1:
+            raise V3ConfigError(
+                f"telemetry.health_window_size must be >= 1, got {telemetry.health_window_size}"
+            )
+
+        names = [resource.name for resource in telemetry.resources]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise V3ConfigError(f"Duplicate telemetry resource names: {duplicates}")
+
+        for resource in telemetry.resources:
+            if not resource.name:
+                raise V3ConfigError("telemetry resource name must be non-empty")
+            if not resource.provider:
+                raise V3ConfigError(
+                    f"telemetry resource {resource.name!r} provider must be non-empty"
+                )
+            if resource.resource_class not in VALID_RESOURCE_CLASSES:
+                raise V3ConfigError(
+                    f"telemetry resource {resource.name!r} has unknown resource_class "
+                    f"{resource.resource_class!r}, must be one of "
+                    f"{sorted(VALID_RESOURCE_CLASSES)}"
+                )
+            if resource.ttl_seconds is not None and resource.ttl_seconds <= 0:
+                raise V3ConfigError(
+                    f"telemetry resource {resource.name!r} ttl_seconds must be > 0, "
+                    f"got {resource.ttl_seconds}"
+                )
+
+        # Two sources claiming one resource would make its telemetry ambiguous.
+        # The registry rejects that at construction; catching it here names the
+        # config key at fault instead of failing on the first collection.
+        # Only checkable for an inline catalog — a catalog_path is re-checked
+        # in load_v3_config, which is where the shared file is read.
+        if telemetry.include_catalog_resources and self.model_router.catalog:
+            catalog_owned = set(
+                CatalogTelemetrySource(
+                    ModelCatalog(entries=tuple(self.model_router.catalog))
+                ).resources()
+            )
+            clashes = sorted(catalog_owned.intersection(names))
+            if clashes:
+                raise V3ConfigError(
+                    f"telemetry resources {clashes} collide with free-tier/promotional "
+                    "model catalog entries of the same name, which the catalog telemetry "
+                    "source already reports. Rename them, or set "
+                    "telemetry.include_catalog_resources to false."
+                )
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -390,6 +512,8 @@ def load_v3_config(path: str | Path) -> V3Config:
     config = V3Config.from_dict(raw)
 
     if config.model_router.catalog_path:
+        from .telemetry import CatalogTelemetrySource
+
         catalog = resolve_model_catalog(config, base_dir=config_path.parent)
         refs = catalog.refs()
         for lane_name, model_ref in config.model_router.lane_assignments.items():
@@ -397,6 +521,18 @@ def load_v3_config(path: str | Path) -> V3Config:
                 raise V3ConfigError(
                     f"lane {lane_name!r} references unknown model ref {model_ref!r} "
                     f"(not in shared catalog {config.model_router.catalog_path})"
+                )
+        if config.telemetry.include_catalog_resources:
+            clashes = sorted(
+                set(CatalogTelemetrySource(catalog).resources()).intersection(
+                    resource.name for resource in config.telemetry.resources
+                )
+            )
+            if clashes:
+                raise V3ConfigError(
+                    f"telemetry resources {clashes} collide with free-tier/promotional "
+                    f"entries in the shared catalog {config.model_router.catalog_path}; "
+                    "rename them, or set telemetry.include_catalog_resources to false"
                 )
     return config
 

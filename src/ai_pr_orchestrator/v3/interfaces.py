@@ -29,6 +29,7 @@ from .domain import (
     WorkItem,
     WorkItemId,
 )
+from .telemetry import ProviderResourceSnapshot
 
 
 class StateConflictError(RuntimeError):
@@ -193,6 +194,27 @@ class CAOSessionController(Protocol):
         ...
 
     def terminate_session(self, handle: SessionHandle) -> None: ...
+
+
+@runtime_checkable
+class ProviderTelemetrySource(Protocol):
+    """Reports live quota/health for the resources it is configured to serve.
+
+    ``snapshot`` is **total**: it never raises, and never signals failure by
+    omission. A source that cannot reach its provider returns a snapshot with
+    ``availability='unknown'`` and a stated reason, so a broken probe is
+    reported as ignorance rather than as an exhausted or an empty quota.
+
+    ``at`` is passed by the caller rather than read from the clock inside, so
+    one fan-out over many resources evaluates every one of them against the
+    same instant.
+    """
+
+    def resources(self) -> tuple[str, ...]: ...
+
+    def snapshot(
+        self, resource: str, *, at: datetime | None = None
+    ) -> ProviderResourceSnapshot: ...
 
 
 @runtime_checkable

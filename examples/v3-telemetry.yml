@@ -1,0 +1,65 @@
+# V3 provider telemetry (machine-level).
+#
+# Declares which accounts to ask about live quota, and how fresh an answer has
+# to be. Inspect the result with:
+#
+#     aipro telemetry --config examples/v3-telemetry.yml
+#     aipro telemetry --config examples/v3-telemetry.yml --json
+#
+# THE ONE RULE: missing telemetry means *unknown*, never *zero*. Every failure
+# mode here — no Hermes install, an expired credential, a timeout, a garbled
+# payload — degrades a resource to `unknown` with a stated reason. Nothing in
+# this file can make an unprobed subscription look like it has free capacity.
+#
+# There are deliberately NO credentials below. Hermes owns credential
+# resolution, so a secret never has to be written into V3 policy config.
+
+model_router:
+  # Free-tier and promotional entries here are reported as telemetry resources
+  # too, so perishable capacity shows up in one listing next to the
+  # subscriptions. Set `telemetry.include_catalog_resources: false` to opt out.
+  catalog_path: model-catalog.yml
+
+telemetry:
+  # Where the account-usage bridge finds Hermes' own interpreter. Both keys are
+  # OPTIONAL on purpose: a config must validate identically in CI, where no
+  # Hermes install exists. A missing interpreter degrades every resource to
+  # `unknown` at collection time rather than failing to load the policy.
+  #
+  # hermes_home: /opt/hermes           # bridge runs <home>/venv/bin/python
+  # hermes_python: /opt/hermes/venv/bin/python   # explicit, takes precedence
+
+  # Freshness budget. Past it a snapshot is marked stale and re-probed instead
+  # of being served as though it were current.
+  snapshot_ttl_seconds: 300
+  probe_timeout_seconds: 30
+
+  # How many recent request outcomes feed the health statistics. Health is NOT
+  # quota: a 429 makes a resource look throttled, never exhausted. Only
+  # positive quota evidence — a spent window or a zero balance — can do that.
+  health_window_size: 50
+
+  resources:
+    # `name` is the policy-level id the broker and operator use; `provider` is
+    # the upstream key Hermes resolves credentials for. Keeping them separate
+    # lets one machine expose two accounts on the same provider, and means
+    # renaming a provider upstream does not rewrite routing decisions.
+    - name: anthropic-sub
+      provider: anthropic
+      resource_class: subscription
+
+    - name: codex-sub
+      provider: openai-codex
+      resource_class: subscription
+
+    # A metered gateway. It reports no reset windows at all, so `next_reset_at`
+    # stays None rather than being invented. Its cash balance is likewise
+    # reported as unknown: Hermes only renders the number into a human-facing
+    # detail string, and parsing it back out would be the scraping this data
+    # path exists to avoid.
+    - name: openrouter
+      provider: openrouter
+      resource_class: metered
+      # Balances move with every request, so poll this one harder than a
+      # subscription whose weekly window barely shifts.
+      ttl_seconds: 60

@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -344,3 +345,104 @@ def test_catalog_reports_missing_required_fields_without_a_traceback(tmp_path: P
 
     with pytest.raises(SystemExit, match="missing required field"):
         cli.main(["catalog", "--catalog", str(path)])
+
+
+def _telemetry_config(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "v3.yml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+HERMES_ONLY = "telemetry:\n  resources:\n    - {name: anthropic-sub, provider: anthropic}\n"
+
+
+def test_telemetry_requires_a_config() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["telemetry"])
+
+
+def test_telemetry_reports_no_resources_distinctly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["telemetry", "--config", str(_telemetry_config(tmp_path, "{}\n"))]) == 0
+    assert "No telemetry resources are configured." in capsys.readouterr().out
+
+
+def test_telemetry_without_a_hermes_install_reports_unknown_not_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # CI has no Hermes. The command must still succeed and say "unknown",
+    # because reporting an unprobed subscription as having free capacity is
+    # the exact failure this data path exists to prevent.
+    config_path = _telemetry_config(tmp_path, HERMES_ONLY)
+
+    assert cli.main(["telemetry", "--config", str(config_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "anthropic-sub" in out
+    assert "unknown" in out
+    assert "no Hermes interpreter configured" in out
+
+
+def test_telemetry_json_carries_a_single_evaluation_timestamp(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _telemetry_config(tmp_path, HERMES_ONLY)
+
+    assert cli.main(["telemetry", "--config", str(config_path), "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["evaluated_at"]
+    rows = {row["resource"]: row for row in payload["resources"]}
+    assert rows["anthropic-sub"]["availability"] == "unknown"
+    assert rows["anthropic-sub"]["reason"]
+
+
+def test_telemetry_includes_catalog_perishable_capacity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "catalog.yml").write_text(
+        "models: [{ref: free-model, descriptor: d, cost_class: free},"
+        " {ref: paid-model, descriptor: d}]\n",
+        encoding="utf-8",
+    )
+    config_path = _telemetry_config(tmp_path, "model_router:\n  catalog_path: catalog.yml\n")
+
+    assert cli.main(["telemetry", "--config", str(config_path), "--json"]) == 0
+
+    refs = {row["resource"] for row in json.loads(capsys.readouterr().out)["resources"]}
+    # Only perishable capacity is a telemetry resource; a paid entry is not.
+    assert refs == {"free-model"}
+
+
+def test_telemetry_opting_out_drops_catalog_resources(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "catalog.yml").write_text(
+        "models: [{ref: free-model, descriptor: d, cost_class: free}]\n", encoding="utf-8"
+    )
+    config_path = _telemetry_config(
+        tmp_path,
+        "model_router:\n  catalog_path: catalog.yml\n"
+        "telemetry:\n  include_catalog_resources: false\n",
+    )
+
+    assert cli.main(["telemetry", "--config", str(config_path)]) == 0
+    assert "No telemetry resources are configured." in capsys.readouterr().out
+
+
+def test_telemetry_reports_a_malformed_config_without_a_traceback(tmp_path: Path) -> None:
+    config_path = _telemetry_config(
+        tmp_path, "telemetry:\n  resources:\n    - {name: r, provider: p, resource_class: vibes}\n"
+    )
+
+    with pytest.raises(SystemExit, match="resource_class"):
+        cli.main(["telemetry", "--config", str(config_path)])
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [(0, "0m"), (90, "1m"), (3600, "1h00m"), (3720, "1h02m"), (86400, "24h00m")],
+)
+def test_format_duration_is_readable_at_every_scale(seconds: int, expected: str) -> None:
+    assert cli._format_duration(timedelta(seconds=seconds)) == expected

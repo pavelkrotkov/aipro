@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from json import JSONDecodeError
 from pathlib import Path
 
@@ -20,6 +20,7 @@ from ai_pr_orchestrator.v3.catalog import (
 )
 from ai_pr_orchestrator.v3.config import load_v3_config, resolve_model_catalog
 from ai_pr_orchestrator.v3.domain import VALID_LANE_ROLES
+from ai_pr_orchestrator.v3.telemetry_hermes import build_telemetry
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -29,6 +30,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "catalog":
         return _run_catalog(args)
+
+    if args.command == "telemetry":
+        return _run_telemetry(args)
 
     if args.command == "inspect":
         return runner.inspect(pr_number=args.pr)
@@ -86,7 +90,94 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     catalog_parser.add_argument("--json", action="store_true", help="Emit JSON instead of a table")
 
+    telemetry_parser = subparsers.add_parser(
+        "telemetry",
+        help="Report live quota, health, and freshness for every configured resource",
+    )
+    telemetry_parser.add_argument(
+        "--config", required=True, help="Path to a V3 config declaring a telemetry section"
+    )
+    telemetry_parser.add_argument(
+        "--json", action="store_true", help="Emit JSON instead of a table"
+    )
+
     return parser
+
+
+def _run_telemetry(args: argparse.Namespace) -> int:
+    """Print normalized telemetry for every configured resource in one pass.
+
+    Diagnostic only: it always exits 0 once the config loads, because an
+    unavailable or exhausted resource is a finding to report, not a failure of
+    the command. Credentials cannot appear in the output — snapshots have no
+    field that holds one, and provider error text is redacted on the way in.
+    """
+    # One timestamp for the whole listing, so two rows cannot disagree about
+    # what time it is when a window resets mid-scan.
+    now = datetime.now(UTC)
+    try:
+        config_path = Path(args.config)
+        config = load_v3_config(config_path)
+        catalog = resolve_model_catalog(config, base_dir=config_path.parent)
+        registry, _ledger = build_telemetry(config.telemetry, catalog=catalog)
+    except SchemaError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    snapshots = registry.snapshot_all(at=now)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "evaluated_at": now.isoformat(),
+                    "resources": [snap.to_dict() for snap in snapshots],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if not snapshots:
+        print("No telemetry resources are configured.")
+        return 0
+
+    print(f"{'RESOURCE':<20} {'AVAILABILITY':<13} {'CLASS':<13} {'AGE':>8}  SOURCE")
+    for snap in snapshots:
+        stale = "" if snap.is_stale(now) is not True else "  [STALE]"
+        age = f"{int(snap.age(now).total_seconds())}s"
+        print(
+            f"{snap.resource:<20} {snap.availability:<13} {snap.resource_class:<13} "
+            f"{age:>8}  {snap.source or '-'}{stale}"
+        )
+        for window in snap.windows:
+            used = "unknown" if window.used_fraction is None else f"{window.used_fraction:.0%}"
+            reset = window.reset_at.isoformat() if window.reset_at else "no reset reported"
+            ttr = window.time_to_reset(now)
+            resets_in = "" if ttr is None else f" (in {_format_duration(ttr)})"
+            print(f"    window {window.label:<18} used {used:>7}  resets {reset}{resets_in}")
+        if snap.cash_balance is not None:
+            print(f"    balance {snap.cash_balance:.2f} {snap.currency}".rstrip())
+        if snap.expires_at is not None:
+            print(f"    expires {snap.expires_at.isoformat()}")
+        for detail in snap.details:
+            print(f"    detail {detail}")
+        if snap.health.total:
+            failure_rate = snap.health.failure_rate
+            print(
+                f"    health {snap.health.total} recent request(s), "
+                f"{failure_rate:.0%} failed, "
+                f"{snap.health.consecutive_failures} consecutive"
+                + (", throttled" if snap.health.is_throttled(now) else "")
+            )
+        if snap.reason:
+            print(f"    reason {snap.reason}")
+    return 0
+
+
+def _format_duration(delta: timedelta) -> str:
+    total = int(delta.total_seconds())
+    hours, remainder = divmod(total, 3600)
+    return f"{hours}h{remainder // 60:02d}m" if hours else f"{remainder // 60}m"
 
 
 def _run_catalog(args: argparse.Namespace) -> int:
