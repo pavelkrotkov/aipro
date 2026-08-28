@@ -228,22 +228,33 @@ class QuotaWindow:
         return out
 
 
-def windows_fully_spent(windows: Sequence[QuotaWindow]) -> bool:
-    """True only when *every* measured window is spent.
+def any_window_spent(windows: Sequence[QuotaWindow]) -> bool:
+    """True when *any* window the provider measured reports full usage.
 
-    A subscription commonly exposes per-model windows side by side: Anthropic
-    reports "Opus week" and "Sonnet week" independently. Spending the Opus
-    allowance says nothing about Sonnet work, so treating *any* full window as
-    exhaustion of the whole resource would strand capacity the account still
-    has. Which window actually binds depends on the model being scheduled, and
-    only the broker knows that — so the resource stays usable while any
-    measured window has headroom, and the per-window detail is preserved for
-    the broker to filter on.
+    Whether one spent window stops the whole resource depends on what that
+    window applies to, and providers do mix the two kinds: Anthropic's OAuth
+    usage API returns ``five_hour`` and ``seven_day`` (which constrain every
+    request) beside ``seven_day_opus`` and ``seven_day_sonnet`` (which
+    constrain one model each). Spending the Opus allowance really does leave
+    Sonnet capacity.
+
+    We cannot tell them apart. Hermes maps those API keys onto display labels
+    and drops the keys, so a window reaches us as prose — the same structural
+    loss as the cash balance in :mod:`~ai_pr_orchestrator.v3.telemetry_hermes`.
+    Recovering the distinction would mean matching on rendered text that has
+    already changed between Hermes builds.
+
+    So a spent window of unknown scope is assumed to constrain everything. The
+    asymmetry is deliberate and matches this module's rule: over-reporting
+    capacity sends the broker at a resource that cannot serve it, while
+    under-reporting only idles a resource until reset, visibly, with
+    :meth:`ProviderResourceSnapshot.spent_windows` naming exactly which window
+    is responsible. Fixing this properly needs the applicability upstream, not
+    a label heuristic here.
 
     Unmeasured windows are ignored rather than assumed empty or full.
     """
-    measured = [w for w in windows if w.used_fraction is not None]
-    return bool(measured) and all(w.is_exhausted for w in measured)
+    return any(w.is_exhausted for w in windows)
 
 
 # --- Health ----------------------------------------------------------------
@@ -493,24 +504,23 @@ class ProviderResourceSnapshot:
         if self.expires_at is not None:
             _require_aware(self.expires_at, f"snapshot {self.resource!r} expires_at")
 
-        # Exhaustion is a property of the whole resource, so it needs *every*
-        # measured window to be spent. One full per-model window still leaves
-        # the account usable for other models — see :func:`windows_fully_spent`.
-        spent = windows_fully_spent(self.windows) or self.cash_balance == 0.0
+        # A spent window of unknown applicability is assumed to constrain the
+        # whole resource; see :func:`any_window_spent` for why we cannot tell
+        # a shared window from a model-specific one.
+        spent = any_window_spent(self.windows) or self.cash_balance == 0.0
         # The invariant this whole module exists for: a probe that failed can
         # never present as an exhausted quota, because 'exhausted' demands a
         # window the provider itself reported as spent.
         if self.availability == "exhausted" and not spent:
             raise TelemetryError(
                 f"snapshot {self.resource!r} claims availability 'exhausted' without "
-                "evidence: not every measured quota window reports full usage and there "
-                "is no zero cash balance. A failed or empty probe is 'unknown', not "
-                "'exhausted'."
+                "evidence: no quota window reports full usage and there is no zero cash "
+                "balance. A failed or empty probe is 'unknown', not 'exhausted'."
             )
         if self.availability == "available" and spent:
             raise TelemetryError(
-                f"snapshot {self.resource!r} claims availability 'available' but every "
-                "measured quota window reports full usage; the snapshot contradicts itself"
+                f"snapshot {self.resource!r} claims availability 'available' but a quota "
+                "window reports full usage; the snapshot contradicts itself"
             )
         if self.availability in ("unavailable", "unknown") and not self.reason:
             raise TelemetryError(

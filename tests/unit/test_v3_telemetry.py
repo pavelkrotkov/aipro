@@ -16,9 +16,9 @@ from ai_pr_orchestrator.v3.telemetry import (
     QuotaWindow,
     TelemetryError,
     TelemetryRegistry,
+    any_window_spent,
     redact_secrets,
     unknown_snapshot,
-    windows_fully_spent,
 )
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
@@ -108,24 +108,25 @@ class TestSnapshotInvariants:
                 windows=(QuotaWindow(label="Weekly", used_fraction=1.0),),
             )
 
-    def test_one_spent_window_among_several_is_not_exhaustion(self):
-        # A spent 5-hour session alongside a 74% week is normal operation: the
-        # session returns within hours. Calling that 'exhausted' would take a
-        # resource with real headroom out of rotation until the weekly reset.
+    def test_one_spent_window_among_several_is_exhaustion(self):
+        # A spent 'Current session' constrains every request to the provider,
+        # while a spent 'Opus week' constrains one model. Hermes drops the API
+        # keys that told those apart, so a spent window of unknown scope stops
+        # the whole resource -- see `any_window_spent`.
         snap = snapshot(
-            availability="available",
+            availability="exhausted",
             windows=(
                 QuotaWindow(label="Current session", used_fraction=1.0),
                 QuotaWindow(label="Current week", used_fraction=0.74),
             ),
         )
-        assert snap.availability == "available"
+        assert snap.availability == "exhausted"
         assert [w.label for w in snap.spent_windows()] == ["Current session"]
 
-    def test_exhausted_needs_every_measured_window_spent(self):
-        with pytest.raises(TelemetryError, match="evidence"):
+    def test_available_is_refused_when_any_window_is_spent(self):
+        with pytest.raises(TelemetryError, match="available"):
             snapshot(
-                availability="exhausted",
+                availability="available",
                 windows=(
                     QuotaWindow(label="Current session", used_fraction=1.0),
                     QuotaWindow(label="Current week", used_fraction=0.74),
@@ -133,19 +134,34 @@ class TestSnapshotInvariants:
             )
 
     def test_unmeasured_windows_are_ignored_not_assumed_spent(self):
-        snap = snapshot(
-            availability="exhausted",
-            windows=(
-                QuotaWindow(label="Current week", used_fraction=1.0),
-                QuotaWindow(label="Opus week"),
-            ),
+        # An unmeasured window is neither evidence of exhaustion nor of room.
+        with pytest.raises(TelemetryError, match="evidence"):
+            snapshot(availability="exhausted", windows=(QuotaWindow(label="Opus week"),))
+        assert (
+            snapshot(
+                availability="available",
+                windows=(
+                    QuotaWindow(label="Current week", used_fraction=0.4),
+                    QuotaWindow(label="Opus week"),
+                ),
+            ).availability
+            == "available"
         )
-        assert snap.availability == "exhausted"
 
-    def test_windows_alone_cannot_be_evidence_when_none_are_measured(self):
-        assert windows_fully_spent(()) is False
-        assert windows_fully_spent((QuotaWindow(label="Opus week"),)) is False
-        assert windows_fully_spent((QuotaWindow(label="W", used_fraction=1.0),)) is True
+    def test_any_window_spent_needs_a_measured_full_window(self):
+        assert any_window_spent(()) is False
+        assert any_window_spent((QuotaWindow(label="Opus week"),)) is False
+        assert any_window_spent((QuotaWindow(label="W", used_fraction=0.99),)) is False
+        assert any_window_spent((QuotaWindow(label="W", used_fraction=1.0),)) is True
+        assert (
+            any_window_spent(
+                (
+                    QuotaWindow(label="Current session", used_fraction=1.0),
+                    QuotaWindow(label="Current week", used_fraction=0.1),
+                )
+            )
+            is True
+        )
 
     @pytest.mark.parametrize("availability", ["unavailable", "unknown"])
     def test_non_usable_states_must_say_why(self, availability):
@@ -242,6 +258,7 @@ class TestSnapshotQueries:
         ledger = ProviderHealthLedger()
         ledger.record("anthropic-sub", "success", at=NOW, latency_ms=12.0)
         snap = snapshot(
+            availability="exhausted",
             windows=(
                 QuotaWindow(label="Current session", used_fraction=1.0, reset_at=NOW),
                 QuotaWindow(label="Current week", used_fraction=0.74),

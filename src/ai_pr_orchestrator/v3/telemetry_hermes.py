@@ -55,10 +55,10 @@ from .telemetry import (
     QuotaWindow,
     TelemetryError,
     TelemetryRegistry,
+    any_window_spent,
     coerce_aware,
     redact_secrets,
     unknown_snapshot,
-    windows_fully_spent,
 )
 
 #: Default freshness budget for a Hermes-sourced snapshot. Usage endpoints are
@@ -129,9 +129,17 @@ def _retry_after(exc):
     if raw is None:
         return None
     try:
-        return float(raw)
+        seconds = float(raw)
     except (TypeError, ValueError):
-        pass
+        seconds = None
+    if seconds is not None:
+        # float() happily accepts "NaN" and "Infinity", and json.dumps emits
+        # them verbatim, so such a header would survive the bridge and blow up
+        # in timedelta() on our side -- turning a rate limit into a generic
+        # source failure.
+        if seconds != seconds or seconds in (float("inf"), float("-inf")):
+            return None
+        return max(0.0, seconds)
     # RFC 9110 allows an HTTP-date instead of delay-seconds. Dropping that
     # form would leave is_throttled() false while the provider is still
     # refusing us, so the broker would retry straight into the backoff.
@@ -223,6 +231,10 @@ class HermesResource:
     ``provider`` is Hermes' own provider key. Keeping them separate means
     renaming a provider upstream does not rewrite every routing decision.
 
+    ``provider`` is canonicalized to match what :data:`BRIDGE_SCRIPT` does with
+    it (``strip().lower()``), so the identity we deduplicate on, the argv we
+    send, and the key we read the result back under are all the same string.
+
     Two resources may not share a ``provider``; :class:`HermesTelemetrySource`
     rejects that, because Hermes cannot select between two accounts on one
     provider.
@@ -237,6 +249,7 @@ class HermesResource:
     extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "provider", self.provider.strip().lower())
         if not self.name:
             raise TelemetryError("telemetry resource name must be non-empty")
         if not self.provider:
@@ -282,8 +295,20 @@ class HermesSubprocessProbe:
         python_executable: str | Path | None = None,
         timeout_seconds: float = 30.0,
     ) -> None:
-        self._hermes_home = Path(hermes_home) if hermes_home else None
-        self._python_executable = Path(python_executable) if python_executable else None
+        # Absolute from the start. We hand the interpreter *and* a different
+        # cwd to `subprocess.run`, and the OS resolves a relative executable
+        # against the new cwd — so a relative `hermes_home` would pass the
+        # `exists()` preflight here and then fail to launch over there.
+        #
+        # Lexically absolute, not `resolve()`d: a venv's `bin/python` is a
+        # symlink to the base interpreter, and following it lands outside the
+        # venv, where `sys.prefix` no longer points at the venv's
+        # site-packages. Verified against the real install — Hermes then fails
+        # to import `httpx`.
+        self._hermes_home = Path(os.path.abspath(hermes_home)) if hermes_home else None
+        self._python_executable = (
+            Path(os.path.abspath(python_executable)) if python_executable else None
+        )
         self._timeout_seconds = timeout_seconds
 
     def interpreter(self) -> Path | None:
@@ -328,10 +353,13 @@ class HermesSubprocessProbe:
                 check=False,
             )
         except subprocess.TimeoutExpired:
+            # Deliberately a local_error, not a per-provider timeout. The
+            # bridge walks the providers sequentially inside one subprocess, so
+            # a deadline on the whole process cannot say which provider hung:
+            # blaming all of them would charge a timeout to providers that
+            # already answered and to providers never contacted at all.
             return self._all_failed(
-                providers,
-                f"Hermes usage probe timed out after {self._timeout_seconds}s",
-                kind="timeout",
+                providers, f"Hermes usage probe timed out after {self._timeout_seconds}s"
             )
         except OSError as exc:
             return self._all_failed(providers, f"could not run the Hermes usage probe: {exc}")
@@ -457,16 +485,28 @@ def _normalize_snapshot(
     # its contents every time it is served.
     observed_at = coerce_aware(raw.get("fetched_at"), "account usage fetched_at") or at
 
+    measured = [w for w in windows if w.used_fraction is not None]
+
     if unavailable_reason:
         availability, reason = "unavailable", str(unavailable_reason)
-    elif windows_fully_spent(windows):
-        # Every measured window, not any: an account reporting "Opus week" at
-        # 100% next to "Sonnet week" with headroom is still usable for Sonnet
-        # work. Which window binds depends on the model, so that call belongs
-        # to the broker, which reads `windows`/`spent_windows()`.
+    elif any_window_spent(windows):
         availability, reason = "exhausted", ""
-    elif windows or details:
+    elif measured:
+        # Positive evidence, and the only kind Hermes gives us structurally: a
+        # window the provider measured that still has room in it.
         availability, reason = "available", ""
+    elif windows or details:
+        # Hermes' own `AccountUsageSnapshot.available` is `bool(windows or
+        # details)`, which answers "is there a panel worth rendering?" — not
+        # "may we dispatch work here?". Copying it made an OpenRouter reply
+        # whose unparsed text reads "Credits balance: $0.00" report as
+        # `available`. Unmeasured windows and prose are not headroom.
+        availability, reason = (
+            "unknown",
+            f"Hermes reported account usage for {resource.provider!r} with no measured "
+            "quota window or structured balance, so remaining capacity cannot be "
+            "determined; only unstructured details were returned",
+        )
     else:
         availability, reason = (
             "unknown",
@@ -560,7 +600,14 @@ def probe_outcome(result: Mapping[str, Any] | None) -> tuple[str, float | None] 
     if kind in _LOCAL_FAILURE_KINDS:
         return None
     retry_after = result.get("retry_after_seconds")
-    seconds = float(retry_after) if isinstance(retry_after, (int, float)) else None
+    # `json.loads` accepts the NaN/Infinity literals `json.dumps` emits, so the
+    # finiteness check belongs here too: this is where the value becomes a
+    # timedelta, and a bridge from a different build is not ours to trust.
+    seconds = (
+        float(retry_after)
+        if isinstance(retry_after, (int, float)) and math.isfinite(retry_after)
+        else None
+    )
     return (_KIND_TO_OUTCOME.get(kind, "transport_error"), seconds)
 
 

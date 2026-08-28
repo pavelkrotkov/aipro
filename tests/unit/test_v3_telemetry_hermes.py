@@ -10,6 +10,7 @@ from __future__ import annotations
 import subprocess
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -150,6 +151,12 @@ def _anthropic_snapshot() -> dict[str, Any]:
     return snapshot
 
 
+def _openrouter_snapshot() -> dict[str, Any]:
+    snapshot = OPENROUTER_OK["snapshot"]
+    assert isinstance(snapshot, dict)
+    return snapshot
+
+
 def _normalize(result, **kwargs):
     resource = kwargs.pop("resource", HermesResource(name="res", provider="openai-codex"))
     return normalize_probe_result(result, resource=resource, at=NOW, **kwargs)
@@ -203,7 +210,8 @@ class TestNormalizingRecordedPayloads:
         )
         assert snap.windows == ()
         assert snap.next_reset_at() is None
-        assert snap.availability == "available"
+        # No measured window and no structured balance: capacity is undetermined.
+        assert snap.availability == "unknown"
 
     def test_openrouter_cash_balance_stays_unknown_rather_than_scraped(self):
         # Hermes only renders the balance into a human-facing detail string;
@@ -220,7 +228,7 @@ class TestNormalizingRecordedPayloads:
 
 
 class TestFailureModesStayDistinguishable:
-    def test_every_window_spent_is_exhausted_not_merely_unavailable(self):
+    def test_a_spent_window_is_exhausted_not_merely_unavailable(self):
         payload = _with_window_usage(
             _with_window_usage(CODEX_OK, "Weekly", 100.0), "Session", 100.0
         )
@@ -230,13 +238,16 @@ class TestFailureModesStayDistinguishable:
         # Still recoverable, and the snapshot says exactly when.
         assert require(snap.window("Weekly")).reset_at is not None
 
-    def test_a_spent_session_beside_a_live_week_is_still_available(self):
-        # The 5-hour session resets long before the week does. Reporting this
-        # as 'exhausted' would idle a resource that has hours of headroom.
+    def test_a_spent_session_beside_a_live_week_is_still_exhausted(self):
+        # Hermes maps the provider's window keys onto display labels and drops
+        # the keys, so we cannot tell a window that constrains every request
+        # from one that constrains a single model. A spent window of unknown
+        # scope stops the resource; `spent_windows()` names which one.
         payload = _with_window_usage(CODEX_OK, "Session", 100.0)
         snap = _normalize(payload)
-        assert snap.availability == "available"
+        assert snap.availability == "exhausted"
         assert [w.label for w in snap.spent_windows()] == ["Session"]
+        assert require(snap.window("Weekly")).used_fraction == pytest.approx(0.885)
 
     def test_an_auth_failure_is_unavailable_not_unknown(self):
         # It is durable and needs a human; a retry will not fix it.
@@ -293,6 +304,38 @@ class TestFailureModesStayDistinguishable:
             "snapshot": {**_anthropic_snapshot(), "windows": [], "details": []},
         }
         snap = _normalize(payload, resource=HermesResource(name="a", provider="anthropic"))
+        assert snap.availability == "unknown"
+
+    def test_unmeasured_windows_are_not_headroom(self):
+        # Hermes' own `AccountUsageSnapshot.available` is `bool(windows or
+        # details)` -- "is there a panel worth rendering?", not "may we
+        # dispatch here?". Windows with no usage figure say nothing either way.
+        payload = _with_window_field(
+            _with_window_field(CODEX_OK, "Session", "used_percent", None),
+            "Weekly",
+            "used_percent",
+            None,
+        )
+        snap = _normalize(payload)
+        assert snap.availability == "unknown"
+        assert "no measured quota window" in snap.reason
+
+    def test_a_zero_balance_rendered_as_prose_is_never_reported_available(self):
+        payload = {
+            "ok": True,
+            "provider": "openrouter",
+            "fidelity": "private",
+            "snapshot": {
+                **_openrouter_snapshot(),
+                "details": ["Credits balance: $0.00"],
+            },
+        }
+        snap = _normalize(
+            payload,
+            resource=HermesResource(
+                name="openrouter", provider="openrouter", resource_class="metered"
+            ),
+        )
         assert snap.availability == "unknown"
 
     def test_a_malformed_payload_degrades_to_unknown_rather_than_raising(self):
@@ -414,6 +457,27 @@ class TestHermesTelemetrySource:
                 probe=_StaticProbe({}),
             )
 
+    def test_provider_identity_is_canonicalized_before_deduplication(self):
+        # BRIDGE_SCRIPT does strip().lower() on every provider argument and
+        # keys its result by that canonical form. Left uncanonicalized here,
+        # these two rows pass the uniqueness check and then both read back the
+        # same probe result under different names.
+        with pytest.raises(TelemetryError, match="anthropic"):
+            HermesTelemetrySource(
+                resources=[
+                    HermesResource(name="work-sub", provider="Anthropic "),
+                    HermesResource(name="personal-sub", provider="anthropic"),
+                ],
+                probe=_StaticProbe({}),
+            )
+
+    def test_an_oddly_spelled_provider_still_matches_its_probe_result(self):
+        source = HermesTelemetrySource(
+            resources=[HermesResource(name="codex-sub", provider="  OpenAI-Codex ")],
+            probe=_StaticProbe({"openai-codex": CODEX_OK}),
+        )
+        assert source.snapshot("codex-sub", at=NOW).availability == "available"
+
     def test_a_broken_install_is_not_recorded_as_a_provider_failure(self):
         # An unrunnable probe says nothing about the provider. Recording it as
         # a failure would drive the broker away from a healthy account because
@@ -501,6 +565,65 @@ class TestSubprocessProbe:
         HermesSubprocessProbe(python_executable=python).probe(["anthropic"])
         assert calls["cwd"] is None
 
+    def test_a_relative_hermes_home_survives_the_cwd_switch(self, tmp_path, monkeypatch):
+        # We hand `subprocess.run` an interpreter *and* a different cwd, and the
+        # OS resolves a relative executable against the new cwd -- so a relative
+        # path would pass the exists() preflight here and fail to launch there.
+        interpreter = tmp_path / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("")
+        monkeypatch.chdir(tmp_path.parent)
+        calls: dict[str, Any] = {}
+
+        def fake_run(argv, **kwargs):
+            calls["argv"] = argv
+            calls.update(kwargs)
+            raise OSError("not actually running it")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        HermesSubprocessProbe(hermes_home=Path(tmp_path.name)).probe(["anthropic"])
+        assert calls["argv"][0] == str(interpreter)
+        assert calls["cwd"] == str(tmp_path)
+
+    def test_a_venv_interpreter_symlink_is_not_followed(self, tmp_path, monkeypatch):
+        # Making the path absolute must stay lexical. A venv's `bin/python` is
+        # a symlink to the base interpreter, and following it lands outside the
+        # venv, where sys.prefix no longer finds the venv's site-packages --
+        # against the real install, Hermes then failed to import httpx.
+        base = tmp_path / "base" / "bin" / "python3"
+        base.parent.mkdir(parents=True)
+        base.write_text("")
+        interpreter = tmp_path / "hermes" / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.symlink_to(base)
+        calls: dict[str, Any] = {}
+
+        def fake_run(argv, **kwargs):
+            calls["argv"] = argv
+            raise OSError("not actually running it")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        HermesSubprocessProbe(hermes_home=tmp_path / "hermes").probe(["anthropic"])
+        assert calls["argv"][0] == str(interpreter)
+
+    def test_a_process_timeout_blames_our_deadline_not_the_providers(self, tmp_path, monkeypatch):
+        # The bridge walks providers sequentially inside one subprocess, so a
+        # deadline on the whole process cannot say which provider hung. A
+        # per-provider timeout would charge one to providers that already
+        # answered and to providers never contacted at all.
+        interpreter = tmp_path / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("")
+
+        def fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, 5.0)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        results = HermesSubprocessProbe(hermes_home=tmp_path).probe(["anthropic", "openai-codex"])
+        assert {r["kind"] for r in results.values()} == {"local_error"}
+        assert all(probe_outcome(r) is None for r in results.values())
+        assert all("timed out" in r["message"] for r in results.values())
+
     @pytest.mark.parametrize(
         "reason",
         ["no Hermes interpreter configured", "does not exist"],
@@ -546,6 +669,23 @@ class TestBridgeRetryAfter:
 
     def test_garbage_is_dropped_rather_than_raising(self):
         assert self._retry_after("whenever") is None
+
+    @pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", "nan", "inf"])
+    def test_non_finite_delays_are_dropped(self, raw):
+        # float() accepts these and json.dumps emits them verbatim, so such a
+        # header would survive the bridge and then raise in timedelta() on our
+        # side -- turning a rate limit into a generic source failure.
+        assert self._retry_after(raw) is None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_retry_after_from_the_bridge_is_dropped(value):
+    # json.loads accepts the NaN/Infinity literals json.dumps emits, so the
+    # check belongs on our side too: a bridge from a different Hermes build is
+    # not ours to trust.
+    assert probe_outcome(
+        {"ok": False, "provider": "p", "kind": "rate_limited", "retry_after_seconds": value}
+    ) == ("rate_limited", None)
 
 
 def _with_window_usage(payload, label, used_percent):

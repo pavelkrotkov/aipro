@@ -47,16 +47,32 @@ So they are different types with different lifetimes:
 
 This is enforced, not merely documented. `ProviderResourceSnapshot.__post_init__`
 refuses `availability="exhausted"` unless there is positive evidence — a
-`cash_balance` of exactly zero, or `windows_fully_spent()`:
+`cash_balance` of exactly zero, or `any_window_spent()`:
 
 > A failed or empty probe is 'unknown', not 'exhausted'.
 
-`windows_fully_spent()` requires **every measured window** to be at
-`used_fraction >= 1.0`, and requires at least one to be measured. One spent
-window is not exhaustion: a subscription whose 5-hour session is used up but
-whose weekly allowance is at 74% still has capacity that returns within hours,
-and taking it out of rotation for the week would be wrong. Unmeasured windows
-are ignored rather than assumed spent — §1 again.
+`any_window_spent()` is true when **any measured** window is at
+`used_fraction >= 1.0`. Unmeasured windows are ignored rather than assumed
+either spent or empty — §1 again.
+
+Whether one spent window should stop the whole resource depends on what that
+window applies to, and providers mix the two kinds. Anthropic's OAuth usage API
+returns `five_hour` and `seven_day`, which constrain every request, beside
+`seven_day_opus` and `seven_day_sonnet`, which constrain one model each.
+Spending the Opus allowance really does leave Sonnet capacity.
+
+**We cannot tell them apart.** Hermes maps those API keys onto display labels
+(`"Current session"`, `"Opus week"`) and drops the keys, so applicability
+reaches us only as prose — the same structural loss as the cash balance in §6.
+Recovering it would mean matching on rendered text that has already changed
+between Hermes builds.
+
+So a spent window of unknown applicability is assumed to constrain everything.
+The asymmetry is deliberate and follows §1: over-reporting capacity sends the
+broker at a resource that cannot serve it, while under-reporting only idles a
+resource until reset — visibly, with `spent_windows()` naming exactly which
+window is responsible. Fixing this properly needs the applicability carried
+upstream through Hermes, not a label heuristic here.
 
 It symmetrically refuses `available` when the evidence says the resource is
 spent, so a snapshot cannot contradict itself in either direction.
@@ -144,8 +160,14 @@ about the provider:
 
 | Failure | Example | Health ledger |
 | --- | --- | --- |
-| The provider answered badly | `401`, `429`, `5xx`, timeout | Recorded |
-| We never reached the provider | no interpreter, import error, unparseable output | **Not recorded** (`local_error`) |
+| The provider answered badly | `401`, `429`, `5xx`, per-request timeout | Recorded |
+| We never reached the provider | no interpreter, import error, unparseable output, **our own process deadline** | **Not recorded** (`local_error`) |
+
+A `probe_timeout_seconds` expiry is a `local_error`, not a per-provider
+timeout. The bridge walks the providers sequentially inside one subprocess, so
+a deadline on the whole process cannot say which provider hung: blaming all of
+them would charge a timeout to providers that already answered and to providers
+never contacted at all.
 
 Recording a local error as a provider failure would drive `failure_rate` and
 `consecutive_failures` up for an endpoint that was never contacted, and the
@@ -166,6 +188,10 @@ error" would manufacture the exact certainty §1 forbids.
 
 `Retry-After` is parsed as either delta-seconds or an HTTP-date (RFC 9110
 permits both); an HTTP-date is converted to seconds from now and floored at 0.
+Non-finite delays are dropped at both ends: `float()` accepts `"NaN"` and
+`"Infinity"`, `json.dumps` emits those literals verbatim and `json.loads`
+accepts them back, and `timedelta()` then raises — turning a rate limit into a
+generic source failure.
 
 ### The private-function deviation
 
@@ -199,6 +225,14 @@ belongs upstream: Hermes exposing the balance as a field.
 **Gateway usage has no reset window.** OpenRouter reports spend, not an
 allowance that returns, so its snapshot has no windows and `next_reset_at()` is
 `None`. Nothing is fabricated to fill the column.
+
+Together those two make OpenRouter `unknown`, not `available`. Hermes' own
+`AccountUsageSnapshot.available` is `bool(windows or details)` — it answers "is
+there a panel worth rendering?", not "may we dispatch work here?". Copying it
+made a reply whose only content was the prose `"Credits balance: $0.00"` report
+as `available`. `available` now requires a **measured** window with room in it,
+which is the only positive evidence of headroom Hermes gives us structurally.
+Unmeasured windows and prose are not headroom.
 
 `observed_at` comes from Hermes' own `fetched_at`, not our clock, so freshness
 is measured from when the data was actually read.
@@ -262,15 +296,17 @@ owning one resource would make its telemetry ambiguous.
 $ aipro telemetry --config examples/v3-telemetry.yml
 RESOURCE             AVAILABILITY  CLASS              AGE  SOURCE
 anthropic-sub        available     subscription        0s  hermes:oauth_usage_api
-    window Current session    used     91%  resets 2026-08-28T17:19:59+00:00 (in 3h06m)
-    window Current week       used     74%  resets 2026-08-29T17:59:59+00:00 (in 27h46m)
+    window Current session    used     37%  resets 2026-08-28T22:59:59+00:00 (in 4h04m)
+    window Current week       used     79%  resets 2026-08-29T17:59:59+00:00 (in 23h04m)
     health 1 recent request(s), 0% failed, 0 consecutive
 codex-sub            unavailable   subscription        0s  hermes
     health 1 recent request(s), 100% failed, 1 consecutive
     reason Hermes usage probe for 'openai-codex' failed (auth_failure): 401 Unauthorized
-openrouter           available     metered             0s  hermes:credits_api
-    detail Credits balance: $7.19
+openrouter           unknown       metered             0s  hermes:credits_api
+    detail Credits balance: $7.16
     health 1 recent request(s), 0% failed, 0 consecutive
+    reason Hermes reported account usage for 'openrouter' with no measured quota
+           window or structured balance, so remaining capacity cannot be determined
 promo-free-generalist available     metered             0s  catalog
     expires 2027-09-30T00:00:00+00:00
     detail promotion active
