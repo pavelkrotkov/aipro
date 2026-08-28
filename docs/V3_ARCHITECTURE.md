@@ -67,16 +67,29 @@ runtime until cutover:
 - `v3._schema` — the mapping/dataclass coercion rules shared by `v3.config`
   and `v3.catalog`: shape validation before construction, rejection of `None`
   for non-optional fields, and `extras` preservation.
+- `v3.telemetry` — live resource state: quota windows, provider health, and
+  freshness, as a pure domain with no vendor knowledge. Missing telemetry
+  yields *unknown*, never *zero*, and health is kept structurally separate
+  from quota so a 429 can never be recorded as an exhausted allowance. See
+  `docs/V3_TELEMETRY.md`.
+- `v3.telemetry_hermes` — the Hermes account-usage adapter, which runs a
+  constant bridge script under Hermes' own interpreter rather than importing
+  its pinned dependency tree. The only telemetry module that names a vendor.
 - `v3.interfaces` — protocols for `GitHubWorkflowStateStore`,
-  `CAOSessionController`, `ModelBroker`, `LaneExecutor`, and `CIPRGate`.
-  All are structural and fakeable in tests without CAO, Hermes, or GitHub.
+  `CAOSessionController`, `ProviderTelemetrySource`, `ModelBroker`,
+  `LaneExecutor`, and `CIPRGate`. All are structural and fakeable in tests
+  without CAO, Hermes, or GitHub.
 - `v3.lanes` — the lane registry, sole authority on the lane-to-profile
   binding. Lane names *and* profile templates are unique: every concurrent
   lane owns an independent agent profile/home.
-- `v3.cao` — the CAO control-plane adapter, and the only V3 module that
-  performs I/O. It never spawns a process, parses a terminal, or picks a
-  model. See `docs/V3_CAO.md` for the CAO version floor, the endpoints it
-  relies on, and Hermes lane profile provisioning.
+- `v3.cao` — the CAO control-plane adapter. It never spawns a process, parses
+  a terminal, or picks a model. See `docs/V3_CAO.md` for the CAO version
+  floor, the endpoints it relies on, and Hermes lane profile provisioning.
+
+`v3.cao` and `v3.telemetry_hermes` are the only V3 modules that perform I/O.
+The first speaks HTTP to CAO; the second spawns exactly one subprocess, a
+constant bridge script under Hermes' own interpreter. Neither ever executes an
+agent.
 
 No V3 core type or interface names a specific vendor or model. `ModelRef`
 points into the catalog; catalog `descriptor` strings are opaque to the core

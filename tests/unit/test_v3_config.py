@@ -460,3 +460,177 @@ class TestSharedCatalogPath:
             {"model_router": {"catalog": [{"ref": "inline-a", "descriptor": "d"}]}}
         )
         assert resolve_model_catalog(config).refs() == ["inline-a"]
+
+
+class TestTelemetrySection:
+    def test_default_telemetry_section_is_valid_and_empty(self) -> None:
+        config = V3Config()
+        config.validate()
+        assert config.telemetry.resources == []
+        assert config.telemetry.include_catalog_resources is True
+
+    def test_resources_load_as_typed_entries(self) -> None:
+        config = V3Config.from_dict(
+            {
+                "telemetry": {
+                    "resources": [
+                        {"name": "anthropic-sub", "provider": "anthropic"},
+                        {
+                            "name": "openrouter",
+                            "provider": "openrouter",
+                            "resource_class": "metered",
+                            "ttl_seconds": 60,
+                        },
+                    ]
+                }
+            }
+        )
+        assert [r.name for r in config.telemetry.resources] == ["anthropic-sub", "openrouter"]
+        assert config.telemetry.resources[0].resource_class == "subscription"
+        assert config.telemetry.resources[1].ttl_seconds == 60
+
+    def test_a_config_with_no_hermes_install_still_validates(self) -> None:
+        """CI has no Hermes; a missing interpreter must not fail policy load."""
+        config = V3Config.from_dict(
+            {"telemetry": {"resources": [{"name": "anthropic-sub", "provider": "anthropic"}]}}
+        )
+        config.validate()
+        assert config.telemetry.hermes_home is None
+        assert config.telemetry.hermes_python is None
+
+    def test_duplicate_resource_names_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="Duplicate telemetry resource names"):
+            V3Config.from_dict(
+                {
+                    "telemetry": {
+                        "resources": [
+                            {"name": "dup", "provider": "anthropic"},
+                            {"name": "dup", "provider": "openrouter"},
+                        ]
+                    }
+                }
+            )
+
+    def test_resource_requires_a_provider(self) -> None:
+        with pytest.raises(V3ConfigError, match="provider must be non-empty"):
+            V3Config.from_dict(
+                {"telemetry": {"resources": [{"name": "anthropic-sub", "provider": ""}]}}
+            )
+
+    def test_unknown_resource_class_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match="unknown resource_class"):
+            V3Config.from_dict(
+                {
+                    "telemetry": {
+                        "resources": [{"name": "r", "provider": "p", "resource_class": "vibes"}]
+                    }
+                }
+            )
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("snapshot_ttl_seconds", 0),
+            ("probe_timeout_seconds", -1),
+            ("health_window_size", 0),
+        ],
+    )
+    def test_non_positive_tuning_values_rejected(self, key, value) -> None:
+        with pytest.raises(V3ConfigError, match=key):
+            V3Config.from_dict({"telemetry": {key: value}})
+
+    @pytest.mark.parametrize("key", ["snapshot_ttl_seconds", "probe_timeout_seconds"])
+    @pytest.mark.parametrize("literal", [".nan", ".inf"])
+    def test_non_finite_tuning_values_rejected(self, tmp_path: Path, key, literal) -> None:
+        # YAML's `.nan` and `.inf` slip past a bare `> 0` check — every
+        # comparison with NaN is false, and infinity really is > 0 — which
+        # would make freshness unevaluable.
+        path = tmp_path / "config.yml"
+        path.write_text(f"telemetry:\n  {key}: {literal}\n", encoding="utf-8")
+        with pytest.raises(V3ConfigError, match="finite"):
+            load_v3_config(path)
+
+    def test_per_resource_ttl_must_be_positive(self) -> None:
+        with pytest.raises(V3ConfigError, match="ttl_seconds must be"):
+            V3Config.from_dict(
+                {"telemetry": {"resources": [{"name": "r", "provider": "p", "ttl_seconds": 0}]}}
+            )
+
+    @pytest.mark.parametrize("literal", [".nan", ".inf"])
+    def test_per_resource_ttl_must_be_finite(self, tmp_path: Path, literal) -> None:
+        path = tmp_path / "config.yml"
+        path.write_text(
+            "telemetry:\n"
+            "  resources:\n"
+            "    - name: r\n"
+            "      provider: p\n"
+            f"      ttl_seconds: {literal}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(V3ConfigError, match="finite"):
+            load_v3_config(path)
+
+    def test_unknown_keys_are_preserved_as_extras(self) -> None:
+        config = V3Config.from_dict(
+            {
+                "telemetry": {
+                    "future_knob": 1,
+                    "resources": [{"name": "r", "provider": "p", "future_field": "x"}],
+                }
+            }
+        )
+        assert config.telemetry.extras == {"future_knob": 1}
+        assert config.telemetry.resources[0].extras == {"future_field": "x"}
+        assert V3Config.from_dict(config.to_dict()) == config
+
+    def test_a_name_claimed_by_both_sources_is_rejected(self) -> None:
+        """Two sources owning one resource would make its telemetry ambiguous."""
+        with pytest.raises(V3ConfigError, match="collide"):
+            V3Config.from_dict(
+                {
+                    "model_router": {
+                        "catalog": [{"ref": "free-model", "descriptor": "d", "cost_class": "free"}]
+                    },
+                    "telemetry": {"resources": [{"name": "free-model", "provider": "anthropic"}]},
+                }
+            )
+
+    def test_a_paid_catalog_entry_of_the_same_name_does_not_collide(self) -> None:
+        # Only free-tier/promotional entries are catalog telemetry resources.
+        config = V3Config.from_dict(
+            {
+                "model_router": {"catalog": [{"ref": "paid-model", "descriptor": "d"}]},
+                "telemetry": {"resources": [{"name": "paid-model", "provider": "anthropic"}]},
+            }
+        )
+        assert config.telemetry.resources[0].name == "paid-model"
+
+    def test_opting_out_of_catalog_resources_removes_the_collision(self) -> None:
+        config = V3Config.from_dict(
+            {
+                "model_router": {
+                    "catalog": [{"ref": "free-model", "descriptor": "d", "cost_class": "free"}]
+                },
+                "telemetry": {
+                    "include_catalog_resources": False,
+                    "resources": [{"name": "free-model", "provider": "anthropic"}],
+                },
+            }
+        )
+        assert config.telemetry.include_catalog_resources is False
+
+    def test_collision_with_a_shared_catalog_is_caught_on_load(self, tmp_path: Path) -> None:
+        (tmp_path / "catalog.yml").write_text(
+            "models: [{ref: free-model, descriptor: d, cost_class: free}]\n", encoding="utf-8"
+        )
+        config_path = tmp_path / "config.yml"
+        config_path.write_text(
+            "model_router:\n"
+            "  catalog_path: catalog.yml\n"
+            "telemetry:\n"
+            "  resources:\n"
+            "    - {name: free-model, provider: anthropic}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(V3ConfigError, match="collide"):
+            load_v3_config(config_path)
