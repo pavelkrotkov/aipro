@@ -126,6 +126,23 @@ _SECRET_KEY_VALUE = re.compile(
     rf"(?i)\b({_SECRET_KEY})\b([\"']?\s*[:=]\s*|\s+)([\"']?)[^\s\"'&,;)\]}}]+"
 )
 
+#: Authorization headers, whose value is credential material under *every*
+#: scheme. ``Basic dXNlcjpwYXNz`` is a base64 ``user:password`` that contains no
+#: key name to anchor on and matches no recognizable token shape, so neither
+#: rule above touches it — only ``Bearer`` was ever caught, and then only
+#: because ``bearer`` happens to be a key name. The scheme is kept because it
+#: is diagnostic and is not itself secret; the rest of the header value goes.
+#: Where the value ends is conditional on how it started. Quoted (a JSON body
+#: or a header-dict repr), it ends at the closing quote, so the rest of the
+#: mapping stays readable. Unquoted, it runs to end of line — a bare ``Digest``
+#: header carries quoted parameters of its own, and stopping at the first of
+#: those would leave the ``response=`` hash, which *is* the credential.
+_AUTH_HEADER = re.compile(
+    r"(?i)\b((?:proxy-)?authorization)([\"']?\s*[:=]\s*)([\"'])?"
+    r"(bearer|basic|digest|negotiate|token)?[ \t]*"
+    r"(?(3)[^\r\n\"']*|[^\r\n]*)"
+)
+
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Recognizable token shapes, which carry no key name to anchor on.
     re.compile(r"\bsk-[A-Za-z0-9._-]{6,}"),
@@ -133,6 +150,12 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # userinfo in a URL, e.g. https://user:secret@host/path
     re.compile(r"(?<=//)[^/\s:@]+:[^/\s@]+(?=@)"),
 )
+
+
+def _mask_auth_header(match: re.Match[str]) -> str:
+    key, separator, quote, scheme = match.groups()
+    kept = f"{scheme} " if scheme else ""
+    return f"{key}{separator}{quote or ''}{kept}{_REDACTED}"
 
 
 def redact_secrets(text: str) -> str:
@@ -143,6 +166,7 @@ def redact_secrets(text: str) -> str:
     a header, a query string, or a URL. This is that last filter, applied where
     such strings enter the telemetry types.
     """
+    text = _AUTH_HEADER.sub(_mask_auth_header, text)
     text = _SECRET_KEY_VALUE.sub(rf"\1\2\3{_REDACTED}", text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub(_REDACTED, text)

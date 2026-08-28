@@ -8,6 +8,7 @@ against shapes Hermes actually emits rather than shapes we wish it emitted.
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
 import types
 from datetime import UTC, datetime, timedelta
@@ -739,6 +740,26 @@ class TestSubprocessProbe:
         assert calls["cwd"] == str(tmp_path)
         assert "PYTHONSAFEPATH" not in calls["env"]
 
+    def test_an_ambient_safe_path_is_cleared_for_a_known_checkout(self, tmp_path, monkeypatch):
+        # Not merely "we don't set it": a machine that exports PYTHONSAFEPATH
+        # globally would otherwise drop the cwd we deliberately chose, and the
+        # configured checkout could not import `agent` at all. Demonstrated
+        # against a real checkout: with the variable inherited, the import
+        # raised ModuleNotFoundError.
+        interpreter = tmp_path / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("")
+        monkeypatch.setenv("PYTHONSAFEPATH", "1")
+        calls: dict[str, Any] = {}
+
+        def fake_run(argv, **kwargs):
+            calls.update(kwargs)
+            raise OSError("not actually running it")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        HermesSubprocessProbe(hermes_home=tmp_path).probe(["anthropic"])
+        assert "PYTHONSAFEPATH" not in calls["env"]
+
     def test_a_venv_interpreter_symlink_is_not_followed(self, tmp_path, monkeypatch):
         # Making the path absolute must stay lexical. A venv's `bin/python` is
         # a symlink to the base interpreter, and following it lands outside the
@@ -896,3 +917,171 @@ class TestBuildTelemetryWiring:
         snap = registry.snapshot("codex-sub", at=NOW)
         assert snap.source == "hermes"
         assert snap.ttl_seconds == 300.0
+
+
+class TestBridgeProbeContainsFailuresPerProvider:
+    """The bridge walks every configured provider in one process.
+
+    A failure reading *one* of them must not cost us the others' readings,
+    because the parent has no way to recover a result the subprocess never
+    printed -- it can only mark the whole batch a local error.
+    """
+
+    def _probe(self, monkeypatch, account_usage):
+        # `from agent import account_usage` resolves through sys.modules and
+        # then getattr, so a namespace stands in for the package fine.
+        monkeypatch.setitem(
+            sys.modules, "agent", types.SimpleNamespace(account_usage=account_usage)
+        )
+        namespace: dict[str, Any] = {}
+        exec(BRIDGE_SCRIPT.split("\nprint(json.dumps")[0], namespace)
+        return namespace["probe"]
+
+    @staticmethod
+    def _window():
+        window = types.SimpleNamespace(
+            label="Session", used_percent=10.0, reset_at=None, detail=None
+        )
+        return window
+
+    def _module(self):
+        healthy = types.SimpleNamespace(
+            provider="anthropic",
+            source="usage_api",
+            fetched_at=None,
+            plan=None,
+            windows=[self._window()],
+            details=[],
+            unavailable_reason=None,
+        )
+
+        class Renamed:
+            provider = "openai-codex"
+            source = "usage_api"
+            fetched_at = None
+            plan = None
+            details: ClassVar[list[str]] = []
+            unavailable_reason = None
+
+            @property
+            def windows(self):
+                raise AttributeError("Hermes renamed 'windows' to 'limits'")
+
+        return types.SimpleNamespace(
+            _fetch_anthropic_account_usage=lambda: healthy,
+            _fetch_codex_account_usage=lambda: Renamed(),
+        )
+
+    def test_a_changed_snapshot_shape_degrades_only_that_provider(self, monkeypatch):
+        # The projection reads Hermes' private snapshot attributes. It used to
+        # sit outside the per-provider try, so a renamed field raised out of
+        # the whole results comprehension: the subprocess died with an empty
+        # stdout and a healthy account's telemetry died with it.
+        probe = self._probe(monkeypatch, self._module())
+
+        assert probe("anthropic")["ok"] is True
+        broken = probe("openai-codex")
+        assert broken["ok"] is False
+        # Local, not provider health: the request succeeded, our reading of it
+        # did not, so no provider gets charged a failure for our parsing.
+        assert broken["kind"] == "local_error"
+        assert "windows" in broken["message"]
+        assert probe_outcome(broken) is None
+
+
+class _SpentProbe:
+    """Reports one 100%-used window resetting at a fixed time."""
+
+    def __init__(self, reset_at: datetime) -> None:
+        self._reset_at = reset_at
+        self.calls = 0
+
+    def probe(self, providers):
+        self.calls += 1
+        return {
+            provider: {
+                "ok": True,
+                "provider": provider,
+                "fidelity": "private",
+                "snapshot": {
+                    "provider": provider,
+                    "source": "usage_api",
+                    "fetched_at": NOW.isoformat(),
+                    "plan": None,
+                    "windows": [
+                        {
+                            "label": "Session",
+                            "used_percent": 100.0,
+                            "reset_at": self._reset_at.isoformat(),
+                            "detail": None,
+                        }
+                    ],
+                    "details": [],
+                    "unavailable_reason": None,
+                },
+            }
+            for provider in providers
+        }
+
+
+class TestCacheExpiryCannotStampede:
+    def _source(self, probe, names, ledger=None):
+        return HermesTelemetrySource(
+            resources=[HermesResource(name=n, provider=n) for n in names],
+            probe=probe,
+            ledger=ledger,
+        )
+
+    def test_an_already_past_reset_does_not_expire_the_cache_on_arrival(self):
+        # Provider rollover lag or a little clock skew can report a window as
+        # spent past its own reset. Arming expiry on that made a freshly
+        # stored reading expire the instant it was written, so one listing at
+        # one timestamp re-probed once per resource -- and recorded a health
+        # sample per resource per probe.
+        probe = _SpentProbe(NOW - timedelta(minutes=5))
+        ledger = ProviderHealthLedger()
+        source = self._source(probe, ("p1", "p2", "p3", "p4"), ledger)
+
+        rows = TelemetryRegistry(sources=[source], ledger=ledger).snapshot_all(at=NOW)
+
+        assert len(rows) == 4
+        assert probe.calls == 1
+        assert ledger.health("p1").total == 1
+
+    def test_a_future_reset_still_expires_the_cache_early(self):
+        # The guard must not have been bought by disabling the feature.
+        probe = _SpentProbe(NOW + timedelta(seconds=30))
+        source = self._source(probe, ("p1",))
+
+        source.snapshot("p1", at=NOW)
+        assert probe.calls == 1
+        source.snapshot("p1", at=NOW + timedelta(seconds=60))
+        assert probe.calls == 2
+
+
+class _RaisingProbe:
+    def probe(self, providers):
+        raise RuntimeError("adapter blew up")
+
+
+def test_a_probe_that_raises_is_our_failure_not_every_providers():
+    # The catch-all filed kind="error", which maps to transport_error, so a
+    # bug on our side of the adapter charged a failure to every configured
+    # resource -- and the broker would then demote providers that had never
+    # been asked anything.
+    ledger = ProviderHealthLedger()
+    source = HermesTelemetrySource(
+        resources=[
+            HermesResource(name="a", provider="anthropic"),
+            HermesResource(name="c", provider="openai-codex"),
+        ],
+        probe=_RaisingProbe(),
+        ledger=ledger,
+    )
+
+    snap = source.snapshot("a", at=NOW)
+
+    assert snap.availability == "unknown"
+    assert "adapter blew up" in snap.reason
+    assert ledger.health("a").total == 0
+    assert ledger.health("c").total == 0

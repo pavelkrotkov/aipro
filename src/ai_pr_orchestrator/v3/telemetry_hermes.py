@@ -193,28 +193,43 @@ def probe(provider):
         }
     if snapshot is None:
         return {"ok": True, "provider": provider, "fidelity": fidelity, "snapshot": None}
-    return {
-        "ok": True,
-        "provider": provider,
-        "fidelity": fidelity,
-        "snapshot": {
-            "provider": snapshot.provider,
-            "source": snapshot.source,
-            "fetched_at": _iso(snapshot.fetched_at),
-            "plan": snapshot.plan,
-            "windows": [
-                {
-                    "label": w.label,
-                    "used_percent": w.used_percent,
-                    "reset_at": _iso(w.reset_at),
-                    "detail": w.detail,
-                }
-                for w in snapshot.windows
-            ],
-            "details": list(snapshot.details),
-            "unavailable_reason": snapshot.unavailable_reason,
-        },
-    }
+    # Inside the per-provider boundary on purpose. Hermes owns this shape and
+    # can rename a field; reading it outside would let one changed provider
+    # abort the whole results list, so a healthy account's telemetry would be
+    # thrown away along with the broken one's. Local, not provider health:
+    # the request succeeded, it is our projection of it that failed.
+    try:
+        return {
+            "ok": True,
+            "provider": provider,
+            "fidelity": fidelity,
+            "snapshot": {
+                "provider": snapshot.provider,
+                "source": snapshot.source,
+                "fetched_at": _iso(snapshot.fetched_at),
+                "plan": snapshot.plan,
+                "windows": [
+                    {
+                        "label": w.label,
+                        "used_percent": w.used_percent,
+                        "reset_at": _iso(w.reset_at),
+                        "detail": w.detail,
+                    }
+                    for w in snapshot.windows
+                ],
+                "details": list(snapshot.details),
+                "unavailable_reason": snapshot.unavailable_reason,
+            },
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "provider": provider,
+            "kind": "local_error",
+            "message": "unreadable account usage shape: {0}: {1}".format(
+                type(exc).__name__, exc
+            ),
+        }
 
 
 print(json.dumps({"results": [probe(p) for p in sys.argv[1:]]}))
@@ -430,6 +445,12 @@ def _bridge_env(*, isolate_sys_path: bool) -> dict[str, str]:
         env.pop(key, None)
     if isolate_sys_path:
         env["PYTHONSAFEPATH"] = "1"
+    else:
+        # Set, not merely left alone. A machine that exports PYTHONSAFEPATH
+        # globally would otherwise drop the cwd we deliberately chose, and a
+        # checkout never installed into its venv is importable only from there
+        # -- so the configured hermes_home would fail to import `agent` at all.
+        env.pop("PYTHONSAFEPATH", None)
     return env
 
 
@@ -609,13 +630,23 @@ def _unknown_for(resource: HermesResource, *, at: datetime, ttl: float | None):
     return degrade
 
 
-def _earliest_spent_reset(results: Iterable[Mapping[str, Any]]) -> datetime | None:
+def _earliest_spent_reset(
+    results: Iterable[Mapping[str, Any]], *, after: datetime
+) -> datetime | None:
     """When the first spent window in these results comes back, if it says.
 
     Read from the raw payload rather than a normalized snapshot because the
     cache is keyed by provider and normalization needs a resource. Only spent
     windows count: a window with headroom left does not make a cached reading
     wrong when it rolls over.
+
+    Only resets strictly after ``after`` qualify. A provider lagging its own
+    rollover, or a little clock skew, can report a spent window whose reset has
+    already passed; arming the cache on that would make a freshly stored
+    reading expire on arrival, and one ``snapshot_all()`` over N resources
+    would fire N probes instead of one. A past reset that the provider is still
+    reporting as spent is not evidence a re-probe would say anything different,
+    so the TTL governs.
     """
     resets: list[datetime] = []
     for result in results:
@@ -635,7 +666,7 @@ def _earliest_spent_reset(results: Iterable[Mapping[str, Any]]) -> datetime | No
                 reset = coerce_aware(window.get("reset_at"), "account usage reset_at")
             except TelemetryError:
                 continue
-            if reset is not None:
+            if reset is not None and reset > after:
                 resets.append(reset)
     return min(resets) if resets else None
 
@@ -765,11 +796,15 @@ class HermesTelemetrySource:
         try:
             results = dict(self._probe.probe(providers))
         except Exception as exc:
+            # local_error, not "error". The probe raising means we never
+            # established that any provider misbehaved -- the failure is on our
+            # side of the adapter. Filing it as transport health would charge a
+            # failure to every configured resource for a bug in this process.
             results = {
                 provider: {
                     "ok": False,
                     "provider": provider,
-                    "kind": "error",
+                    "kind": "local_error",
                     "message": f"{type(exc).__name__}: {exc}",
                 }
                 for provider in providers
@@ -777,7 +812,7 @@ class HermesTelemetrySource:
         elapsed = timedelta(seconds=max(0.0, time.monotonic() - started))
         self._cache = results
         self._probed_at = now
-        self._expires_at = _earliest_spent_reset(results.values())
+        self._expires_at = _earliest_spent_reset(results.values(), after=now)
         self._record_health(results, now, elapsed=elapsed)
         return results
 

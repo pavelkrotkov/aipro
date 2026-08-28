@@ -174,7 +174,10 @@ and the subprocess would inherit ours — the same hazard, one level down. There
 `PYTHONSAFEPATH=1` drops the cwd entry instead, leaving the interpreter's own
 environment to supply `agent`. It is deliberately **not** set when a checkout
 *is* known, because there the entry is load-bearing: a checkout never installed
-into its venv is importable only via `cwd`.
+into its venv is importable only via `cwd`. In that case it is actively
+**cleared**, not merely left unset: a machine that exports `PYTHONSAFEPATH`
+globally would otherwise drop the very `cwd` we chose on purpose, and the
+configured checkout could not import `agent` at all.
 
 Paths are made absolute **lexically** (`os.path.abspath`), never `resolve()`d.
 A venv's `bin/python` is a symlink to the base interpreter, and following it
@@ -201,6 +204,17 @@ Recording a local error as a provider failure would drive `failure_rate` and
 broker would route away from a healthy account because *our* install is broken.
 `local_error` kinds map to no `RequestOutcome` at all; the resource is simply
 `unknown`.
+
+The same rule applies to the adapter's own catch-all: if `probe()` itself
+raises, no provider was shown to have misbehaved, so that is a `local_error`
+too. Reading Hermes' private snapshot shape is likewise local — the request
+succeeded and it is our *projection* of it that failed.
+
+**One provider's failure must not cost the others their readings.** The bridge
+walks every configured provider in a single process and the parent can only see
+what that process printed, so an exception escaping the results list would take
+healthy accounts down with the broken one. Every per-provider step, including
+the snapshot projection, therefore returns a result rather than raising.
 
 ### Fidelity gates the verdict
 
@@ -239,6 +253,13 @@ TTL after it became usable — five minutes, by default, for a window that reset
 in thirty seconds. Only *spent* windows do this; an ordinary rollover does not
 make a cached reading wrong, and re-probing on one would just spend a
 rate-limited request to learn nothing.
+
+Only a reset **in the future** may do it. Provider rollover lag or modest clock
+skew can report a window as spent past its own reset time; arming expiry on
+that would make a freshly stored reading expire the instant it was written, and
+a single `snapshot_all()` over N resources would fire N probes at one timestamp
+instead of one. A past reset the provider still calls spent is not evidence
+that asking again would produce a different answer, so the TTL governs.
 
 ### The private-function deviation
 
@@ -299,6 +320,17 @@ fails on every one of them — `_` is a word character, so there is no boundary
 before `API` or `secret`. Each prefix segment must end in a separator, so
 `notatoken` is not read as a namespaced `token`, and the trailing boundary
 keeps `max_tokens=4096` and `token_count = 12` intact.
+
+`Authorization` and `Proxy-Authorization` are handled by scheme rather than by
+key name, because their value is credential material under *every* scheme.
+`Basic dXNlcjpwYXNz` is a base64 `user:password` containing no key name to
+anchor on and matching no recognizable token shape — only `Bearer` was ever
+caught, and then only because `bearer` happens to be a key name. The scheme is
+kept (it is diagnostic and is not itself secret) and the value goes. Where the
+value ends depends on how it started: quoted, at the closing quote, so a header
+dict or JSON body stays readable; unquoted, at end of line, because a `Digest`
+header carries quoted parameters of its own and stopping at the first would
+leave the `response=` hash, which *is* the credential.
 
 ## 8. Configuration
 

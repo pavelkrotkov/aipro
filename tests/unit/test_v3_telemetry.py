@@ -560,6 +560,50 @@ class TestRedaction:
         # and `token_count` from reading as a key name.
         assert redact_secrets(text) == text
 
+    @pytest.mark.parametrize(
+        ("text", "secret"),
+        [
+            ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="),
+            ("Proxy-Authorization: Basic Zm9vOmJhcg==", "Zm9vOmJhcg=="),
+            ("authorization=Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: NTLM TlRMTVNTUAAB", "TlRMTVNTUAAB"),
+            (
+                'Authorization: Digest username="alice", response=deadbeefhash',
+                "deadbeefhash",
+            ),
+            ("{'Authorization': 'Basic dXNlcjpwYXNz'}", "dXNlcjpwYXNz"),
+        ],
+    )
+    def test_an_authorization_header_is_redacted_under_every_scheme(self, text, secret):
+        # Only `Bearer` was ever caught, and only because `bearer` happens to
+        # be a key name. `Basic dXNlcjpwYXNz` is a base64 user:password with
+        # no key name inside it and no recognizable token shape, so it went
+        # straight to the operator's terminal. Digest is the reason the
+        # unquoted value runs to end of line: stopping at the first quoted
+        # parameter would leave `response=`, which *is* the credential.
+        cleaned = redact_secrets(text)
+        assert secret not in cleaned
+        assert "REDACTED" in cleaned
+
+    def test_the_authentication_scheme_survives_because_it_is_diagnostic(self):
+        assert redact_secrets("Authorization: Basic abc") == "Authorization: Basic «REDACTED»"
+
+    def test_redacting_a_header_does_not_eat_the_rest_of_a_mapping_or_message(self):
+        # The quoted form ends at its closing quote, so a header dict stays
+        # readable and a following line is untouched.
+        assert redact_secrets("{'Authorization': 'Basic abc', 'Accept': 'json'}") == (
+            "{'Authorization': 'Basic «REDACTED»', 'Accept': 'json'}"
+        )
+        assert redact_secrets("Authorization: Basic abc\n401 for /usage").endswith(
+            "\n401 for /usage"
+        )
+
+    def test_the_word_authorization_in_prose_is_not_a_header(self):
+        # A separator is required, so an error narrative keeps its meaning.
+        assert redact_secrets("authorization failed after 3 attempts") == (
+            "authorization failed after 3 attempts"
+        )
+
 
 def test_unknown_snapshot_is_never_mistaken_for_an_empty_quota():
     snap = unknown_snapshot("some-resource", reason="probe timed out", at=NOW)
