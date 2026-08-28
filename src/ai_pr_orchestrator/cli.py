@@ -91,6 +91,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _run_catalog(args: argparse.Namespace) -> int:
     """Print catalog candidates with normalized effective price/resource class."""
+    # One timestamp for the whole listing. Reading the clock per entry would
+    # let a promotion expire mid-scan, so the filter and the row it produces
+    # could disagree about whether the same entry is eligible.
+    now = datetime.now(UTC)
     try:
         if args.catalog:
             catalog = load_model_catalog(args.catalog)
@@ -102,12 +106,11 @@ def _run_catalog(args: argparse.Namespace) -> int:
         entries = (
             list(catalog.entries)
             if args.all
-            else catalog.eligible(role=args.role, difficulty=args.difficulty)
+            else catalog.eligible(role=args.role, difficulty=args.difficulty, at=now)
         )
     except SchemaError as exc:
         raise SystemExit(str(exc)) from exc
 
-    now = datetime.now(UTC)
     rows = [
         {
             "ref": entry.ref,
@@ -132,10 +135,14 @@ def _run_catalog(args: argparse.Namespace) -> int:
         return 0
 
     if not rows:
-        print("No eligible catalog candidates.")
+        print("Catalog is empty." if args.all else "No eligible catalog candidates.")
         return 0
 
-    header = f"{'REF':<24} {'RESOURCE':<13} {'COST':<7} {'IN/MTOK':>9} {'OUT/MTOK':>9}  PROMO"
+    # Under --all the table mixes dispatchable and undispatchable entries, so
+    # it has to say which is which or an operator reads an unusable resource
+    # as available.
+    header = f"{'REF':<24} {'RESOURCE':<13} {'COST':<7} {'IN/MTOK':>9} {'OUT/MTOK':>9}  "
+    header += f"{'PROMO':<5}  ELIGIBLE" if args.all else "PROMO"
     print(header)
     for row in rows:
         in_price = (
@@ -149,10 +156,12 @@ def _run_catalog(args: argparse.Namespace) -> int:
             else f"{row['effective_output_price_per_mtok']:.4f}"
         )
         promo = "yes" if row["promotion_active"] else "-"
-        print(
+        line = (
             f"{row['ref']:<24} {row['resource_class']:<13} {row['cost_class']:<7} "
-            f"{in_price:>9} {out_price:>9}  {promo}"
+            f"{in_price:>9} {out_price:>9}  "
         )
+        line += f"{promo:<5}  {'yes' if row['eligible'] else 'no'}" if args.all else promo
+        print(line)
     return 0
 
 

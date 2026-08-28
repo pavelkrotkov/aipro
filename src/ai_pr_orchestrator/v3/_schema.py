@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import dataclasses
 import types
-from dataclasses import fields
+from collections.abc import Mapping
+from dataclasses import MISSING, fields
 from datetime import datetime
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
@@ -55,8 +56,8 @@ def value_matches_type(hint: Any, value: Any) -> bool:
         if not args:  # bare list/dict: container type only.
             return True
         return all(value_matches_type(args[0], item) for item in value)
-    if origin is dict or hint is dict:
-        if not isinstance(value, dict):
+    if origin in (dict, Mapping) or hint in (dict, Mapping):
+        if not isinstance(value, Mapping):
             return False
         args = get_args(hint)
         if not args:
@@ -125,6 +126,19 @@ def build_dataclass(cls: type, data: Any, error: type[SchemaError]) -> Any:
         raise error(f"expected a mapping for {cls.__name__}, got {type(data).__name__}")
     kwargs, extras = typed_kwargs(cls, data)
     validate_declared_shapes(cls, kwargs, cls.__name__, error)
+    # Report an omitted required field as a schema error. Left to the
+    # constructor it would surface as a TypeError, which callers that catch
+    # SchemaError (the CLI) would not handle.
+    missing = sorted(
+        f.name
+        for f in fields(cls)
+        if f.name != "extras"
+        and f.default is MISSING
+        and f.default_factory is MISSING
+        and f.name not in kwargs
+    )
+    if missing:
+        raise error(f"{cls.__name__} is missing required field(s): {missing}")
     kwargs["extras"] = extras
     return cls(**kwargs)
 
@@ -132,8 +146,9 @@ def build_dataclass(cls: type, data: Any, error: type[SchemaError]) -> Any:
 def to_mapping(value: Any) -> Any:
     """Serialize a dataclass tree back to plain mappings, merging ``extras``.
 
-    Datetimes are emitted in ISO 8601 form so the result is JSON-encodable,
-    not just YAML-encodable.
+    Datetimes are emitted in ISO 8601 form, and the immutable containers used
+    to freeze entries (tuples, mapping proxies) are widened back to lists and
+    dicts, so the result is plain JSON/YAML-encodable data.
     """
     if isinstance(value, datetime):
         return value.isoformat()
@@ -149,8 +164,8 @@ def to_mapping(value: Any) -> Any:
     to_dict = getattr(value, "to_dict", None)
     if callable(to_dict):
         return to_dict()
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple, set, frozenset)):
         return [to_mapping(v) for v in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {k: to_mapping(v) for k, v in value.items()}
     return value

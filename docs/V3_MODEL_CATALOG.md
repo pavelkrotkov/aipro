@@ -85,6 +85,13 @@ declares a list price simply reverts to that price when the window closes. A
 promotional entry with no list price drops out of the eligible set instead of
 silently starting to cost money.
 
+For that to hold, "temporarily free" and "permanently free" must stay
+distinct. `cost_class: free` and `resource_class: free_tier` both price at zero
+*unconditionally*, so an entry claiming one of them alongside `promotional`
+would look time-boxed while in fact staying free and eligible forever after its
+window closed. That combination is rejected at load time: express a temporary
+offer as a promotion over the class the entry reverts to.
+
 Subscription entries report their **list** price. Whether already-bought
 allowance should count as marginally free is an economic judgement about
 perishable capacity, and belongs to the broker.
@@ -120,12 +127,18 @@ operator may edit the shared file at any time: running phases keep the catalog
 they were handed, and only **future** assignments see the change. A catalog
 edit can never re-point a session that is already executing.
 
+The freeze is deep: `capabilities` and `roles` are tuples and `quality_by_role`
+is a mapping proxy, normalized at construction. A shallow `frozen=True` would
+only block rebinding, leaving a caller able to append a role to an entry a
+running phase already holds — changing its eligibility mid-flight and skipping
+the entry invariants entirely.
+
 ## 7. Inspecting eligibility
 
 ```console
 $ aipro catalog --catalog examples/model-catalog.yml --role worker --difficulty 3
 REF                      RESOURCE      COST      IN/MTOK  OUT/MTOK  PROMO
-promo-free-generalist    free_tier     free       0.0000    0.0000  yes
+promo-free-generalist    metered       low        0.0000    0.0000  yes
 subscription-primary     subscription  high       3.0000   15.0000  -
 subscription-secondary   subscription  high       2.5000   10.0000  -
 ```
@@ -133,6 +146,24 @@ subscription-secondary   subscription  high       2.5000   10.0000  -
 (`gateway-cheap-reviewer` is absent because it declares `roles: [reviewer]`,
 and `retired-candidate` because it is disabled.)
 
-`--config` resolves the catalog a V3 config points at, `--all` includes
-ineligible entries (with an `eligible` flag), and `--json` emits the same rows
-machine-readably for diagnostics.
+`--config` resolves the catalog a V3 config points at, and `--json` emits the
+same rows machine-readably for diagnostics.
+
+`--all` adds the ineligible entries, and adds an `ELIGIBLE` column so a mixed
+table cannot be misread as a list of dispatchable resources:
+
+```console
+$ aipro catalog --catalog examples/model-catalog.yml --all
+REF                      RESOURCE      COST      IN/MTOK  OUT/MTOK  PROMO  ELIGIBLE
+promo-free-generalist    metered       low        0.0000    0.0000  yes    yes
+gateway-cheap-reviewer   metered       low        0.3500    1.1000  -      yes
+subscription-primary     subscription  high       3.0000   15.0000  -      no
+subscription-secondary   subscription  high       2.5000   10.0000  -      no
+retired-candidate        metered       medium     1.0000    3.0000  -      no
+```
+
+(The subscription entries read `no` here because `--difficulty` defaults to 1
+and both declare a floor of 2.)
+
+The whole listing is evaluated at a single timestamp, so a promotion expiring
+mid-scan cannot make the filter and the row it produced disagree.

@@ -21,6 +21,7 @@ from ai_pr_orchestrator.v3.catalog import (
 )
 
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+SAMPLE_CATALOG = Path(__file__).resolve().parents[2] / "examples" / "model-catalog.yml"
 
 
 def entry(**overrides: object) -> ModelCatalogEntry:
@@ -48,8 +49,26 @@ class TestEntryValidation:
 
     @pytest.mark.parametrize("field", ["input_price_per_mtok", "output_price_per_mtok"])
     def test_negative_price_rejected(self, field: str) -> None:
-        with pytest.raises(ModelCatalogError, match="must be >= 0"):
+        with pytest.raises(ModelCatalogError, match="finite value >= 0"):
             entry(**{field: -0.01})
+
+    @pytest.mark.parametrize("field", ["input_price_per_mtok", "output_price_per_mtok"])
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_price_rejected(self, field: str, value: float) -> None:
+        # NaN/inf pass a bare ``< 0`` check and would poison budget
+        # comparisons and the CLI's JSON output.
+        with pytest.raises(ModelCatalogError, match="finite value >= 0"):
+            entry(**{field: value})
+
+    def test_non_finite_price_rejected_from_yaml(self, tmp_path: Path) -> None:
+        path = tmp_path / "catalog.yml"
+        path.write_text(
+            "models: [{ref: a, descriptor: d, input_price_per_mtok: .nan, "
+            "output_price_per_mtok: .inf}]",
+            encoding="utf-8",
+        )
+        with pytest.raises(ModelCatalogError, match="finite value >= 0"):
+            load_model_catalog(path)
 
     def test_free_cost_class_with_a_price_is_contradictory(self) -> None:
         with pytest.raises(ModelCatalogError, match="non-zero"):
@@ -66,6 +85,17 @@ class TestEntryValidation:
     def test_promo_window_without_promotional_flag_rejected(self) -> None:
         with pytest.raises(ModelCatalogError, match="promotional is false"):
             entry(promo_ends_at=NOW)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [{"cost_class": "free"}, {"resource_class": "free_tier"}],
+    )
+    def test_promotional_plus_permanently_free_is_rejected(self, overrides: dict[str, str]) -> None:
+        # A window that cannot expire: both classifications price at zero
+        # regardless of promotion_active, so the entry would stay free and
+        # eligible forever after its "temporary" offer ended.
+        with pytest.raises(ModelCatalogError, match="could never expire"):
+            entry(promotional=True, promo_ends_at=NOW, **overrides)
 
     def test_malformed_timestamp_rejected(self) -> None:
         with pytest.raises(ModelCatalogError, match="ISO 8601"):
@@ -127,6 +157,49 @@ class TestEntryValidation:
 
     def test_descriptor_is_never_parsed(self) -> None:
         assert entry(descriptor="anything::at-all/v9").descriptor == "anything::at-all/v9"
+
+    def test_missing_required_field_is_a_catalog_error(self) -> None:
+        # Not a TypeError: callers (the CLI) catch SchemaError and would
+        # otherwise print a traceback for ordinary malformed input.
+        with pytest.raises(ModelCatalogError, match="missing required field"):
+            ModelCatalogEntry.from_dict({"descriptor": "d"})
+
+
+class TestEntryImmutability:
+    """A handed-out entry must not be mutable through its collections.
+
+    ``frozen=True`` alone only blocks rebinding, so eligibility could be
+    changed in place on a snapshot already given to a running phase.
+    """
+
+    def test_collections_are_immutable(self) -> None:
+        candidate = entry(
+            roles=["reviewer"], capabilities=["tools"], quality_by_role={"reviewer": 3}
+        )
+        with pytest.raises(AttributeError):
+            candidate.roles.append("worker")  # ty: ignore[unresolved-attribute]
+        with pytest.raises(AttributeError):
+            candidate.capabilities.append("coding")  # ty: ignore[unresolved-attribute]
+        with pytest.raises(TypeError):
+            candidate.quality_by_role["reviewer"] = 5  # ty: ignore[invalid-assignment]
+
+    def test_input_collections_are_copied(self) -> None:
+        roles = ["reviewer"]
+        quality = {"reviewer": 3}
+        candidate = entry(roles=roles, quality_by_role=quality)
+        roles.append("worker")
+        quality["reviewer"] = 5
+        assert candidate.roles == ("reviewer",)
+        assert candidate.quality_for("reviewer") == 3
+        assert candidate.is_eligible(role="worker", at=NOW) is False
+
+    def test_serialization_emits_plain_containers(self) -> None:
+        data = entry(
+            roles=["reviewer"], capabilities=["tools"], quality_by_role={"reviewer": 3}
+        ).to_dict()
+        assert data["roles"] == ["reviewer"]
+        assert data["capabilities"] == ["tools"]
+        assert data["quality_by_role"] == {"reviewer": 3}
 
 
 class TestPromotionWindow:
@@ -293,12 +366,13 @@ class TestLoading:
         path.write_text(
             """
 models:
-  # A promotional free model, offered below list price for a window.
+  # A promotional free model, offered below list price for a window. It is
+  # metered rather than free_tier, so the window can actually close.
   - ref: promo-free-coder
     descriptor: opaque-promo-descriptor
     provider: gateway
-    resource_class: free_tier
-    cost_class: free
+    resource_class: metered
+    cost_class: low
     promotional: true
     promo_ends_at: 2026-12-31T00:00:00Z
     capabilities: [tools, coding]
@@ -404,6 +478,21 @@ models:
             load_model_catalog(path)
 
     def test_shipped_sample_catalog_is_valid(self) -> None:
-        sample = Path(__file__).resolve().parents[2] / "examples" / "model-catalog.yml"
-        catalog = load_model_catalog(sample)
+        catalog = load_model_catalog(SAMPLE_CATALOG)
         assert catalog.refs(), "sample catalog should declare candidates"
+
+    def test_shipped_sample_promotion_actually_expires(self) -> None:
+        # The sample documents that its promotional entry falls out of the
+        # eligible set when the window closes. It only does so because the
+        # entry avoids cost_class 'free'/free_tier, which would price it at
+        # zero forever; assert the documented behaviour, not just validity.
+        promo = load_model_catalog(SAMPLE_CATALOG).get("promo-free-generalist")
+        assert promo is not None
+        assert promo.promo_ends_at is not None
+        during = promo.promo_ends_at - timedelta(days=1)
+        after = promo.promo_ends_at + timedelta(days=1)
+
+        assert promo.effective_prices(during) == (0.0, 0.0)
+        assert promo.is_eligible(role="worker", at=during) is True
+        assert promo.effective_prices(after) is None
+        assert promo.is_eligible(role="worker", at=after) is False

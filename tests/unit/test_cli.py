@@ -272,6 +272,21 @@ def test_catalog_all_shows_ineligible_entries_with_unknown_price(
     assert by_ref["unknown-price"]["eligible"] is False
 
 
+def test_catalog_all_text_output_marks_eligibility(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Without a column the table renders undispatchable entries exactly like
+    # usable ones, which reads as "available".
+    assert cli.main(["catalog", "--catalog", str(_catalog(tmp_path)), "--all"]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "ELIGIBLE" in lines[0]
+    rows = {line.split()[0]: line.split()[-1] for line in lines[1:]}
+    assert rows["free-any-role"] == "yes"
+    assert rows["unknown-price"] == "no"
+    assert rows["hard-work-only"] == "no"
+
+
 def test_catalog_reads_the_path_declared_by_a_config(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -311,3 +326,21 @@ def test_catalog_reports_when_nothing_is_eligible(
 
     assert cli.main(["catalog", "--catalog", str(path)]) == 0
     assert "No eligible catalog candidates." in capsys.readouterr().out
+
+
+def test_catalog_reports_an_empty_catalog_distinctly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "catalog.yml"
+    path.write_text("models: []", encoding="utf-8")
+
+    assert cli.main(["catalog", "--catalog", str(path), "--all"]) == 0
+    assert "Catalog is empty." in capsys.readouterr().out
+
+
+def test_catalog_reports_missing_required_fields_without_a_traceback(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.yml"
+    path.write_text("models: [{descriptor: d}]", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="missing required field"):
+        cli.main(["catalog", "--catalog", str(path)])

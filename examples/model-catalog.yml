@@ -27,24 +27,33 @@
 # because an unknown cash price is not the same thing as a free one.
 
 models:
-  # --- Promotional / free-tier capacity -----------------------------------
-  # A model offered free for a window. When the window closes this entry has
-  # no list price, so it stops being eligible rather than silently costing
-  # money.
+  # --- Promotional capacity -------------------------------------------------
+  # A metered model offered free for a window, with no published list price.
+  # While the window is open it prices at zero. When it closes, its cost is
+  # unknown rather than free, so it drops out of the eligible set instead of
+  # silently starting to bill.
+  #
+  # Note what this entry deliberately does NOT say: `cost_class: free` or
+  # `resource_class: free_tier`. Those mean *permanently* free and would
+  # outlive the window, leaving a "temporary" offer free forever. Declaring
+  # both is rejected at load time.
   - ref: promo-free-generalist
     descriptor: promo-generalist-descriptor
     provider: promo-gateway
-    resource_class: free_tier
-    cost_class: free
+    resource_class: metered
+    cost_class: low
     promotional: true
-    promo_ends_at: 2026-09-30T00:00:00Z
+    promo_ends_at: 2027-09-30T00:00:00Z
     capabilities: [tools, coding]
     roles: [worker, reviewer]
     quality_by_role: {worker: 3, reviewer: 3}
     family: generalist-a
     vendor: vendor-a
     max_context_tokens: 131072
-    notes: Promotional free access; re-confirm before relying on it.
+    notes: >-
+      Promotional free access, no published list price. Re-confirm before the
+      window closes; after it, this entry is ineligible until a price is
+      declared.
     source_updated_at: 2026-05-30T09:00:00Z
 
   # --- Metered capacity behind a custom/aggregator endpoint ---------------

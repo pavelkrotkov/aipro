@@ -28,9 +28,12 @@ fallback chain from this metadata; the catalog does not store one.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -84,6 +87,12 @@ class ModelCatalogEntry:
     opaque provider-owned string that only the broker/execution adapter
     interprets. V3 core never parses ``descriptor``, which is what keeps
     vendor and model names out of routing logic.
+
+    Entries are deeply immutable: the collection fields are normalized to
+    tuples and mapping proxies at construction. A shallow ``frozen=True``
+    would only stop rebinding, leaving a caller free to append a role to an
+    entry already handed to a running phase — which would change its
+    eligibility mid-flight and skip the invariants below entirely.
     """
 
     ref: str
@@ -103,9 +112,9 @@ class ModelCatalogEntry:
     promotional: bool = False
     promo_starts_at: datetime | None = None
     promo_ends_at: datetime | None = None
-    capabilities: list[str] = field(default_factory=list)
+    capabilities: tuple[str, ...] = ()
     #: Lane roles this entry may serve. Empty means "suitable for any role".
-    roles: list[str] = field(default_factory=list)
+    roles: tuple[str, ...] = ()
     #: Difficulty floor: do not spend this candidate on work easier than
     #: this. Lets an expensive/scarce entry be reserved for hard tasks
     #: without encoding that rule in the broker.
@@ -120,7 +129,7 @@ class ModelCatalogEntry:
     data_policy: str = ""
     #: Manual quality tier per lane role. A role present here must also be
     #: listed in ``roles``.
-    quality_by_role: dict[str, int] = field(default_factory=dict)
+    quality_by_role: Mapping[str, int] = field(default_factory=dict)
     max_concurrency: int | None = None
     notes: str = ""
     #: When the volatile fields (pricing, promotion) were last confirmed.
@@ -134,6 +143,12 @@ class ModelCatalogEntry:
             raise ModelCatalogError("catalog entry ref must be non-empty")
         if not self.descriptor:
             raise ModelCatalogError(f"catalog entry {self.ref!r} descriptor must be non-empty")
+
+        # Normalize the collection fields to immutable containers before any
+        # invariant runs, so what is validated is what the entry will hold.
+        for name in ("capabilities", "roles"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        object.__setattr__(self, "quality_by_role", MappingProxyType(dict(self.quality_by_role)))
 
         for name in ("promo_starts_at", "promo_ends_at", "source_updated_at"):
             object.__setattr__(self, name, _coerce_dt(getattr(self, name), self.ref, name))
@@ -151,9 +166,12 @@ class ModelCatalogEntry:
 
         for name in ("input_price_per_mtok", "output_price_per_mtok"):
             price = getattr(self, name)
-            if price is not None and price < 0:
+            # NaN/infinity would pass a bare ``< 0`` test, then propagate into
+            # budget comparisons that silently do the wrong thing and into
+            # CLI JSON output that is not valid JSON.
+            if price is not None and (not math.isfinite(price) or price < 0):
                 raise ModelCatalogError(
-                    f"catalog entry {self.ref!r} {name} must be >= 0, got {price}"
+                    f"catalog entry {self.ref!r} {name} must be a finite value >= 0, got {price}"
                 )
 
         # A declared price contradicts a free cost class / free tier. Left
@@ -183,6 +201,18 @@ class ModelCatalogEntry:
         ):
             raise ModelCatalogError(
                 f"catalog entry {self.ref!r} declares a promotion window but promotional is false"
+            )
+        # "Temporarily free" and "permanently free" are different claims, and
+        # the permanent one wins in pricing: cost_class 'free'/free_tier price
+        # at zero whether or not the promotion is still running. An entry
+        # asserting both looks time-boxed but would in fact stay free and
+        # eligible forever once its window closed.
+        if self.promotional and (self.cost_class == "free" or self.resource_class == "free_tier"):
+            raise ModelCatalogError(
+                f"catalog entry {self.ref!r} is promotional but also classified permanently "
+                f"free (cost_class={self.cost_class!r}, resource_class={self.resource_class!r}); "
+                "its promotion could never expire. Drop the promotion, or declare the class "
+                "the entry reverts to when the window closes."
             )
 
         unknown_caps = sorted(set(self.capabilities) - VALID_CAPABILITIES)
