@@ -89,6 +89,12 @@ class SessionSpec:
                 "run/round identity, lane findings cannot be attributed "
                 "correctly across overlapping rounds"
             )
+        if self.run_id != self.context.run_id:
+            raise ValueError(
+                f"SessionSpec run_id {self.run_id!r} does not match its context "
+                f"run_id {self.context.run_id!r}: the session name and the durable "
+                "metadata must carry the same run identity or attribution diverges"
+            )
         if self.model_lease is not None and self.model_lease.assignment.lane != self.lane.lane:
             raise ValueError(
                 f"SessionSpec lane {self.lane.lane!r} does not match model lease "

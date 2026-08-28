@@ -360,3 +360,22 @@ class TestQueueLabelDistinctness:
     def test_distinct_labels_accepted(self) -> None:
         config = V3Config.from_dict({})
         config.validate()
+
+
+class TestDefaultLaneValidation:
+    def test_defaults_relying_configs_can_reference_the_effective_lanes(self) -> None:
+        config = V3Config(
+            model_router={  # ty: ignore[invalid-argument-type]
+                "catalog": [{"ref": "high-capability", "descriptor": "provider:model"}],
+                "lane_assignments": {"developer": "high-capability"},
+            },
+            review_policy={"reviewer_lanes": ["requirements-reviewer"]},  # ty: ignore[invalid-argument-type]
+        )
+
+        config.validate()
+
+    def test_references_to_unknown_lanes_are_still_rejected(self) -> None:
+        config = V3Config(model_router={"lane_assignments": {"nonexistent": "ref"}})  # ty: ignore[invalid-argument-type]
+
+        with pytest.raises(V3ConfigError, match="nonexistent"):
+            config.validate()

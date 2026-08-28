@@ -54,6 +54,14 @@ class CAOControlPlaneConfig:
     control_dir: str = ".cao"
     session_poll_interval_seconds: int = 30
     session_timeout_seconds: int = 3600
+    #: Root URL of CAO's HTTP control plane. It is the only supported way V3
+    #: talks to the session fabric — no terminal scraping, no CLI shelling.
+    base_url: str = "http://localhost:9889"
+    #: Per-HTTP-request budget. Distinct from ``session_timeout_seconds``,
+    #: which bounds how long an agent session may run: a session legitimately
+    #: runs for an hour while every individual control-plane call is expected
+    #: to answer in seconds.
+    request_timeout_seconds: float = 30.0
     #: Unknown keys from a newer writer, preserved for forward compatibility.
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -223,11 +231,30 @@ class V3Config:
 
     def validate(self) -> None:
         """Validate cross-section invariants; raises :class:`V3ConfigError`."""
-        lane_names = [lane.name for lane in self.hermes_lanes.lanes]
+        # A hermes_lanes section that declares nothing yields the default lane
+        # set at registry-build time, so references must be validated against
+        # that effective set — not the raw empty list, which would make it
+        # impossible for a defaults-relying config to set lane_assignments
+        # or reviewer_lanes.
+        from .lanes import DEFAULT_LANES
+
+        declared_lanes = list(self.hermes_lanes.lanes)
+        if declared_lanes:
+            lanes = declared_lanes
+        else:
+            lanes = [
+                LaneProfileConfig(
+                    name=lane.lane,
+                    role=lane.role,
+                    profile_template=lane.profile_template,
+                )
+                for lane in DEFAULT_LANES
+            ]
+        lane_names = [lane.name for lane in lanes]
         if len(lane_names) != len(set(lane_names)):
             raise V3ConfigError(f"Duplicate lane names in hermes_lanes: {lane_names}")
 
-        for lane in self.hermes_lanes.lanes:
+        for lane in lanes:
             if not lane.name:
                 raise V3ConfigError("lane name must be non-empty")
             if not lane.profile_template:
@@ -241,11 +268,11 @@ class V3Config:
                 f"enabled={q.enabled_label!r} done={q.done_label!r} error={q.error_label!r}"
             )
 
-        foremen = [lane for lane in self.hermes_lanes.lanes if lane.role == "foreman"]
+        foremen = [lane for lane in lanes if lane.role == "foreman"]
         if len(foremen) > 1:
             raise V3ConfigError("At most one foreman lane is allowed")
 
-        for lane in self.hermes_lanes.lanes:
+        for lane in lanes:
             if lane.role not in VALID_LANE_ROLES:
                 raise V3ConfigError(f"Invalid role {lane.role!r} for lane {lane.name!r}")
             if lane.max_concurrent < 1:
@@ -264,10 +291,7 @@ class V3Config:
                 )
 
         for reviewer in self.review_policy.reviewer_lanes:
-            lane = next(
-                (c for c in self.hermes_lanes.lanes if c.name == reviewer),
-                None,
-            )
+            lane = next((c for c in lanes if c.name == reviewer), None)
             if lane is None:
                 raise V3ConfigError(f"review_policy references unknown reviewer lane {reviewer!r}")
             if lane.role != "reviewer":
@@ -282,6 +306,10 @@ class V3Config:
             raise V3ConfigError("cao.session_poll_interval_seconds must be >= 1")
         if self.cao.session_timeout_seconds < 1:
             raise V3ConfigError("cao.session_timeout_seconds must be >= 1")
+        if not self.cao.base_url:
+            raise V3ConfigError("cao.base_url must be non-empty")
+        if self.cao.request_timeout_seconds <= 0:
+            raise V3ConfigError("cao.request_timeout_seconds must be > 0")
 
         if self.escalation.max_consecutive_coder_failures < 1:
             raise V3ConfigError("max_consecutive_coder_failures must be >= 1")

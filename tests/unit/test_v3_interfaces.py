@@ -490,3 +490,25 @@ class TestSessionSpecPolicyStrings:
             context=ctx,
         )
         assert spec.context is ctx
+
+
+class TestSessionSpecRunIdAgreement:
+    def test_a_spec_whose_run_id_diverges_from_its_context_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="run_id"):
+            SessionSpec(
+                lane=LaneIdentity(lane="worker-a", role="worker", profile_template="p"),
+                run_id="run-1",
+                workdir="/tmp/x",
+                env={},
+                context=LaneExecutionContext(run_id="run-2"),
+            )
+
+    def test_a_spec_with_agreeing_run_identity_constructs(self) -> None:
+        spec = SessionSpec(
+            lane=LaneIdentity(lane="worker-a", role="worker", profile_template="p"),
+            run_id="run-1",
+            workdir="/tmp/x",
+            env={},
+            context=LaneExecutionContext(run_id="run-1"),
+        )
+        assert spec.context.run_id == spec.run_id
