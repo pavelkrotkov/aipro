@@ -212,6 +212,23 @@ class CaoSessionMetadata:
             )
         assignment = data.get("model_assignment")
         launched_at = data.get("launched_at")
+        # The launch time is the anchor for the timeout budget. Silently
+        # defaulting it to "now" would hand an already over-budget session a
+        # fresh full budget every restart, so missing or malformed values are
+        # treated as corruption, not as a default.
+        if not isinstance(launched_at, str):
+            raise CaoMetadataError(
+                "CAO session metadata carries no durable launched_at timestamp; "
+                "without it the timeout budget cannot be honored and the "
+                "metadata is treated as corruption"
+            )
+        try:
+            parsed_launched_at = datetime.fromisoformat(launched_at)
+        except ValueError as exc:
+            raise CaoMetadataError(
+                f"CAO session metadata launched_at {launched_at!r} is not a "
+                f"parseable timestamp: {exc}"
+            ) from exc
         return cls(
             session_name=data.get("session_name", ""),
             terminal_id=data.get("terminal_id", ""),
@@ -226,11 +243,7 @@ class CaoSessionMetadata:
                 ModelAssignment.from_dict(assignment) if assignment is not None else None
             ),
             activity_seen=bool(data.get("activity_seen", False)),
-            launched_at=(
-                datetime.fromisoformat(launched_at)
-                if isinstance(launched_at, str)
-                else datetime.now(UTC)
-            ),
+            launched_at=parsed_launched_at,
         )
 
 
@@ -301,6 +314,11 @@ class CaoSessionController:
         self._sessions: dict[str, CaoSessionMetadata] = {}
         self._idle_readings: dict[str, int] = {}
         self._active_seen: set[str] = set()
+        # Names whose durable metadata was confirmed to carry
+        # ``activity_seen=True``. A local flag without a confirmed write keeps
+        # re-attempting the PATCH on later activity observations, so a failed
+        # persistence attempt is retried instead of silently lost at restart.
+        self._durable_activity_confirmed: set[str] = set()
 
     @staticmethod
     def _build_client(config: CAOControlPlaneConfig) -> httpx.Client:
@@ -411,11 +429,13 @@ class CaoSessionController:
             params={"message": message},
         )
         self._raise_for_status(response, f"submit work to session {metadata.session_name!r}")
-        # New work invalidates any idle streak accumulated by the previous
-        # turn. Acceptance is not activity, though: the control plane accepts
-        # input while the provider is still starting, so only a status
-        # response showing a post-start state (see observe) may count.
-        self._idle_readings[metadata.session_name] = 0
+        # New work invalidates the previous turn's evidence in full: any idle
+        # streak AND any recorded activity. Acceptance is not activity, though:
+        # the control plane accepts input while the provider is still starting,
+        # so only a status response showing a post-start state (see observe)
+        # may count again. Without this clearing, an accepted follow-up could
+        # be reported complete while it is still queued.
+        self._clear_activity(metadata)
 
     # --- Observation -------------------------------------------------------
 
@@ -512,8 +532,20 @@ class CaoSessionController:
 
         A session CAO has already forgotten is treated as terminated: cleanup
         is idempotent so a crash between kill and record-keeping is recoverable.
+
+        This includes the timeout path: :meth:`observe` stops an over-budget
+        session remotely and drops its local registration before reporting
+        ``timed_out``, so a caller completing the normal lifecycle with
+        :meth:`terminate_session` afterwards gets a no-op, not an error. The
+        handle is checked against CAO first, so a session still alive out of
+        band is still stopped, while an already-deleted one is simply gone.
         """
-        metadata = self._metadata_for(handle)
+        metadata = self._sessions.get(handle.session_id)
+        if metadata is None:
+            remote = self._lookup_session(handle.session_id)
+            if remote is not None:
+                self._stop_session(remote)
+            return
         self._stop_session(metadata)
 
     # --- Internals ---------------------------------------------------------
@@ -576,6 +608,7 @@ class CaoSessionController:
         # already ran would look like one that never picked work up.
         if metadata.activity_seen:
             self._active_seen.add(metadata.session_name)
+            self._durable_activity_confirmed.add(metadata.session_name)
 
     def _mark_active(self, session_name: str) -> None:
         """Record observed post-start activity, in memory and durably.
@@ -584,21 +617,56 @@ class CaoSessionController:
         travels in CAO's per-terminal metadata (whole-dict replace), so a
         fresh process adopting the session restores the idle-settle guard
         even if it never sees a processing reading itself.
+
+        Persistence is retried on every later activity observation until a
+        write is confirmed: a failed PATCH must not cost the durable evidence
+        at restart.
         """
         self._active_seen.add(session_name)
         metadata = self._sessions.get(session_name)
-        if metadata is None or metadata.activity_seen:
+        if metadata is None:
+            return
+        if metadata.activity_seen and session_name in self._durable_activity_confirmed:
             return
         updated = dataclasses.replace(metadata, activity_seen=True)
-        self._sessions[metadata.session_name] = updated
+        self._sessions[session_name] = updated
+        try:
+            response = self._request(
+                "PATCH",
+                f"/terminals/{metadata.terminal_id}/metadata",
+                json={"metadata": updated.to_dict()},
+            )
+            self._raise_for_status(
+                response, f"persist activity metadata for session {session_name!r}"
+            )
+        except CaoControlPlaneError:
+            # Best-effort persistence: the in-memory signal already holds and
+            # the next observed post-start reading re-attempts the write.
+            return
+        self._durable_activity_confirmed.add(session_name)
+
+    def _clear_activity(self, metadata: CaoSessionMetadata) -> None:
+        """Drop all activity evidence for a session, in memory and durably.
+
+        Used when new work is accepted: a queued follow-up must not inherit
+        the previous turn's activity, or idle-settle could complete the
+        follow-up before it ever executed.
+        """
+        name = metadata.session_name
+        self._active_seen.discard(name)
+        self._idle_readings[name] = 0
+        self._durable_activity_confirmed.discard(name)
+        updated = dataclasses.replace(metadata, activity_seen=False)
+        self._sessions[name] = updated
+        # A failed clear is left best-effort on purpose: stale durable
+        # evidence only keeps the idle-settle guard armed longer, which can
+        # delay completion but never wrongly complete a queued follow-up.
         with contextlib.suppress(CaoControlPlaneError):
             self._request(
                 "PATCH",
                 f"/terminals/{metadata.terminal_id}/metadata",
                 json={"metadata": updated.to_dict()},
             )
-            # Best-effort persistence: the in-memory signal already holds and
-            # the next observed post-start reading re-attempts the write.
 
     def _stop_session(self, metadata: CaoSessionMetadata) -> None:
         """Delete the remote session and drop every piece of local per-name
@@ -610,6 +678,7 @@ class CaoSessionController:
         self._sessions.pop(metadata.session_name, None)
         self._idle_readings.pop(metadata.session_name, None)
         self._active_seen.discard(metadata.session_name)
+        self._durable_activity_confirmed.discard(metadata.session_name)
 
     @staticmethod
     def _validate_attribution(metadata: CaoSessionMetadata, spec: SessionSpec) -> None:
@@ -638,14 +707,15 @@ class CaoSessionController:
             mismatches.append(
                 f"model assignment {metadata.model_assignment!r} != requested {expected_model!r}"
             )
-        if spec.context.round_id is not None and metadata.context.round_id != spec.context.round_id:
+        # A recorded round/work item must match the request whenever EITHER
+        # side carries a value: an execution explicitly tied to round N must
+        # never be driven by a context-less request. Adoption is allowed only
+        # when both sides are absent or they are equal.
+        if metadata.context.round_id != spec.context.round_id:
             mismatches.append(
                 f"round_id {metadata.context.round_id!r} != requested {spec.context.round_id!r}"
             )
-        if (
-            spec.context.work_item_id is not None
-            and metadata.context.work_item_id != spec.context.work_item_id
-        ):
+        if metadata.context.work_item_id != spec.context.work_item_id:
             mismatches.append(
                 f"work_item_id {metadata.context.work_item_id!r} != requested "
                 f"{spec.context.work_item_id!r}"

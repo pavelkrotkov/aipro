@@ -11,6 +11,7 @@ from ai_pr_orchestrator.v3 import cao as cao_module
 from ai_pr_orchestrator.v3.cao import (
     CaoAdoptionMismatchError,
     CaoControlPlaneError,
+    CaoMetadataError,
     CaoSessionController,
     CaoSessionMetadata,
     CaoSessionNotFoundError,
@@ -407,6 +408,60 @@ def test_observed_activity_is_persisted_to_the_durable_metadata(respx_mock):
     assert body["metadata"]["activity_seen"] is True
 
 
+def test_accepted_follow_up_clears_prior_activity_evidence(respx_mock):
+    # After one task ran, idle readings alone must not complete the NEXT
+    # task: accepting follow-up work clears both the in-memory and the
+    # durable activity evidence, so completion again requires fresh
+    # observed activity even while the follow-up is queued/starting.
+    controller = make_controller(idle_settle_polls=2)
+    handle = launch(controller, respx_mock)
+    respx_mock.post(f"{BASE}/terminals/{TERMINAL}/input").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+    durable_route = respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+        return_value=httpx.Response(200, json=terminal_payload())
+    )
+    status_route(respx_mock, "processing", "idle", "idle", "idle", "idle", "idle")
+
+    assert controller.observe(handle).state == "running"  # activity observed
+    assert controller.observe(handle).state == "running"
+    controller.submit_work(handle, "address the review findings")
+
+    import json
+
+    cleared = json.loads(durable_route.calls.last.request.content)
+    assert cleared["metadata"]["activity_seen"] is False
+    # The follow-up is accepted but still queued: idle readings never settle it.
+    states = [controller.observe(handle).state for _ in range(4)]
+    assert states == ["running", "running", "running", "running"]
+
+
+def test_failed_activity_persistence_is_retried_on_later_activity(respx_mock):
+    # A metadata PATCH that fails must not silently cost the durable
+    # evidence: the next observed activity re-attempts the write until it
+    # is confirmed.
+    controller = make_controller()
+    handle = launch(controller, respx_mock)
+    respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+        side_effect=[
+            httpx.Response(500, text="boom"),
+            httpx.Response(200, json=terminal_payload()),
+        ]
+    )
+    status_route(respx_mock, "processing", "processing")
+
+    controller.observe(handle)  # write fails; local flag still holds
+    controller.observe(handle)  # retry lands
+
+    patch_calls = [
+        call
+        for call in respx_mock.calls
+        if call.request.method == "PATCH"
+        and call.request.url.path == f"/terminals/{TERMINAL}/metadata"
+    ]
+    assert len(patch_calls) == 2
+
+
 def test_durable_activity_evidence_survives_a_restart(respx_mock):
     # The first process observed execution and recorded it in CAO's metadata;
     # a restarted process adopting the session must honor that evidence even
@@ -653,6 +708,10 @@ def test_an_adopted_session_can_be_driven_without_relaunching(respx_mock):
     input_route = respx_mock.post(f"{BASE}/terminals/{TERMINAL}/input").mock(
         return_value=httpx.Response(200, json={"success": True})
     )
+    # Submitting work now also clears durable activity evidence.
+    respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+        return_value=httpx.Response(200, json=terminal_payload())
+    )
     controller = make_controller()
     observation = controller.adopt_session(SESSION)
 
@@ -712,6 +771,25 @@ def test_incomplete_attribution_metadata_is_a_controlled_error(missing):
         CaoSessionMetadata.from_dict(payload)
 
     assert not isinstance(excinfo.value, KeyError)
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        ("missing", lambda p: p.pop("launched_at", None)),
+        ("null", lambda p: p.__setitem__("launched_at", None)),
+        ("non-string", lambda p: p.__setitem__("launched_at", 12345)),
+        ("garbage", lambda p: p.__setitem__("launched_at", "not-a-timestamp")),
+    ],
+)
+def test_metadata_without_a_durable_launch_time_is_rejected(label, mutate):
+    # Defaulting the launch time to "now" would hand an already over-budget
+    # session a fresh full timeout budget on every restart.
+    payload = attribution_payload()
+    mutate(payload)
+
+    with pytest.raises(CaoMetadataError, match="launched_at"):
+        CaoSessionMetadata.from_dict(payload)
 
 
 def test_an_adopted_session_is_refused_when_attribution_disagrees(respx_mock):
@@ -789,6 +867,25 @@ def test_a_session_from_an_earlier_review_round_is_not_adopted(respx_mock):
         controller.adopt_session(SESSION, later_round)
     with pytest.raises(CaoAdoptionMismatchError, match="work_item_id"):
         controller.adopt_session(SESSION, later_item)
+
+
+def test_a_context_less_request_cannot_drive_a_session_bound_to_a_round(respx_mock):
+    # The durable metadata records round-2/wi-9. A request whose context
+    # omits both must be refused: "the request does not say" is not agreement.
+    controller = make_controller()
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
+    )
+    respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
+        return_value=httpx.Response(200, json=terminal_payload(metadata=attribution_payload()))
+    )
+    spec = make_spec()
+    contextless = dataclasses.replace(spec, context=LaneExecutionContext(run_id=RUN_ID))
+
+    with pytest.raises(CaoAdoptionMismatchError, match="round_id"):
+        controller.adopt_session(SESSION, contextless)
+
+    assert SESSION not in controller._sessions
 
 
 def test_a_provisioning_session_is_not_treated_as_absent(respx_mock):
@@ -876,6 +973,30 @@ def test_a_timed_out_session_is_stopped_remotely(respx_mock):
     # Nothing is left to poll or re-adopt under the same deterministic name.
     with pytest.raises(SessionNotRegisteredError):
         controller.observe(handle)
+
+
+def test_terminating_a_timed_out_session_is_idempotent(respx_mock):
+    # observe() already stopped the over-budget session and dropped its
+    # local registration, so the normal lifecycle's terminate_session call
+    # must be a clean no-op, not SessionNotRegisteredError.
+    controller = CaoSessionController(
+        CAOControlPlaneConfig(base_url=BASE, session_timeout_seconds=0),
+        LaneRegistry.default(),
+    )
+    handle = launch(controller, respx_mock)
+    respx_mock.delete(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+    status_route(respx_mock, "processing")
+    assert controller.observe(handle, now=datetime.now(UTC) + timedelta(seconds=61)).state == (
+        "timed_out"
+    )
+    # CAO no longer knows the session either.
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(404, json={"detail": "not found"})
+    )
+
+    controller.terminate_session(handle)
 
 
 def test_terminating_an_already_gone_session_is_not_an_error(respx_mock):
