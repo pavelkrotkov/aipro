@@ -634,3 +634,106 @@ def test_heartbeat_rejected_from_non_owner_host():
     # The owner can still heartbeat.
     s2 = owner_queue.heartbeat(s)
     assert s2.extras["heartbeat_at"] is not None
+
+
+# --- round-3 (final) remediation regression tests ----------------------------
+
+
+def test_reclaim_does_not_leak_optional_attribution():
+    fake = _ready_fake()
+    queue = _queue(fake)
+    s = queue.claim(
+        _issue(),
+        "run-1",
+        branch="old-branch",
+        worktree="/old-wt",
+        pr_number=7,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    stale_now = datetime(2026, 1, 1, 0, 16, tzinfo=UTC)
+    reclaimed = queue.reclaim_expired(_issue(), s, "run-2", now=stale_now)
+    c = q.claim_from_state(reclaimed)
+    assert c.branch is None and c.worktree is None and c.pr_number is None
+    assert "branch" not in reclaimed.extras
+    assert "heartbeat_at" not in reclaimed.extras
+
+
+def test_reclaim_of_requeued_work_does_not_leak_attribution():
+    fake = _ready_fake()
+    queue = _queue(fake)
+    s = queue.claim(_issue(), "run-1", branch="feat/x", pr_number=9)
+    queue.transition(_issue(), s, "queued")
+    loaded = queue.load_state("owner/repo#1")
+    assert loaded is not None
+    s2 = queue.claim(_issue(), "run-2")
+    assert "branch" not in s2.extras and "pr_number" not in s2.extras
+
+
+def test_update_verify_fails_when_state_vanishes():
+    class _DeletingFake(FakeGitHubClient):
+        """Concurrent writer deletes the comment right after our edit."""
+
+        def get_comment(self, comment_id):
+            return None
+
+    fake = _DeletingFake()
+    fake.seed_issue(1, ["v3-work"])
+    queue = _queue(fake)
+    s = queue.claim(_issue(), "run-1")
+    with pytest.raises(StateConflictError):
+        queue.save_state(s.transition("coding"), expected_updated_at=s.updated_at)
+
+
+def test_heartbeat_rejected_with_empty_host_id():
+    fake = _ready_fake()
+    owner_queue = _queue(fake)  # host-A
+    s = owner_queue.claim(_issue(), "run-1")
+    anon_queue = q.GitHubIssueQueue(fake, "owner", "repo", GitHubQueueConfig(), host_id="")
+    with pytest.raises(q.ClaimConflictError):
+        anon_queue.heartbeat(s)
+
+
+def test_repair_labels_uses_committed_state_not_stale_handle():
+    gate = _LabelGate()
+    queue = _queue(gate)
+    s = queue.claim(_issue(), "run-1")
+    gate.fail_labels = True
+    with pytest.raises(q.LabelSyncError):
+        queue.transition(_issue(), s, "reviewing")
+    gate.fail_labels = False
+    # Pass the PRE-transition handle: repair must still apply the *committed* phase.
+    queue.repair_labels(_issue(), s)
+    assert "v3-work-review" in gate.get_labels(1)
+    assert "v3-work-active" not in gate.get_labels(1)
+
+
+def test_marker_text_inside_payload_does_not_truncate_state():
+    fake = _ready_fake()
+    queue = _queue(fake)
+    s = queue.claim(_issue(), "run-1")
+    poisoned = ReviewerFinding(
+        id="evil",
+        lane="breaker",
+        body="some text with <!-- v3-runtime-state:end --> inline",
+        severity="major",
+        run_id="run-1",
+        round_id="r1",
+        thread_id="T1",
+    )
+    state = replace(s.transition("coding"), findings=[poisoned])
+    queue.save_state(state, expected_updated_at=s.updated_at)
+    loaded = queue.load_state("owner/repo#1")
+    assert loaded is not None
+    assert loaded.findings[0].id == "evil"  # payload survived intact
+
+
+def test_dry_run_full_lifecycle_does_not_mutate():
+    fake = FakeGitHubClient()
+    fake.seed_issue(1, ["v3-work"])
+    queue = _queue(fake, dry_run=True)
+    s = queue.claim(_issue(), "run-1")
+    s2 = queue.transition(_issue(), s, "coding")  # must not raise
+    s3 = queue.mark_review(_issue(), s2)
+    assert s3.phase == "reviewing"
+    assert fake.get_labels(1) == ["v3-work"]  # nothing mutated
+    assert fake.get_pr_comments(1) == []

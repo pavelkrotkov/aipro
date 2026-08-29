@@ -115,6 +115,20 @@ class LabelSyncError(QueueError):
     """
 
 
+#: Every claim-attribution key that must be removed before merging a fresh claim
+#: (optional keys included: ``to_dict()`` omits ``None`` fields, so stale values from
+#: a previous owner would otherwise survive a re-claim or reclamation).
+_CLAIM_ATTRIBUTION_KEYS = (
+    *_REQUIRED_CLAIM_KEYS,
+    "heartbeat_at",
+    "branch",
+    "worktree",
+    "pr_number",
+    "run_id",
+    "phase",
+)
+
+
 def work_item_id_of(issue: GitHubIssueRef) -> str:
     """Stable work-item id derived from the authoritative GitHub issue."""
 
@@ -227,12 +241,16 @@ class GitHubIssueQueue:
         marker = self._cfg.state_comment_marker
         self._start = f"{marker}:start"
         self._end = f"{marker}:end"
+        # Markers are only recognized on dedicated HTML-comment lines. Reviewer finding
+        # bodies or extras may legitimately contain the marker *text*; such inline
+        # occurrences are not delimiters, so serialized payloads can never truncate.
         self._block_re = re.compile(
-            rf"<!--\s*{re.escape(self._start)}\s*-->(.*?)<!--\s*{re.escape(self._end)}\s*-->",
+            rf"<!--\s*{re.escape(self._start)}\s*-->\n(.*?)\n<!--\s*{re.escape(self._end)}\s*-->",
             re.DOTALL,
         )
         self._any_marker_re = re.compile(
-            rf"<!--\s*(?:{re.escape(self._start)}|{re.escape(self._end)})\s*-->",
+            rf"^<!--\s*(?:{re.escape(self._start)}|{re.escape(self._end)})\s*-->\s*$",
+            re.MULTILINE,
         )
         self._lifecycle_labels = (
             self._cfg.enabled_label,
@@ -330,6 +348,10 @@ class GitHubIssueQueue:
         expected_updated_at: datetime | None,
     ) -> None:
         if comment is None:
+            if self._dry_run:
+                # A dry-run claim intentionally created no comment; simulated
+                # transitions must still be computable end-to-end.
+                return
             raise StateConflictError(
                 f"No existing state for {issue.slug()}; cannot update without a precondition"
             )
@@ -354,18 +376,29 @@ class GitHubIssueQueue:
         # writer clobbered our write in the read-edit window, surface a conflict rather
         # than reporting success (GitHub PATCH has no If-Match).
         verify = self._client.get_comment(edited.id) if edited.id else None
-        if verify is not None:
-            verify_block = self._extract_block(verify.body)
-            if verify_block is not None:
-                try:
-                    verify_updated = WorkflowState.from_dict(verify_block).updated_at
-                except DomainError:
-                    verify_updated = None
-                if verify_updated != state.updated_at:
-                    raise StateConflictError(
-                        f"Post-write conflict for {issue.slug()}: comment #{edited.id} "
-                        f"no longer holds version {state.updated_at.isoformat()!r}"
-                    )
+        if verify is None or not self._has_any_marker(verify.body):
+            raise StateConflictError(
+                f"Post-write conflict for {issue.slug()}: comment #{edited.id} "
+                "vanished or lost its state markers after the edit"
+            )
+        verify_block = self._extract_block(verify.body)
+        if verify_block is None:
+            raise StateConflictError(
+                f"Post-write conflict for {issue.slug()}: comment #{edited.id} "
+                "no longer carries a parseable state block"
+            )
+        try:
+            verify_updated = WorkflowState.from_dict(verify_block).updated_at
+        except DomainError as exc:
+            raise StateConflictError(
+                f"Post-write conflict for {issue.slug()}: comment #{edited.id} "
+                f"holds malformed state ({exc})"
+            ) from exc
+        if verify_updated != state.updated_at:
+            raise StateConflictError(
+                f"Post-write conflict for {issue.slug()}: comment #{edited.id} "
+                f"no longer holds version {state.updated_at.isoformat()!r}"
+            )
 
     def _settle_after_create(self, issue: GitHubIssueRef, created) -> None:
         """Resolve any duplicate state comments created by a concurrent claim.
@@ -444,8 +477,13 @@ class GitHubIssueQueue:
                 self.save_state(state, expected_updated_at=None)
             elif existing.phase == "queued":
                 # Preserve workflow history AND non-claim extras across a fresh claim
-                # of requeued work (mixed-version rollouts must not lose fields).
-                extras = {k: v for k, v in existing.extras.items() if k not in _REQUIRED_CLAIM_KEYS}
+                # of requeued work (mixed-version rollouts must not lose fields). Every
+                # claim-attribution key is removed first: optional keys (branch,
+                # worktree, pr_number, heartbeat_at) from the previous owner must not
+                # leak into the new claim.
+                extras = {
+                    k: v for k, v in existing.extras.items() if k not in _CLAIM_ATTRIBUTION_KEYS
+                }
                 extras.update(claim.to_dict())
                 state = replace(
                     state,
@@ -479,7 +517,7 @@ class GitHubIssueQueue:
 
         claim = claim_from_state(state)
         now = _utc(now or datetime.now(UTC))
-        if self._host_id and claim.host_id != self._host_id:
+        if claim.host_id != self._host_id:
             raise ClaimConflictError(
                 f"Lease for {state.work_item_id} is held by host {claim.host_id!r}, "
                 f"not {self._host_id!r}; a non-owner cannot heartbeat it"
@@ -536,15 +574,17 @@ class GitHubIssueQueue:
     def repair_labels(self, issue: GitHubIssueRef, state: WorkflowState | None = None) -> None:
         """Idempotently repair the issue's lifecycle label to match its *current* phase.
 
-        Reads the authoritative state from GitHub (no optimistic precondition), so it
-        can fix a label left behind by a partial failure without needing the caller's
-        now-stale handle.
+        Always reloads the authoritative state from GitHub — a caller's handle is at
+        best a hint (and after a :class:`LabelSyncError` it is pre-transition, so
+        trusting it would restore the *old* label). The supplied ``state``, if any, is
+        used only to validate identity.
         """
 
-        current = state or self.load_state(work_item_id_of(issue))
+        if state is not None:
+            self._require_same_identity(issue, state)
+        current = self.load_state(work_item_id_of(issue))
         if current is None:
             return
-        self._require_same_identity(issue, current)
         self._apply_phase_labels(issue, current.phase)
 
     def complete(
@@ -612,7 +652,8 @@ class GitHubIssueQueue:
             pr_number=pr_number,
         )
         # Preserve authoritative workflow data; only attribution/lease is replaced.
-        extras = {k: v for k, v in stale_state.extras.items() if k not in _REQUIRED_CLAIM_KEYS}
+        # Optional attribution keys from the stale owner must not leak either.
+        extras = {k: v for k, v in stale_state.extras.items() if k not in _CLAIM_ATTRIBUTION_KEYS}
         extras.update(claim.to_dict())
         new_state = WorkflowState(
             work_item_id=stale_state.work_item_id,
