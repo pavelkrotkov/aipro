@@ -72,6 +72,22 @@ VALID_LANE_ROLES: frozenset[str] = frozenset(("foreman", "worker", "reviewer"))
 Severity = Literal["info", "minor", "major", "blocker"]
 VALID_SEVERITIES: frozenset[str] = frozenset(("info", "minor", "major", "blocker"))
 
+#: Lifecycle status of a finding. Terminal statuses are set only via an
+#: explicit disposition (see ``FindingRegistry.apply_disposition``).
+FindingStatus = Literal["open", "accepted", "rejected", "deferred", "archived"]
+VALID_FINDING_STATUSES: frozenset[str] = frozenset(
+    ("open", "accepted", "rejected", "deferred", "archived")
+)
+#: Statuses that settle a finding; archival/compaction may drop their detail.
+TERMINAL_FINDING_STATUSES: frozenset[str] = frozenset(
+    ("accepted", "rejected", "deferred", "archived")
+)
+
+EvidenceKind = Literal["file", "snippet", "thread", "command", "log"]
+VALID_EVIDENCE_KINDS: frozenset[str] = frozenset(
+    ("file", "snippet", "thread", "command", "log")
+)
+
 DispositionAction = Literal[
     "fix",
     "reject_wont_fix",
@@ -362,9 +378,118 @@ class ModelAssignment:
 # --- Reviewer findings -----------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Evidence:
+    """A verifiable piece of evidence backing one finding.
+
+    ``kind`` selects what the remaining fields mean: ``file``/``snippet``
+    point at code (``path`` plus optional line range and ``snippet``),
+    ``thread`` references a GitHub review thread, ``command``/``log`` carry
+    a reproduction command or captured output in ``text``. Evidence is
+    never rewritten during deduplication or merging.
+    """
+
+    kind: EvidenceKind
+    path: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    snippet: str | None = None
+    thread_id: str | None = None
+    text: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in VALID_EVIDENCE_KINDS:
+            raise DomainError(
+                f"Invalid evidence kind {self.kind!r}, must be one of {sorted(VALID_EVIDENCE_KINDS)}"
+            )
+        if self.path is not None:
+            _validate_path(self.path, context="Evidence.path")
+        for name in ("line_start", "line_end"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise DomainError(f"Evidence.{name} must be positive, got {value}")
+        if (
+            self.line_start is not None
+            and self.line_end is not None
+            and self.line_end < self.line_start
+        ):
+            raise DomainError(
+                f"Evidence.line_end ({self.line_end}) must be >= line_start ({self.line_start})"
+            )
+        if self.path is None and self.thread_id is None and not (self.text or self.snippet):
+            raise DomainError(
+                "Evidence must carry at least one of path, thread_id, snippet, or text"
+            )
+        if self.kind == "thread" and not self.thread_id:
+            raise DomainError("Evidence of kind 'thread' requires thread_id")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize_dataclass(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Evidence:
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def _validate_path(path: str, *, context: str) -> None:
+    """Reject malformed or dangerous file paths on findings/evidence."""
+    if not path or not path.strip():
+        raise DomainError(f"{context} must be a non-empty path")
+    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+        raise DomainError(f"{context} must be repo-relative, got absolute path {path!r}")
+    parts = path.replace("\\", "/").split("/")
+    if ".." in parts:
+        raise DomainError(f"{context} must not traverse parent directories: {path!r}")
+    if any(p.strip() == "" for p in parts):
+        raise DomainError(f"{context} contains an empty path segment: {path!r}")
+
+
+@dataclass(frozen=True)
+class FindingProvenance:
+    """Origin of one reviewer finding (or of one merged into another).
+
+    Kept for every finding even after deduplication so the merged result
+    still names each reviewer lane and its original finding id.
+    """
+
+    lane: LaneName
+    finding_id: str
+    run_id: RunId
+    round_id: RoundId
+    thread_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.lane:
+            raise DomainError("FindingProvenance.lane must be non-empty")
+        if not self.finding_id:
+            raise DomainError("FindingProvenance.finding_id must be non-empty")
+        if not self.run_id:
+            raise DomainError("FindingProvenance.run_id must be non-empty")
+        if not self.round_id:
+            raise DomainError("FindingProvenance.round_id must be non-empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize_dataclass(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FindingProvenance:
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
 @dataclass
 class ReviewerFinding:
-    """A single finding produced by a reviewer lane."""
+    """A single finding produced by a reviewer lane.
+
+    The first seven fields are the original V3 schema (issue #41) and are
+    never renamed — persisted queue/state payloads depend on them. The
+    remaining fields extend the schema with structured evidence, provenance
+    and disposition state (issue #50); every one is optional with a default
+    so payloads written by older versions still round-trip. Unknown keys in
+    a persisted payload are preserved in ``extras`` and written back on
+    serialization.
+    """
 
     id: str
     lane: LaneName
@@ -377,8 +502,51 @@ class ReviewerFinding:
     line: int | None = None
     #: GitHub review-thread identifier this finding was filed on, if any.
     thread_id: str | None = None
+    #: Last line of the (inclusive) range the finding applies to; ``None``
+    #: means a single-line or file-level finding.
+    line_end: int | None = None
+    #: Reviewer confidence in [0.0, 1.0]; ``None`` when the reviewer did not
+    #: report one.
+    confidence: float | None = None
+    #: Short machine-comparable claim (what the reviewer asserts). Falls
+    #: back to ``body`` when the reviewer supplied only prose.
+    claim: str | None = None
+    #: Verifiable evidence backing the claim; preserved verbatim through
+    #: deduplication and merging.
+    evidence: list[Evidence] = field(default_factory=list)
+    #: How to falsify/verify the claim.
+    falsification: str | None = None
+    #: Optional reproduction/test command.
+    reproduction_command: str | None = None
+    #: Optional suggested fix.
+    suggested_fix: str | None = None
+    #: Head SHA the reviewer actually reviewed. Findings for a different
+    #: head SHA than the current round are quarantined, never applied.
+    head_sha: str | None = None
+    #: Lifecycle status; terminal values are only set via a disposition.
+    status: FindingStatus = "open"
+    #: Reason recorded with the last status change (required for terminal
+    #: statuses).
+    status_reason: str | None = None
+    #: Group identifier when this finding conflicts with another reviewer's
+    #: finding over the same code region; conflicts are adjudicated, never
+    #: collapsed.
+    conflict_group_id: str | None = None
+    #: Provenance of this finding: its own origin plus any findings merged
+    #: into it during deduplication, in order.
+    sources: list[FindingProvenance] = field(default_factory=list)
+    #: Unknown fields from a newer writer, preserved for lossless round trips.
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not self.id:
+            raise DomainError("ReviewerFinding.id must be non-empty")
+        if not self.lane:
+            raise DomainError("ReviewerFinding.lane must be non-empty")
+        if not self.run_id:
+            raise DomainError("ReviewerFinding.run_id must be non-empty")
+        if not self.round_id:
+            raise DomainError("ReviewerFinding.round_id must be non-empty")
         if self.severity not in VALID_SEVERITIES:
             raise DomainError(
                 f"Invalid severity {self.severity!r}, must be one of {sorted(VALID_SEVERITIES)}"
@@ -387,17 +555,78 @@ class ReviewerFinding:
             raise DomainError("ReviewerFinding.body must be non-empty")
         if self.line is not None and self.line <= 0:
             raise DomainError(f"ReviewerFinding.line must be positive, got {self.line}")
+        if self.line_end is not None and self.line_end <= 0:
+            raise DomainError(f"ReviewerFinding.line_end must be positive, got {self.line_end}")
+        if self.line is not None and self.line_end is not None and self.line_end < self.line:
+            raise DomainError(
+                f"ReviewerFinding.line_end ({self.line_end}) must be >= line ({self.line})"
+            )
+        if self.path is not None:
+            _validate_path(self.path, context="ReviewerFinding.path")
+        if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
+            raise DomainError(
+                f"ReviewerFinding.confidence must be within [0.0, 1.0], got {self.confidence}"
+            )
+        if self.head_sha is not None and not self.head_sha.strip():
+            raise DomainError("ReviewerFinding.head_sha must be non-empty when present")
+        if self.status not in VALID_FINDING_STATUSES:
+            raise DomainError(
+                f"Invalid status {self.status!r}, must be one of {sorted(VALID_FINDING_STATUSES)}"
+            )
+        if self.status in TERMINAL_FINDING_STATUSES and not (self.status_reason or "").strip():
+            raise DomainError(
+                f"ReviewerFinding status {self.status!r} requires a non-empty status_reason"
+            )
+        if self.status == "open" and self.status_reason is not None:
+            raise DomainError("status_reason is only valid once the finding leaves 'open'")
+        for evidence_item in self.evidence:
+            if not isinstance(evidence_item, Evidence):
+                raise DomainError(
+                    "ReviewerFinding.evidence items must be Evidence instances, got "
+                    f"{type(evidence_item).__name__}"
+                )
+        for source in self.sources:
+            if not isinstance(source, FindingProvenance):
+                raise DomainError(
+                    "ReviewerFinding.sources items must be FindingProvenance instances, got "
+                    f"{type(source).__name__}"
+                )
 
     def to_dict(self) -> dict[str, Any]:
-        return _serialize_dataclass(self)
+        data = _serialize_dataclass(self)
+        reserved = {f.name for f in fields(self)} - {"extras"}
+        collisions = sorted(reserved & set(self.extras))
+        if collisions:
+            raise DomainError(
+                f"ReviewerFinding.extras may not override validated fields: {collisions}"
+            )
+        data.pop("extras", None)
+        data.update(self.extras)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReviewerFinding:
         data = dict(data)
         if isinstance(data.get("created_at"), str):
             data["created_at"] = _str_to_dt(data["created_at"])
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        if isinstance(data.get("evidence"), list):
+            data["evidence"] = [
+                e if isinstance(e, Evidence) else Evidence.from_dict(e) for e in data["evidence"]
+            ]
+        if isinstance(data.get("sources"), list):
+            data["sources"] = [
+                s if isinstance(s, FindingProvenance) else FindingProvenance.from_dict(s)
+                for s in data["sources"]
+            ]
+        known = {f.name for f in fields(cls)} - {"extras"}
+        kwargs: dict[str, Any] = {}
+        extras: dict[str, Any] = {}
+        for key, value in data.items():
+            if key in known:
+                kwargs[key] = value
+            else:
+                extras[key] = value
+        return cls(**kwargs, extras=extras)
 
 
 @dataclass
