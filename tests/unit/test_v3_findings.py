@@ -734,3 +734,83 @@ class TestReviewRound2:
         active, archived = registry.compact()
         assert [f.id for f in active] == ["f1"]
         assert archived == []
+
+
+# --- review round 3 (final) regression tests ---------------------------------
+
+
+def test_hydration_applies_stale_head_quarantine():
+    stale = make_finding(id="stale", claim="old", head_sha="0000000")
+    current = make_finding(id="current", claim="new", head_sha=HEAD)
+    headless = make_finding(id="headless", claim="legacy", head_sha=None)  # legacy shape
+    registry = FindingRegistry(current_head_sha=HEAD, findings=[stale, current, headless])
+    # The stale finding is quarantined, not left active; the current one is
+    # admitted; the headless one is quarantined under the strict default.
+    assert [f.id for f in registry.findings] == ["current"]
+    assert {q.finding.id for q in registry.quarantined} == {"stale", "headless"}
+
+
+def test_hydration_legacy_optout_admits_headless_findings():
+    headless = make_finding(id="headless", claim="legacy", head_sha=None)
+    registry = FindingRegistry(
+        current_head_sha=HEAD,
+        findings=[headless],
+        quarantine_unknown_head_sha=False,
+    )
+    assert [f.id for f in registry.findings] == ["headless"]
+    assert registry.quarantined == []
+
+
+def test_queue_ownership_changes_preserve_archived_records():
+    from dataclasses import replace
+
+    from test_v3_queue import FakeGitHubClient, _issue
+
+    from ai_pr_orchestrator.v3.config import GitHubQueueConfig
+    from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
+
+    fake = FakeGitHubClient()
+    fake.seed_issue(1, ["v3-work"])
+    queue = GitHubIssueQueue(fake, "owner", "repo", GitHubQueueConfig(), host_id="host-A")
+    claim_time = datetime(2026, 1, 1, tzinfo=UTC)
+    s = queue.claim(_issue(), "run-1", now=claim_time)
+    # Compact an accepted finding so an archived record exists in state.
+    finding = ReviewerFinding(
+        id="f1",
+        lane="r1",
+        body="b",
+        severity="major",
+        run_id="run-1",
+        round_id="r1",
+        thread_id="T1",
+        head_sha=HEAD,
+    )
+    registry = FindingRegistry(current_head_sha=HEAD, findings=[finding])
+    registry.apply_disposition(
+        "f1", "fix", rationale="fixed", decided_by="foreman", reply_body="done"
+    )
+    _, newly_archived = registry.compact()
+    saved = queue.load_state("owner/repo#1")
+    assert saved is not None
+    with_archive = replace(
+        saved.transition("coding"),
+        archived=list(newly_archived),
+    )
+    queue.save_state(with_archive, expected_updated_at=s.updated_at)
+    before = queue.load_state("owner/repo#1")
+    assert before is not None
+    assert len(before.archived) == 1
+
+    # Lease expires; a reclaim must NOT wipe the compacted audit records.
+    stale_now = datetime(2026, 1, 1, 0, 16, tzinfo=UTC)
+    queue.reclaim_expired(_issue(), before, "run-2", now=stale_now)
+    reclaimed = queue.load_state("owner/repo#1")
+    assert reclaimed is not None
+    assert len(reclaimed.archived) == 1  # archive survived the ownership change
+
+    # Re-claim path too: queue the work, then claim it fresh.
+    queue.transition(_issue(), reclaimed, "queued")
+    queue.claim(_issue(), "run-3")
+    final = queue.load_state("owner/repo#1")
+    assert final is not None
+    assert len(final.archived) == 1  # archive survived the re-claim

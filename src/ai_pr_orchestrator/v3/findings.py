@@ -204,21 +204,31 @@ class FindingRegistry:
 
     def __post_init__(self) -> None:
         # Hydrating from persisted state (FindingRegistry(findings=...))
-        # bypasses ``register``, so duplicate ids must be rejected here too —
-        # a legacy state with two lanes reusing an id would otherwise corrupt
-        # apply_disposition and detect_conflicts' by-id map (finding round-2
+        # bypasses ``register``, so the same admission checks must run here:
+        # duplicate ids (a legacy state with two lanes reusing an id would
+        # corrupt apply_disposition and detect_conflicts' by-id map — round-2
+        # fix #1) and stale/unknown head_sha (persisted findings from a
+        # previous PR head must be quarantined, not left active — round-3
         # fix #1).
         seen: set[str] = set()
+        admitted: list[ReviewerFinding] = []
         for finding in self.findings:
             if finding.id in seen:
                 raise DomainError(f"finding id {finding.id!r} is already registered")
             seen.add(finding.id)
+            stored = self._admit(finding)
+            if stored is not None:
+                admitted.append(stored)
+        object.__setattr__(self, "findings", admitted)
 
-    def register(self, finding: ReviewerFinding) -> ReviewerFinding | None:
-        """Validate and admit one finding; return the stored finding, or
-        ``None`` when it was quarantined."""
-        if any(existing.id == finding.id for existing in self.findings):
-            raise DomainError(f"finding id {finding.id!r} is already registered")
+    def _admit(self, finding: ReviewerFinding) -> ReviewerFinding | None:
+        """Shared admission path for register() and hydration.
+
+        Checks head-SHA quarantine and seeds provenance. Returns the stored
+        finding, or ``None`` when the finding was quarantined. Caller is
+        responsible for duplicate-id detection (``register`` against live
+        state, ``__post_init__`` via the pre-pass ``seen`` set).
+        """
         if self.current_head_sha:
             given = finding.head_sha and finding.head_sha.strip().lower()
             current = self.current_head_sha.strip().lower()
@@ -258,8 +268,18 @@ class FindingRegistry:
                     thread_id=finding.thread_id,
                 )
             ]
-        self.findings.append(finding)
         return finding
+
+    def register(self, finding: ReviewerFinding) -> ReviewerFinding | None:
+        """Validate and admit one finding; return the stored finding, or
+        ``None`` when it was quarantined."""
+        if any(existing.id == finding.id for existing in self.findings):
+            raise DomainError(f"finding id {finding.id!r} is already registered")
+        stored = self._admit(finding)
+        if stored is None:
+            return None
+        self.findings.append(stored)
+        return stored
 
     def deduplicate(self) -> list[ReviewerFinding]:
         """Merge exact duplicates (same dedup key) in place and return the
