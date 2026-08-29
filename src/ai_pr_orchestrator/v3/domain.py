@@ -84,9 +84,7 @@ TERMINAL_FINDING_STATUSES: frozenset[str] = frozenset(
 )
 
 EvidenceKind = Literal["file", "snippet", "thread", "command", "log"]
-VALID_EVIDENCE_KINDS: frozenset[str] = frozenset(
-    ("file", "snippet", "thread", "command", "log")
-)
+VALID_EVIDENCE_KINDS: frozenset[str] = frozenset(("file", "snippet", "thread", "command", "log"))
 
 DispositionAction = Literal[
     "fix",

@@ -82,6 +82,12 @@ runtime until cutover:
 - `v3.lanes` — the lane registry, sole authority on the lane-to-profile
   binding. Lane names *and* profile templates are unique: every concurrent
   lane owns an independent agent profile/home.
+- `v3.findings` — deterministic finding processing over `v3.domain` finding
+  types: normalized dedup keys (exact duplicates identified without any LLM
+  call), conflict grouping for explicit adjudication (conflicting findings
+  are never collapsed), disposition application, archival/compaction of
+  terminal-disposition findings, and a human-readable GitHub summary
+  renderer. No I/O.
 - `v3.cao` — the CAO control-plane adapter. It never spawns a process, parses
   a terminal, or picks a model. See `docs/V3_CAO.md` for the CAO version
   floor, the endpoints it relies on, and Hermes lane profile provisioning.
