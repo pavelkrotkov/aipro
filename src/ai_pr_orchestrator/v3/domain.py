@@ -78,10 +78,15 @@ FindingStatus = Literal["open", "accepted", "rejected", "deferred", "archived"]
 VALID_FINDING_STATUSES: frozenset[str] = frozenset(
     ("open", "accepted", "rejected", "deferred", "archived")
 )
-#: Statuses that settle a finding; archival/compaction may drop their detail.
-TERMINAL_FINDING_STATUSES: frozenset[str] = frozenset(
+#: Statuses that require a ``status_reason`` when set (finding round-2 fix #10).
+FINDING_STATUSES_REQUIRING_REASON: frozenset[str] = frozenset(
     ("accepted", "rejected", "deferred", "archived")
 )
+#: Statuses that actually settle a finding. ``deferred`` is deliberately
+#: excluded: a deferred finding stays active and re-settleable (finding
+#: round-1 fix #15), so archival/compaction must not treat it as terminal
+#: (finding round-2 fix #10).
+TERMINAL_FINDING_STATUSES: frozenset[str] = frozenset(("accepted", "rejected", "archived"))
 
 EvidenceKind = Literal["file", "snippet", "thread", "command", "log"]
 VALID_EVIDENCE_KINDS: frozenset[str] = frozenset(("file", "snippet", "thread", "command", "log"))
@@ -230,6 +235,9 @@ class WorkflowState:
     findings: list[ReviewerFinding] = field(default_factory=list)
     #: Policy decisions applied to ``findings``; persisted alongside them.
     dispositions: list[FindingDisposition] = field(default_factory=list)
+    #: Compact archive records for settled findings, persisted so compaction
+    #: does not destroy the audit trail on save/reload (finding round-2 fix #9).
+    archived: list[ArchivedFinding] = field(default_factory=list)
     #: Unknown fields from a newer writer, preserved for lossless round trips.
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -266,6 +274,7 @@ class WorkflowState:
             terminal_reason=terminal_reason,
             findings=list(self.findings),
             dispositions=list(self.dispositions),
+            archived=list(self.archived),
             extras=dict(self.extras),
         )
 
@@ -299,6 +308,11 @@ class WorkflowState:
             data["dispositions"] = [
                 d if isinstance(d, FindingDisposition) else FindingDisposition.from_dict(d)
                 for d in data["dispositions"]
+            ]
+        if isinstance(data.get("archived"), list):
+            data["archived"] = [
+                a if isinstance(a, ArchivedFinding) else ArchivedFinding.from_dict(a)
+                for a in data["archived"]
             ]
         known = {f.name for f in fields(cls)} - {"extras"}
         kwargs: dict[str, Any] = {}
@@ -485,6 +499,9 @@ class FindingProvenance:
     run_id: RunId
     round_id: RoundId
     thread_id: str | None = None
+    #: Unknown fields from a newer writer, preserved for lossless round trips
+    #: (finding round-2 fix #3).
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.lane:
@@ -497,10 +514,100 @@ class FindingProvenance:
             raise DomainError("FindingProvenance.round_id must be non-empty")
 
     def to_dict(self) -> dict[str, Any]:
-        return _serialize_dataclass(self)
+        data = _serialize_dataclass(self)
+        reserved = {f.name for f in fields(self)} - {"extras"}
+        collisions = sorted(reserved & set(self.extras))
+        if collisions:
+            raise DomainError(
+                f"FindingProvenance.extras may not override validated fields: {collisions}"
+            )
+        data.pop("extras", None)
+        data.update(self.extras)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FindingProvenance:
+        """Lenient deserialization: unknown fields go to ``extras`` so
+        provenance written by a newer version survives a mixed-version
+        load/save cycle (finding round-2 fix #3)."""
+        data = dict(data)
+        known = {f.name for f in fields(cls)} - {"extras"}
+        kwargs: dict[str, Any] = {}
+        extras: dict[str, Any] = {}
+        for key, value in data.items():
+            if key in known:
+                kwargs[key] = value
+            else:
+                extras[key] = value
+        return cls(**kwargs, extras=extras)
+
+
+@dataclass
+class ArchivedFinding:
+    """Compact record kept after a terminal disposition, so durable state
+    stays bounded once findings settle. Full evidence may be dropped; the
+    identity, outcome, and reviewer provenance survive. Defined here (not in
+    ``findings.py``) so :class:`WorkflowState` can persist the archive
+    without a circular import (finding round-2 fix #9)."""
+
+    finding_id: str
+    lane: LaneName
+    severity: Severity
+    status: FindingStatus
+    status_reason: str
+    summary: str
+    sources: list[FindingProvenance] = field(default_factory=list)
+
+    @classmethod
+    def from_finding(cls, finding: ReviewerFinding) -> ArchivedFinding:
+        if finding.status_reason is None:
+            raise DomainError(
+                f"finding {finding.id} has no status_reason; cannot archive without a reason"
+            )
+        sources = finding.sources or [
+            FindingProvenance(
+                lane=finding.lane,
+                finding_id=finding.id,
+                run_id=finding.run_id,
+                round_id=finding.round_id,
+                thread_id=finding.thread_id,
+            )
+        ]
+        return cls(
+            finding_id=finding.id,
+            lane=finding.lane,
+            severity=finding.severity,
+            status=finding.status,
+            status_reason=finding.status_reason,
+            # Blank/whitespace claims must fall back to the body, exactly like
+            # the machine-comparable claim does — otherwise a blank claim
+            # produces an empty archive summary (finding round-2 fix #5).
+            summary=(
+                finding.claim
+                if finding.claim is not None and finding.claim.strip()
+                else finding.body
+            ),
+            sources=list(sources),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "finding_id": self.finding_id,
+            "lane": self.lane,
+            "severity": self.severity,
+            "status": self.status,
+            "status_reason": self.status_reason,
+            "summary": self.summary,
+            "sources": [s.to_dict() for s in self.sources],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ArchivedFinding:
+        data = dict(data)
+        data["sources"] = [
+            s if isinstance(s, FindingProvenance) else FindingProvenance.from_dict(s)
+            for s in data.get("sources", [])
+        ]
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in known})
 
@@ -602,7 +709,10 @@ class ReviewerFinding:
             raise DomainError(
                 f"Invalid status {self.status!r}, must be one of {sorted(VALID_FINDING_STATUSES)}"
             )
-        if self.status in TERMINAL_FINDING_STATUSES and not (self.status_reason or "").strip():
+        if (
+            self.status in FINDING_STATUSES_REQUIRING_REASON
+            and not (self.status_reason or "").strip()
+        ):
             raise DomainError(
                 f"ReviewerFinding status {self.status!r} requires a non-empty status_reason"
             )

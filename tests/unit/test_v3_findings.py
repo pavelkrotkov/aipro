@@ -580,3 +580,157 @@ class TestRound1Fixes:
         text = render_findings_summary(registry.findings)
         assert "src/`evil`.py" not in text  # naked backtick would break the code span
         assert "src/\\`evil\\`.py" in text
+
+
+# --- Review round 2 ---------------------------------------------------------
+
+
+class TestReviewRound2:
+    def _conflict_registry(self) -> FindingRegistry:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="a", lane="review-a", claim="is a bug", line=10))
+        registry.register(make_finding(id="b", lane="review-b", claim="intended", line=10))
+        return registry
+
+    # --- round-2 fix #1 -----------------------------------------------------
+    def test_hydrated_registry_rejects_duplicate_ids(self) -> None:
+        with pytest.raises(DomainError, match="already registered"):
+            FindingRegistry(
+                findings=[
+                    make_finding(id="dup", lane="review-a", claim="x"),
+                    make_finding(id="dup", lane="review-b", claim="y"),
+                ]
+            )
+
+    # --- round-2 fix #2 -----------------------------------------------------
+    def test_conflict_group_ids_differ_for_separator_ambiguous_members(self) -> None:
+        registry = self._conflict_registry()
+        registry.findings[0].id = "a"  # explicit; ids are arbitrary strings
+        # Two member sets whose plain-separator join collides must not share a
+        # group id: ['a', 'b\x1fc'] vs ['a\x1fb', 'c'].
+        registry.findings[0].id = "a"
+        registry.findings[1].id = "b\x1fc"
+        groups_1 = registry.detect_conflicts()
+        registry = self._conflict_registry()
+        registry.findings[0].id = "a\x1fb"
+        registry.findings[1].id = "c"
+        groups_2 = registry.detect_conflicts()
+        assert set(groups_1) != set(groups_2)
+
+    # --- round-2 fix #3 -----------------------------------------------------
+    def test_provenance_unknown_fields_survive_round_trip(self) -> None:
+        payload = FindingProvenance(
+            lane="review-a", finding_id="f1", run_id="run-1", round_id="round-1"
+        ).to_dict()
+        payload["future_meta"] = {"priority": 3}
+        provenance = FindingProvenance.from_dict(payload)
+        assert provenance.extras == {"future_meta": {"priority": 3}}
+        reloaded = FindingProvenance.from_dict(provenance.to_dict())
+        assert reloaded.extras == {"future_meta": {"priority": 3}}
+        assert reloaded.to_dict()["future_meta"] == {"priority": 3}
+
+    # --- round-2 fix #4 -----------------------------------------------------
+    def test_disposition_thread_id_defaults_from_finding(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x", thread_id="PRRT_1"))
+        _, disposition = registry.apply_disposition(
+            "f1", "fix", rationale="r", decided_by="foreman", reply_body="done"
+        )
+        assert disposition.thread_id == "PRRT_1"
+
+    def test_disposition_rejects_mismatched_thread_id(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x", thread_id="PRRT_1"))
+        with pytest.raises(DomainError, match="mismatched thread_id"):
+            registry.apply_disposition(
+                "f1",
+                "fix",
+                rationale="r",
+                decided_by="foreman",
+                thread_id="PRRT_other",
+                reply_body="done",
+            )
+
+    # --- round-2 fix #5 -----------------------------------------------------
+    def test_blank_claim_archive_summary_falls_back_to_body(self) -> None:
+        archived = ArchivedFinding.from_finding(
+            make_finding(
+                id="f1",
+                claim="   ",
+                body="real body text",
+                status="rejected",
+                status_reason="reject_wont_fix: stale",
+            )
+        )
+        assert archived.summary == "real body text"
+
+    # --- round-2 fix #6 -----------------------------------------------------
+    def test_render_summary_neutralizes_mentions_and_newlines(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x", body="text\n\n@alice ping"))
+        text = render_findings_summary(registry.findings)
+        # The reviewer body is flattened onto the single bullet line and its
+        # mention is neutralized.
+        assert "- **major** — text  \\@alice ping (`src/app.py:10`)" in text
+        assert "@alice" not in text.replace("\\@alice", "")
+
+    # --- round-2 fix #7 -----------------------------------------------------
+    def test_single_line_canonicalization_in_keys(self) -> None:
+        assert compute_finding_id(
+            head_sha=HEAD, lane="review-a", claim="x", path="src/app.py", line=10
+        ) == compute_finding_id(
+            head_sha=HEAD, lane="review-a", claim="x", path="src/app.py", line=10, line_end=10
+        )
+        assert finding_dedup_key(make_finding(id="a", claim="x", line=10)) == finding_dedup_key(
+            make_finding(id="b", claim="x", line=10, line_end=10)
+        )
+        # A genuinely multi-line finding must still differ.
+        assert finding_dedup_key(
+            make_finding(id="a", claim="x", line=10, line_end=20)
+        ) != finding_dedup_key(make_finding(id="b", claim="x", line=10, line_end=10))
+
+    # --- round-2 fix #8 -----------------------------------------------------
+    def test_evidence_dedup_is_order_insensitive(self) -> None:
+        e1 = Evidence(kind="file", path="src/app.py", extras={"a": 1, "b": 2})
+        e2 = Evidence(kind="file", path="src/app.py", extras={"b": 2, "a": 1})
+        a = make_finding(id="a", claim="x", evidence=[e1])
+        b = make_finding(id="b", claim="x", evidence=[e2])
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(a)
+        registry.register(b)
+        merged = registry.deduplicate()
+        assert len(merged) == 1
+        assert len(merged[0].evidence) == 1
+
+    # --- round-2 fix #9 -----------------------------------------------------
+    def test_archive_survives_workflow_state_round_trip(self) -> None:
+        from ai_pr_orchestrator.v3.domain import WorkflowState
+
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x"))
+        registry.apply_disposition("f1", "fix", rationale="r", decided_by="foreman")
+        _, archived = registry.compact()
+        state = WorkflowState(
+            work_item_id="wi-1", run_id="run-1", phase="reviewing", archived=list(archived)
+        )
+        reloaded = WorkflowState.from_dict(state.to_dict())
+        assert reloaded.archived == archived
+        assert reloaded.archived[0].finding_id == "f1"
+        assert reloaded.archived[0].sources and reloaded.archived[0].sources[0].finding_id == "f1"
+
+    # --- round-2 fix #10 ----------------------------------------------------
+    def test_deferred_is_not_terminal_but_still_requires_reason(self) -> None:
+        from ai_pr_orchestrator.v3.domain import (
+            FINDING_STATUSES_REQUIRING_REASON,
+            TERMINAL_FINDING_STATUSES,
+        )
+
+        assert "deferred" in FINDING_STATUSES_REQUIRING_REASON
+        assert "deferred" not in TERMINAL_FINDING_STATUSES
+        # Deferred findings are never archived by compact (round-1 fix #15).
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x"))
+        registry.apply_disposition("f1", "reply_deferred", rationale="r", decided_by="foreman")
+        active, archived = registry.compact()
+        assert [f.id for f in active] == ["f1"]
+        assert archived == []

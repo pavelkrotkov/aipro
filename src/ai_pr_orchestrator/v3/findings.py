@@ -11,12 +11,14 @@ retries of the same reviewer/head/claim.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC
 from typing import Any
 
 from .domain import (
+    ArchivedFinding,
     DispositionAction,
     DomainError,
     Evidence,
@@ -25,7 +27,6 @@ from .domain import (
     FindingStatus,
     LaneName,
     ReviewerFinding,
-    Severity,
 )
 
 #: Higher is more urgent.
@@ -74,6 +75,16 @@ def _reject_separator(component: str, context: str) -> None:
         raise DomainError(f"{context} must not contain the reserved separator character")
 
 
+def _canonical_line_end(line: int | None, line_end: int | None) -> str:
+    """Canonical encoding of the line range in a dedup/id key: the schema
+    defines ``line_end=None`` as a single-line finding, so ``(line=10,
+    line_end=None)`` and ``(line=10, line_end=10)`` must produce the same
+    key (finding round-2 fix #7)."""
+    if line_end is None or line_end == line:
+        return ""
+    return str(line_end)
+
+
 def compute_finding_id(
     *,
     head_sha: str,
@@ -102,7 +113,7 @@ def compute_finding_id(
             normalize_claim(claim),
             path or "",
             str(line or ""),
-            str(line_end or ""),
+            _canonical_line_end(line, line_end),
         )
     )
     return "finding-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -122,7 +133,7 @@ def finding_dedup_key(finding: ReviewerFinding) -> str:
             normalize_claim(_claim_of(finding)),
             finding.path or "",
             str(finding.line or ""),
-            str(finding.line_end or ""),
+            _canonical_line_end(finding.line, finding.line_end),
         )
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -166,67 +177,6 @@ class QuarantinedFinding:
 
 
 @dataclass
-class ArchivedFinding:
-    """Compact record kept after a terminal disposition, so durable state
-    stays bounded once findings settle. Full evidence may be dropped; the
-    identity, outcome, and reviewer provenance survive."""
-
-    finding_id: str
-    lane: LaneName
-    severity: Severity
-    status: FindingStatus
-    status_reason: str
-    summary: str
-    sources: list[FindingProvenance] = field(default_factory=list)
-
-    @classmethod
-    def from_finding(cls, finding: ReviewerFinding) -> ArchivedFinding:
-        if finding.status_reason is None:
-            raise DomainError(
-                f"finding {finding.id} has no status_reason; cannot archive without a reason"
-            )
-        sources = finding.sources or [
-            FindingProvenance(
-                lane=finding.lane,
-                finding_id=finding.id,
-                run_id=finding.run_id,
-                round_id=finding.round_id,
-                thread_id=finding.thread_id,
-            )
-        ]
-        return cls(
-            finding_id=finding.id,
-            lane=finding.lane,
-            severity=finding.severity,
-            status=finding.status,
-            status_reason=finding.status_reason,
-            summary=finding.claim if finding.claim is not None else finding.body,
-            sources=list(sources),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "finding_id": self.finding_id,
-            "lane": self.lane,
-            "severity": self.severity,
-            "status": self.status,
-            "status_reason": self.status_reason,
-            "summary": self.summary,
-            "sources": [s.to_dict() for s in self.sources],
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> ArchivedFinding:
-        data = dict(data)
-        data["sources"] = [
-            s if isinstance(s, FindingProvenance) else FindingProvenance.from_dict(s)
-            for s in data.get("sources", [])
-        ]
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
-
-
-@dataclass
 class FindingRegistry:
     """In-memory registry that validates, deduplicates, and settles findings.
 
@@ -251,6 +201,18 @@ class FindingRegistry:
     #: coder ``reply_body`` before its disposition settles it (finding
     #: round-1 fix #12).
     require_coder_reply_before_resolve: bool = True
+
+    def __post_init__(self) -> None:
+        # Hydrating from persisted state (FindingRegistry(findings=...))
+        # bypasses ``register``, so duplicate ids must be rejected here too —
+        # a legacy state with two lanes reusing an id would otherwise corrupt
+        # apply_disposition and detect_conflicts' by-id map (finding round-2
+        # fix #1).
+        seen: set[str] = set()
+        for finding in self.findings:
+            if finding.id in seen:
+                raise DomainError(f"finding id {finding.id!r} is already registered")
+            seen.add(finding.id)
 
     def register(self, finding: ReviewerFinding) -> ReviewerFinding | None:
         """Validate and admit one finding; return the stored finding, or
@@ -342,7 +304,11 @@ class FindingRegistry:
             seen_sources: set[str] = set()
             for f in sorted(group, key=lambda f: f.id):
                 for item in f.evidence:
-                    marker = repr(item.to_dict())
+                    # Canonical serialization: evidence dicts merge an
+                    # ``extras`` bucket, so plain repr() is insertion-order
+                    # dependent and identical evidence with differently
+                    # ordered keys would both survive (finding round-2 fix #8).
+                    marker = json.dumps(item.to_dict(), sort_keys=True, default=repr)
                     if marker not in seen_evidence:
                         seen_evidence.add(marker)
                         evidence.append(item)
@@ -421,9 +387,13 @@ class FindingRegistry:
             finding.conflict_group_id = None
         for root in sorted(components):
             members = sorted(components[root])
-            group_id = (
-                "conflict-" + hashlib.sha256(_SEP.join(members).encode("utf-8")).hexdigest()[:12]
-            )
+            # Length-prefixed member encoding: finding ids are arbitrary
+            # non-empty strings and may contain the ``_SEP`` character, so a
+            # plain join could make distinct member sets hash identically
+            # (['a','b\x1fc'] vs ['a\x1fb','c']); the length prefix keeps each
+            # encoded member unambiguous (finding round-2 fix #2).
+            encoded = ",".join(f"{len(m)}:{m}" for m in members)
+            group_id = "conflict-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
             for member in members:
                 by_id[member].conflict_group_id = group_id
             result[group_id] = members
@@ -453,9 +423,18 @@ class FindingRegistry:
             raise DomainError(
                 f"finding {finding_id!r} is already {finding.status!r} and cannot be re-settled"
             )
+        # The persisted disposition must keep the thread identity: default the
+        # caller's ``thread_id`` from the finding and reject a mismatch rather
+        # than silently dropping the finding's thread (finding round-2 fix #4).
+        if thread_id is not None and finding.thread_id and thread_id != finding.thread_id:
+            raise DomainError(
+                f"finding {finding_id!r} lives on thread {finding.thread_id!r}; "
+                f"disposition supplied mismatched thread_id {thread_id!r}"
+            )
+        effective_thread_id = thread_id if thread_id is not None else finding.thread_id
         if (
             self.require_coder_reply_before_resolve
-            and (finding.thread_id or thread_id)
+            and effective_thread_id
             and not (reply_body or "").strip()
         ):
             raise DomainError(
@@ -467,7 +446,7 @@ class FindingRegistry:
             action=action,
             rationale=rationale,
             decided_by=decided_by,
-            thread_id=thread_id,
+            thread_id=effective_thread_id,
             reply_body=reply_body,
         )
         updated = replace(
@@ -512,11 +491,18 @@ def _ranges_overlap(a: ReviewerFinding, b: ReviewerFinding) -> bool:
 
 
 #: GitHub markdown special characters escaped in reviewer-controlled text.
-_MD_ESCAPE = re.compile(r"([\\`*_{}\[\]<>#+\-.!|])")
+#: ``@`` is included so a reviewer body cannot turn its text into a user
+#: mention (finding round-2 fix #6).
+_MD_ESCAPE = re.compile(r"([\\`*_{}\[\]<>#+\-.!|@])")
 
 
 def _md_escape(text: str | None) -> str:
-    return _MD_ESCAPE.sub(r"\\\1", text or "")
+    # Normalize line breaks to spaces first: a raw newline would let the
+    # reviewer body escape the bullet it is rendered into (finding round-2
+    # fix #6). ``@`` is backslash-escaped, which GitHub renders literally
+    # without triggering a mention notification.
+    collapsed = (text or "").replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    return _MD_ESCAPE.sub(r"\\\1", collapsed)
 
 
 def _md_escape_code(text: str | None) -> str:
