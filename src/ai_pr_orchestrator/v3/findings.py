@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field, fields, replace
+from datetime import UTC
 from typing import Any
 
 from .domain import (
@@ -46,10 +47,31 @@ ACTION_TO_STATUS: dict[DispositionAction, FindingStatus] = {
 
 _WS = re.compile(r"\s+")
 
+#: Reserved join/field separator. Legal inside ``head_sha``/``path``/claim
+#: values, so every component fed to a key builder is checked and rejected if
+#: it contains the separator — otherwise a crafted payload could make two
+#: distinct findings collide on the same key. (finding round-1 fix #8)
+_SEP = "\x1f"
+
 
 def normalize_claim(text: str) -> str:
     """Normalize claim text for comparison: collapse whitespace, lowercase."""
     return _WS.sub(" ", text).strip().lower()
+
+
+def _claim_of(finding: ReviewerFinding) -> str:
+    """The machine-comparable claim, falling back to the body when the claim
+    is missing or blank. A blank claim must never become a universal dedup key
+    (finding round-1 fix #14)."""
+    claim = finding.claim
+    if claim is not None and claim.strip():
+        return claim
+    return finding.body
+
+
+def _reject_separator(component: str, context: str) -> None:
+    if _SEP in component:
+        raise DomainError(f"{context} must not contain the reserved separator character")
 
 
 def compute_finding_id(
@@ -68,7 +90,12 @@ def compute_finding_id(
     same reviewer reporting the same normalized claim against the same
     head SHA yields the same id.
     """
-    raw = "\x1f".join(
+    _reject_separator(head_sha, "head_sha")
+    _reject_separator(lane, "lane")
+    _reject_separator(claim, "claim")
+    if path is not None:
+        _reject_separator(path, "path")
+    raw = _SEP.join(
         (
             head_sha.strip().lower(),
             lane.strip().lower(),
@@ -85,11 +112,14 @@ def finding_dedup_key(finding: ReviewerFinding) -> str:
     """Semantic/positional dedup key: same head, same normalized claim, same
     location. Findings sharing a key are exact duplicates regardless of which
     reviewer lane produced them."""
-    claim = finding.claim if finding.claim is not None else finding.body
-    raw = "\x1f".join(
+    _reject_separator(finding.head_sha or "", "head_sha")
+    _reject_separator(_claim_of(finding), "claim")
+    if finding.path is not None:
+        _reject_separator(finding.path, "path")
+    raw = _SEP.join(
         (
             (finding.head_sha or "").strip().lower(),
-            normalize_claim(claim),
+            normalize_claim(_claim_of(finding)),
             finding.path or "",
             str(finding.line or ""),
             str(finding.line_end or ""),
@@ -102,10 +132,21 @@ def _severity_of(finding: ReviewerFinding) -> int:
     return SEVERITY_RANK[finding.severity]
 
 
+def _aware_created_at(finding: ReviewerFinding) -> Any:
+    """Normalize a possibly-naive ``created_at`` for comparison.
+
+    Naive datetimes (as constructed directly by callers) would otherwise
+    raise ``TypeError`` when compared against aware ones during dedup, which
+    would abort the whole pass (finding round-1 fix #17).
+    """
+    dt = finding.created_at
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
 def _canonical_among(group: list[ReviewerFinding]) -> ReviewerFinding:
     """Pick the canonical representative: highest severity, then earliest
     created_at, then lexicographically smallest id — all deterministic."""
-    return sorted(group, key=lambda f: (-_severity_of(f), f.created_at, f.id))[0]
+    return sorted(group, key=lambda f: (-_severity_of(f), _aware_created_at(f), f.id))[0]
 
 
 def _first_present(group: list[ReviewerFinding], attr: str) -> Any:
@@ -201,25 +242,50 @@ class FindingRegistry:
     findings: list[ReviewerFinding] = field(default_factory=list)
     quarantined: list[QuarantinedFinding] = field(default_factory=list)
     archived: list[ArchivedFinding] = field(default_factory=list)
+    #: When True, a finding with no ``head_sha`` at all is quarantined rather
+    #: than silently treated as matching the current head. This is the strict
+    #: default; set to False as the explicit legacy-compatibility path for
+    #: pre-#50 payloads that predate ``head_sha`` (finding round-1 fix #2).
+    quarantine_unknown_head_sha: bool = True
+    #: When True, a finding that lives on a GitHub review thread must carry a
+    #: coder ``reply_body`` before its disposition settles it (finding
+    #: round-1 fix #12).
+    require_coder_reply_before_resolve: bool = True
 
     def register(self, finding: ReviewerFinding) -> ReviewerFinding | None:
         """Validate and admit one finding; return the stored finding, or
         ``None`` when it was quarantined."""
-        if (
-            self.current_head_sha
-            and finding.head_sha
-            and finding.head_sha.strip().lower() != self.current_head_sha.strip().lower()
-        ):
-            self.quarantined.append(
-                QuarantinedFinding(
-                    finding=finding,
-                    reason=(
-                        f"finding head_sha {finding.head_sha!r} does not match current "
-                        f"head {self.current_head_sha!r}"
-                    ),
+        if any(existing.id == finding.id for existing in self.findings):
+            raise DomainError(f"finding id {finding.id!r} is already registered")
+        if self.current_head_sha:
+            given = finding.head_sha and finding.head_sha.strip().lower()
+            current = self.current_head_sha.strip().lower()
+            if not given:
+                if self.quarantine_unknown_head_sha:
+                    self.quarantined.append(
+                        QuarantinedFinding(
+                            finding=finding,
+                            reason=(
+                                f"finding has no head_sha to verify against current "
+                                f"head {self.current_head_sha!r}"
+                            ),
+                        )
+                    )
+                    return None
+                # Explicit legacy-compatibility path: pre-#50 findings carry
+                # no head_sha; admit them rather than silently treating unknown
+                # as current, because the operator opted in.
+            elif given != current:
+                self.quarantined.append(
+                    QuarantinedFinding(
+                        finding=finding,
+                        reason=(
+                            f"finding head_sha {finding.head_sha!r} does not match current "
+                            f"head {self.current_head_sha!r}"
+                        ),
+                    )
                 )
-            )
-            return None
+                return None
         if not finding.sources:
             finding.sources = [
                 FindingProvenance(
@@ -241,6 +307,20 @@ class FindingRegistry:
         broken by earliest ``created_at`` then id); merged-in duplicates
         contribute their evidence and provenance, never their deletion.
         """
+        # Hydrated registries (FindingRegistry(findings=...)) bypass
+        # ``register``, so seed missing provenance here too (finding round-1
+        # fix #10).
+        for finding in self.findings:
+            if not finding.sources:
+                finding.sources = [
+                    FindingProvenance(
+                        lane=finding.lane,
+                        finding_id=finding.id,
+                        run_id=finding.run_id,
+                        round_id=finding.round_id,
+                        thread_id=finding.thread_id,
+                    )
+                ]
         groups: dict[str, list[ReviewerFinding]] = {}
         for finding in self.findings:
             groups.setdefault(finding_dedup_key(finding), []).append(finding)
@@ -250,6 +330,11 @@ class FindingRegistry:
             if len(group) == 1:
                 merged.append(group[0])
                 continue
+            statuses = {f.status for f in group}
+            if len(statuses) > 1:
+                raise DomainError(
+                    f"cannot deduplicate findings across lifecycle states {sorted(statuses)}"
+                )
             canonical = _canonical_among(group)
             evidence: list[Evidence] = []
             seen_evidence: set[str] = set()
@@ -281,49 +366,67 @@ class FindingRegistry:
 
     def detect_conflicts(self) -> dict[str, list[str]]:
         """Group obviously contradictory findings: same path, overlapping
-        line ranges, incompatible claims (different normalized claims and
-        the group spans more than one lane).
+        line ranges, incompatible claims, and at least two distinct lanes.
+
+        Conflicting pairs that share a finding are merged into connected
+        COMPONENTS so every finding in the web carries one consistent
+        ``conflict_group_id`` (finding round-1 fix #4), and findings from the
+        same lane never conflict with themselves (finding round-1 fix #5).
 
         Returns a mapping of conflict group id to finding ids and stamps
         ``conflict_group_id`` on each participating finding. Conflicting
         findings are never merged or dropped — they stay distinct so a
         human/policy can adjudicate.
         """
+        by_id = {f.id: f for f in self.findings}
         by_path: dict[str, list[ReviewerFinding]] = {}
         for finding in self.findings:
             if finding.path and finding.line is not None:
                 by_path.setdefault(finding.path, []).append(finding)
-        groups: dict[str, list[ReviewerFinding]] = {}
+        # Union-find over conflict edges to group findings into connected
+        # components regardless of the order pairs are considered.
+        parent: dict[str, str] = {}
+        edges: list[tuple[str, str]] = []
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            parent.setdefault(a, a)
+            parent.setdefault(b, b)
+            root_a, root_b = find(a), find(b)
+            if root_a != root_b:
+                parent[root_a] = root_b
+
         for path in sorted(by_path):
             bucket = sorted(by_path[path], key=lambda f: f.id)
             for i, a in enumerate(bucket):
                 for b in bucket[i + 1 :]:
+                    if a.lane == b.lane:
+                        continue
                     if not _ranges_overlap(a, b):
                         continue
-                    claim_a = a.claim if a.claim is not None else a.body
-                    claim_b = b.claim if b.claim is not None else b.body
-                    if normalize_claim(claim_a) == normalize_claim(claim_b):
+                    if normalize_claim(_claim_of(a)) == normalize_claim(_claim_of(b)):
                         continue
-                    if a.lane == b.lane and len({a.id, b.id}) == 1:
-                        continue
-                    pair = tuple(sorted((a.id, b.id)))
-                    group_key = (
-                        "conflict-"
-                        + hashlib.sha256("\x1f".join((path, *pair)).encode("utf-8")).hexdigest()[
-                            :12
-                        ]
-                    )
-                    groups.setdefault(group_key, [])
-                    if a.id not in [f.id for f in groups[group_key]]:
-                        groups[group_key].append(a)
-                    if b.id not in [f.id for f in groups[group_key]]:
-                        groups[group_key].append(b)
+                    edges.append((a.id, b.id))
+                    union(a.id, b.id)
+        components: dict[str, set[str]] = {}
+        for a, b in edges:
+            components.setdefault(find(a), set()).update((a, b))
         result: dict[str, list[str]] = {}
-        for group_id in sorted(groups):
-            members = sorted(groups[group_id], key=lambda f: f.id)
-            for finding in members:
-                finding.conflict_group_id = group_id
-            result[group_id] = [f.id for f in members]
+        for finding in self.findings:
+            finding.conflict_group_id = None
+        for root in sorted(components):
+            members = sorted(components[root])
+            group_id = (
+                "conflict-" + hashlib.sha256(_SEP.join(members).encode("utf-8")).hexdigest()[:12]
+            )
+            for member in members:
+                by_id[member].conflict_group_id = group_id
+            result[group_id] = members
         return result
 
     def apply_disposition(
@@ -346,9 +449,18 @@ class FindingRegistry:
         if index is None:
             raise DomainError(f"no finding with id {finding_id!r} is registered")
         finding = self.findings[index]
-        if finding.status != "open":
+        if finding.status not in ("open", "deferred"):
             raise DomainError(
                 f"finding {finding_id!r} is already {finding.status!r} and cannot be re-settled"
+            )
+        if (
+            self.require_coder_reply_before_resolve
+            and (finding.thread_id or thread_id)
+            and not (reply_body or "").strip()
+        ):
+            raise DomainError(
+                f"finding {finding_id!r} lives on a review thread; reply_body is "
+                "required before resolving it"
             )
         disposition = FindingDisposition(
             finding_id=finding_id,
@@ -367,15 +479,18 @@ class FindingRegistry:
         return updated, disposition
 
     def compact(self) -> tuple[list[ReviewerFinding], list[ArchivedFinding]]:
-        """Move findings at a terminal status into the compact archive.
+        """Move settled findings into the compact archive.
 
-        Returns (active findings, newly archived records). Archived records
-        keep identity, outcome, summary, and provenance — durable state
-        stays bounded without losing the audit trail.
+        Returns (active findings, newly archived records). Archive records
+        keep identity, outcome, summary, and provenance — durable state stays
+        bounded without losing the audit trail. ``deferred`` findings are NOT
+        archived: a deferred finding must stay active (with its evidence) so a
+        follow-up disposition can still resolve it later (finding round-1 fix
+        #15).
         """
         active: list[ReviewerFinding] = []
         for finding in self.findings:
-            if finding.status in ("accepted", "rejected", "deferred", "archived"):
+            if finding.status in ("accepted", "rejected", "archived"):
                 self.archived.append(ArchivedFinding.from_finding(finding))
             else:
                 active.append(finding)
@@ -396,11 +511,29 @@ def _ranges_overlap(a: ReviewerFinding, b: ReviewerFinding) -> bool:
     return start_a <= end_b and start_b <= end_a
 
 
+#: GitHub markdown special characters escaped in reviewer-controlled text.
+_MD_ESCAPE = re.compile(r"([\\`*_{}\[\]<>#+\-.!|])")
+
+
+def _md_escape(text: str | None) -> str:
+    return _MD_ESCAPE.sub(r"\\\1", text or "")
+
+
+def _md_escape_code(text: str | None) -> str:
+    """Escape only the characters that break out of an inline code span
+    (backtick/backslash); inline code does not render the other Markdown
+    special characters, so a path like ``src/app.py`` stays readable."""
+    return (text or "").replace("\\", "\\\\").replace("`", "\\`")
+
+
 def render_findings_summary(findings: list[ReviewerFinding]) -> str:
     """Render a concise human-readable GitHub markdown summary.
 
     Open and terminal findings are listed grouped by severity (highest
     first); conflicting findings are flagged, never resolved silently.
+    Reviewer-controlled text (bodies, paths, reasons) is Markdown-escaped
+    so a finding cannot inject formatting into the posted summary (finding
+    round-1 fix #18).
     """
     lines: list[str] = ["## Reviewer findings", ""]
     ordered = sorted(findings, key=lambda f: (-_severity_of(f), f.path or "", f.line or 0, f.id))
@@ -410,15 +543,17 @@ def render_findings_summary(findings: list[ReviewerFinding]) -> str:
     for finding in ordered:
         location = ""
         if finding.path:
-            location = f" (`{finding.path}:{finding.line or '?'}`)"
-        lines.append(f"- **{finding.severity}** — {finding.body}{location}")
+            location = f" (`{_md_escape_code(finding.path)}:{finding.line or '?'}`)"
+        lines.append(f"- **{finding.severity}** — {_md_escape(finding.body)}{location}")
         if finding.conflict_group_id:
             lines.append(
                 f"  - ⚠️ conflicts with another reviewer's finding "
-                f"(group `{finding.conflict_group_id}`); needs adjudication"
+                f"(group `{_md_escape_code(finding.conflict_group_id)}`); needs adjudication"
             )
         if finding.status != "open":
-            lines.append(f"  - disposition: **{finding.status}** — {finding.status_reason}")
+            lines.append(
+                f"  - disposition: **{finding.status}** — {_md_escape(finding.status_reason)}"
+            )
     return "\n".join(lines)
 
 

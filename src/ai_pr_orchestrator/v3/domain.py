@@ -16,7 +16,7 @@ vendor/model.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -394,6 +394,9 @@ class Evidence:
     snippet: str | None = None
     thread_id: str | None = None
     text: str | None = None
+    #: Unknown fields from a newer writer, preserved for lossless round trips
+    #: and written back by ``to_dict``.
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.kind not in VALID_EVIDENCE_KINDS:
@@ -414,6 +417,14 @@ class Evidence:
             raise DomainError(
                 f"Evidence.line_end ({self.line_end}) must be >= line_start ({self.line_start})"
             )
+        if self.line_end is not None and self.line_start is None:
+            raise DomainError("Evidence.line_end requires line_start to be set")
+        if self.kind in ("file", "snippet") and self.path is None:
+            raise DomainError(f"Evidence of kind {self.kind!r} requires a code path")
+        if self.kind == "snippet" and not (self.snippet or "").strip():
+            raise DomainError("Evidence of kind 'snippet' requires snippet text")
+        if self.kind in ("command", "log") and not (self.text or "").strip():
+            raise DomainError(f"Evidence of kind {self.kind!r} requires non-blank text")
         if self.path is None and self.thread_id is None and not (self.text or self.snippet):
             raise DomainError(
                 "Evidence must carry at least one of path, thread_id, snippet, or text"
@@ -422,12 +433,30 @@ class Evidence:
             raise DomainError("Evidence of kind 'thread' requires thread_id")
 
     def to_dict(self) -> dict[str, Any]:
-        return _serialize_dataclass(self)
+        data = _serialize_dataclass(self)
+        reserved = {f.name for f in fields(self)} - {"extras"}
+        collisions = sorted(reserved & set(self.extras))
+        if collisions:
+            raise DomainError(f"Evidence.extras may not override validated fields: {collisions}")
+        data.pop("extras", None)
+        data.update(self.extras)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Evidence:
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        """Lenient deserialization: unknown fields go to ``extras`` and
+        strict validation is skipped so legacy payloads (e.g. paths written
+        before #50 tightened the rules) still load."""
+        data = dict(data)
+        known = {f.name for f in fields(cls)} - {"extras"}
+        kwargs: dict[str, Any] = {}
+        extras: dict[str, Any] = {}
+        for key, value in data.items():
+            if key in known:
+                kwargs[key] = value
+            else:
+                extras[key] = value
+        return _construct_lenient(cls, kwargs, extras)
 
 
 def _validate_path(path: str, *, context: str) -> None:
@@ -559,6 +588,8 @@ class ReviewerFinding:
             raise DomainError(
                 f"ReviewerFinding.line_end ({self.line_end}) must be >= line ({self.line})"
             )
+        if self.line_end is not None and self.line is None:
+            raise DomainError("ReviewerFinding.line_end requires line to be set")
         if self.path is not None:
             _validate_path(self.path, context="ReviewerFinding.path")
         if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
@@ -591,19 +622,38 @@ class ReviewerFinding:
                 )
 
     def to_dict(self) -> dict[str, Any]:
-        data = _serialize_dataclass(self)
         reserved = {f.name for f in fields(self)} - {"extras"}
         collisions = sorted(reserved & set(self.extras))
         if collisions:
             raise DomainError(
                 f"ReviewerFinding.extras may not override validated fields: {collisions}"
             )
-        data.pop("extras", None)
+        data: dict[str, Any] = {}
+        for f in fields(self):
+            if f.name == "extras":
+                continue
+            value = getattr(self, f.name)
+            # The pre-#50 fields are the durable core of the schema and are
+            # always carried so legacy #43 queue payloads keep their shape.
+            # The #50 extension fields are omitted when they still hold their
+            # default value, keeping old payloads compact (and under
+            # max_state_block_chars) when a newer writer round-trips them.
+            if f.name not in _CORE_FIELDS and _is_default_value(f, value):
+                continue
+            data[f.name] = _serialize_value(value)
         data.update(self.extras)
         return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReviewerFinding:
+        """Lenient deserialization: unknown fields go to ``extras``.
+
+        Strict ``__post_init__`` validation is deliberately skipped on load so
+        payloads written before #50 tightened the validation rules (e.g. an
+        older, permissive ``path``) still reconstruct the whole work-item
+        state instead of failing to load. Newly constructed findings keep full
+        validation.
+        """
         data = dict(data)
         if isinstance(data.get("created_at"), str):
             data["created_at"] = _str_to_dt(data["created_at"])
@@ -624,7 +674,7 @@ class ReviewerFinding:
                 kwargs[key] = value
             else:
                 extras[key] = value
-        return cls(**kwargs, extras=extras)
+        return _construct_lenient(cls, kwargs, extras)
 
 
 @dataclass
@@ -747,3 +797,52 @@ def _str_to_dt(s: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+#: Durable pre-#50 (issue #41) fields always carried by ``to_dict``.
+_CORE_FIELDS = frozenset({"id", "lane", "body", "severity", "run_id", "round_id", "created_at"})
+
+
+def _is_default_value(f: Any, value: Any) -> bool:
+    """True when ``value`` equals the dataclass default for field ``f``.
+
+    Handles plain defaults and ``default_factory`` fields uniformly, so
+    round-tripping an omitted extension field reconstructs the identical
+    default value.
+    """
+    if f.default is not MISSING:
+        return value == f.default
+    return value == f.default_factory()
+
+
+def _serialize_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_nested_to_dict(v) for v in value]
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    return value
+
+
+def _construct_lenient(cls: type, kwargs: dict[str, Any], extras: dict[str, Any]) -> Any:
+    """Build a dataclass instance without running ``__post_init__``.
+
+    Used by the ``*_from_dict`` deserialization path so that payloads written
+    before a validation rule was tightened (e.g. the stricter #50 path rules)
+    still load instead of raising ``DomainError`` on the whole work-item state.
+    Every field is set, with missing fields falling back to their declared
+    default so optional/default-factory fields are always present.
+    """
+    obj = object.__new__(cls)
+    for f in fields(cls):
+        if f.name == "extras":
+            object.__setattr__(obj, "extras", extras)
+        elif f.name in kwargs:
+            object.__setattr__(obj, f.name, kwargs[f.name])
+        elif f.default is not MISSING:
+            object.__setattr__(obj, f.name, f.default)
+        else:
+            assert f.default_factory is not MISSING
+            object.__setattr__(obj, f.name, f.default_factory())
+    return obj

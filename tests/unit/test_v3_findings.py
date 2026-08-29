@@ -153,9 +153,13 @@ class TestRoundTrip:
         assert finding.sources == []
         assert finding.confidence is None
         assert finding.head_sha is None
-        # New fields default; serialization adds only known keys.
+        # New #50 extension fields default; they are omitted on write so
+        # legacy payloads stay compact (finding round-1 fix #7).
         data = finding.to_dict()
-        assert "confidence" in data and data["confidence"] is None
+        assert "confidence" not in data
+        assert "head_sha" not in data
+        assert "claim" not in data
+        assert "evidence" not in data
         assert "extras" not in data
 
 
@@ -292,7 +296,12 @@ class TestDispositions:
         registry.register(make_finding(id="f2", claim="y"))
         registry.register(make_finding(id="f3", claim="z"))
         updated, disposition = registry.apply_disposition(
-            "f1", "fix", rationale="real bug", decided_by="foreman", thread_id="PRRT_1"
+            "f1",
+            "fix",
+            rationale="real bug",
+            decided_by="foreman",
+            thread_id="PRRT_1",
+            reply_body="fixed in 1234abc",
         )
         assert updated.status == "accepted"
         assert "real bug" in (updated.status_reason or "")
@@ -372,3 +381,202 @@ class TestCompactionAndSummary:
 
 def test_normalize_claim() -> None:
     assert normalize_claim("  A  B\tC\n") == "a b c"
+
+
+class TestRound1Fixes:
+    """Regression tests for codex review round-1 findings on the #50 schema."""
+
+    # --- #1: legacy path validation tolerated on deserialization -----------
+    def test_legacy_permissive_path_loads_leniently(self) -> None:
+        legacy = make_finding().to_dict()
+        legacy["path"] = "/abs/legacy.py"  # strict #50 rules reject absolutes
+        finding = ReviewerFinding.from_dict(legacy)
+        assert finding.path == "/abs/legacy.py"
+        # ...but strict construction still rejects it.
+        with pytest.raises(DomainError):
+            make_finding(path="/abs/legacy.py")
+
+    # --- #2: missing head_sha quarantined, explicit legacy compat ----------
+    def test_unknown_head_sha_quarantined_by_default(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        assert registry.register(make_finding(head_sha=None)) is None
+        assert registry.findings == []
+        assert len(registry.quarantined) == 1
+        assert "no head_sha" in registry.quarantined[0].reason
+
+    def test_unknown_head_sha_legacy_compat_opt_in(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD, quarantine_unknown_head_sha=False)
+        assert registry.register(make_finding(head_sha=None)) is not None
+        assert len(registry.findings) == 1
+
+    # --- #3: reject dedup across lifecycle states --------------------------
+    def test_dedup_across_lifecycle_states_rejected(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(
+            make_finding(id="a", claim="null deref", status="accepted", status_reason="saw it")
+        )
+        registry.register(make_finding(id="b", claim="null deref"))
+        with pytest.raises(DomainError, match="across lifecycle states"):
+            registry.deduplicate()
+
+    # --- #4: conflicts merge into connected components ---------------------
+    def test_conflict_connected_component_single_group(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="a", lane="review-a", claim="is a bug", line=10))
+        registry.register(make_finding(id="b", lane="review-b", claim="works", line=10))
+        registry.register(make_finding(id="c", lane="review-c", claim="flaky", line=10))
+        groups = registry.detect_conflicts()
+        assert len(groups) == 1
+        (group_id,) = groups
+        assert sorted(groups[group_id]) == ["a", "b", "c"]
+        # Every member carries one consistent group id.
+        for finding in registry.findings:
+            assert finding.conflict_group_id == group_id
+
+    # --- #5: same-lane findings never conflict -----------------------------
+    def test_same_lane_findings_not_conflicted(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="a", lane="review-a", claim="is a bug", line=10))
+        registry.register(make_finding(id="b", lane="review-a", claim="intended", line=10))
+        assert registry.detect_conflicts() == {}
+
+    # --- #6: evidence kind-specific validation -----------------------------
+    def test_evidence_file_requires_path(self) -> None:
+        with pytest.raises(DomainError, match="code path"):
+            Evidence(kind="file", text="deref")
+
+    def test_evidence_snippet_requires_path_and_text(self) -> None:
+        with pytest.raises(DomainError, match="snippet text"):
+            Evidence(kind="snippet", path="src/app.py")
+        Evidence(kind="snippet", path="src/app.py", snippet="x = 1")
+
+    def test_evidence_command_log_require_text(self) -> None:
+        with pytest.raises(DomainError, match="non-blank text"):
+            Evidence(kind="command")
+        with pytest.raises(DomainError, match="non-blank text"):
+            Evidence(kind="log", text="   ")
+        Evidence(kind="command", text="pytest -q")
+        Evidence(kind="log", text="output")
+
+    # --- #8: reserved separator rejected in key components -----------------
+    def test_separator_injection_rejected(self) -> None:
+        with pytest.raises(DomainError, match="separator"):
+            compute_finding_id(head_sha=HEAD, lane="review-a", claim="a\x1fb")
+        with pytest.raises(DomainError, match="separator"):
+            compute_finding_id(head_sha=HEAD, lane="review-a", claim="x", path="src/\x1fapp")
+        with pytest.raises(DomainError, match="separator"):
+            finding_dedup_key(make_finding(claim="a\x1fb"))
+
+    # --- #9: duplicate finding ids rejected at registration ----------------
+    def test_duplicate_finding_id_rejected(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x"))
+        with pytest.raises(DomainError, match="already registered"):
+            registry.register(make_finding(id="f1", claim="different"))
+
+    # --- #10: hydrated registries seed provenance in deduplicate -----------
+    def test_hydrated_registry_seeds_sources(self) -> None:
+        registry = FindingRegistry(findings=[make_finding(id="f1", claim="x", sources=[])])
+        merged = registry.deduplicate()
+        assert merged[0].sources and merged[0].sources[0].finding_id == "f1"
+
+    # --- #11 (rebutted): conflicts are advisory, never auto-resolved -------
+    def test_conflicts_are_advisory_not_auto_resolved(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        a = make_finding(id="a", lane="review-a", claim="is a bug", line=10)
+        b = make_finding(id="b", lane="review-b", claim="intended", line=10)
+        registry.register(a)
+        registry.register(b)
+        registry.detect_conflicts()
+        # Both findings remain present, open, and fully intact for adjudication.
+        assert len(registry.findings) == 2
+        assert all(f.status == "open" for f in registry.findings)
+        assert {f.id for f in registry.findings} == {"a", "b"}
+
+    # --- #12: require coder reply before resolve ---------------------------
+    def test_threaded_disposition_requires_reply(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x", thread_id="PRRT_1"))
+        with pytest.raises(DomainError, match="reply_body"):
+            registry.apply_disposition("f1", "fix", rationale="r", decided_by="foreman")
+        updated, _ = registry.apply_disposition(
+            "f1", "fix", rationale="r", decided_by="foreman", reply_body="done"
+        )
+        assert updated.status == "accepted"
+
+    def test_reply_policy_off_when_disabled(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD, require_coder_reply_before_resolve=False)
+        registry.register(make_finding(id="f1", claim="x", thread_id="PRRT_1"))
+        updated, _ = registry.apply_disposition("f1", "fix", rationale="r", decided_by="foreman")
+        assert updated.status == "accepted"
+
+    # --- #13: evidence unknown nested fields preserved in extras -----------
+    def test_evidence_unknown_fields_preserved(self) -> None:
+        payload = Evidence(kind="file", path="src/app.py").to_dict()
+        payload["future_meta"] = {"k": 1}
+        evidence = Evidence.from_dict(payload)
+        assert evidence.extras == {"future_meta": {"k": 1}}
+        assert evidence.to_dict()["future_meta"] == {"k": 1}
+
+    # --- #14: blank claim falls back to body for dedup ---------------------
+    def test_blank_claim_not_universal_dedup_key(self) -> None:
+        a = make_finding(id="a", claim="   ", body="foo")
+        b = make_finding(id="b", claim="", body="bar")
+        assert finding_dedup_key(a) != finding_dedup_key(b)
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(a)
+        registry.register(b)
+        assert len(registry.deduplicate()) == 2
+
+    # --- #15: deferred findings stay active and re-settlable ---------------
+    def test_deferred_finding_not_archived_and_re_settleable(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x"))
+        registry.apply_disposition(
+            "f1", "reply_deferred", rationale="next round", decided_by="foreman"
+        )
+        active, archived = registry.compact()
+        assert archived == []
+        assert [f.id for f in active] == ["f1"]
+        updated, _ = registry.apply_disposition(
+            "f1", "fix", rationale="now fixed", decided_by="foreman"
+        )
+        assert updated.status == "accepted"
+
+    # --- #16: line_end requires line / line_start --------------------------
+    def test_line_end_requires_line(self) -> None:
+        with pytest.raises(DomainError, match="line_end requires line"):
+            make_finding(line=None, line_end=12)
+        with pytest.raises(DomainError, match="line_end requires line_start"):
+            Evidence(kind="file", path="src/app.py", line_end=12)
+
+    # --- #17: naive/aware created_at compare in dedup ----------------------
+    def test_dedup_handles_mixed_naive_aware_created_at(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="a", claim="null deref", created_at=datetime(2026, 8, 1)))
+        registry.register(
+            make_finding(
+                id="b",
+                claim="null deref",
+                created_at=datetime(2026, 8, 2, tzinfo=UTC),
+            )
+        )
+        merged = registry.deduplicate()
+        assert len(merged) == 1
+
+    # --- #18: reviewer markdown escaped in summary -------------------------
+    def test_render_summary_escapes_reviewer_markdown(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x", body="a *b* [c](http://x) `d`"))
+        text = render_findings_summary(registry.findings)
+        assert "*b*" not in text
+        assert "[c]" not in text
+        assert "\\*b\\*" in text
+        assert "\\[c\\]" in text
+
+    def test_render_summary_escapes_path_backtick(self) -> None:
+        registry = FindingRegistry(current_head_sha=HEAD)
+        registry.register(make_finding(id="f1", claim="x", path="src/`evil`.py", body="ok"))
+        text = render_findings_summary(registry.findings)
+        assert "src/`evil`.py" not in text  # naked backtick would break the code span
+        assert "src/\\`evil\\`.py" in text
