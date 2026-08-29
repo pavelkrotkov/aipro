@@ -14,9 +14,10 @@ from typing import Any
 
 import pytest
 
-from ai_pr_orchestrator.v3.broker import PolicyBroker, TaskDemand
+from ai_pr_orchestrator.v3.broker import BrokerError, PolicyBroker, TaskDemand
 from ai_pr_orchestrator.v3.catalog import ModelCatalog, ModelCatalogEntry
 from ai_pr_orchestrator.v3.config import BrokerConfig, ResourceReserveConfig
+from ai_pr_orchestrator.v3.domain import ModelAssignment
 from ai_pr_orchestrator.v3.telemetry import (
     ProviderHealth,
     ProviderResourceSnapshot,
@@ -161,6 +162,8 @@ class TestRanking:
         # The allowance is already bought, so its marginal cash cost is zero
         # however high its list price is. That judgement is the broker's; the
         # catalog deliberately reports list price and refuses to make it.
+        # The subscription is *measured* here: an unmeasured one scores
+        # unknown on quota (unknown-is-not-favourable) and need not win.
         decision = broker(
             entry("metered-cheap", input_price_per_mtok=1.0, output_price_per_mtok=2.0),
             entry(
@@ -169,6 +172,10 @@ class TestRanking:
                 input_price_per_mtok=15.0,
                 output_price_per_mtok=75.0,
             ),
+            snapshots=[
+                snapshot("subscription", window("weekly", 0.1, resets_in=timedelta(days=5)))
+            ],
+            resource_by_provider={"subscription": "subscription"},
         ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
 
         assert decision.assignment.model_ref == "subscription"
@@ -706,3 +713,201 @@ def test_render_shows_ranked_scores_and_rejections():
     assert "ranked:" in text
     assert "diversity" in text
     assert "rejected:" in text and "disabled" in text
+
+
+# --- review round 1 regression tests -----------------------------------------
+
+
+def test_reserves_deserialize_from_plain_dicts():
+    from ai_pr_orchestrator.v3.config import V3Config
+
+    cfg = V3Config.from_dict(
+        {
+            "broker": {
+                "reserves": [{"resource": "sub", "fraction": 0.2}],
+            }
+        }
+    )
+    decision = broker(
+        subscription("sub"),
+        snapshots=[snapshot("sub", window("weekly", 0.95, resets_in=timedelta(days=5)))],
+        resource_by_provider={"sub": "sub"},
+        config=cfg.broker,
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    # 5% remaining - 20% reserve < 0: the *deserialized* reserve (a typed
+    # ResourceReserveConfig built from a plain dict, not a crash) breached the
+    # window and excluded the candidate.
+    assert decision.assignment is None
+    reason = next(c.reason for c in decision.rejected if c.ref == "sub")
+    assert "reserve" in reason
+
+
+def test_unmeasured_subscription_is_unknown_not_unlimited():
+    # A subscription with NO snapshot must not score perfect quota or skip
+    # reserve/scarcity reasoning: unknown is not favourable.
+    measured = broker(
+        subscription("measured"),
+        snapshots=[snapshot("measured", window("weekly", 0.05, resets_in=timedelta(days=5)))],
+        resource_by_provider={"measured": "measured"},
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    unmeasured = broker(subscription("blind")).select(
+        TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW
+    )
+    m_score = next(c.score for c in measured.ranked if c.ref == "measured")
+    u_score = next(c.score for c in unmeasured.ranked if c.ref == "blind")
+    assert m_score is not None and u_score is not None
+    assert u_score.quota_pressure < m_score.quota_pressure  # unknown below measured-good
+
+
+def test_perishability_is_bounded_by_jointly_usable_quota():
+    # Session window: 80% remaining, resets in 1h. Weekly: 1% remaining, resets
+    # in 5d. The perishable surplus usable is ~1% (weekly binds), NOT ~80%.
+    decision = broker(
+        subscription("both"),
+        snapshots=[
+            snapshot(
+                "both",
+                window("session", 0.9, resets_in=timedelta(hours=1)),
+                window("weekly", 0.1, resets_in=timedelta(days=5)),
+            )
+        ],
+        resource_by_provider={"both": "both"},
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    score = next(c.score for c in decision.ranked if c.ref == "both")
+    assert score is not None
+    # Session has 90% remaining and resets in 1h (urgency ~0.96); weekly has
+    # only 10% remaining. The jointly usable surplus is bounded by the weekly
+    # window (~0.10), so perishability must be small, not ~0.9*0.96.
+    assert score.perishability < 0.2
+
+
+def test_scarcity_gate_checks_all_windows_not_just_the_binding_one():
+    # Session: 40% available, resets in 1h (near-reset would lift the gate).
+    # Weekly: 5% available, resets in 6 days (scarce, far). Easy work must be
+    # rejected even though the *binding* (session) window is about to reset.
+    decision = broker(
+        subscription("split"),
+        snapshots=[
+            snapshot(
+                "split",
+                window("session", 0.6, resets_in=timedelta(hours=1)),
+                window("weekly", 0.95, resets_in=timedelta(days=6)),
+            )
+        ],
+        resource_by_provider={"split": "split"},
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    assert decision.assignment is None
+    reason = next(c.reason for c in decision.rejected if c.ref == "split")
+    assert "scarce" in reason
+
+
+def test_reserve_is_atomic_under_concurrency():
+    import threading
+
+    b = broker(entry("capped", max_concurrency=1), entry("spare"))
+    assignment = ModelAssignment(lane="developer", model_ref="capped")
+
+    lease = b.reserve(assignment)
+    with pytest.raises(BrokerError):
+        b.reserve(assignment)  # cap 1 already taken
+    b.release(lease)
+    lease2 = b.reserve(assignment)  # released -> reservable again
+    b.release(lease2)
+
+    # Hammer it from threads: never more than cap concurrent holders.
+    results = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            b.reserve(assignment)
+            with lock:
+                results.append("ok")
+        except BrokerError:
+            with lock:
+                results.append("blocked")
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert results.count("ok") <= 1
+
+
+def test_diversity_weight_is_independent_of_quality_weight():
+    e_family = entry("same-family", vendor="house", family="shared")
+    e_other = entry("other", vendor="rival", family="rival")
+    demand = TaskDemand(lane="r2", role="reviewer", difficulty=3, peers=("incumbent",))
+    incumbent = entry("incumbent", vendor="house", family="shared")
+
+    tuned = broker(
+        e_family,
+        e_other,
+        incumbent,
+        config=BrokerConfig(weight_quality=5.0, weight_diversity=0.1),
+    ).select(demand, at=NOW)
+    s_family = next(c.score for c in tuned.ranked if c.ref == "same-family")
+    assert s_family is not None
+    # The published component is normalized 0..1 regardless of weights.
+    assert s_family.diversity_penalty == 1.0
+
+
+def test_naive_evaluation_timestamp_is_normalized():
+    naive = datetime(2026, 8, 28, 12, 0)  # no tzinfo
+    decision = broker(entry("solo")).select(
+        TaskDemand(lane="developer", role="worker", difficulty=3), at=naive
+    )
+    assert decision.evaluated_at.tzinfo is not None
+
+
+def test_provider_mapping_beats_ref_name_match():
+    # A telemetry resource named like the ref but mapped to a DIFFERENT
+    # provider must not be attached via the ref-name shortcut.
+    decision = broker(
+        entry("paid", provider="real"),
+        snapshots=[
+            snapshot("paid", window("weekly", 0.01, resets_in=timedelta(days=1))),
+            snapshot("real", window("weekly", 0.99, resets_in=timedelta(days=1))),
+        ],
+        resource_by_provider={"real": "real"},
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    score = next(c.score for c in decision.ranked if c.ref == "paid")
+    assert score is not None
+    # The provider mapping binds 'paid' to the 'real' resource, which is
+    # nearly exhausted — the roomy resource that merely *shares the ref's
+    # name* must be ignored.
+    assert score.quota_pressure < 0.5
+
+
+def test_zero_cash_balance_is_named_as_the_exhaustion_cause():
+    decision = broker(
+        entry("broke"),
+        snapshots=[
+            snapshot("broke", availability="exhausted", cash_balance=0.0)  # no windows
+        ],
+        resource_by_provider={"broke": "broke"},
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    reason = next(c.reason for c in decision.rejected if c.ref == "broke")
+    assert "cash balance" in reason
+
+
+def test_subscription_without_token_prices_is_dispatchable():
+    # Fixed-price plans expose no per-token prices; the subscription's marginal
+    # cost is zero by definition, so it must not be rejected for missing them.
+    decision = broker(
+        subscription("flat"),
+        snapshots=[snapshot("flat", window("weekly", 0.5, resets_in=timedelta(days=3)))],
+        resource_by_provider={"flat": "flat"},
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    assert decision.assignment is not None
+
+
+def test_unset_providers_share_one_conservative_failure_domain():
+    # Two fallbacks with no declared provider must NOT both enter the chain:
+    # the broker cannot know they are distinct failure domains.
+    decision = broker(
+        entry("primary", provider="p1"),
+        entry("blank-a", provider=""),
+        entry("blank-b", provider=""),
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    blank_fallbacks = [r for r in decision.fallbacks if r.startswith("blank-")]
+    assert len(blank_fallbacks) <= 1

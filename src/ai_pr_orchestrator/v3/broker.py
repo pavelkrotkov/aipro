@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from threading import Lock
 from types import MappingProxyType
 from typing import Any
 
@@ -34,12 +35,29 @@ from .catalog import (
     ModelCatalog,
     ModelCatalogEntry,
 )
-from .domain import VALID_LANE_ROLES, LaneName, ModelAssignment, ModelRef
+from .domain import (
+    VALID_LANE_ROLES,
+    LaneName,
+    ModelAssignment,
+    ModelLease,
+    ModelRef,
+)
 from .telemetry import ProviderResourceSnapshot
 
 
 class BrokerError(SchemaError):
     """Raised when a broker request is malformed."""
+
+
+def _utc(dt: datetime) -> datetime:
+    """Return ``dt`` made timezone-aware (UTC). Naive input is assumed UTC.
+
+    Normalizing at the API boundary keeps every decision record absolute and
+    comparable: a naive ``at`` would otherwise blow up later against aware
+    promotion/reset timestamps or publish a decision with no offset at all.
+    """
+
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 #: A resource may legitimately have no telemetry at all — pay-as-you-go
@@ -272,9 +290,12 @@ class PolicyBroker:
         # one provider, which is what makes this lookup single-valued.
         self._resource_by_provider = dict(resource_by_provider or {})
         self._reserves = {r.resource: r for r in config.reserves}
+        # Atomic capacity reservation state (ModelBroker protocol).
+        self._cap_lock = Lock()
+        self._outstanding: dict[ModelRef, int] = {}
 
     def select(self, demand: TaskDemand, *, at: datetime | None = None) -> BrokerDecision:
-        now = at or datetime.now(UTC)
+        now = _utc(at or datetime.now(UTC))
         ranked: list[Candidate] = []
         rejected: list[Candidate] = []
 
@@ -316,6 +337,37 @@ class PolicyBroker:
             return demand.incumbent
         return ranked[0].ref if ranked else None
 
+    # --- ModelBroker protocol: atomic capacity reservation -------------------
+
+    def reserve(self, assignment: ModelAssignment) -> ModelLease:
+        """Atomically claim one concurrency slot for ``assignment``.
+
+        ``select()`` ranks against a caller-supplied ``in_flight`` snapshot and
+        is deliberately stateless; *this* is the serialization point. The
+        outstanding count is checked and incremented under one lock, so two
+        lanes scheduling concurrently cannot both take a model's last slot.
+        The caller must :meth:`release` the lease when its dispatch ends.
+        """
+        with self._cap_lock:
+            entry = self._catalog.get(assignment.model_ref)
+            cap = entry.max_concurrency if entry else None
+            if cap is not None and self._outstanding.get(assignment.model_ref, 0) >= cap:
+                raise BrokerError(
+                    f"model {assignment.model_ref!r} is at its concurrency cap ({cap}); "
+                    "cannot reserve another slot"
+                )
+            self._outstanding[assignment.model_ref] = (
+                self._outstanding.get(assignment.model_ref, 0) + 1
+            )
+        return ModelLease(model_ref=assignment.model_ref, lane=assignment.lane)
+
+    def release(self, lease: ModelLease) -> None:
+        """Return the slot taken by :meth:`reserve` (idempotent per lease)."""
+        with self._cap_lock:
+            current = self._outstanding.get(lease.model_ref, 0)
+            if current > 0:
+                self._outstanding[lease.model_ref] = current - 1
+
     def _fallback_chain(
         self, ranked: Sequence[Candidate], chosen: ModelRef | None
     ) -> tuple[ModelRef, ...]:
@@ -342,11 +394,17 @@ class PolicyBroker:
         return tuple(chain)
 
     def _provider_of(self, ref: ModelRef) -> str:
+        """The failure domain a candidate dispatches through.
+
+        An entry that declares no provider cannot be assumed to have its own
+        endpoint or credentials: the conservative assumption is that all such
+        entries share one unknown domain, so a provider outage defeats a chain
+        built from them just as it would a chain of same-provider models.
+        Claiming diversity the configuration does not evidence would be worse
+        than admitting there is none to claim.
+        """
         entry = self._catalog.get(ref)
-        # An entry that declares no provider shares a failure domain with
-        # nothing, so it is keyed on itself rather than pooled with every
-        # other blank.
-        return (entry.provider if entry else "") or f"<unset:{ref}>"
+        return (entry.provider if entry else "") or "<unset-provider>"
 
     # --- Scoring -----------------------------------------------------------
 
@@ -358,7 +416,7 @@ class PolicyBroker:
 
         quality = self._quality_component(entry, demand)
         cash_cost = self._cash_cost_component(entry, now)
-        quota_pressure = self._quota_component(snap, binding)
+        quota_pressure = self._quota_component(entry, snap, binding)
         health = self._health_component(snap)
         perishability = self._perishability_component(snap, views)
         diversity_penalty = self._diversity_penalty(entry, demand)
@@ -376,18 +434,19 @@ class PolicyBroker:
                 + config.weight_quota_pressure * quota_pressure
                 + config.weight_health * health
                 + config.weight_perishability * perishability
-                - diversity_penalty
+                - config.weight_diversity * diversity_penalty
             ),
         )
 
     def _diversity_penalty(self, entry: ModelCatalogEntry, demand: TaskDemand) -> float:
-        """Cost of seating this candidate next to the peers already chosen.
+        """Normalized similarity to the peers already chosen, in ``0.0``..``1.0``.
 
         Adversarial review wants independent opinions: two models from one
-        lineage tend to share blind spots, so a shared family is penalized
-        more than a merely shared vendor, and a shared vendor more than
-        nothing. The primary choice is never penalized — the penalty applies
-        only where an adversarial set is actually forming.
+        lineage tend to share blind spots, so a shared family costs more than a
+        merely shared vendor, and both cost more than nothing. The raw
+        component is published unweighted; :attr:`BrokerConfig.weight_diversity`
+        scales it in the total, so tuning diversity never requires re-deriving
+        what similarity meant.
         """
         if not demand.peers:
             return 0.0
@@ -398,25 +457,34 @@ class PolicyBroker:
             if peer_entry is None:
                 continue
             if entry.family and entry.family == peer_entry.family:
-                penalty += self._config.weight_quality  # strongest tie: one lineage
+                penalty += 1.0  # strongest tie: one lineage
             elif entry.vendor and entry.vendor == peer_entry.vendor:
-                penalty += self._config.weight_quality / 2.0
-        return penalty
+                penalty += 0.5
+        # Bounded component: cap at the strongest possible disagreement cost.
+        return min(1.0, penalty)
 
-    def _quota_component(self, snap: Snapshot, binding: _WindowView | None) -> float:
+    def _quota_component(
+        self, entry: ModelCatalogEntry, snap: Snapshot, binding: _WindowView | None
+    ) -> float:
         """Headroom on the window that binds, from ``0.0`` to ``1.0``.
 
-        Three cases that must not collapse into each other: a candidate with
-        no allowance to run out (pay-as-you-go) is unconstrained and scores
-        ``1.0``; a candidate whose allowance we could not measure scores the
-        configured unknown value; a measured one scores its real headroom
-        above reserve.
+        Four cases that must not collapse into each other: a *metered*
+        candidate with no allowance to run out (pay-as-you-go) is unconstrained
+        and scores ``1.0``; a subscription whose allowance we could not
+        measure scores the configured unknown value — unobserved is not the
+        same as unlimited, and an unmeasured subscription must not beat a
+        measured one nor skip reserve and scarcity filtering; a measured one
+        scores its real headroom above reserve.
         """
         if snap is None:
-            return 1.0
+            # An unmeasured subscription is unknown, not unlimited.
+            return self._config.unknown_quota_score if self._is_subscription(entry) else 1.0
         if binding is None:
             return self._config.unknown_quota_score
         return max(0.0, min(1.0, binding.available))
+
+    def _is_subscription(self, entry: ModelCatalogEntry) -> bool:
+        return entry.resource_class == "subscription"
 
     def _health_component(self, snap: Snapshot) -> float:
         if snap is None:
@@ -430,7 +498,14 @@ class PolicyBroker:
         return max(0.0, 1.0 - rate)
 
     def _perishability_component(self, snap: Snapshot, views: Sequence[_WindowView]) -> float:
-        """How much allowance is about to reset unused.
+        """How much allowance is about to reset unused, per resource, not per window.
+
+        With several simultaneously constraining windows the surplus usable is
+        the *minimum* across them — a roomy session window cannot be drawn
+        through a weekly window that is nearly spent — so the bonus is bounded
+        by the tightest resetting window rather than the roomiest. Otherwise a
+        hard task could be routed here on the strength of expiring capacity it
+        could not actually consume.
 
         Purely a bonus. The mirror case — an allowance too scarce to spend on
         easy work — is handled by a filter with a stated reason rather than a
@@ -442,16 +517,31 @@ class PolicyBroker:
             if snap is not None
             else 0.0
         )
-        best = 0.0
-        for view in views:
-            if view.hours_to_reset is None:
-                continue
-            urgency = max(0.0, 1.0 - view.hours_to_reset / config.pull_forward_horizon_hours)
-            # Allowance that other work is already going to consume is not
-            # surplus, so it is not perishable and must not be pulled forward.
-            surplus = max(0.0, view.available - burn * view.hours_to_reset)
-            best = max(best, surplus * urgency)
-        return best
+        resetting = [(v, v.hours_to_reset) for v in views if v.hours_to_reset is not None]
+        if not resetting:
+            return self._promo_perishability(snap, config)
+        # Jointly usable surplus after projected burn: the tightest window's
+        # available headroom governs what any dispatch can actually draw.
+        joint_surplus = min(max(0.0, v.available - burn * h) for v, h in resetting)
+        # Urgency follows the soonest reset among the constraining windows.
+        urgency = max(max(0.0, 1.0 - h / config.pull_forward_horizon_hours) for _, h in resetting)
+        promo = self._promo_perishability(snap, config)
+        return max(joint_surplus * urgency, promo)
+
+    def _promo_perishability(self, snap: Snapshot, config: Any) -> float:
+        """Perishable value of a promotion that is about to end.
+
+        A promotion's expiry is the same economic event as a quota reset:
+        capacity that vanishes unused is capacity wasted. The snapshot carries
+        ``expires_at`` precisely so this policy can see the deadline.
+        """
+        if snap is None or snap.expires_at is None:
+            return 0.0
+        hours = (snap.expires_at - datetime.now(UTC)).total_seconds() / 3600.0
+        if hours <= 0.0:
+            return 0.0
+        urgency = max(0.0, 1.0 - hours / config.pull_forward_horizon_hours)
+        return urgency  # the whole promotion is surplus about to vanish
 
     def _quality_component(self, entry: ModelCatalogEntry, demand: TaskDemand) -> float:
         quality = entry.quality_for(demand.role)
@@ -502,7 +592,12 @@ class PolicyBroker:
                 f"is reserved for difficulty >= {entry.min_task_difficulty}, "
                 f"this task is difficulty {demand.difficulty}"
             )
-        if not entry.has_known_price(now):
+        if not entry.has_known_price(now) and not self._is_subscription(entry):
+            # Token prices are mandatory for *metered* capacity: without one,
+            # no budget or reserve policy can reason about spending it. A
+            # subscription's marginal cash cost is zero by definition (the
+            # allowance is already bought), so it needs no token prices to be
+            # dispatchable — fixed-price plans rarely expose them.
             return (
                 "has no determinable price at "
                 f"{now.isoformat()}: its promotion ended and it declares no list price, "
@@ -531,9 +626,16 @@ class PolicyBroker:
             return ""
         if snap.availability == "exhausted":
             spent = ", ".join(w.label for w in snap.spent_windows())
+            if spent:
+                return (
+                    f"has spent its allowance on window(s) [{spent}]; a spent window blocks "
+                    "dispatch however much headroom the longer windows still report"
+                )
+            # No windows reported: the exhaustion came from the cash balance,
+            # and naming the real cause is the point of the rejection.
             return (
-                f"has spent its allowance on window(s) [{spent}]; a spent window blocks "
-                "dispatch however much headroom the longer windows still report"
+                "is exhausted: its cash balance is zero and it declares no quota "
+                "windows; top up the account or use a different resource"
             )
         if snap.availability == "unavailable":
             # Not time-boxed by a reset, so waiting will not fix it — the
@@ -567,32 +669,42 @@ class PolicyBroker:
                 f"at or below the configured reserve of {worst.reserve:.0%}; the reserve is "
                 "held for the operator rather than spent by the broker"
             )
-        return self._reject_on_scarcity(demand, _binding(views))
+        return self._reject_on_scarcity(demand, views)
 
-    def _reject_on_scarcity(self, demand: TaskDemand, binding: _WindowView | None) -> str:
+    def _reject_on_scarcity(self, demand: TaskDemand, views: Sequence[_WindowView]) -> str:
         """Withhold a nearly-spent allowance from work that does not need it.
 
-        Only when the reset is far enough away to matter: the same remainder
-        is worth spending freely when it is about to roll over, because
-        holding it back then simply wastes it.
+        Every simultaneously constraining window is checked: a near-reset
+        exemption on one window must not admit work that also draws on a
+        *different* scarce window whose reset is far away, or the easy dispatch
+        consumes allowance the policy meant to hold for hard tasks.
+
+        Only when no scarce window is far from resetting is the gate lifted:
+        the same remainder is worth spending freely when it is about to roll
+        over, because holding it back then simply wastes it.
         """
         config = self._config
-        if binding is None or binding.available >= config.scarcity_threshold:
-            return ""
-        if (
-            binding.hours_to_reset is not None
-            and binding.hours_to_reset <= config.pull_forward_horizon_hours
-        ):
+        scarce = [v for v in views if v.available < config.scarcity_threshold]
+        if not scarce:
             return ""
         if demand.difficulty >= config.scarcity_difficulty_floor:
             return ""
+        # The gate lifts only if *every* scarce window resets within the
+        # pull-forward horizon (a window with no known reset never lifts it).
+        near = all(
+            v.hours_to_reset is not None and v.hours_to_reset <= config.pull_forward_horizon_hours
+            for v in scarce
+        )
+        if near:
+            return ""
+        worst = min(scarce, key=lambda v: v.available)
         when = (
             "reports no reset"
-            if binding.hours_to_reset is None
-            else f"does not reset for {binding.hours_to_reset:.0f}h"
+            if worst.hours_to_reset is None
+            else f"does not reset for {worst.hours_to_reset:.0f}h"
         )
         return (
-            f"has only {binding.available:.0%} of window {binding.label!r} left above "
+            f"has only {worst.available:.0%} of window {worst.label!r} left above "
             f"reserve and {when}: that allowance is scarce and is held for work at "
             f"difficulty >= {config.scarcity_difficulty_floor} "
             f"(this task is difficulty {demand.difficulty})"
@@ -601,11 +713,17 @@ class PolicyBroker:
     # --- Telemetry lookup --------------------------------------------------
 
     def _snapshot_for(self, entry: ModelCatalogEntry) -> Snapshot:
-        snap = self._snapshots.get(entry.ref)
-        if snap is not None:
-            return snap
+        # The explicit provider mapping is authoritative: a telemetry resource
+        # that happens to share a paid ref's *name* is a different account, and
+        # attaching its quota/health here would route work on the wrong
+        # capacity. Direct ref matching is reserved for catalog-owned telemetry
+        # where the resource was deliberately named after the ref.
         resource = self._resource_by_provider.get(entry.provider)
-        return self._snapshots.get(resource) if resource else None
+        if resource:
+            snap = self._snapshots.get(resource)
+            if snap is not None:
+                return snap
+        return self._snapshots.get(entry.ref)
 
     def _windows(self, snap: Snapshot, now: datetime) -> tuple[_WindowView, ...]:
         """Every *measured* window, with its reserve already subtracted.

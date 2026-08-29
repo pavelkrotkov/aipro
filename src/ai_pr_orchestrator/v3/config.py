@@ -225,6 +225,10 @@ class BrokerConfig:
     weight_quota_pressure: float = 0.75
     weight_health: float = 0.75
     weight_perishability: float = 1.0
+    #: Cost of seating a candidate whose lineage resembles the peers already
+    #: in an adversarial set. Independent of ``weight_quality`` on purpose:
+    #: caring more about capability must not silently change diversity policy.
+    weight_diversity: float = 1.0
 
     #: Allowance the broker must leave unspent, per resource.
     reserves: list[ResourceReserveConfig] = field(default_factory=list)
@@ -356,6 +360,7 @@ _NESTED_LIST_FIELDS: dict[tuple[str, str], type] = {
     ("hermes_lanes", "lanes"): LaneProfileConfig,
     ("model_router", "catalog"): ModelCatalogEntry,
     ("telemetry", "resources"): TelemetryResourceConfig,
+    ("broker", "reserves"): ResourceReserveConfig,
 }
 
 
@@ -479,6 +484,34 @@ class V3Config:
 
         if self.review_policy.max_review_rounds < 1:
             raise V3ConfigError("max_review_rounds must be >= 1")
+
+        b = self.broker
+        import math
+
+        if not math.isfinite(b.pull_forward_horizon_hours) or b.pull_forward_horizon_hours <= 0:
+            raise V3ConfigError(
+                "broker.pull_forward_horizon_hours must be finite and > 0, "
+                f"got {b.pull_forward_horizon_hours!r}"
+            )
+        if not math.isfinite(b.reference_price_per_mtok) or b.reference_price_per_mtok <= 0:
+            raise V3ConfigError(
+                "broker.reference_price_per_mtok must be finite and > 0, "
+                f"got {b.reference_price_per_mtok!r}"
+            )
+        if b.max_fallbacks < 0:
+            raise V3ConfigError(f"broker.max_fallbacks must be >= 0, got {b.max_fallbacks}")
+        for reserve in b.reserves:
+            if not 0.0 <= reserve.fraction <= 1.0:
+                raise V3ConfigError(
+                    f"broker reserve for {reserve.resource!r} fraction must be within "
+                    f"0.0..1.0, got {reserve.fraction!r}"
+                )
+            for label, fraction in reserve.windows.items():
+                if not 0.0 <= fraction <= 1.0:
+                    raise V3ConfigError(
+                        f"broker reserve for {reserve.resource!r} window {label!r} "
+                        f"fraction must be within 0.0..1.0, got {fraction!r}"
+                    )
 
         if self.cao.session_poll_interval_seconds < 1:
             raise V3ConfigError("cao.session_poll_interval_seconds must be >= 1")
