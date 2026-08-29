@@ -23,6 +23,8 @@ import yaml
 from ._schema import SchemaError, build_dataclass, to_mapping, typed_kwargs
 from ._schema import validate_declared_shapes as _validate_shapes
 from .catalog import (
+    MAX_QUALITY,
+    MIN_QUALITY,
     VALID_RESOURCE_CLASSES,
     ModelCatalog,
     ModelCatalogEntry,
@@ -185,11 +187,115 @@ class TelemetryConfig:
 
 
 @dataclass(frozen=True)
+class ResourceReserveConfig:
+    """How much of a resource's allowance the broker must not spend.
+
+    ``fraction`` applies to every window; ``windows`` overrides it for one
+    window by label. Per-window reserves exist because the windows mean
+    different things: holding back a fifth of a weekly allowance is prudent,
+    holding back a fifth of a five-hour session window is a much larger
+    concession that a deployment may not want to make.
+
+    Window labels are provider prose (Hermes renders them for display), so a
+    per-window reserve is keyed on text that can change between provider or
+    Hermes versions. An override whose label matches nothing simply does not
+    bind — it cannot invent a constraint — and the broker's dry-run prints the
+    labels it actually saw, which is how a drifted label is spotted.
+    """
+
+    resource: str
+    fraction: float = 0.0
+    windows: dict[str, float] = field(default_factory=dict)
+    #: Unknown keys from a newer writer, preserved for forward compatibility.
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BrokerConfig:
+    """How the model broker ranks catalog candidates.
+
+    Every knob here is policy, not a vendor fact: the broker must be able to
+    change its mind about *what it values* without anyone editing the catalog,
+    and the catalog must be able to gain a model without anyone editing the
+    broker.
+    """
+
+    #: Quality tier an entry must reach for a role, over and above the floor
+    #: that difficulty already implies. Adjudication-style work wants a
+    #: stronger model than its nominal difficulty asks for; this is how that
+    #: is expressed without inventing a role the lane registry does not have.
+    min_quality_by_role: dict[str, int] = field(default_factory=dict)
+    #: Quality to assume for an entry the catalog leaves unscored for a role.
+    #: ``None`` (the default) makes such an entry undispatchable with an
+    #: actionable reason, rather than guessing in the operator's favour.
+    default_quality: int | None = None
+
+    #: Relative importance of each score component. Raising one of these is
+    #: how a deployment says "we care more about capability than spend" (or
+    #: the reverse) without touching broker code.
+    weight_quality: float = 1.0
+    weight_cash_cost: float = 1.0
+    weight_quota_pressure: float = 0.75
+    weight_health: float = 0.75
+    weight_perishability: float = 1.0
+    #: Cost of seating a candidate whose lineage resembles the peers already
+    #: in an adversarial set. Independent of ``weight_quality`` on purpose:
+    #: caring more about capability must not silently change diversity policy.
+    weight_diversity: float = 1.0
+
+    #: Allowance the broker must leave unspent, per resource.
+    reserves: list[ResourceReserveConfig] = field(default_factory=list)
+    #: Share of a window the deployment expects its *other* work to consume
+    #: per hour, keyed by telemetry resource. Subtracted from the headroom
+    #: before any of it is called surplus, so allowance that is already
+    #: spoken for is not pulled forward as if it were going to waste.
+    projected_burn_fraction_per_hour: dict[str, float] = field(default_factory=dict)
+    #: How far ahead a reset has to be before its allowance stops looking
+    #: perishable. Beyond this horizon there is time for normal work to
+    #: consume the window, so there is nothing to rescue.
+    pull_forward_horizon_hours: float = 24.0
+    #: Headroom below which an allowance is treated as scarce.
+    scarcity_threshold: float = 0.25
+    #: Difficulty a task must reach to spend a scarce allowance. Withholding
+    #: it is a filter rather than a score penalty: an operator has to be able
+    #: to read why a subscription sat idle, and a rule that only bites when
+    #: the weighted arithmetic happens to land is not a policy.
+    scarcity_difficulty_floor: int = 4
+
+    #: Recent failure rate at which a resource stops being dispatchable.
+    max_failure_rate: float = 0.5
+    #: Requests needed before a failure rate is treated as evidence at all.
+    #: Below it, one unlucky call would exclude an otherwise fine provider.
+    min_health_samples: int = 5
+    #: Scores for what we could not measure. Both sit below a confirmed-good
+    #: reading and above a confirmed-bad one, so evidence is rewarded without
+    #: freezing out a candidate that has simply never been tried.
+    unknown_quota_score: float = 0.5
+    unknown_health_score: float = 0.75
+
+    #: Cash cost is scored against this reference price rather than against
+    #: the other candidates, so adding an unrelated model to the catalog never
+    #: changes what an existing one scores.
+    reference_price_per_mtok: float = 5.0
+    #: Token mix assumed for one dispatch, used to blend input and output
+    #: prices into a single comparable figure.
+    expected_input_mtok: float = 1.0
+    expected_output_mtok: float = 0.25
+    #: Unknown keys from a newer writer, preserved for forward compatibility.
+    extras: dict[str, Any] = field(default_factory=dict)
+    #: Fallback chain is bounded so a large catalog does not become the chain.
+    max_fallbacks: int = 3
+    #: Require each fallback to leave the previous one's failure domain
+    #: (a different provider), so a provider outage does not empty the chain.
+    require_distinct_fallback_provider: bool = True
+
+
+@dataclass(frozen=True)
 class SafetyPolicyConfig:
     """Safety rails carried over from the V1 safety surface.
 
     These controls bound what the engine is allowed to touch and how much
-    work one run may do; they must survive the V1→V3 cutover, so they are
+    work one run may do; they must survive the V1-to-V3 cutover, so they are
     declared here as first-class policy rather than left implicit.
 
     ``disallow_forks`` restricts runs to same-repo PRs; ``disallow_workflow_
@@ -256,6 +362,7 @@ _SECTION_TYPES: dict[str, type] = {
     "hermes_lanes": HermesLanesConfig,
     "model_router": ModelRouterConfig,
     "telemetry": TelemetryConfig,
+    "broker": BrokerConfig,
     "review_policy": ReviewPolicyConfig,
     "ci_policy": CIPolicyConfig,
     "safety": SafetyPolicyConfig,
@@ -266,6 +373,7 @@ _NESTED_LIST_FIELDS: dict[tuple[str, str], type] = {
     ("hermes_lanes", "lanes"): LaneProfileConfig,
     ("model_router", "catalog"): ModelCatalogEntry,
     ("telemetry", "resources"): TelemetryResourceConfig,
+    ("broker", "reserves"): ResourceReserveConfig,
 }
 
 
@@ -281,6 +389,7 @@ class V3Config:
     hermes_lanes: HermesLanesConfig = field(default_factory=HermesLanesConfig)
     model_router: ModelRouterConfig = field(default_factory=ModelRouterConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    broker: BrokerConfig = field(default_factory=BrokerConfig)
     review_policy: ReviewPolicyConfig = field(default_factory=ReviewPolicyConfig)
     ci_policy: CIPolicyConfig = field(default_factory=CIPolicyConfig)
     safety: SafetyPolicyConfig = field(default_factory=SafetyPolicyConfig)
@@ -414,6 +523,72 @@ class V3Config:
 
         if self.review_policy.max_review_rounds < 1:
             raise V3ConfigError("max_review_rounds must be >= 1")
+
+        b = self.broker
+        import math
+
+        weights = {
+            "weight_quality": b.weight_quality,
+            "weight_cash_cost": b.weight_cash_cost,
+            "weight_quota_pressure": b.weight_quota_pressure,
+            "weight_health": b.weight_health,
+            "weight_perishability": b.weight_perishability,
+            "weight_diversity": b.weight_diversity,
+        }
+        for name, value in weights.items():
+            if not math.isfinite(value) or value < 0:
+                raise V3ConfigError(f"broker.{name} must be finite and >= 0, got {value!r}")
+        if not math.isfinite(b.pull_forward_horizon_hours) or b.pull_forward_horizon_hours <= 0:
+            raise V3ConfigError(
+                "broker.pull_forward_horizon_hours must be finite and > 0, "
+                f"got {b.pull_forward_horizon_hours!r}"
+            )
+        if not math.isfinite(b.reference_price_per_mtok) or b.reference_price_per_mtok <= 0:
+            raise V3ConfigError(
+                "broker.reference_price_per_mtok must be finite and > 0, "
+                f"got {b.reference_price_per_mtok!r}"
+            )
+        for name, value in (
+            ("expected_input_mtok", b.expected_input_mtok),
+            ("expected_output_mtok", b.expected_output_mtok),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise V3ConfigError(f"broker.{name} must be finite and >= 0, got {value!r}")
+        if b.max_fallbacks < 0:
+            raise V3ConfigError(f"broker.max_fallbacks must be >= 0, got {b.max_fallbacks}")
+        for role, tier in b.min_quality_by_role.items():
+            if role not in VALID_LANE_ROLES:
+                raise V3ConfigError(f"broker.min_quality_by_role references unknown role {role!r}")
+            if not MIN_QUALITY <= tier <= MAX_QUALITY:
+                raise V3ConfigError(
+                    f"broker.min_quality_by_role[{role!r}] must be within "
+                    f"{MIN_QUALITY}..{MAX_QUALITY}, got {tier!r}"
+                )
+        if b.default_quality is not None and not MIN_QUALITY <= b.default_quality <= MAX_QUALITY:
+            raise V3ConfigError(
+                f"broker.default_quality must be within {MIN_QUALITY}..{MAX_QUALITY}, "
+                f"got {b.default_quality!r}"
+            )
+        seen_reserve_resources: set[str] = set()
+        for reserve in b.reserves:
+            if reserve.resource in seen_reserve_resources:
+                raise V3ConfigError(
+                    f"broker.reserves declares {reserve.resource!r} more than once; "
+                    "merge the global fraction and per-window overrides into one "
+                    "entry instead of letting file order pick the winner"
+                )
+            seen_reserve_resources.add(reserve.resource)
+            if not 0.0 <= reserve.fraction <= 1.0:
+                raise V3ConfigError(
+                    f"broker reserve for {reserve.resource!r} fraction must be within "
+                    f"0.0..1.0, got {reserve.fraction!r}"
+                )
+            for label, fraction in reserve.windows.items():
+                if not 0.0 <= fraction <= 1.0:
+                    raise V3ConfigError(
+                        f"broker reserve for {reserve.resource!r} window {label!r} "
+                        f"fraction must be within 0.0..1.0, got {fraction!r}"
+                    )
 
         if self.cao.session_poll_interval_seconds < 1:
             raise V3ConfigError("cao.session_poll_interval_seconds must be >= 1")
