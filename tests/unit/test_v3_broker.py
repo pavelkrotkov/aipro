@@ -911,3 +911,139 @@ def test_unset_providers_share_one_conservative_failure_domain():
     ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
     blank_fallbacks = [r for r in decision.fallbacks if r.startswith("blank-")]
     assert len(blank_fallbacks) <= 1
+
+
+# --- review round 2 regression tests -----------------------------------------
+
+
+def test_reserve_returns_the_interfaces_lease_shape():
+    from ai_pr_orchestrator.v3.interfaces import ModelLease as InterfaceLease
+
+    b = broker(entry("solo"))
+    lease = b.reserve(ModelAssignment(lane="developer", model_ref="solo"))
+    assert isinstance(lease, InterfaceLease)
+    assert lease.assignment.model_ref == "solo"
+    assert lease.lease_id  # identity for per-lease release
+    b.release(lease)
+
+
+def test_cap_counts_external_dispatches_not_just_local_leases():
+    b = broker(entry("capped", max_concurrency=2))
+    assignment = ModelAssignment(lane="developer", model_ref="capped")
+    # One dispatch already running outside the broker's accounting:
+    b.reserve(assignment, external_in_flight=1)
+    b.reserve(assignment)  # total 2 == cap, allowed
+    with pytest.raises(BrokerError):
+        b.reserve(assignment)  # total would be 3 > cap
+
+
+def test_release_is_idempotent_per_lease():
+    b = broker(entry("capped", max_concurrency=2))
+    assignment = ModelAssignment(lane="developer", model_ref="capped")
+    lease_a = b.reserve(assignment)
+    lease_b = b.reserve(assignment)  # cap 2, both held
+    b.release(lease_a)
+    b.release(lease_a)  # double release: no second decrement
+    # Only ONE slot is free (lease_b still held), so exactly one more fits.
+    extra = b.reserve(assignment)
+    with pytest.raises(BrokerError):
+        b.reserve(assignment)
+    b.release(lease_b)
+    b.release(extra)
+
+
+def test_promotion_urgency_uses_evaluation_time_not_wall_clock():
+    expiring = entry(
+        "expiring",
+        resource_class="subscription",
+        promotional=True,
+        promo_starts_at=NOW - timedelta(days=1),
+        promo_ends_at=NOW + timedelta(hours=1),
+        input_price_per_mtok=None,
+        output_price_per_mtok=None,
+    )
+    expiring_snap = snapshot("expiring", expires_at=NOW + timedelta(hours=1))
+    at_now = broker(
+        expiring, snapshots=[expiring_snap], resource_by_provider={"expiring": "expiring"}
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    after = broker(
+        expiring, snapshots=[expiring_snap], resource_by_provider={"expiring": "expiring"}
+    ).select(
+        TaskDemand(lane="developer", role="worker", difficulty=3),
+        at=NOW + timedelta(days=2),
+    )
+    s_now = next(c.score for c in at_now.ranked if c.ref == "expiring")
+    s_after = next(c.score for c in after.ranked if c.ref == "expiring")
+    assert s_now is not None and s_after is not None
+    # Replaying after the expiry must not pretend the promo was still live.
+    assert s_after.perishability < s_now.perishability
+
+
+def test_nonfinite_weights_rejected():
+    from ai_pr_orchestrator.v3.config import V3Config, V3ConfigError
+
+    with pytest.raises(V3ConfigError):
+        V3Config.from_dict({"broker": {"weight_quality": float("nan")}}).validate()
+    with pytest.raises(V3ConfigError):
+        V3Config.from_dict({"broker": {"weight_quality": -1.0}}).validate()
+
+
+def test_quota_free_metered_snapshot_stays_unconstrained():
+    # Health telemetry but no windows: a metered candidate must keep the
+    # unconstrained quota score, not be demoted to "unknown".
+    probed = broker(
+        entry("metered"),
+        snapshots=[snapshot("metered")],  # no windows, availability=available
+        resource_by_provider={"metered": "metered"},
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    unprobed = broker(entry("metered")).select(
+        TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW
+    )
+    p = next(c.score for c in probed.ranked if c.ref == "metered")
+    u = next(c.score for c in unprobed.ranked if c.ref == "metered")
+    assert p is not None and u is not None
+    assert p.quota_pressure == u.quota_pressure == 1.0
+
+
+def test_duplicate_reserve_resources_rejected():
+    from ai_pr_orchestrator.v3.config import V3Config, V3ConfigError
+
+    with pytest.raises(V3ConfigError) as exc:
+        V3Config.from_dict(
+            {
+                "broker": {
+                    "reserves": [
+                        {"resource": "sub", "fraction": 0.1},
+                        {"resource": "sub", "fraction": 0.5},
+                    ]
+                }
+            }
+        ).validate()
+    assert "more than once" in str(exc.value)
+
+
+def test_decision_record_serializes_the_complete_demand():
+    demand = TaskDemand(
+        lane="r1",
+        role="reviewer",
+        difficulty=3,
+        peers=("other",),
+        incumbent="inc",
+        in_flight={"inc": 1},
+    )
+    decision = broker(entry("inc"), entry("other")).select(demand, at=NOW)
+    record = decision.to_dict()
+    assert record["demand"]["peers"] == ["other"]
+    assert record["demand"]["incumbent"] == "inc"
+    assert record["demand"]["in_flight"] == {"inc": 1}
+
+
+def test_render_shows_binding_window_and_reserve():
+    decision = broker(
+        subscription("sub"),
+        snapshots=[snapshot("sub", window("weekly", 0.5, resets_in=timedelta(days=3)))],
+        resource_by_provider={"sub": "sub"},
+        config=BrokerConfig(reserves=[ResourceReserveConfig(resource="sub", fraction=0.1)]),
+    ).select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
+    text = decision.render()
+    assert "reserve 0.10 via weekly" in text  # drift-diagnostic surface

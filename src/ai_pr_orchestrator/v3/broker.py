@@ -35,13 +35,8 @@ from .catalog import (
     ModelCatalog,
     ModelCatalogEntry,
 )
-from .domain import (
-    VALID_LANE_ROLES,
-    LaneName,
-    ModelAssignment,
-    ModelLease,
-    ModelRef,
-)
+from .domain import VALID_LANE_ROLES, LaneName, ModelAssignment, ModelRef
+from .interfaces import ModelLease
 from .telemetry import ProviderResourceSnapshot
 
 
@@ -128,6 +123,22 @@ class TaskDemand:
                 f"got {self.difficulty}"
             )
 
+    def to_dict(self) -> dict[str, Any]:
+        """The complete demand, so a decision record can be replayed.
+
+        Every field participates in the decision (peers → diversity,
+        incumbent → stickiness, in_flight → concurrency), so serializing a
+        subset would make two materially different requests look alike.
+        """
+        return {
+            "lane": self.lane,
+            "role": self.role,
+            "difficulty": self.difficulty,
+            "peers": list(self.peers),
+            "incumbent": self.incumbent,
+            "in_flight": dict(self.in_flight),
+        }
+
 
 # --- Decision --------------------------------------------------------------
 
@@ -154,6 +165,10 @@ class ScoreBreakdown:
     #: Reported rather than weighted: the reserve's effect is to *exclude*, so
     #: what a reader needs is how close the decision came to that edge.
     reserve_effect: float = 0.0
+    #: The window label that carried ``reserve_effect`` (or a diagnostic when
+    #: no window was measured), so a drifted per-window reserve override is
+    #: visible in the dry run instead of silently unenforced.
+    binding_window: str = ""
     #: Subtracted, not added: how much this candidate resembles the ones
     #: already seated in the same adversarial review set.
     diversity_penalty: float = 0.0
@@ -167,6 +182,7 @@ class ScoreBreakdown:
             "health": self.health,
             "perishability": self.perishability,
             "reserve_effect": self.reserve_effect,
+            "binding_window": self.binding_window,
             "diversity_penalty": self.diversity_penalty,
             "total": self.total,
         }
@@ -211,9 +227,7 @@ class BrokerDecision:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "lane": self.demand.lane,
-            "role": self.demand.role,
-            "difficulty": self.demand.difficulty,
+            "demand": self.demand.to_dict(),
             "evaluated_at": self.evaluated_at.isoformat(),
             "assignment": self.assignment.to_dict() if self.assignment else None,
             "fallbacks": list(self.fallbacks),
@@ -229,6 +243,9 @@ class BrokerDecision:
         The rejected are printed alongside the ranked on purpose — "no eligible
         model" with no cause is unactionable, and this is the surface an
         operator reads to fix the catalog or the policy instead of bisecting.
+        The binding window's label and applied reserve are shown per candidate
+        so a drifted per-window reserve override (one that stopped matching the
+        provider's labels) is visible here instead of silently unenforced.
         """
 
         lines: list[str] = []
@@ -253,7 +270,8 @@ class BrokerDecision:
                 f"  {c.ref}: total {s.total:.3f} "
                 f"(quality {s.quality:.2f}, cost {s.cash_cost:.2f}, "
                 f"quota {s.quota_pressure:.2f}, health {s.health:.2f}, "
-                f"perish {s.perishability:.2f}, diversity -{s.diversity_penalty:.2f})"
+                f"perish {s.perishability:.2f}, diversity -{s.diversity_penalty:.2f}, "
+                f"reserve {s.reserve_effect:.2f} via {s.binding_window})"
             )
         if self.rejected:
             lines.append("rejected:")
@@ -293,6 +311,8 @@ class PolicyBroker:
         # Atomic capacity reservation state (ModelBroker protocol).
         self._cap_lock = Lock()
         self._outstanding: dict[ModelRef, int] = {}
+        self._leases: dict[str, ModelRef] = {}
+        self._next_lease_seq = 0
 
     def select(self, demand: TaskDemand, *, at: datetime | None = None) -> BrokerDecision:
         now = _utc(at or datetime.now(UTC))
@@ -339,34 +359,55 @@ class PolicyBroker:
 
     # --- ModelBroker protocol: atomic capacity reservation -------------------
 
-    def reserve(self, assignment: ModelAssignment) -> ModelLease:
+    def reserve(
+        self,
+        assignment: ModelAssignment,
+        *,
+        external_in_flight: int = 0,
+    ) -> ModelLease:
         """Atomically claim one concurrency slot for ``assignment``.
 
         ``select()`` ranks against a caller-supplied ``in_flight`` snapshot and
-        is deliberately stateless; *this* is the serialization point. The
-        outstanding count is checked and incremented under one lock, so two
-        lanes scheduling concurrently cannot both take a model's last slot.
-        The caller must :meth:`release` the lease when its dispatch ends.
+        is deliberately stateless; *this* is the serialization point. The cap
+        check counts both broker-local outstanding leases *and* the dispatches
+        the caller declares as already running outside this broker
+        (``external_in_flight``), so a mixed accounting cannot overbook the
+        model. The caller must :meth:`release` the lease when its dispatch
+        ends.
         """
         with self._cap_lock:
             entry = self._catalog.get(assignment.model_ref)
             cap = entry.max_concurrency if entry else None
-            if cap is not None and self._outstanding.get(assignment.model_ref, 0) >= cap:
-                raise BrokerError(
-                    f"model {assignment.model_ref!r} is at its concurrency cap ({cap}); "
-                    "cannot reserve another slot"
-                )
+            if cap is not None:
+                total = self._outstanding.get(assignment.model_ref, 0) + external_in_flight
+                if total >= cap:
+                    raise BrokerError(
+                        f"model {assignment.model_ref!r} is at its concurrency cap "
+                        f"({total} outstanding incl. {external_in_flight} external, "
+                        f"cap {cap}); cannot reserve another slot"
+                    )
+            lease_id = f"{assignment.lane}:{assignment.model_ref}:{self._next_lease_seq}"
+            self._next_lease_seq += 1
             self._outstanding[assignment.model_ref] = (
                 self._outstanding.get(assignment.model_ref, 0) + 1
             )
-        return ModelLease(model_ref=assignment.model_ref, lane=assignment.lane)
+            self._leases[lease_id] = assignment.model_ref
+        return ModelLease(lease_id=lease_id, assignment=assignment)
 
     def release(self, lease: ModelLease) -> None:
-        """Return the slot taken by :meth:`reserve` (idempotent per lease)."""
+        """Return the slot taken by :meth:`reserve`.
+
+        Idempotent *per lease*: releasing the same lease twice is a no-op
+        (its identity is tracked), so cleanup paths cannot double-decrement
+        the counter while other leases for the same model are still held.
+        """
         with self._cap_lock:
-            current = self._outstanding.get(lease.model_ref, 0)
+            ref = self._leases.pop(lease.lease_id, None)
+            if ref is None:
+                return  # already released (or never issued here)
+            current = self._outstanding.get(ref, 0)
             if current > 0:
-                self._outstanding[lease.model_ref] = current - 1
+                self._outstanding[ref] = current - 1
 
     def _fallback_chain(
         self, ranked: Sequence[Candidate], chosen: ModelRef | None
@@ -418,7 +459,7 @@ class PolicyBroker:
         cash_cost = self._cash_cost_component(entry, now)
         quota_pressure = self._quota_component(entry, snap, binding)
         health = self._health_component(snap)
-        perishability = self._perishability_component(snap, views)
+        perishability = self._perishability_component(snap, views, now)
         diversity_penalty = self._diversity_penalty(entry, demand)
         return ScoreBreakdown(
             quality=quality,
@@ -428,6 +469,11 @@ class PolicyBroker:
             perishability=perishability,
             diversity_penalty=diversity_penalty,
             reserve_effect=binding.reserve if binding else 0.0,
+            binding_window=(
+                binding.label
+                if binding
+                else ("no measured windows" if snap is not None else "no telemetry")
+            ),
             total=(
                 config.weight_quality * quality
                 + config.weight_cash_cost * cash_cost
@@ -480,7 +526,12 @@ class PolicyBroker:
             # An unmeasured subscription is unknown, not unlimited.
             return self._config.unknown_quota_score if self._is_subscription(entry) else 1.0
         if binding is None:
-            return self._config.unknown_quota_score
+            if self._is_subscription(entry):
+                return self._config.unknown_quota_score
+            # A metered candidate whose snapshot declares no quota windows has
+            # no allowance to measure — collecting health or balance telemetry
+            # must not *lower* its ranking versus an unprobed twin.
+            return 1.0
         return max(0.0, min(1.0, binding.available))
 
     def _is_subscription(self, entry: ModelCatalogEntry) -> bool:
@@ -497,7 +548,9 @@ class PolicyBroker:
             return self._config.unknown_health_score
         return max(0.0, 1.0 - rate)
 
-    def _perishability_component(self, snap: Snapshot, views: Sequence[_WindowView]) -> float:
+    def _perishability_component(
+        self, snap: Snapshot, views: Sequence[_WindowView], now: datetime
+    ) -> float:
         """How much allowance is about to reset unused, per resource, not per window.
 
         With several simultaneously constraining windows the surplus usable is
@@ -519,28 +572,33 @@ class PolicyBroker:
         )
         resetting = [(v, v.hours_to_reset) for v in views if v.hours_to_reset is not None]
         if not resetting:
-            return self._promo_perishability(snap, config)
-        # Jointly usable surplus after projected burn: the tightest window's
-        # available headroom governs what any dispatch can actually draw.
-        joint_surplus = min(max(0.0, v.available - burn * h) for v, h in resetting)
-        # Urgency follows the soonest reset among the constraining windows.
+            return self._promo_perishability(snap, now)
+        # Every measured window bounds the jointly usable surplus, including
+        # ones with an unknown reset: a window that may not reset for a long
+        # time still constrains what a dispatch can draw right now. Only
+        # windows with a *known* reset contribute urgency or projected burn.
+        joint_surplus = min(
+            max(0.0, v.available - (burn * h if h is not None else 0.0)) for v, h in resetting
+        )
+        # Urgency follows the soonest known reset among the constraining windows.
         urgency = max(max(0.0, 1.0 - h / config.pull_forward_horizon_hours) for _, h in resetting)
-        promo = self._promo_perishability(snap, config)
+        promo = self._promo_perishability(snap, now)
         return max(joint_surplus * urgency, promo)
 
-    def _promo_perishability(self, snap: Snapshot, config: Any) -> float:
+    def _promo_perishability(self, snap: Snapshot, now: datetime) -> float:
         """Perishable value of a promotion that is about to end.
 
         A promotion's expiry is the same economic event as a quota reset:
-        capacity that vanishes unused is capacity wasted. The snapshot carries
-        ``expires_at`` precisely so this policy can see the deadline.
+        capacity that vanishes unused is capacity wasted. Evaluated at ``now``
+        (the caller's normalized evaluation time), not the wall clock, so a
+        dry run or replay is consistent with the recorded inputs.
         """
         if snap is None or snap.expires_at is None:
             return 0.0
-        hours = (snap.expires_at - datetime.now(UTC)).total_seconds() / 3600.0
+        hours = (snap.expires_at - now).total_seconds() / 3600.0
         if hours <= 0.0:
             return 0.0
-        urgency = max(0.0, 1.0 - hours / config.pull_forward_horizon_hours)
+        urgency = max(0.0, 1.0 - hours / self._config.pull_forward_horizon_hours)
         return urgency  # the whole promotion is surplus about to vanish
 
     def _quality_component(self, entry: ModelCatalogEntry, demand: TaskDemand) -> float:
@@ -713,16 +771,14 @@ class PolicyBroker:
     # --- Telemetry lookup --------------------------------------------------
 
     def _snapshot_for(self, entry: ModelCatalogEntry) -> Snapshot:
-        # The explicit provider mapping is authoritative: a telemetry resource
-        # that happens to share a paid ref's *name* is a different account, and
-        # attaching its quota/health here would route work on the wrong
-        # capacity. Direct ref matching is reserved for catalog-owned telemetry
-        # where the resource was deliberately named after the ref.
+        # The explicit provider mapping is authoritative *and* exclusive: when
+        # it maps this provider to a resource, that resource's snapshot is the
+        # only one this entry may use — a missing snapshot means "unmeasured",
+        # never "fall back to whatever shares the ref's name" (a different
+        # account). Direct ref matching applies only when no mapping exists.
         resource = self._resource_by_provider.get(entry.provider)
         if resource:
-            snap = self._snapshots.get(resource)
-            if snap is not None:
-                return snap
+            return self._snapshots.get(resource)
         return self._snapshots.get(entry.ref)
 
     def _windows(self, snap: Snapshot, now: datetime) -> tuple[_WindowView, ...]:

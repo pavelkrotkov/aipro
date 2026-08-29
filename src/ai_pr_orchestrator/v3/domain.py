@@ -359,32 +359,6 @@ class ModelAssignment:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
-@dataclass(frozen=True)
-class ModelLease:
-    """A claimed concurrency slot for one model assignment.
-
-    Issued by a broker's ``reserve`` and returned by its ``release``; carrying
-    the lane keeps the lease attributable to the unit of work that holds it.
-    """
-
-    lane: LaneName
-    model_ref: ModelRef
-
-    def __post_init__(self) -> None:
-        if not self.lane:
-            raise DomainError("ModelLease.lane must be non-empty")
-        if not self.model_ref:
-            raise DomainError("ModelLease.model_ref must be non-empty")
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"lane": self.lane, "model_ref": self.model_ref}
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> ModelLease:
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
-
-
 # --- Reviewer findings -----------------------------------------------------
 
 

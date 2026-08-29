@@ -488,6 +488,17 @@ class V3Config:
         b = self.broker
         import math
 
+        weights = {
+            "weight_quality": b.weight_quality,
+            "weight_cash_cost": b.weight_cash_cost,
+            "weight_quota_pressure": b.weight_quota_pressure,
+            "weight_health": b.weight_health,
+            "weight_perishability": b.weight_perishability,
+            "weight_diversity": b.weight_diversity,
+        }
+        for name, value in weights.items():
+            if not math.isfinite(value) or value < 0:
+                raise V3ConfigError(f"broker.{name} must be finite and >= 0, got {value!r}")
         if not math.isfinite(b.pull_forward_horizon_hours) or b.pull_forward_horizon_hours <= 0:
             raise V3ConfigError(
                 "broker.pull_forward_horizon_hours must be finite and > 0, "
@@ -500,7 +511,15 @@ class V3Config:
             )
         if b.max_fallbacks < 0:
             raise V3ConfigError(f"broker.max_fallbacks must be >= 0, got {b.max_fallbacks}")
+        seen_reserve_resources: set[str] = set()
         for reserve in b.reserves:
+            if reserve.resource in seen_reserve_resources:
+                raise V3ConfigError(
+                    f"broker.reserves declares {reserve.resource!r} more than once; "
+                    "merge the global fraction and per-window overrides into one "
+                    "entry instead of letting file order pick the winner"
+                )
+            seen_reserve_resources.add(reserve.resource)
             if not 0.0 <= reserve.fraction <= 1.0:
                 raise V3ConfigError(
                     f"broker reserve for {reserve.resource!r} fraction must be within "
