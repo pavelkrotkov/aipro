@@ -260,6 +260,19 @@ class V3Config:
                 f"review={q.review_label!r} needs_human={q.needs_human_label!r} "
                 f"done={q.done_label!r} error={q.error_label!r}"
             )
+        empty = [
+            name
+            for name, value in zip(
+                ("enabled", "active", "review", "needs_human", "done", "error"),
+                labels,
+                strict=False,
+            )
+            if not value
+        ]
+        if empty:
+            raise V3ConfigError(f"github_queue lifecycle labels must be non-empty: missing {empty}")
+        if not q.state_comment_marker:
+            raise V3ConfigError("github_queue.state_comment_marker must be non-empty")
         if q.lease_seconds < 1:
             raise V3ConfigError("github_queue.lease_seconds must be >= 1")
         if q.max_state_block_chars < 1:

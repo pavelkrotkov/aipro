@@ -165,14 +165,16 @@ class GitHubClient:
         import urllib.parse
 
         q = urllib.parse.urlencode(
-            {"q": f'repo:{self._owner}/{self._repo} label:"{label}" state:open'}
+            {
+                "q": f'repo:{self._owner}/{self._repo} label:"{label}" is:issue state:open',
+                "per_page": "100",
+            }
         )
-        data = self._get(f"/search/issues?{q}")
-        return [
-            item.get("number")
-            for item in (data.get("items") or [])
-            if isinstance(item.get("number"), int)
-        ]
+        items = self._get_paginated(f"/search/issues?{q}", items_key="items")
+        return [item for item in (i.get("number") for i in items) if isinstance(item, int)]
+
+    def delete_comment(self, comment_id: int) -> None:
+        self._delete(f"/repos/{self._owner}/{self._repo}/issues/comments/{comment_id}")
 
     def add_label(self, issue_number: int, label: str) -> list[dict[str, Any]]:
         data = self._post(

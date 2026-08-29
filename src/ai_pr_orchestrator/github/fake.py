@@ -286,6 +286,9 @@ class FakeGitHubClient:
     def list_issues_by_label(self, label: str) -> list[int]:
         return sorted(n for n, labels in self._labels.items() if label in labels)
 
+    def delete_comment(self, comment_id: int) -> None:
+        self._comments.pop(comment_id, None)
+
     def add_label(self, issue_number: int, label: str) -> list[dict[str, Any]]:
         labels = self._labels.setdefault(issue_number, [])
         if label not in labels:
