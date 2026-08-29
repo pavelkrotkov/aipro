@@ -490,6 +490,7 @@ class GitHubIssueQueue:
                     round_id=existing.round_id,
                     findings=list(existing.findings),
                     dispositions=list(existing.dispositions),
+                    archived=list(existing.archived),
                     extras=extras,
                 )
                 self.save_state(state, expected_updated_at=existing.updated_at)
@@ -663,6 +664,7 @@ class GitHubIssueQueue:
             updated_at=now,
             findings=list(stale_state.findings),
             dispositions=list(stale_state.dispositions),
+            archived=list(stale_state.archived),
             extras=extras,
         )
         self.save_state(new_state, expected_updated_at=stale_state.updated_at)

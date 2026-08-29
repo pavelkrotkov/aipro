@@ -16,7 +16,7 @@ vendor/model.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -71,6 +71,25 @@ VALID_LANE_ROLES: frozenset[str] = frozenset(("foreman", "worker", "reviewer"))
 
 Severity = Literal["info", "minor", "major", "blocker"]
 VALID_SEVERITIES: frozenset[str] = frozenset(("info", "minor", "major", "blocker"))
+
+#: Lifecycle status of a finding. Terminal statuses are set only via an
+#: explicit disposition (see ``FindingRegistry.apply_disposition``).
+FindingStatus = Literal["open", "accepted", "rejected", "deferred", "archived"]
+VALID_FINDING_STATUSES: frozenset[str] = frozenset(
+    ("open", "accepted", "rejected", "deferred", "archived")
+)
+#: Statuses that require a ``status_reason`` when set (finding round-2 fix #10).
+FINDING_STATUSES_REQUIRING_REASON: frozenset[str] = frozenset(
+    ("accepted", "rejected", "deferred", "archived")
+)
+#: Statuses that actually settle a finding. ``deferred`` is deliberately
+#: excluded: a deferred finding stays active and re-settleable (finding
+#: round-1 fix #15), so archival/compaction must not treat it as terminal
+#: (finding round-2 fix #10).
+TERMINAL_FINDING_STATUSES: frozenset[str] = frozenset(("accepted", "rejected", "archived"))
+
+EvidenceKind = Literal["file", "snippet", "thread", "command", "log"]
+VALID_EVIDENCE_KINDS: frozenset[str] = frozenset(("file", "snippet", "thread", "command", "log"))
 
 DispositionAction = Literal[
     "fix",
@@ -216,6 +235,9 @@ class WorkflowState:
     findings: list[ReviewerFinding] = field(default_factory=list)
     #: Policy decisions applied to ``findings``; persisted alongside them.
     dispositions: list[FindingDisposition] = field(default_factory=list)
+    #: Compact archive records for settled findings, persisted so compaction
+    #: does not destroy the audit trail on save/reload (finding round-2 fix #9).
+    archived: list[ArchivedFinding] = field(default_factory=list)
     #: Unknown fields from a newer writer, preserved for lossless round trips.
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -252,6 +274,7 @@ class WorkflowState:
             terminal_reason=terminal_reason,
             findings=list(self.findings),
             dispositions=list(self.dispositions),
+            archived=list(self.archived),
             extras=dict(self.extras),
         )
 
@@ -285,6 +308,11 @@ class WorkflowState:
             data["dispositions"] = [
                 d if isinstance(d, FindingDisposition) else FindingDisposition.from_dict(d)
                 for d in data["dispositions"]
+            ]
+        if isinstance(data.get("archived"), list):
+            data["archived"] = [
+                a if isinstance(a, ArchivedFinding) else ArchivedFinding.from_dict(a)
+                for a in data["archived"]
             ]
         known = {f.name for f in fields(cls)} - {"extras"}
         kwargs: dict[str, Any] = {}
@@ -362,9 +390,240 @@ class ModelAssignment:
 # --- Reviewer findings -----------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Evidence:
+    """A verifiable piece of evidence backing one finding.
+
+    ``kind`` selects what the remaining fields mean: ``file``/``snippet``
+    point at code (``path`` plus optional line range and ``snippet``),
+    ``thread`` references a GitHub review thread, ``command``/``log`` carry
+    a reproduction command or captured output in ``text``. Evidence is
+    never rewritten during deduplication or merging.
+    """
+
+    kind: EvidenceKind
+    path: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    snippet: str | None = None
+    thread_id: str | None = None
+    text: str | None = None
+    #: Unknown fields from a newer writer, preserved for lossless round trips
+    #: and written back by ``to_dict``.
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.kind not in VALID_EVIDENCE_KINDS:
+            raise DomainError(
+                f"Invalid evidence kind {self.kind!r}, must be one of {sorted(VALID_EVIDENCE_KINDS)}"
+            )
+        if self.path is not None:
+            _validate_path(self.path, context="Evidence.path")
+        for name in ("line_start", "line_end"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise DomainError(f"Evidence.{name} must be positive, got {value}")
+        if (
+            self.line_start is not None
+            and self.line_end is not None
+            and self.line_end < self.line_start
+        ):
+            raise DomainError(
+                f"Evidence.line_end ({self.line_end}) must be >= line_start ({self.line_start})"
+            )
+        if self.line_end is not None and self.line_start is None:
+            raise DomainError("Evidence.line_end requires line_start to be set")
+        if self.kind in ("file", "snippet") and self.path is None:
+            raise DomainError(f"Evidence of kind {self.kind!r} requires a code path")
+        if self.kind == "snippet" and not (self.snippet or "").strip():
+            raise DomainError("Evidence of kind 'snippet' requires snippet text")
+        if self.kind in ("command", "log") and not (self.text or "").strip():
+            raise DomainError(f"Evidence of kind {self.kind!r} requires non-blank text")
+        if self.path is None and self.thread_id is None and not (self.text or self.snippet):
+            raise DomainError(
+                "Evidence must carry at least one of path, thread_id, snippet, or text"
+            )
+        if self.kind == "thread" and not self.thread_id:
+            raise DomainError("Evidence of kind 'thread' requires thread_id")
+
+    def to_dict(self) -> dict[str, Any]:
+        data = _serialize_dataclass(self)
+        reserved = {f.name for f in fields(self)} - {"extras"}
+        collisions = sorted(reserved & set(self.extras))
+        if collisions:
+            raise DomainError(f"Evidence.extras may not override validated fields: {collisions}")
+        data.pop("extras", None)
+        data.update(self.extras)
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Evidence:
+        """Lenient deserialization: unknown fields go to ``extras`` and
+        strict validation is skipped so legacy payloads (e.g. paths written
+        before #50 tightened the rules) still load."""
+        data = dict(data)
+        known = {f.name for f in fields(cls)} - {"extras"}
+        kwargs: dict[str, Any] = {}
+        extras: dict[str, Any] = {}
+        for key, value in data.items():
+            if key in known:
+                kwargs[key] = value
+            else:
+                extras[key] = value
+        return _construct_lenient(cls, kwargs, extras)
+
+
+def _validate_path(path: str, *, context: str) -> None:
+    """Reject malformed or dangerous file paths on findings/evidence."""
+    if not path or not path.strip():
+        raise DomainError(f"{context} must be a non-empty path")
+    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+        raise DomainError(f"{context} must be repo-relative, got absolute path {path!r}")
+    parts = path.replace("\\", "/").split("/")
+    if ".." in parts:
+        raise DomainError(f"{context} must not traverse parent directories: {path!r}")
+    if any(p.strip() == "" for p in parts):
+        raise DomainError(f"{context} contains an empty path segment: {path!r}")
+
+
+@dataclass(frozen=True)
+class FindingProvenance:
+    """Origin of one reviewer finding (or of one merged into another).
+
+    Kept for every finding even after deduplication so the merged result
+    still names each reviewer lane and its original finding id.
+    """
+
+    lane: LaneName
+    finding_id: str
+    run_id: RunId
+    round_id: RoundId
+    thread_id: str | None = None
+    #: Unknown fields from a newer writer, preserved for lossless round trips
+    #: (finding round-2 fix #3).
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.lane:
+            raise DomainError("FindingProvenance.lane must be non-empty")
+        if not self.finding_id:
+            raise DomainError("FindingProvenance.finding_id must be non-empty")
+        if not self.run_id:
+            raise DomainError("FindingProvenance.run_id must be non-empty")
+        if not self.round_id:
+            raise DomainError("FindingProvenance.round_id must be non-empty")
+
+    def to_dict(self) -> dict[str, Any]:
+        data = _serialize_dataclass(self)
+        reserved = {f.name for f in fields(self)} - {"extras"}
+        collisions = sorted(reserved & set(self.extras))
+        if collisions:
+            raise DomainError(
+                f"FindingProvenance.extras may not override validated fields: {collisions}"
+            )
+        data.pop("extras", None)
+        data.update(self.extras)
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FindingProvenance:
+        """Lenient deserialization: unknown fields go to ``extras`` so
+        provenance written by a newer version survives a mixed-version
+        load/save cycle (finding round-2 fix #3)."""
+        data = dict(data)
+        known = {f.name for f in fields(cls)} - {"extras"}
+        kwargs: dict[str, Any] = {}
+        extras: dict[str, Any] = {}
+        for key, value in data.items():
+            if key in known:
+                kwargs[key] = value
+            else:
+                extras[key] = value
+        return cls(**kwargs, extras=extras)
+
+
+@dataclass
+class ArchivedFinding:
+    """Compact record kept after a terminal disposition, so durable state
+    stays bounded once findings settle. Full evidence may be dropped; the
+    identity, outcome, and reviewer provenance survive. Defined here (not in
+    ``findings.py``) so :class:`WorkflowState` can persist the archive
+    without a circular import (finding round-2 fix #9)."""
+
+    finding_id: str
+    lane: LaneName
+    severity: Severity
+    status: FindingStatus
+    status_reason: str
+    summary: str
+    sources: list[FindingProvenance] = field(default_factory=list)
+
+    @classmethod
+    def from_finding(cls, finding: ReviewerFinding) -> ArchivedFinding:
+        if finding.status_reason is None:
+            raise DomainError(
+                f"finding {finding.id} has no status_reason; cannot archive without a reason"
+            )
+        sources = finding.sources or [
+            FindingProvenance(
+                lane=finding.lane,
+                finding_id=finding.id,
+                run_id=finding.run_id,
+                round_id=finding.round_id,
+                thread_id=finding.thread_id,
+            )
+        ]
+        return cls(
+            finding_id=finding.id,
+            lane=finding.lane,
+            severity=finding.severity,
+            status=finding.status,
+            status_reason=finding.status_reason,
+            # Blank/whitespace claims must fall back to the body, exactly like
+            # the machine-comparable claim does — otherwise a blank claim
+            # produces an empty archive summary (finding round-2 fix #5).
+            summary=(
+                finding.claim
+                if finding.claim is not None and finding.claim.strip()
+                else finding.body
+            ),
+            sources=list(sources),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "finding_id": self.finding_id,
+            "lane": self.lane,
+            "severity": self.severity,
+            "status": self.status,
+            "status_reason": self.status_reason,
+            "summary": self.summary,
+            "sources": [s.to_dict() for s in self.sources],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ArchivedFinding:
+        data = dict(data)
+        data["sources"] = [
+            s if isinstance(s, FindingProvenance) else FindingProvenance.from_dict(s)
+            for s in data.get("sources", [])
+        ]
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
 @dataclass
 class ReviewerFinding:
-    """A single finding produced by a reviewer lane."""
+    """A single finding produced by a reviewer lane.
+
+    The first seven fields are the original V3 schema (issue #41) and are
+    never renamed — persisted queue/state payloads depend on them. The
+    remaining fields extend the schema with structured evidence, provenance
+    and disposition state (issue #50); every one is optional with a default
+    so payloads written by older versions still round-trip. Unknown keys in
+    a persisted payload are preserved in ``extras`` and written back on
+    serialization.
+    """
 
     id: str
     lane: LaneName
@@ -377,8 +636,51 @@ class ReviewerFinding:
     line: int | None = None
     #: GitHub review-thread identifier this finding was filed on, if any.
     thread_id: str | None = None
+    #: Last line of the (inclusive) range the finding applies to; ``None``
+    #: means a single-line or file-level finding.
+    line_end: int | None = None
+    #: Reviewer confidence in [0.0, 1.0]; ``None`` when the reviewer did not
+    #: report one.
+    confidence: float | None = None
+    #: Short machine-comparable claim (what the reviewer asserts). Falls
+    #: back to ``body`` when the reviewer supplied only prose.
+    claim: str | None = None
+    #: Verifiable evidence backing the claim; preserved verbatim through
+    #: deduplication and merging.
+    evidence: list[Evidence] = field(default_factory=list)
+    #: How to falsify/verify the claim.
+    falsification: str | None = None
+    #: Optional reproduction/test command.
+    reproduction_command: str | None = None
+    #: Optional suggested fix.
+    suggested_fix: str | None = None
+    #: Head SHA the reviewer actually reviewed. Findings for a different
+    #: head SHA than the current round are quarantined, never applied.
+    head_sha: str | None = None
+    #: Lifecycle status; terminal values are only set via a disposition.
+    status: FindingStatus = "open"
+    #: Reason recorded with the last status change (required for terminal
+    #: statuses).
+    status_reason: str | None = None
+    #: Group identifier when this finding conflicts with another reviewer's
+    #: finding over the same code region; conflicts are adjudicated, never
+    #: collapsed.
+    conflict_group_id: str | None = None
+    #: Provenance of this finding: its own origin plus any findings merged
+    #: into it during deduplication, in order.
+    sources: list[FindingProvenance] = field(default_factory=list)
+    #: Unknown fields from a newer writer, preserved for lossless round trips.
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not self.id:
+            raise DomainError("ReviewerFinding.id must be non-empty")
+        if not self.lane:
+            raise DomainError("ReviewerFinding.lane must be non-empty")
+        if not self.run_id:
+            raise DomainError("ReviewerFinding.run_id must be non-empty")
+        if not self.round_id:
+            raise DomainError("ReviewerFinding.round_id must be non-empty")
         if self.severity not in VALID_SEVERITIES:
             raise DomainError(
                 f"Invalid severity {self.severity!r}, must be one of {sorted(VALID_SEVERITIES)}"
@@ -387,17 +689,102 @@ class ReviewerFinding:
             raise DomainError("ReviewerFinding.body must be non-empty")
         if self.line is not None and self.line <= 0:
             raise DomainError(f"ReviewerFinding.line must be positive, got {self.line}")
+        if self.line_end is not None and self.line_end <= 0:
+            raise DomainError(f"ReviewerFinding.line_end must be positive, got {self.line_end}")
+        if self.line is not None and self.line_end is not None and self.line_end < self.line:
+            raise DomainError(
+                f"ReviewerFinding.line_end ({self.line_end}) must be >= line ({self.line})"
+            )
+        if self.line_end is not None and self.line is None:
+            raise DomainError("ReviewerFinding.line_end requires line to be set")
+        if self.path is not None:
+            _validate_path(self.path, context="ReviewerFinding.path")
+        if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
+            raise DomainError(
+                f"ReviewerFinding.confidence must be within [0.0, 1.0], got {self.confidence}"
+            )
+        if self.head_sha is not None and not self.head_sha.strip():
+            raise DomainError("ReviewerFinding.head_sha must be non-empty when present")
+        if self.status not in VALID_FINDING_STATUSES:
+            raise DomainError(
+                f"Invalid status {self.status!r}, must be one of {sorted(VALID_FINDING_STATUSES)}"
+            )
+        if (
+            self.status in FINDING_STATUSES_REQUIRING_REASON
+            and not (self.status_reason or "").strip()
+        ):
+            raise DomainError(
+                f"ReviewerFinding status {self.status!r} requires a non-empty status_reason"
+            )
+        if self.status == "open" and self.status_reason is not None:
+            raise DomainError("status_reason is only valid once the finding leaves 'open'")
+        for evidence_item in self.evidence:
+            if not isinstance(evidence_item, Evidence):
+                raise DomainError(
+                    "ReviewerFinding.evidence items must be Evidence instances, got "
+                    f"{type(evidence_item).__name__}"
+                )
+        for source in self.sources:
+            if not isinstance(source, FindingProvenance):
+                raise DomainError(
+                    "ReviewerFinding.sources items must be FindingProvenance instances, got "
+                    f"{type(source).__name__}"
+                )
 
     def to_dict(self) -> dict[str, Any]:
-        return _serialize_dataclass(self)
+        reserved = {f.name for f in fields(self)} - {"extras"}
+        collisions = sorted(reserved & set(self.extras))
+        if collisions:
+            raise DomainError(
+                f"ReviewerFinding.extras may not override validated fields: {collisions}"
+            )
+        data: dict[str, Any] = {}
+        for f in fields(self):
+            if f.name == "extras":
+                continue
+            value = getattr(self, f.name)
+            # The pre-#50 fields are the durable core of the schema and are
+            # always carried so legacy #43 queue payloads keep their shape.
+            # The #50 extension fields are omitted when they still hold their
+            # default value, keeping old payloads compact (and under
+            # max_state_block_chars) when a newer writer round-trips them.
+            if f.name not in _CORE_FIELDS and _is_default_value(f, value):
+                continue
+            data[f.name] = _serialize_value(value)
+        data.update(self.extras)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReviewerFinding:
+        """Lenient deserialization: unknown fields go to ``extras``.
+
+        Strict ``__post_init__`` validation is deliberately skipped on load so
+        payloads written before #50 tightened the validation rules (e.g. an
+        older, permissive ``path``) still reconstruct the whole work-item
+        state instead of failing to load. Newly constructed findings keep full
+        validation.
+        """
         data = dict(data)
         if isinstance(data.get("created_at"), str):
             data["created_at"] = _str_to_dt(data["created_at"])
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        if isinstance(data.get("evidence"), list):
+            data["evidence"] = [
+                e if isinstance(e, Evidence) else Evidence.from_dict(e) for e in data["evidence"]
+            ]
+        if isinstance(data.get("sources"), list):
+            data["sources"] = [
+                s if isinstance(s, FindingProvenance) else FindingProvenance.from_dict(s)
+                for s in data["sources"]
+            ]
+        known = {f.name for f in fields(cls)} - {"extras"}
+        kwargs: dict[str, Any] = {}
+        extras: dict[str, Any] = {}
+        for key, value in data.items():
+            if key in known:
+                kwargs[key] = value
+            else:
+                extras[key] = value
+        return _construct_lenient(cls, kwargs, extras)
 
 
 @dataclass
@@ -520,3 +907,52 @@ def _str_to_dt(s: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+#: Durable pre-#50 (issue #41) fields always carried by ``to_dict``.
+_CORE_FIELDS = frozenset({"id", "lane", "body", "severity", "run_id", "round_id", "created_at"})
+
+
+def _is_default_value(f: Any, value: Any) -> bool:
+    """True when ``value`` equals the dataclass default for field ``f``.
+
+    Handles plain defaults and ``default_factory`` fields uniformly, so
+    round-tripping an omitted extension field reconstructs the identical
+    default value.
+    """
+    if f.default is not MISSING:
+        return value == f.default
+    return value == f.default_factory()
+
+
+def _serialize_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_nested_to_dict(v) for v in value]
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    return value
+
+
+def _construct_lenient(cls: type, kwargs: dict[str, Any], extras: dict[str, Any]) -> Any:
+    """Build a dataclass instance without running ``__post_init__``.
+
+    Used by the ``*_from_dict`` deserialization path so that payloads written
+    before a validation rule was tightened (e.g. the stricter #50 path rules)
+    still load instead of raising ``DomainError`` on the whole work-item state.
+    Every field is set, with missing fields falling back to their declared
+    default so optional/default-factory fields are always present.
+    """
+    obj = object.__new__(cls)
+    for f in fields(cls):
+        if f.name == "extras":
+            object.__setattr__(obj, "extras", extras)
+        elif f.name in kwargs:
+            object.__setattr__(obj, f.name, kwargs[f.name])
+        elif f.default is not MISSING:
+            object.__setattr__(obj, f.name, f.default)
+        else:
+            assert f.default_factory is not MISSING
+            object.__setattr__(obj, f.name, f.default_factory())
+    return obj
