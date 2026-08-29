@@ -23,6 +23,8 @@ import yaml
 from ._schema import SchemaError, build_dataclass, to_mapping, typed_kwargs
 from ._schema import validate_declared_shapes as _validate_shapes
 from .catalog import (
+    MAX_QUALITY,
+    MIN_QUALITY,
     VALID_RESOURCE_CLASSES,
     ModelCatalog,
     ModelCatalogEntry,
@@ -509,8 +511,27 @@ class V3Config:
                 "broker.reference_price_per_mtok must be finite and > 0, "
                 f"got {b.reference_price_per_mtok!r}"
             )
+        for name, value in (
+            ("expected_input_mtok", b.expected_input_mtok),
+            ("expected_output_mtok", b.expected_output_mtok),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise V3ConfigError(f"broker.{name} must be finite and >= 0, got {value!r}")
         if b.max_fallbacks < 0:
             raise V3ConfigError(f"broker.max_fallbacks must be >= 0, got {b.max_fallbacks}")
+        for role, tier in b.min_quality_by_role.items():
+            if role not in VALID_LANE_ROLES:
+                raise V3ConfigError(f"broker.min_quality_by_role references unknown role {role!r}")
+            if not MIN_QUALITY <= tier <= MAX_QUALITY:
+                raise V3ConfigError(
+                    f"broker.min_quality_by_role[{role!r}] must be within "
+                    f"{MIN_QUALITY}..{MAX_QUALITY}, got {tier!r}"
+                )
+        if b.default_quality is not None and not MIN_QUALITY <= b.default_quality <= MAX_QUALITY:
+            raise V3ConfigError(
+                f"broker.default_quality must be within {MIN_QUALITY}..{MAX_QUALITY}, "
+                f"got {b.default_quality!r}"
+            )
         seen_reserve_resources: set[str] = set()
         for reserve in b.reserves:
             if reserve.resource in seen_reserve_resources:

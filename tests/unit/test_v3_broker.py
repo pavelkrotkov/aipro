@@ -930,11 +930,18 @@ def test_reserve_returns_the_interfaces_lease_shape():
 def test_cap_counts_external_dispatches_not_just_local_leases():
     b = broker(entry("capped", max_concurrency=2))
     assignment = ModelAssignment(lane="developer", model_ref="capped")
-    # One dispatch already running outside the broker's accounting:
-    b.reserve(assignment, external_in_flight=1)
-    b.reserve(assignment)  # total 2 == cap, allowed
+    # One dispatch already running outside the broker's accounting: the local
+    # lease plus the external one already fill the cap.
+    first = b.reserve(assignment, external_in_flight=1)  # 1 ext + 1 local = 2
     with pytest.raises(BrokerError):
-        b.reserve(assignment)  # total would be 3 > cap
+        b.reserve(assignment)  # would be 3 > cap
+    # A later protocol caller that cannot pass external_in_flight still sees
+    # the persisted external occupancy: it keeps blocking until the last local
+    # lease is released.
+    b.release(first)
+    # Releasing the last local lease expires the persisted external snapshot
+    # (it described the world at reserve time), freeing the model again.
+    b.reserve(assignment)  # allowed again
 
 
 def test_release_is_idempotent_per_lease():

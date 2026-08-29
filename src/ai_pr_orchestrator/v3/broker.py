@@ -169,6 +169,11 @@ class ScoreBreakdown:
     #: no window was measured), so a drifted per-window reserve override is
     #: visible in the dry run instead of silently unenforced.
     binding_window: str = ""
+    #: Every quota-window label the provider actually reported for this
+    #: candidate. A per-window reserve override whose label no longer matches
+    #: any of these has silently stopped binding — this list is how the dry
+    #: run surfaces that drift.
+    observed_windows: tuple[str, ...] = ()
     #: Subtracted, not added: how much this candidate resembles the ones
     #: already seated in the same adversarial review set.
     diversity_penalty: float = 0.0
@@ -183,6 +188,7 @@ class ScoreBreakdown:
             "perishability": self.perishability,
             "reserve_effect": self.reserve_effect,
             "binding_window": self.binding_window,
+            "observed_windows": list(self.observed_windows),
             "diversity_penalty": self.diversity_penalty,
             "total": self.total,
         }
@@ -271,7 +277,8 @@ class BrokerDecision:
                 f"(quality {s.quality:.2f}, cost {s.cash_cost:.2f}, "
                 f"quota {s.quota_pressure:.2f}, health {s.health:.2f}, "
                 f"perish {s.perishability:.2f}, diversity -{s.diversity_penalty:.2f}, "
-                f"reserve {s.reserve_effect:.2f} via {s.binding_window})"
+                f"reserve {s.reserve_effect:.2f} via {s.binding_window}; "
+                f"windows: {', '.join(s.observed_windows) if s.observed_windows else 'none'})"
             )
         if self.rejected:
             lines.append("rejected:")
@@ -313,6 +320,7 @@ class PolicyBroker:
         self._outstanding: dict[ModelRef, int] = {}
         self._leases: dict[str, ModelRef] = {}
         self._next_lease_seq = 0
+        self._external: dict[ModelRef, int] = {}
 
     def select(self, demand: TaskDemand, *, at: datetime | None = None) -> BrokerDecision:
         now = _utc(at or datetime.now(UTC))
@@ -379,17 +387,26 @@ class PolicyBroker:
             entry = self._catalog.get(assignment.model_ref)
             cap = entry.max_concurrency if entry else None
             if cap is not None:
-                total = self._outstanding.get(assignment.model_ref, 0) + external_in_flight
+                total = self._outstanding.get(assignment.model_ref, 0) + self._external.get(
+                    assignment.model_ref, 0
+                )
                 if total >= cap:
                     raise BrokerError(
                         f"model {assignment.model_ref!r} is at its concurrency cap "
-                        f"({total} outstanding incl. {external_in_flight} external, "
+                        f"({total} outstanding incl. "
+                        f"{self._external.get(assignment.model_ref, 0)} external, "
                         f"cap {cap}); cannot reserve another slot"
                     )
             lease_id = f"{assignment.lane}:{assignment.model_ref}:{self._next_lease_seq}"
             self._next_lease_seq += 1
             self._outstanding[assignment.model_ref] = (
                 self._outstanding.get(assignment.model_ref, 0) + 1
+            )
+            # Persist the caller-declared external occupancy (never decreased
+            # here: only the operator's reconciliation knows when those
+            # dispatches actually ended).
+            self._external[assignment.model_ref] = max(
+                self._external.get(assignment.model_ref, 0), external_in_flight
             )
             self._leases[lease_id] = assignment.model_ref
         return ModelLease(lease_id=lease_id, assignment=assignment)
@@ -408,6 +425,11 @@ class PolicyBroker:
             current = self._outstanding.get(ref, 0)
             if current > 0:
                 self._outstanding[ref] = current - 1
+            # When the last local lease for a model goes away, its persisted
+            # external occupancy expires with it: the caller's declared
+            # snapshot described the world at reserve time.
+            if self._outstanding.get(ref, 0) == 0:
+                self._external.pop(ref, None)
 
     def _fallback_chain(
         self, ranked: Sequence[Candidate], chosen: ModelRef | None
@@ -474,6 +496,7 @@ class PolicyBroker:
                 if binding
                 else ("no measured windows" if snap is not None else "no telemetry")
             ),
+            observed_windows=tuple(v.label for v in views),
             total=(
                 config.weight_quality * quality
                 + config.weight_cash_cost * cash_cost
@@ -523,10 +546,11 @@ class PolicyBroker:
         scores its real headroom above reserve.
         """
         if snap is None:
-            # An unmeasured subscription is unknown, not unlimited.
-            return self._config.unknown_quota_score if self._is_subscription(entry) else 1.0
+            # An unmeasured allowance-backed resource (subscription or free
+            # tier) is unknown, not unlimited.
+            return self._config.unknown_quota_score if self._has_allowance(entry) else 1.0
         if binding is None:
-            if self._is_subscription(entry):
+            if self._has_allowance(entry):
                 return self._config.unknown_quota_score
             # A metered candidate whose snapshot declares no quota windows has
             # no allowance to measure — collecting health or balance telemetry
@@ -534,8 +558,13 @@ class PolicyBroker:
             return 1.0
         return max(0.0, min(1.0, binding.available))
 
-    def _is_subscription(self, entry: ModelCatalogEntry) -> bool:
-        return entry.resource_class == "subscription"
+    def _has_allowance(self, entry: ModelCatalogEntry) -> bool:
+        """True when the resource class carries a quota allowance that can bind.
+
+        Subscriptions and free tiers both have one; only pay-as-you-go
+        metered capacity is genuinely unconstrained by a window.
+        """
+        return entry.resource_class in ("subscription", "free_tier")
 
     def _health_component(self, snap: Snapshot) -> float:
         if snap is None:
@@ -570,18 +599,28 @@ class PolicyBroker:
             if snap is not None
             else 0.0
         )
-        resetting = [(v, v.hours_to_reset) for v in views if v.hours_to_reset is not None]
-        if not resetting:
+        if not views:
+            # No measured windows at all: only a promotion deadline can make
+            # this capacity perishable.
             return self._promo_perishability(snap, now)
-        # Every measured window bounds the jointly usable surplus, including
-        # ones with an unknown reset: a window that may not reset for a long
-        # time still constrains what a dispatch can draw right now. Only
+        # Every *measured* window bounds the jointly usable surplus — including
+        # ones whose reset time is unknown, since a window that may not reset
+        # for a long time still constrains what a dispatch can draw now. Only
         # windows with a *known* reset contribute urgency or projected burn.
         joint_surplus = min(
-            max(0.0, v.available - (burn * h if h is not None else 0.0)) for v, h in resetting
+            max(
+                0.0,
+                v.available - (burn * v.hours_to_reset if v.hours_to_reset is not None else 0.0),
+            )
+            for v in views
         )
+        known_resets = [v.hours_to_reset for v in views if v.hours_to_reset is not None]
+        if not known_resets:
+            # Nothing is about to roll over on a known schedule; only a promotion
+            # deadline can make this capacity perishable.
+            return self._promo_perishability(snap, now)
         # Urgency follows the soonest known reset among the constraining windows.
-        urgency = max(max(0.0, 1.0 - h / config.pull_forward_horizon_hours) for _, h in resetting)
+        urgency = max(max(0.0, 1.0 - h / config.pull_forward_horizon_hours) for h in known_resets)
         promo = self._promo_perishability(snap, now)
         return max(joint_surplus * urgency, promo)
 
@@ -621,7 +660,7 @@ class PolicyBroker:
         cash price.
         """
         config = self._config
-        if entry.resource_class == "subscription":
+        if self._has_allowance(entry):
             blended = 0.0
         else:
             prices = entry.effective_prices(now)
@@ -650,7 +689,7 @@ class PolicyBroker:
                 f"is reserved for difficulty >= {entry.min_task_difficulty}, "
                 f"this task is difficulty {demand.difficulty}"
             )
-        if not entry.has_known_price(now) and not self._is_subscription(entry):
+        if not entry.has_known_price(now) and not self._has_allowance(entry):
             # Token prices are mandatory for *metered* capacity: without one,
             # no budget or reserve policy can reason about spending it. A
             # subscription's marginal cash cost is zero by definition (the
