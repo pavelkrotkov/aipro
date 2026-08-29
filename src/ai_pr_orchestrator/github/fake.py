@@ -99,6 +99,9 @@ class FakeGitHubClient:
         self._prs[pr.number] = pr
         self._labels[pr.number] = list(pr.labels)
 
+    def seed_issue(self, number: int, labels: list[str] | None = None) -> None:
+        self._labels[number] = list(labels) if labels else []
+
     def seed_comment(
         self,
         issue_number: int,
@@ -276,6 +279,15 @@ class FakeGitHubClient:
         mc.body = body
         mc.updated_at = self._tick()
         return mc.to_model()
+
+    def get_labels(self, issue_number: int) -> list[str]:
+        return list(self._labels.get(issue_number, []))
+
+    def list_issues_by_label(self, label: str) -> list[int]:
+        return sorted(n for n, labels in self._labels.items() if label in labels)
+
+    def delete_comment(self, comment_id: int) -> None:
+        self._comments.pop(comment_id, None)
 
     def add_label(self, issue_number: int, label: str) -> list[dict[str, Any]]:
         labels = self._labels.setdefault(issue_number, [])

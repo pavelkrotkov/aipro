@@ -157,6 +157,25 @@ class GitHubClient:
             )
         return _parse_comment(data)
 
+    def get_labels(self, issue_number: int) -> list[str]:
+        data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{issue_number}")
+        return [label["name"] for label in (data.get("labels") or [])]
+
+    def list_issues_by_label(self, label: str) -> list[int]:
+        import urllib.parse
+
+        q = urllib.parse.urlencode(
+            {
+                "q": f'repo:{self._owner}/{self._repo} label:"{label}" is:issue state:open',
+                "per_page": "100",
+            }
+        )
+        items = self._get_paginated(f"/search/issues?{q}", items_key="items")
+        return [item for item in (i.get("number") for i in items) if isinstance(item, int)]
+
+    def delete_comment(self, comment_id: int) -> None:
+        self._delete(f"/repos/{self._owner}/{self._repo}/issues/comments/{comment_id}")
+
     def add_label(self, issue_number: int, label: str) -> list[dict[str, Any]]:
         data = self._post(
             f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/labels",

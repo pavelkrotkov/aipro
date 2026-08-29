@@ -45,7 +45,18 @@ class GitHubQueueConfig:
     enabled_label: str = "v3-work"
     done_label: str = "v3-work-done"
     error_label: str = "v3-work-error"
+    #: Full lifecycle labels. ``enabled_label`` is the "ready/queued" label;
+    #: the rest map to the V3 phases per :mod:`ai_pr_orchestrator.v3.queue`.
+    active_label: str = "v3-work-active"
+    review_label: str = "v3-work-review"
+    needs_human_label: str = "v3-work-needs-human"
     state_comment_marker: str = "v3-runtime-state"
+    #: How long a claim's lease stays valid without a heartbeat.
+    lease_seconds: int = 900
+    #: Upper bound on the serialized machine-state block, in characters.
+    #: Larger payloads are compacted (see ``v3.queue`` compaction docs);
+    #: if compaction cannot fit, saving raises.
+    max_state_block_chars: int = 60000
     #: Unknown keys from a newer writer, preserved for forward compatibility.
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -324,12 +335,38 @@ class V3Config:
                 raise V3ConfigError(f"lane {lane.name!r} profile_template must be non-empty")
 
         q = self.github_queue
-        labels = (q.enabled_label, q.done_label, q.error_label)
+        labels = (
+            q.enabled_label,
+            q.active_label,
+            q.review_label,
+            q.needs_human_label,
+            q.done_label,
+            q.error_label,
+        )
         if len(labels) != len(set(labels)):
             raise V3ConfigError(
                 "github_queue lifecycle labels must be distinct: "
-                f"enabled={q.enabled_label!r} done={q.done_label!r} error={q.error_label!r}"
+                f"enabled={q.enabled_label!r} active={q.active_label!r} "
+                f"review={q.review_label!r} needs_human={q.needs_human_label!r} "
+                f"done={q.done_label!r} error={q.error_label!r}"
             )
+        empty = [
+            name
+            for name, value in zip(
+                ("enabled", "active", "review", "needs_human", "done", "error"),
+                labels,
+                strict=False,
+            )
+            if not value
+        ]
+        if empty:
+            raise V3ConfigError(f"github_queue lifecycle labels must be non-empty: missing {empty}")
+        if not q.state_comment_marker:
+            raise V3ConfigError("github_queue.state_comment_marker must be non-empty")
+        if q.lease_seconds < 1:
+            raise V3ConfigError("github_queue.lease_seconds must be >= 1")
+        if q.max_state_block_chars < 1:
+            raise V3ConfigError("github_queue.max_state_block_chars must be >= 1")
 
         foremen = [lane for lane in lanes if lane.role == "foreman"]
         if len(foremen) > 1:
