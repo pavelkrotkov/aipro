@@ -560,3 +560,77 @@ def test_empty_lifecycle_label_rejected():
         V3Config(github_queue=GitHubQueueConfig(enabled_label="")).validate()
     with pytest.raises(V3ConfigError):
         V3Config(github_queue=GitHubQueueConfig(state_comment_marker="")).validate()
+
+
+# --- round-2 remediation regression tests -----------------------------------
+
+
+def test_claim_arbitration_fails_when_created_comment_disappears():
+    class _VanishingFake(FakeGitHubClient):
+        """Mimics a concurrent claimant's arbitration deleting our comment."""
+
+        def get_pr_comments(self, issue_number):
+            # After our POST lands, the rescan sees nothing (our comment was deleted).
+            return []
+
+    fake = _VanishingFake()
+    queue = _queue(fake)
+    with pytest.raises(q.ClaimConflictError):
+        queue.claim(_issue(), "run-1")
+
+
+def test_claim_requeues_preserve_non_claim_extras():
+    fake = _ready_fake()
+    queue = _queue(fake)
+    s = queue.claim(_issue(), "run-1")
+    tagged = replace(
+        s.transition("queued"),
+        extras={**s.extras, "adapter_field": "survive-me"},
+    )
+    queue.save_state(tagged, expected_updated_at=s.updated_at)
+    s2 = queue.claim(_issue(), "run-2")
+    assert s2.extras.get("adapter_field") == "survive-me"
+
+
+def test_claim_label_failure_raises_label_sync_error():
+    gate = _LabelGate()
+    queue = _queue(gate)
+    gate.fail_labels = True
+    with pytest.raises(q.LabelSyncError):
+        queue.claim(_issue(), "run-1")
+
+
+def test_reclaim_label_failure_raises_label_sync_error():
+    gate = _LabelGate()
+    queue = _queue(gate)
+    s = queue.claim(_issue(), "run-1", now=datetime(2026, 1, 1, tzinfo=UTC))
+    # Park the issue under the review label so reclaim must add/remove labels.
+    gate.add_label(1, "v3-work-review")
+    stale_now = datetime(2026, 1, 1, 0, 16, tzinfo=UTC)
+    gate.fail_labels = True
+    with pytest.raises(q.LabelSyncError):
+        queue.reclaim_expired(_issue(), s, "run-2", now=stale_now)
+
+
+def test_transition_rejects_split_identity():
+    fake = _ready_fake()
+    fake.seed_issue(2, [])
+    queue = _queue(fake)
+    s = queue.claim(_issue(), "run-1")
+    other_issue = GitHubIssueRef(owner="owner", repo="repo", number=2)
+    with pytest.raises(DomainError):
+        queue.transition(other_issue, s, "coding")
+    with pytest.raises(DomainError):
+        queue.repair_labels(other_issue, s)
+
+
+def test_heartbeat_rejected_from_non_owner_host():
+    fake = _ready_fake()
+    owner_queue = _queue(fake)  # host-A
+    s = owner_queue.claim(_issue(), "run-1")
+    other_queue = q.GitHubIssueQueue(fake, "owner", "repo", GitHubQueueConfig(), host_id="host-B")
+    with pytest.raises(q.ClaimConflictError):
+        other_queue.heartbeat(s)
+    # The owner can still heartbeat.
+    s2 = owner_queue.heartbeat(s)
+    assert s2.extras["heartbeat_at"] is not None

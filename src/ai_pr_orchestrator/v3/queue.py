@@ -377,13 +377,19 @@ class GitHubIssueQueue:
         state_comments = [
             c for c in self._client.get_pr_comments(issue.number) if self._block_re.search(c.body)
         ]
+        created_id = getattr(created, "id", None)
         if not state_comments:
-            return  # removed already; nothing further to arbitrate
+            # Our own state comment vanished between POST and this rescan (a concurrent
+            # claimant's arbitration deleted it). We cannot hold the claim.
+            raise ClaimConflictError(
+                f"State comment for {issue.slug()} disappeared after posting; "
+                "a concurrent claimant's arbitration superseded this claim"
+            )
         authoritative = min(state_comments, key=lambda c: getattr(c, "id", 0))
         for dup in state_comments:
             if dup.id != authoritative.id and not self._dry_run:
                 self._client.delete_comment(dup.id)
-        if created is not None and getattr(created, "id", None) != authoritative.id:
+        if created is not None and created_id != authoritative.id:
             raise ClaimConflictError(
                 f"Concurrent claim won for {issue.slug()}; this foreman did not "
                 "become the authoritative claimant"
@@ -437,12 +443,16 @@ class GitHubIssueQueue:
             if existing is None:
                 self.save_state(state, expected_updated_at=None)
             elif existing.phase == "queued":
-                # Preserve workflow history across a fresh claim of requeued work.
+                # Preserve workflow history AND non-claim extras across a fresh claim
+                # of requeued work (mixed-version rollouts must not lose fields).
+                extras = {k: v for k, v in existing.extras.items() if k not in _REQUIRED_CLAIM_KEYS}
+                extras.update(claim.to_dict())
                 state = replace(
                     state,
                     round_id=existing.round_id,
                     findings=list(existing.findings),
                     dispositions=list(existing.dispositions),
+                    extras=extras,
                 )
                 self.save_state(state, expected_updated_at=existing.updated_at)
             else:
@@ -451,7 +461,12 @@ class GitHubIssueQueue:
                 )
         except StateConflictError as exc:
             raise ClaimConflictError(str(exc)) from exc
-        self._apply_phase_labels(issue, "claiming")
+        try:
+            self._apply_phase_labels(issue, "claiming")
+        except Exception as exc:
+            raise LabelSyncError(
+                f"Claim for {issue.slug()} committed but label update failed: {exc}"
+            ) from exc
         return state
 
     def heartbeat(self, state: WorkflowState, *, now: datetime | None = None) -> WorkflowState:
@@ -464,6 +479,11 @@ class GitHubIssueQueue:
 
         claim = claim_from_state(state)
         now = _utc(now or datetime.now(UTC))
+        if self._host_id and claim.host_id != self._host_id:
+            raise ClaimConflictError(
+                f"Lease for {state.work_item_id} is held by host {claim.host_id!r}, "
+                f"not {self._host_id!r}; a non-owner cannot heartbeat it"
+            )
         if claim.is_stale(now):
             raise ClaimConflictError(
                 f"Lease for {state.work_item_id} expired at "
@@ -500,6 +520,7 @@ class GitHubIssueQueue:
 
         if phase not in VALID_PHASES:
             raise DomainError(f"Invalid phase {phase!r}")
+        self._require_same_identity(issue, state)
         new_state = state.transition(
             cast(Any, phase), round_id=round_id, terminal_reason=terminal_reason
         )
@@ -523,6 +544,7 @@ class GitHubIssueQueue:
         current = state or self.load_state(work_item_id_of(issue))
         if current is None:
             return
+        self._require_same_identity(issue, current)
         self._apply_phase_labels(issue, current.phase)
 
     def complete(
@@ -568,6 +590,7 @@ class GitHubIssueQueue:
         """
 
         now = _utc(now or datetime.now(UTC))
+        self._require_same_identity(issue, stale_state)
         if stale_state.phase in _TERMINAL_PHASES:
             raise NoActiveClaimError(
                 f"State for {stale_state.work_item_id} is terminal "
@@ -602,10 +625,24 @@ class GitHubIssueQueue:
             extras=extras,
         )
         self.save_state(new_state, expected_updated_at=stale_state.updated_at)
-        self._apply_phase_labels(issue, "claiming")
+        try:
+            self._apply_phase_labels(issue, "claiming")
+        except Exception as exc:
+            raise LabelSyncError(
+                f"Reclaim for {issue.slug()} committed but label update failed: {exc}"
+            ) from exc
         return new_state
 
     # --- Private helpers ---------------------------------------------------
+
+    def _require_same_identity(self, issue: GitHubIssueRef, state: WorkflowState) -> None:
+        """Reject split-identity calls where ``issue`` and ``state`` refer to different
+        work items — committing state to one issue while mutating another's labels."""
+
+        if work_item_id_of(issue) != state.work_item_id:
+            raise DomainError(
+                f"Issue {issue.slug()} does not match the state's work item {state.work_item_id!r}"
+            )
 
     def _resolve_issue(self, work_item_id: str) -> GitHubIssueRef:
         """Parse ``work_item_id`` and refuse identities bound to another repository.
