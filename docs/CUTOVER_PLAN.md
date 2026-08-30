@@ -1,6 +1,6 @@
-# aipro V3 Cutover Plan (issue #55) — rev 2
+# aipro V3 Cutover Plan (issue #55) — rev 4
 
-Status: **proposed (rev 2, addressing review round 1)**. Review before any V1
+Status: **proposed (rev 4, addressing review round 3)**. Review before any V1
 code is removed. This is the human-authorization gate for retiring V1.
 
 ## 0. Goal
@@ -34,9 +34,9 @@ revertible commit away, and in-flight V3 work is drained before any revert.
 
 | Phase | Deliverable | Adds / removes | Gate to advance |
 | --- | --- | --- | --- |
-| **P1** Plan (rev 2) | this doc | docs only | review sign-off |
+| **P1** Plan (rev 4) | this doc | docs only | review sign-off |
 | **P2** Production glue | Foreman policy loop (`v3.foreman` over `GitHubWorkflowStateStore`+broker+lanes+lane-registry), `CaoLaneExecutor` (real `CaoSessionController` + Hermes lane), `CIPRGate`+GitHub CI adapter, GitHub `issue-content`/`pr-create` protocol ops, `git` worktree/branch/commit/push interface+impl, catalog-resolver+`PolicyBroker` wiring, **`GitHubIssueQueue.abandon()` (requeue+clear-claim drain op)**, **`v3.cleanup` production TTL sweeper** (owns CAO-session + worktree TTLs, invoked by the foreman) | adds only | `uv run pytest` + new unit tests green |
-| **P3** E2E harness foundation | `tests/e2e/` deterministic harness; **real adapters** ref`d against a `FakeCAOServer` (real CAO HTTP contract) + scripted telemetry/clock; scenarios 1–4 (clean issue→3 reviews→CI→PR; blocking-fix; rebuttal/independent-acceptance; disagreement→adjudication) | adds only | scenarios 1–4 pass repeatedly |
+| **P3** E2E harness foundation | `tests/e2e/` deterministic harness; **real adapters** ref`d against a `FakeCAOServer` (real CAO HTTP contract) + `FakeGitHub` boundary + scripted telemetry/clock; scenarios 1–4 (clean issue→draft PR→3 reviews→CI→PR-ready — **draft PR created before the CI gate since `CIPRGate.evaluate()` requires a PR ref**; blocking-fix; rebuttal/independent-acceptance; disagreement→adjudication) | adds only | scenarios 1–4 pass repeatedly |
 | **P4** Soak + failure + safety | `tests/e2e/soak.py` runner **exercising the `v3.cleanup` production sweeper (not its own copy)**; scenarios 5–12; **safety-parity scenarios** (fork reject, workflow-file restriction, iteration/commit/invocation budgets, `max_prompt_tokens`, `allowed_pr_author_associations`, credential-stripping) | adds only | full soak pass, no dup side effects, safety enforced |
 | **P5** Default + trigger + docs | V3 thin queue trigger workflow (adds before delete); make Hermes+CAO default; README runbook; **`docs/V1_MIGRATION.md`**; **`examples/v3-config.yml`** (new path, distinct from the V1 sample it supersedes) + update README references | adds, then docs react | P2–P4 green + your sign-off |
 | **P6** V1 retirement | DELETE `coders/`, `reviewers/`, `runner.py` monolithic loop, V1 `workflow.yml`, and now-unused V1 `models`/`state_*`/`config.py` + **the now-superseded `examples/sample-config.yml` (V1 path only)**; adapt `agents/`, `decision_application.py` consumers; rewire `aipro` CLI to V3; migration notes finalize. **The `examples/v3-config.yml` sample survives.** | removes V1 path | P5 shipped; CI green with notes |
@@ -47,7 +47,7 @@ the E2E/soak/safety suite must run the real adapters green on CI (P3–P4), and
 the replacement trigger/sample/docs/migration notes must already be shipped
 (P5). P6 then deletes only what is provably superseded.
 
-## 3. Intent of each gate (rev 2)
+## 3. Intent of each gate (rev 4)
 
 - **P2 IS the missing-glue gate.** Rev-2 lesson: P2/P3 must not be tests-only. The
   foreman loop, `CaoLaneExecutor`, `CIPRGate`, broker wiring, and the repo/PR
@@ -59,6 +59,10 @@ the replacement trigger/sample/docs/migration notes must already be shipped
   `CaoSessionController` ↔ `CaoLaneExecutor` integration, not a scripted pair.
 - **P4 runs broker scenarios through the real `PolicyBroker`** with only
   telemetry and the clock scripted — a broken ranking/wiring cannot pass.
+- **GitHub is also faked at the transport boundary** (`FakeGitHub`, same
+  principle as `FakeCAOServer`): the real `GitHubIssueQueue`, `CIPRGateImpl`,
+  and PR/issue adapters run against it, so the E2E path stays deterministic
+  without mutating live GitHub and without dropping the production adapters.
 - **Cleanup TTL (defined here, owned in P2 by `v3.cleanup`, enforced in P4):**
   CAO sessions are orphaned past `CAOControlPlaneConfig.session_lease_ttl_seconds`
   (default 2h) without renewal; git worktrees are orphaned past 24h of
@@ -74,10 +78,12 @@ the replacement trigger/sample/docs/migration notes must already be shipped
   stops heartbeat renewal and calls `abandon` on each active item.
 - **Safety-parity scenarios (P4)** mirror the V1-permitted operations:
   `disallow_forks`, `disallow_workflow_file_changes`, per-run budgets
-  (`max_*`), **`max_prompt_tokens`**, **`allowed_pr_author_associations`**, and
-  credential stripping are each exercised as a pass/fail E2E case through the
-  real policy path, not just asserted in config. V1's enforcement is not
-  removed (P6) until each passes.
+  (`max_*`), **`max_prompt_tokens`**, **`allowed_pr_author_associations`**,
+  **opt-in label removal stops active work** (V1's `only_run_on_labeled_prs`
+  parity: `claim()` revalidates the enabled label and the foreman abandons
+  active items when it disappears mid-run), and credential stripping — each is
+  exercised as a pass/fail E2E case through the real policy path, not just
+  asserted in config. V1's enforcement is not removed (P6) until each passes.
 
 ## 4. V1 → V3 inventory (complete, all consumers accounted for)
 
@@ -114,12 +120,16 @@ divergence.
   usable path. Each destructive phase's PR bundles the removal *and* its
   counterpart docs/config so a discarded intermediate state is never valid.
 - **In-flight V3 work:** before any fallback from an active V3 state, **quiesce
-  then drain** — stop new claims, stop heartbeat renewal, and call
-  `GitHubIssueQueue.abandon()` on every active item to reach zero active
-  leases; reconcile or sweep outstanding CAO sessions via `v3.cleanup`. GitHub
-  issue-comment state is left intact. **V1 cannot read V3 state**, so draining
-  is a hard precondition to any revert that could strand a claim or start
-  duplicate work.
+  then drain** — stop new claims, stop heartbeat renewal, then **explicitly
+  terminate and confirm every active CAO session has stopped** (a TTL sweep is
+  *not* sufficient: a session mid-commit could keep pushing after its claim is
+  released), and only then call `GitHubIssueQueue.abandon()` on each item to
+  reach zero active leases. `abandon()` **clears lease ownership while
+  retaining durable branch/PR linkage** (branch name, PR number), so a later
+  V3 claimant recovers the existing branch/PR instead of duplicating them.
+  GitHub issue-comment state is left intact. **V1 cannot read V3 state**, so
+  draining is a hard precondition to any revert that could strand a claim or
+  start duplicate work.
 - Reopening a closed epic/tracking issue is a repo mutation, not a git revert;
   the P7 procedure lists the exact issues to reopen. There is no compatibility
   loader: V1↔V3 config/state conversion is out of scope and stated as such.
