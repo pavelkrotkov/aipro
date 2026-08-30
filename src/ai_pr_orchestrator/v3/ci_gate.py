@@ -77,9 +77,7 @@ class CIPRGateImpl:
             # A required check that has not completed is pending, not failed;
             # one that never reported at all is failed by name.
             failed.extend(
-                name
-                for name in missing_required
-                if name not in pending and name not in failed
+                name for name in missing_required if name not in pending and name not in failed
             )
 
         if not runs and not statuses:

@@ -8,8 +8,13 @@ from pathlib import Path
 import yaml
 
 from ai_pr_orchestrator.v3.broker import PolicyBroker, TaskDemand
-from ai_pr_orchestrator.v3.catalog import ModelCatalog, ModelCatalogEntry
-from ai_pr_orchestrator.v3.config import TelemetryResourceConfig, V3Config
+from ai_pr_orchestrator.v3.catalog import ModelCatalogEntry
+from ai_pr_orchestrator.v3.config import (
+    ModelRouterConfig,
+    TelemetryConfig,
+    TelemetryResourceConfig,
+    V3Config,
+)
 from ai_pr_orchestrator.v3.model_router import ModelRouterError, build_model_broker, resolve_catalog
 from ai_pr_orchestrator.v3.telemetry import ProviderResourceSnapshot
 
@@ -32,7 +37,7 @@ def entry(ref: str) -> ModelCatalogEntry:
 
 
 def _config(*entries: ModelCatalogEntry) -> V3Config:
-    return V3Config(model_router={"catalog": [e.to_dict() for e in entries]})
+    return V3Config(model_router=ModelRouterConfig(catalog=list(entries)))
 
 
 class _StaticTelemetry:
@@ -63,17 +68,16 @@ def test_inline_catalog_resolves():
 def test_catalog_path_resolves_from_file(tmp_path: Path):
     path = tmp_path / "catalog.yml"
     path.write_text(yaml.safe_dump({"models": [entry("gamma").to_dict()]}))
-    config = V3Config(model_router={"catalog_path": str(path)})
+    config = V3Config(model_router=ModelRouterConfig(catalog_path=str(path)))
     catalog = resolve_catalog(config)
     assert catalog.refs() == ["gamma"]
 
 
 def test_inline_and_path_together_are_rejected(tmp_path: Path):
     config = V3Config(
-        model_router={
-            "catalog": [entry("alpha").to_dict()],
-            "catalog_path": str(tmp_path / "catalog.yml"),
-        }
+        model_router=ModelRouterConfig(
+            catalog=[entry("alpha")], catalog_path=str(tmp_path / "catalog.yml")
+        )
     )
     try:
         resolve_catalog(config)
@@ -89,8 +93,10 @@ def test_empty_section_yields_empty_catalog():
 def test_build_broker_takes_one_snapshot_per_resource():
     telemetry = _StaticTelemetry()
     config = V3Config(
-        model_router={"catalog": [entry("alpha").to_dict()]},
-        telemetry={"resources": [{"name": "acct-main", "provider": "prov-main"}]},
+        model_router=ModelRouterConfig(catalog=[entry("alpha")]),
+        telemetry=TelemetryConfig(
+            resources=[TelemetryResourceConfig(name="acct-main", provider="prov-main")]
+        ),
     )
     broker = build_model_broker(config, telemetry_source=telemetry, at=NOW)
     assert isinstance(broker, PolicyBroker)

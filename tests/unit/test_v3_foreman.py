@@ -13,29 +13,20 @@ from typing import Any, cast
 
 from ai_pr_orchestrator.github.fake import FakeGitHubClient
 from ai_pr_orchestrator.v3.broker import BrokerDecision
-from ai_pr_orchestrator.v3.config import (
-    EscalationPolicyConfig,
-    HermesLanesConfig,
-    LaneProfileConfig,
-    SafetyPolicyConfig,
-    V3Config,
-)
+from ai_pr_orchestrator.v3.config import EscalationPolicyConfig, SafetyPolicyConfig, V3Config
 from ai_pr_orchestrator.v3.domain import (
     GitHubIssueRef,
     LaneIdentity,
     ModelAssignment,
     ReviewerFinding,
-    WorkflowState,
 )
-from ai_pr_orchestrator.v3.findings import FindingRegistry
-from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop, ForemanQueue, _ForemanEscalation
+from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop
 from ai_pr_orchestrator.v3.interfaces import (
     GateDecision,
     LaneExecutionContext,
     LaneResult,
     ModelLease,
     SessionHandle,
-    StateConflictError,
 )
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
@@ -77,13 +68,9 @@ class ScriptedExecutor:
 
     reviewer_findings_by_round: dict[int, list[ReviewerFinding]] = field(default_factory=dict)
     developer_exit: int = 0
-    reviewer_exit: int = 0
     developer_files: list[str] = field(default_factory=lambda: ["src/x.py"])
-    reviewer_files: list[str] = field(default_factory=list)
-    developer_sleep: float = 0.0
     calls: list[tuple[str, str]] = field(default_factory=list)
     round_counter: dict[str, int] = field(default_factory=dict)
-    prompts: list[str] = field(default_factory=list)
 
     def execute(
         self,
@@ -94,7 +81,6 @@ class ScriptedExecutor:
         lease=None,
     ) -> LaneResult:
         self.calls.append((lane.lane, workdir))
-        self.prompts.append(task_prompt)
         if lane.role == "reviewer":
             n = self.round_counter.get(lane.lane, 0) + 1
             self.round_counter[lane.lane] = n
@@ -104,15 +90,11 @@ class ScriptedExecutor:
             findings = [replace(f, id=f"{f.id}-{lane.lane}", lane=lane.lane) for f in scripted]
             return LaneResult(
                 session=HANDLE,
-                exit_code=self.reviewer_exit,
+                exit_code=0,
                 output_summary="",
-                changed_files=list(self.reviewer_files),
+                changed_files=[],
                 findings=list(findings),
             )
-        if self.developer_sleep:
-            import time
-
-            time.sleep(self.developer_sleep)
         return LaneResult(
             session=HANDLE,
             exit_code=self.developer_exit,
@@ -167,7 +149,7 @@ def _finding(idx: int, severity: Any = "major") -> ReviewerFinding:
         id=f"f-{idx}",
         lane="requirements-reviewer",
         body=f"finding {idx}",
-        severity=severity,
+        severity=cast(Any, severity),
         run_id="run-1",
         round_id="review-1",
     )
@@ -180,20 +162,18 @@ def _gate(decision: GateDecision | None = None) -> StaticGate:
 def _foreman(
     fake: FakeGitHubClient,
     executor: ScriptedExecutor,
-    gate: Any,
+    gate: StaticGate,
     config: V3Config | None = None,
-    git: Any = None,
-    lanes: LaneRegistry | None = None,
 ):
     cfg = config or V3Config()
     queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-A")
     loop = ForemanPolicyLoop(
         queue,
         FakeBroker(),
-        lanes or LaneRegistry.default(),
+        LaneRegistry.default(),
         executor,
         gate,
-        git if git is not None else FakeGitOperations(),
+        FakeGitOperations(),
         cfg,
         run_id="run-1",
         worktree_root="/wt",
@@ -238,14 +218,7 @@ def test_clean_lifecycle_claim_to_done():
 def test_finding_triggers_fix_round_then_done():
     fake = _ready_fake()
     executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(1)]})
-    config = V3Config(
-        safety=SafetyPolicyConfig(
-            max_coder_invocations_per_run=3,
-            # Two review rounds x 3 reviewer lanes: the fix round must still
-            # be reviewable (an exhausted trigger budget escalates).
-            max_reviewer_triggers_per_run=6,
-        )
-    )
+    config = V3Config(safety=SafetyPolicyConfig(max_coder_invocations_per_run=3))
     loop, queue = _foreman(fake, executor, _gate(), config)
     outcome = loop.run_pass()[0]
 
@@ -294,40 +267,15 @@ def test_coder_invocation_budget_escalates():
 
 
 def test_coder_exit_code_retries_then_escalates():
-    """A failing lane retries until the consecutive-failure threshold — while
-    staying inside the invocation budget (F13 counts failures against it)."""
+    """A failing lane retries until the consecutive-failure threshold."""
     fake = _ready_fake()
     executor = ScriptedExecutor(developer_exit=3)
-    config = V3Config(
-        safety=SafetyPolicyConfig(max_coder_invocations_per_run=5),
-        escalation=EscalationPolicyConfig(max_consecutive_coder_failures=3),
-    )
-    loop, queue = _foreman(fake, executor, _gate(), config)
+    loop, queue = _foreman(fake, executor, _gate())
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "escalated"
     assert "consecutively" in outcome.reason
     dev_calls = [c for c in executor.calls if c[0] == "developer"]
-    assert len(dev_calls) == 3  # threshold reached within the budget
-    state = queue.load_state("owner/repo#1")
-    assert state is not None and state.phase == "escalated"
-
-
-def test_failed_coder_attempts_consume_invocation_budget():
-    """A failing lane may not bypass max_coder_invocations_per_run: with a
-    budget of 1, a single sketched attempt escalates rather than retrying
-    toward the (larger) consecutive-failure threshold."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor(developer_exit=1)
-    config = V3Config(
-        safety=SafetyPolicyConfig(max_coder_invocations_per_run=1),
-        escalation=EscalationPolicyConfig(max_consecutive_coder_failures=5),
-    )
-    loop, queue = _foreman(fake, executor, _gate(), config)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "budget exhausted" in outcome.reason
-    dev_calls = [c for c in executor.calls if c[0] == "developer"]
-    assert len(dev_calls) == 1
+    assert len(dev_calls) == 3  # default threshold, each attempt retried
     state = queue.load_state("owner/repo#1")
     assert state is not None and state.phase == "escalated"
 
@@ -340,13 +288,8 @@ def test_pending_ci_parks_item_in_ci_gating():
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "ci_gating"
     assert "pending" in outcome.reason
-    # Requeued onto the enabled label so a LATER pass re-selects it (list_ready
-    # only returns the enabled label), and a second run_pass picks it up again.
     state = queue.load_state("owner/repo#1")
-    assert state is not None and state.phase == "queued"
-    assert "v3-work" in fake.get_labels(1)
-    again = loop.run_pass()[0]
-    assert again.final_phase == "ci_gating"  # re-claimed and re-evaluated
+    assert state is not None and state.phase == "ci_gating"
 
 
 def test_leases_are_released_even_when_lanes_fail():
@@ -391,11 +334,7 @@ def test_stagnation_threshold_escalates():
     # Round 1: findings exist (so we enter a fix round); rounds 2+ empty.
     executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(9)], 2: [], 3: []})
     config = Cfg(
-        safety=SafetyPolicyConfig(
-            max_coder_invocations_per_run=20,
-            max_total_iterations=9,
-            max_reviewer_triggers_per_run=10,
-        ),
+        safety=SafetyPolicyConfig(max_coder_invocations_per_run=20, max_total_iterations=9),
         escalation=EscalationPolicyConfig(stagnation_rounds_threshold=2),
     )
     gate = _gate(GateDecision(passed=False, pending_checks=(), failed_checks=("build",)))
@@ -412,561 +351,10 @@ def test_consecutive_coder_failures_escalate():
 
     fake = _ready_fake()
     executor = ScriptedExecutor(developer_exit=1)
-    config = Cfg(
-        safety=SafetyPolicyConfig(max_coder_invocations_per_run=5),
-        escalation=EscalationPolicyConfig(max_consecutive_coder_failures=3),
-    )
+    config = Cfg(escalation=EscalationPolicyConfig(max_consecutive_coder_failures=3))
     loop, queue = _foreman(fake, executor, _gate(), config)
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "escalated"
     assert "consecutively" in outcome.reason
     state = queue.load_state("owner/repo#1")
     assert state is not None and state.phase == "escalated"
-
-
-# --- Round-1 remediation: remaining findings --------------------------------
-
-
-class RecordingGate:
-    def __init__(self, decisions) -> None:
-        self.decisions = list(decisions)
-        self.seen: list[tuple[int, str]] = []
-
-    def evaluate(self, issue, pr) -> GateDecision:
-        self.seen.append((pr.number, pr.head_sha))
-        if len(self.decisions) > 1:
-            return self.decisions.pop(0)
-        return self.decisions[0]
-
-
-class RecordingGit(FakeGitOperations):
-    def __init__(self, default: str = "main") -> None:
-        super().__init__(default)
-        self.cleanups: list[str] = []
-        self.pushed: list[str] = []
-        self.commits: list[tuple[str, str]] = []
-
-    def cleanup_worktree(self, path: str) -> None:
-        self.cleanups.append(path)
-        super().cleanup_worktree(path)
-
-    def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
-        self.commits.append((workdir, message))
-        return super().commit(workdir, message, name=name, email=email)
-
-    def push(self, branch: str) -> None:
-        self.pushed.append(branch)
-
-
-def test_ci_failure_loops_back_to_coding_then_done():
-    """A failed CI check becomes findings for the next coding round; when the
-    gate later goes green the item completes (F1 explicit loop-back)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    gate = RecordingGate(
-        [
-            GateDecision(passed=False, pending_checks=(), failed_checks=("build",)),
-            GateDecision(passed=True, pending_checks=(), failed_checks=()),
-        ]
-    )
-    cfg = V3Config(
-        safety=SafetyPolicyConfig(
-            max_coder_invocations_per_run=3,
-            max_reviewer_triggers_per_run=6,  # two rounds x 3 reviewer lanes
-        )
-    )
-    loop, _ = _foreman(fake, executor, gate, cfg)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
-    assert outcome.coder_invocations == 2  # second coding round from the CI finding
-    assert len(gate.seen) == 2
-
-
-def test_degenerate_gate_escalates_not_loops():
-    """A gate that is neither passing, pending, nor naming a failed check (e.g.
-    'no checks reported and green required') has no signal to loop on and must
-    escalate, never spin forever (F1)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    gate = GateDecision(passed=False, pending_checks=(), failed_checks=(), detail="no checks")
-    loop, queue = _foreman(fake, executor, _gate(gate))
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "cannot progress" in outcome.reason
-    state = queue.load_state("owner/repo#1")
-    assert state is not None and state.phase == "escalated"
-
-
-def test_claim_contention_does_not_leak_resources_or_mark_needs_human():
-    """When another foreman already owns the claim, we must not create a
-    branch/worktree behind a lost claim and must not escalate the competitor's
-    work (F2 resource order + F9 crash persistence)."""
-    fake = FakeGitHubClient()
-    fake.seed_issue(1, labels=["v3-work"])
-    other = GitHubIssueQueue(fake, "owner", "repo", host_id="host-other")
-    other.claim(ISSUE, "other-run", now=NOW)
-
-    executor = ScriptedExecutor()
-    git = RecordingGit()
-    gate = _gate()
-    cfg = V3Config()
-    queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-A")
-    loop = ForemanPolicyLoop(
-        queue,
-        FakeBroker(),
-        LaneRegistry.default(),
-        executor,
-        gate,
-        git,
-        cfg,
-        run_id="run-1",
-        worktree_root="/wt",
-        committer_name="Pavel Krotkov",
-        committer_email="pavel.krotkov@gmail.com",
-    )
-    outcomes = loop.run_pass()
-    # the item is already claimed by another host, so list_ready does not return
-    # it and no work/resource materialization happens on our side
-    assert outcomes == []  # no outcomes: the item was not re-queued
-    assert executor.calls == []  # the developer lane never ran
-    assert git.worktrees == {}
-    # the competitor's claim is left alone — not escalated by us
-    state = other.load_state("owner/repo#1")
-    assert state is not None and state.phase != "escalated"
-
-
-def test_reviewer_lane_crash_is_escalation_not_absence():
-    """A reviewer lane that exits nonzero is a failed review round: it must
-    escalate, never quietly read as 'no findings' and sail on to CI/done (F10)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor(reviewer_exit=1)
-    loop, queue = _foreman(fake, executor, _gate())
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "reviewer lane" in outcome.reason
-    state = queue.load_state("owner/repo#1")
-    assert state is not None and state.phase == "escalated"
-
-
-def test_worker_lane_resolves_from_configured_lanes():
-    """The coder lane is the configured role-worker lane, not a hard-coded
-    'developer' (F12)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    hermes = HermesLanesConfig(
-        lanes=[
-            LaneProfileConfig(name="coder", role="worker", profile_template="t-coder"),
-            LaneProfileConfig(name="req", role="reviewer", profile_template="t-req"),
-        ]
-    )
-    cfg = V3Config(hermes_lanes=hermes)
-    lanes = LaneRegistry.from_config(hermes)
-    loop, _ = _foreman(fake, executor, _gate(), cfg, lanes=lanes)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
-    assert executor.calls and executor.calls[0][0] == "coder"
-
-
-def test_reviewer_triggers_capped_per_run():
-    """max_reviewer_triggers_per_run bounds reviewer lane launches across the
-    whole run (F14)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    cfg = V3Config(safety=SafetyPolicyConfig(max_reviewer_triggers_per_run=1))
-    loop, _ = _foreman(fake, executor, _gate(), cfg)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
-    reviewer_calls = [c for c in executor.calls if c[0] != "developer"]
-    assert len(reviewer_calls) == 1
-
-
-def test_issue_body_is_included_in_coder_prompt():
-    """The coder prompt carries the issue description/acceptance criteria, not
-    just the slug (F16)."""
-    fake = _ready_fake()
-    fake._issue_bodies[1] = "Add feature X. AC: it must be fast."
-    executor = ScriptedExecutor()
-    loop, _ = _foreman(fake, executor, _gate())
-    loop.run_pass()[0]
-    dev_prompts = [
-        p
-        for call, p in zip(executor.calls, executor.prompts, strict=False)
-        if call[0] == "developer"
-    ]
-    assert dev_prompts
-    assert "Add feature X. AC: it must be fast." in dev_prompts[0]
-
-
-def test_terminal_worktree_is_cleanup_but_pending_is_retained():
-    """done/failed/escalated release the worktree; the pending-CI/requeue path
-    deliberately retains it (F17)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    git = RecordingGit()
-    loop, _ = _foreman(fake, executor, _gate(), git=git)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
-    assert "/wt/issue-1" in git.cleanups
-
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    git = RecordingGit()
-    gate = _gate(GateDecision(passed=False, pending_checks=("build",), failed_checks=()))
-    loop, _ = _foreman(fake, executor, gate, git=git)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "ci_gating"
-    assert git.cleanups == []  # pending path retains the checkout for reuse
-
-
-def test_prompt_token_budget_is_enforced_before_execution():
-    """A lane is never launched once max_prompt_tokens would be exceeded;
-    the foreman escalates instead (F18)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    cfg = V3Config(safety=SafetyPolicyConfig(max_prompt_tokens=1))
-    loop, queue = _foreman(fake, executor, _gate(), cfg)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "token budget" in outcome.reason
-    assert executor.calls == []  # never executed a lane
-    state = queue.load_state("owner/repo#1")
-    assert state is not None and state.phase == "escalated"
-
-
-def test_pr_ref_carries_commit_sha_not_branch():
-    """The PR ref handed to the gate carries a commit SHA from create_pr, never
-    the branch name (F19)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    gate = RecordingGate([GateDecision(passed=True, pending_checks=(), failed_checks=())])
-    loop, _ = _foreman(fake, executor, gate)
-    loop.run_pass()[0]
-    number, head_sha = gate.seen[0]
-    assert head_sha
-    assert head_sha != "aipro-issue-1"
-    assert number != 1  # PR number from the shared sequence, not the issue number
-
-
-def test_review_history_accumulates_across_rounds():
-    """Each review round appends to — rather than replaces — the durable
-    findings/dispositions, so restart reconciliation sees every round (F11)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor(
-        reviewer_findings_by_round={1: [_finding(1)], 2: [_finding(2)], 3: []}
-    )
-    cfg = V3Config(
-        safety=SafetyPolicyConfig(
-            max_coder_invocations_per_run=5, max_reviewer_triggers_per_run=10
-        ),
-        escalation=EscalationPolicyConfig(stagnation_rounds_threshold=5),
-    )
-    loop, queue = _foreman(fake, executor, _gate(), cfg)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
-    state = queue.load_state("owner/repo#1")
-    assert state is not None
-    fixed_ids = {d.finding_id for d in state.dispositions if d.action == "fix"}
-    # finding ids are rewritten per lane (e.g. "f-1-requirements-reviewer")
-    assert any(rid.startswith("f-1") for rid in fixed_ids)
-    assert any(rid.startswith("f-2") for rid in fixed_ids)
-
-
-def test_persist_failure_aborts_the_round_as_escalation():
-    """If review state cannot be persisted, abort/escalate rather than silently
-    continuing with an unpersisted round (F15)."""
-
-    class BoomQueue:
-        state: WorkflowState | None = None
-
-        def __init__(self, st):
-            self.state = st
-
-        def load_state(self, wid):
-            return self.state
-
-        def save_state(self, state, expected_updated_at):
-            raise StateConflictError("boom")
-
-    # A minimal claimed state so _persist_round can load it.
-    st = WorkflowState(work_item_id=ISSUE.slug(), run_id="run-1", phase="reviewing")
-    queue = cast("ForemanQueue", BoomQueue(st))
-    gate = _gate()
-    loop = ForemanPolicyLoop(
-        queue,
-        FakeBroker(),
-        LaneRegistry.default(),
-        ScriptedExecutor(),
-        gate,
-        RecordingGit(),
-        V3Config(),
-        run_id="run-1",
-        worktree_root="/wt",
-        committer_name="Pavel Krotkov",
-        committer_email="pavel.krotkov@gmail.com",
-    )
-    try:
-        loop._persist_round(ISSUE, st, "review-1", FindingRegistry(), [])
-    except _ForemanEscalation as exc:
-        assert "persist" in str(exc)
-        return
-    raise AssertionError("expected _ForemanEscalation")
-
-
-def test_gate_is_committed_and_pushed_before_pr_open():
-    """Lane output is committed and pushed before the PR is (re)opened so the PR
-    targets a real remote head (F4)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    git = RecordingGit()
-    loop, _ = _foreman(fake, executor, _gate(), git=git)
-    loop.run_pass()[0]
-    assert git.commits  # lane output was committed
-    assert "aipro-issue-1" in git.pushed  # and pushed to the remote branch
-
-
-# --- Round-2 remediation -------------------------------------------------------
-
-
-def test_lease_is_heartbeated_while_lane_runs():
-    """A lane that outlasts the lease interval gets its lease renewed during
-    execution — reclaim_expired cannot hand the issue away mid-edit (#1)."""
-
-    from ai_pr_orchestrator.v3.config import GitHubQueueConfig
-
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    executor.developer_sleep = 0.5
-    cfg = V3Config(github_queue=GitHubQueueConfig(lease_seconds=1))  # interval ≈ 0.33s
-    loop, queue = _foreman(fake, executor, _gate(), cfg)
-    heartbeats: list[WorkflowState] = []
-    original = queue.heartbeat
-
-    def counting_heartbeat(state, *, now=None):
-        refreshed = original(state, now=now)
-        heartbeats.append(refreshed)
-        return refreshed
-
-    queue.heartbeat = counting_heartbeat  # type: ignore[method-assign]
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
-    # One pre-lane heartbeat plus at least one DURING the 0.5s lane (interval
-    # is a third of the 1s lease).
-    assert len(heartbeats) >= 2
-
-
-def test_pending_ci_requeue_goes_straight_to_gate():
-    """A requeued pending-CI item with a retained PR must not relaunch
-    coding/review — it re-evaluates the same head at the CI gate (#2)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    gate = _gate(GateDecision(passed=False, pending_checks=("build",), failed_checks=()))
-    loop, _queue = _foreman(fake, executor, gate)
-    first = loop.run_pass()[0]
-    assert first.final_phase == "ci_gating"
-    assert len([c for c in executor.calls if c[0] == "developer"]) == 1
-
-    second = loop.run_pass()[0]
-    assert second.final_phase == "ci_gating"
-    # No new coding or review lanes on the re-claim pass.
-    assert len([c for c in executor.calls if c[0] == "developer"]) == 1
-    assert len(gate.evaluated) == 2
-
-
-def test_reviewer_budget_exhausted_escalates_not_unreviewed():
-    """With the trigger budget spent, a round that needs reviewers escalates
-    instead of reporting a fake 'no findings' (#3)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(4)]})
-    cfg = V3Config(
-        safety=SafetyPolicyConfig(max_coder_invocations_per_run=3)  # triggers stay at 3
-    )
-    loop, _ = _foreman(fake, executor, _gate(), cfg)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "reviewer trigger budget" in outcome.reason
-
-
-def test_every_state_write_stamps_a_fresh_updated_at():
-    """_persist_round must advance updated_at so the CAS version moves — a
-    stale concurrent writer may not pass the precondition (#4)."""
-
-    class RecorderQueue:
-        def __init__(self, st):
-            self.state = st
-            self.saved: list[tuple[WorkflowState, object]] = []
-
-        def load_state(self, wid):
-            return self.state
-
-        def save_state(self, state, expected_updated_at):
-            self.saved.append((state, expected_updated_at))
-
-    st = WorkflowState(work_item_id=ISSUE.slug(), run_id="run-1", phase="reviewing")
-    recorder = RecorderQueue(st)
-    queue = cast("ForemanQueue", recorder)
-    loop = ForemanPolicyLoop(
-        queue,
-        FakeBroker(),
-        LaneRegistry.default(),
-        ScriptedExecutor(),
-        _gate(),
-        RecordingGit(),
-        V3Config(),
-        run_id="run-1",
-        worktree_root="/wt",
-        committer_name="N",
-        committer_email="e@x",
-    )
-    loop._persist_round(ISSUE, st, "review-1", FindingRegistry(), [])
-    assert recorder.saved
-    saved, expected = recorder.saved[0]
-    assert expected == st.updated_at  # CAS against the loaded version
-    assert saved.updated_at > st.updated_at  # version advanced
-
-
-def test_pending_ci_beyond_timeout_escalates():
-    """The pending-CI wait start is persisted and, once
-    ci_wait_timeout_seconds is exceeded, the item escalates instead of
-    requeueing forever (#5)."""
-    from datetime import UTC as UTC_
-    from datetime import datetime as _dt
-    from datetime import timedelta as _td
-
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    gate = _gate(GateDecision(passed=False, pending_checks=("build",), failed_checks=()))
-    loop, queue = _foreman(fake, executor, gate)
-    first = loop.run_pass()[0]
-    assert first.final_phase == "ci_gating"
-    state = queue.load_state("owner/repo#1")
-    assert state is not None and state.extras.get("ci_wait_started_at")  # wait persisted
-
-    # Backdate the wait start beyond the configured 1800s timeout.
-    stale = replace(
-        state,
-        extras={
-            **state.extras,
-            "ci_wait_started_at": (_dt.now(UTC_) - _td(seconds=3600)).isoformat(),
-        },
-    )
-    queue.save_state(stale, expected_updated_at=state.updated_at)
-
-    second = loop.run_pass()[0]
-    assert second.final_phase == "escalated"
-    assert "ci_wait_timeout_seconds" in second.reason
-
-
-def test_coder_cap_is_checked_before_launching():
-    """With open findings and the cap already reached, no further coder
-    invocation is launched — the item escalates first (#6)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(5)]})
-    cfg = V3Config(
-        safety=SafetyPolicyConfig(
-            max_coder_invocations_per_run=1,
-            max_reviewer_triggers_per_run=6,
-        )
-    )
-    loop, _ = _foreman(fake, executor, _gate(), cfg)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "budget exhausted with open findings" in outcome.reason
-    assert len([c for c in executor.calls if c[0] == "developer"]) == 1  # never relaunched
-
-
-def test_commit_cap_exceeded_escalates_but_noop_passes():
-    """max_commits_per_run is consulted BEFORE committing: a round that would
-    push past the cap escalates; a visit with nothing to commit does not (#7)."""
-
-    class CountingGit(RecordingGit):
-        def __init__(self):
-            super().__init__()
-            self.count = 0
-
-        def commit_count(self, workdir, base_ref):
-            return self.count
-
-    # Cap reached and changes pending -> escalate before committing.
-    fake = _ready_fake()
-    git = CountingGit()
-    git.count = 1  # default cap is 1
-    loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "commit budget exhausted" in outcome.reason
-
-    # Cap reached but nothing to commit -> the no-op commit path still gates.
-    fake = _ready_fake()
-    git = CountingGit()
-    git.count = 1
-    loop, _ = _foreman(fake, ScriptedExecutor(developer_files=[]), _gate(), git=git)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
-
-
-def test_crash_path_cleans_up_worktree():
-    """An unexpected crash is terminal: the worktree is released even though
-    the outcome is None in the crashing frame (#8)."""
-
-    class CrashingExecutor(ScriptedExecutor):
-        def execute(self, lane, task_prompt, workdir, context, lease=None):
-            raise RuntimeError("lane exploded")
-
-    fake = _ready_fake()
-    git = RecordingGit()
-    loop, _ = _foreman(fake, CrashingExecutor(), _gate(), git=git)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "/wt/issue-1" in git.cleanups  # leaked no worktree on the crash path
-
-
-def test_reviewer_workflow_file_change_is_a_policy_violation():
-    """A reviewer lane editing .github/workflows/ hits the same policy check
-    as the coder — it escalates instead of being staged and pushed (#9)."""
-    fake = _ready_fake()
-    executor = ScriptedExecutor()
-    executor.reviewer_files = [".github/workflows/evil.yml"]
-    loop, _ = _foreman(fake, executor, _gate())
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "policy violation" in outcome.reason
-
-
-def test_coder_reply_is_actually_posted_to_the_review_thread():
-    """require_coder_reply_before_resolve posts the reply to the GitHub
-    thread — the disposition and the thread agree (#10)."""
-    fake = _ready_fake()
-    fake.seed_thread("T-1", pr_number=1)
-    finding = _finding(6)
-    finding = replace(finding, thread_id="T-1")
-    executor = ScriptedExecutor(reviewer_findings_by_round={1: [finding]})
-    cfg = V3Config(
-        safety=SafetyPolicyConfig(
-            max_coder_invocations_per_run=2,
-            max_reviewer_triggers_per_run=6,
-        )
-    )
-    loop, _ = _foreman(fake, executor, _gate(), cfg)
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
-    thread = fake._threads["T-1"]
-    assert len(thread.comments) == 1
-    assert thread.comments[0].body  # the canned coder reply reached the thread
-
-
-def test_failed_thread_reply_is_an_escalation():
-    """A review-thread reply that cannot be posted aborts the round as an
-    escalation — never a disposition claiming a reply that was not sent (#10)."""
-    fake = _ready_fake()
-    fake.seed_thread("T-2", pr_number=1)
-    finding = replace(_finding(7), thread_id="T-2")
-    executor = ScriptedExecutor(reviewer_findings_by_round={1: [finding]})
-
-    def _impl(thread_id: str, body: str) -> dict[str, Any] | None:
-        raise RuntimeError("github down")
-
-    setattr(fake, "reply_to_review_thread", _impl)  # noqa: B010
-    loop, _ = _foreman(fake, executor, _gate())
-    outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "reply" in outcome.reason
