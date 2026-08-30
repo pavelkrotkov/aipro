@@ -261,3 +261,40 @@ class CIPRGate(Protocol):
     """
 
     def evaluate(self, issue: GitHubIssueRef, pr: GitHubPullRequestRef) -> GateDecision: ...
+
+
+@runtime_checkable
+class GitOperations(Protocol):
+    """Repo lifecycle operations: branch, worktree, commit, push.
+
+    All methods take explicit identity parameters (committer name/email) so
+    the implementation never reads ambient git config — a forged or missing
+    global identity must not silently change what lands on the remote. Every
+    operation is deliberately one primitive: the foreman composes them, so
+    tests can fake each step and the production implementation can shell out
+    to git without embedding policy.
+    """
+
+    def default_branch(self) -> str: ...
+
+    def create_branch(self, branch: str, from_ref: str) -> None: ...
+
+    def create_worktree(self, path: str, branch: str) -> str:
+        """Materialize ``branch`` at ``path``; return the resolved workdir."""
+
+        ...
+
+    def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
+        """Commit all changes in ``workdir``; return the new head SHA."""
+
+        ...
+
+    def commit_count(self, workdir: str, base_ref: str) -> int:
+        """Commits in ``workdir`` not reachable from ``base_ref``."""
+
+        ...
+
+    def push(self, branch: str) -> None: ...
+
+    def cleanup_worktree(self, path: str) -> None: ...
+
