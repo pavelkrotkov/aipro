@@ -108,7 +108,7 @@ class FakeGitHubClient:
         self._labels[number] = list(labels) if labels else []
         if body is not None:
             self._issue_bodies[number] = body
-        # Issues and pull requests share one repo-wide number sequence. A seeded
+# Issues and pull requests share one repo-wide number sequence. A seeded
         # issue must advance ``_next_pr_number`` past it, otherwise a later
         # create_pr() would mint a PR that aliases this issue's number (and any
         # labels stored under it).
@@ -243,7 +243,7 @@ class FakeGitHubClient:
             title=title,
             body=body,
             state="open",
-            # A real PR carries an actual commit SHA in ``head_sha``; the fake
+# A real PR carries an actual commit SHA in ``head_sha``; the fake
             # synthesizes a deterministic one so callers that rely on the SHA
             # (e.g. the foreman's PR ref for gating) never see the branch name
             # or an empty string masquerading as a head.
