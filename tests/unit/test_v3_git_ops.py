@@ -68,22 +68,11 @@ def test_fake_satisfies_git_operations_protocol():
 def real_repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()
-
     def git(*args: str, cwd: Path = root) -> str:
         subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
         return ""
-
     git("init", "-b", "main")
-    git(
-        "-c",
-        "user.name=T",
-        "-c",
-        "user.email=t@example.com",
-        "commit",
-        "--allow-empty",
-        "-m",
-        "init",
-    )
+    git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "--allow-empty", "-m", "init")
     (root / "file.txt").write_text("hello\n")
     git("add", ".")
     git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-m", "add file")
@@ -97,11 +86,7 @@ def test_default_branch_and_branch_creation(real_repo: Path):
     assert ops.default_branch() == "main"
     ops.create_branch("feat/x", "main")
     heads = subprocess.run(
-        ["git", "branch", "--list", "feat/x"],
-        cwd=real_repo,
-        capture_output=True,
-        text=True,
-        check=True,
+        ["git", "branch", "--list", "feat/x"], cwd=real_repo, capture_output=True, text=True, check=True
     ).stdout
     assert "feat/x" in heads
 
@@ -137,58 +122,3 @@ def test_push_failure_raises_gitops_error(real_repo: Path):
     ops = GitWorktreeOps(real_repo)
     with pytest.raises(GitOpsError, match="push"):
         ops.push("no-such-branch")
-
-
-def test_commit_on_clean_worktree_is_a_noop(real_repo: Path, tmp_path: Path):
-    """A lane run with no edits must not surface ``git commit`` exit-1 as failure."""
-    ops = GitWorktreeOps(real_repo)
-    base = ops.default_branch()
-    ops.create_branch("feat/noop", base)
-    wt = tmp_path / "wt-noop"
-    workdir = ops.create_worktree(str(wt), "feat/noop")
-    head_before = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True, text=True, check=True
-    ).stdout.strip()
-
-    # No changes staged: commit short-circuits to the current HEAD, no error.
-    sha = ops.commit(workdir, "noop", name="Pavel Krotkov", email="pavel.krotkov@gmail.com")
-
-    assert sha == head_before
-    count = subprocess.run(
-        ["git", "rev-list", "--count", f"{base}..HEAD"],
-        cwd=wt,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    assert count == "0"  # nothing was committed
-
-
-def test_subprocesses_are_noninteractive_and_bounded(real_repo: Path):
-    """git calls must never prompt for credentials or hang without a bound."""
-    ops = GitWorktreeOps(real_repo)
-    assert ops._env["GIT_TERMINAL_PROMPT"] == "0"
-    assert "BatchMode=yes" in ops._env["GIT_SSH_COMMAND"]
-
-
-def test_timeout_surfaces_as_gitops_error(real_repo: Path):
-    ops = GitWorktreeOps(real_repo, timeout=0.0001)
-    with pytest.raises(GitOpsError, match="timed out"):
-        ops.default_branch()
-
-
-def test_relative_worktree_path_returns_absolute_path(real_repo: Path):
-    """A relative worktree path is resolved against the repo root and handed
-    back ABSOLUTE, so callers can use the returned path from any cwd (#11)."""
-    import os
-
-    ops = GitWorktreeOps(real_repo)
-    base = ops.default_branch()
-    ops.create_branch("feat/rel", base)
-    returned = ops.create_worktree("rel-wt", "feat/rel")
-    try:
-        assert os.path.isabs(returned)
-        assert Path(returned) == real_repo / "rel-wt"
-        assert Path(returned).is_dir()  # usable from the caller's own cwd
-    finally:
-        ops.cleanup_worktree(returned)

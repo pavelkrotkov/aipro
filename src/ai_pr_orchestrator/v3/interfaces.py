@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from .domain import (
     FindingDisposition,
@@ -30,9 +30,6 @@ from .domain import (
     WorkItemId,
 )
 from .telemetry import ProviderResourceSnapshot
-
-if TYPE_CHECKING:
-    from .cao import SessionObservation
 
 
 class StateConflictError(RuntimeError):
@@ -188,30 +185,13 @@ class GitHubWorkflowStateStore(Protocol):
 
 @runtime_checkable
 class CAOSessionController(Protocol):
-    """Starts and stops agent sessions on the CAO execution fabric.
-
-    Round-2 review, PR #71 #6: the protocol now lists every operation
-    the executor uses (``start_session``, ``submit_work``,
-    ``adopt_session``, ``poll_session``, ``terminate_session``,
-    ``update_turn_context``) so a struct-typed fake that satisfies the
-    protocol is also a valid executor dependency. The previous short
-    protocol let ``FakeCAOSessionController`` pass the runtime check
-    but fail at the executor's first ``submit_work`` call.
-    """
+    """Starts and stops agent sessions on the CAO execution fabric."""
 
     def start_session(self, spec: SessionSpec) -> SessionHandle: ...
-
-    def submit_work(self, handle: SessionHandle, message: str) -> None: ...
 
     def poll_session(self, handle: SessionHandle) -> LaneResult | None:
         """Return the result if the session finished, else None."""
         ...
-
-    def adopt_session(
-        self, session_name: str, spec: SessionSpec | None = None
-    ) -> SessionObservation: ...
-
-    def update_turn_context(self, handle: SessionHandle, context: LaneExecutionContext) -> None: ...
 
     def terminate_session(self, handle: SessionHandle) -> None: ...
 
@@ -317,3 +297,4 @@ class GitOperations(Protocol):
     def push(self, branch: str) -> None: ...
 
     def cleanup_worktree(self, path: str) -> None: ...
+
