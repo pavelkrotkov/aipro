@@ -35,11 +35,11 @@ revertible commit away, and in-flight V3 work is drained before any revert.
 | Phase | Deliverable | Adds / removes | Gate to advance |
 | --- | --- | --- | --- |
 | **P1** Plan (rev 2) | this doc | docs only | review sign-off |
-| **P2** Production glue | Foreman policy loop (`v3.foreman` over `GitHubWorkflowStateStore`+broker+lanes+lane-registry), `CaoLaneExecutor` (real `CaoSessionController` + Hermes lane), `CIPRGate`+GitHub CI adapter, GitHub `issue-content`/`pr-create` protocol ops, `git` worktree/branch/commit/push interface+impl, catalog-resolver+`PolicyBroker` wiring | adds only | `uv run pytest` + new unit tests green |
+| **P2** Production glue | Foreman policy loop (`v3.foreman` over `GitHubWorkflowStateStore`+broker+lanes+lane-registry), `CaoLaneExecutor` (real `CaoSessionController` + Hermes lane), `CIPRGate`+GitHub CI adapter, GitHub `issue-content`/`pr-create` protocol ops, `git` worktree/branch/commit/push interface+impl, catalog-resolver+`PolicyBroker` wiring, **`GitHubIssueQueue.abandon()` (requeue+clear-claim drain op)**, **`v3.cleanup` production TTL sweeper** (owns CAO-session + worktree TTLs, invoked by the foreman) | adds only | `uv run pytest` + new unit tests green |
 | **P3** E2E harness foundation | `tests/e2e/` deterministic harness; **real adapters** ref`d against a `FakeCAOServer` (real CAO HTTP contract) + scripted telemetry/clock; scenarios 1–4 (clean issue→3 reviews→CI→PR; blocking-fix; rebuttal/independent-acceptance; disagreement→adjudication) | adds only | scenarios 1–4 pass repeatedly |
-| **P4** Soak + failure + safety | `tests/e2e/soak.py` runner with TTL sweep; scenarios 5–12; **safety-parity scenarios** (fork reject, workflow-file restriction, iteration/commit/invocation budgets, credential-stripping) | adds only | full soak pass, no dup side effects, safety enforced |
-| **P5** Default + trigger + docs | V3 thin queue trigger workflow (adds before delete); make Hermes+CAO default; README runbook; **`docs/V1_MIGRATION.md`**; **V3 sample config replacing `examples/sample-config.yml`** + update references | adds, then docs react | P2–P4 green + your sign-off |
-| **P6** V1 retirement | DELETE `coders/`, `reviewers/`, `runner.py` monolithic loop, V1 `workflow.yml` + now-unused V1 `models`/`state_*`/`config.py` + adapt `agents/`, `decision_application.py` consumers; rewire `aipro` CLI to V3; **migration notes finalize** | removes V1 path | P5 shipped; CI green with notes |
+| **P4** Soak + failure + safety | `tests/e2e/soak.py` runner **exercising the `v3.cleanup` production sweeper (not its own copy)**; scenarios 5–12; **safety-parity scenarios** (fork reject, workflow-file restriction, iteration/commit/invocation budgets, `max_prompt_tokens`, `allowed_pr_author_associations`, credential-stripping) | adds only | full soak pass, no dup side effects, safety enforced |
+| **P5** Default + trigger + docs | V3 thin queue trigger workflow (adds before delete); make Hermes+CAO default; README runbook; **`docs/V1_MIGRATION.md`**; **`examples/v3-config.yml`** (new path, distinct from the V1 sample it supersedes) + update README references | adds, then docs react | P2–P4 green + your sign-off |
+| **P6** V1 retirement | DELETE `coders/`, `reviewers/`, `runner.py` monolithic loop, V1 `workflow.yml`, and now-unused V1 `models`/`state_*`/`config.py` + **the now-superseded `examples/sample-config.yml` (V1 path only)**; adapt `agents/`, `decision_application.py` consumers; rewire `aipro` CLI to V3; migration notes finalize. **The `examples/v3-config.yml` sample survives.** | removes V1 path | P5 shipped; CI green with notes |
 | **P7** Epic close | close V1 epic #16 pointing to #56; reopen-and-mode notes vs issues **not** handled by a git revert | docs | P6 shipped |
 
 **Deletion gate (before P6):** the complete production path must exist (P2),
@@ -59,16 +59,25 @@ the replacement trigger/sample/docs/migration notes must already be shipped
   `CaoSessionController` ↔ `CaoLaneExecutor` integration, not a scripted pair.
 - **P4 runs broker scenarios through the real `PolicyBroker`** with only
   telemetry and the clock scripted — a broken ranking/wiring cannot pass.
-- **Cleanup TTL (defined here, enforced in P4):** CAO sessions are orphaned
-  past `CAOControlPlaneConfig.session_lease_ttl_seconds` (default 2h) without a
-  renewal; git worktrees are orphaned past 24h of inactivity; both are
-  checked/removed by a sweep that runs between soak rounds. The sweep owns its
-  clock and logs each removal. (Config fields for these two TTLs are added in
-  P2 under `v3.config`.)
+- **Cleanup TTL (defined here, owned in P2 by `v3.cleanup`, enforced in P4):**
+  CAO sessions are orphaned past `CAOControlPlaneConfig.session_lease_ttl_seconds`
+  (default 2h) without renewal; git worktrees are orphaned past 24h of
+  inactivity. `v3.cleanup` is a **production component the foreman invokes**; the
+  P4 soak suite calls that same component each round (it does not reimplement
+  cleanup). The sweeper owns its clock and logs each removal. (Config fields for
+  the two TTLs are added in P2 under `v3.config`.)
+- **Draining active claims (defined here, implemented P2)**: rollback/shrink
+  requires reaching **zero active leases**. `GitHubIssueQueue.reclaim_expired`
+  does not drain — it re-claims and extends the lease — so a
+  `GitHubIssueQueue.abandon(issue, state)` operation (requeue to `queued` and
+  clear claim attribution, idempotent) is the drain primitive. The foreman
+  stops heartbeat renewal and calls `abandon` on each active item.
 - **Safety-parity scenarios (P4)** mirror the V1-permitted operations:
-  `disallow_forks`, `disallow_workflow_file_changes`, per-run budgets, and
+  `disallow_forks`, `disallow_workflow_file_changes`, per-run budgets
+  (`max_*`), **`max_prompt_tokens`**, **`allowed_pr_author_associations`**, and
   credential stripping are each exercised as a pass/fail E2E case through the
-  real policy path, not just asserted in config.
+  real policy path, not just asserted in config. V1's enforcement is not
+  removed (P6) until each passes.
 
 ## 4. V1 → V3 inventory (complete, all consumers accounted for)
 
@@ -96,18 +105,21 @@ added safety scenarios are documented in P4. `soak.py` runs `--runs N
 leaked active claim, stuck active label, orphan beyond TTL, or state
 divergence.
 
-## 6. Rollback (rev 2 — full-path, including active V3 state)
+## 6. Rollback (rev 3 — full-path, including active V3 state)
 
-- **Reverting a destructive phase reverts its whole PR**, which bundles the
-  removal *and* its counterpart docs/config/trigger, so no valid intermediate
-  state leaves users broken (see §1.3). P4/P5/P6 docs are part of the same PR
-  as the deletion they describe.
-- **In-flight V3 work:** before falling back from a V3-active state, **quiesce
-  then drain** — stop new claims, reconcile outstanding CAO sessions and lease
-  expiry to zero (`GitHubIssueQueue.reclaim_expired`/heartbeat stop), and leave
-  GitHub issue-comment state intact. **V1 cannot read V3 state**, so draining
-  is a precondition to any revert that could strand a claim or start duplicate
-  work; the revert procedure requires it explicitly.
+- **Full fallback requires reverting BOTH destructive PRs in reverse order,
+  after draining** — P6 (V1 removal) then P5 (V3 default/trigger/config/docs).
+  Reverting P6 alone restores the old V1 files while P5 still sets V3 as the
+  default and ships the V3 sample/README, so V1 would not actually be the
+  usable path. Each destructive phase's PR bundles the removal *and* its
+  counterpart docs/config so a discarded intermediate state is never valid.
+- **In-flight V3 work:** before any fallback from an active V3 state, **quiesce
+  then drain** — stop new claims, stop heartbeat renewal, and call
+  `GitHubIssueQueue.abandon()` on every active item to reach zero active
+  leases; reconcile or sweep outstanding CAO sessions via `v3.cleanup`. GitHub
+  issue-comment state is left intact. **V1 cannot read V3 state**, so draining
+  is a hard precondition to any revert that could strand a claim or start
+  duplicate work.
 - Reopening a closed epic/tracking issue is a repo mutation, not a git revert;
   the P7 procedure lists the exact issues to reopen. There is no compatibility
   loader: V1↔V3 config/state conversion is out of scope and stated as such.
