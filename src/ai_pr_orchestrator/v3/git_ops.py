@@ -82,7 +82,9 @@ class GitWorktreeOps:
         return out.strip()
 
     def commit_count(self, workdir: str, base_ref: str) -> int:
-        out = self._run("-C", str(self._workdir(workdir)), "rev-list", "--count", f"{base_ref}..HEAD")
+        out = self._run(
+            "-C", str(self._workdir(workdir)), "rev-list", "--count", f"{base_ref}..HEAD"
+        )
         return int(out.strip())
 
     def push(self, branch: str) -> None:
