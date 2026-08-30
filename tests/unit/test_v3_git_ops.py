@@ -137,3 +137,41 @@ def test_push_failure_raises_gitops_error(real_repo: Path):
     ops = GitWorktreeOps(real_repo)
     with pytest.raises(GitOpsError, match="push"):
         ops.push("no-such-branch")
+
+
+def test_commit_on_clean_worktree_is_a_noop(real_repo: Path, tmp_path: Path):
+    """A lane run with no edits must not surface ``git commit`` exit-1 as failure."""
+    ops = GitWorktreeOps(real_repo)
+    base = ops.default_branch()
+    ops.create_branch("feat/noop", base)
+    wt = tmp_path / "wt-noop"
+    workdir = ops.create_worktree(str(wt), "feat/noop")
+    head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    # No changes staged: commit short-circuits to the current HEAD, no error.
+    sha = ops.commit(workdir, "noop", name="Pavel Krotkov", email="pavel.krotkov@gmail.com")
+
+    assert sha == head_before
+    count = subprocess.run(
+        ["git", "rev-list", "--count", f"{base}..HEAD"],
+        cwd=wt,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert count == "0"  # nothing was committed
+
+
+def test_subprocesses_are_noninteractive_and_bounded(real_repo: Path):
+    """git calls must never prompt for credentials or hang without a bound."""
+    ops = GitWorktreeOps(real_repo)
+    assert ops._env["GIT_TERMINAL_PROMPT"] == "0"
+    assert "BatchMode=yes" in ops._env["GIT_SSH_COMMAND"]
+
+
+def test_timeout_surfaces_as_gitops_error(real_repo: Path):
+    ops = GitWorktreeOps(real_repo, timeout=0.0001)
+    with pytest.raises(GitOpsError, match="timed out"):
+        ops.default_branch()

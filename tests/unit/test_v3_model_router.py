@@ -73,6 +73,19 @@ def test_catalog_path_resolves_from_file(tmp_path: Path):
     assert catalog.refs() == ["gamma"]
 
 
+def test_relative_catalog_path_resolves_against_config_dir(tmp_path: Path):
+    """A relative catalog_path must resolve against the config file's directory
+    (via ``base_dir``), never the process working directory."""
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "catalog.yml").write_text(yaml.safe_dump({"models": [entry("gamma").to_dict()]}))
+    config = V3Config(model_router=ModelRouterConfig(catalog_path="catalog.yml"))
+
+    catalog = resolve_catalog(config, base_dir=config_dir)
+
+    assert catalog.refs() == ["gamma"]
+
+
 def test_inline_and_path_together_are_rejected(tmp_path: Path):
     config = V3Config(
         model_router=ModelRouterConfig(
