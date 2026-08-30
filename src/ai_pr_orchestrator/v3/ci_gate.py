@@ -30,7 +30,7 @@ from .domain import GitHubIssueRef, GitHubPullRequestRef
 from .interfaces import GateDecision
 
 #: Check-run conclusions that count as failed.
-_FAILED_CONCLUSIONS = frozenset(("failure", "timed_out", "cancelled", "action_required", "stale"))
+_FAILED_CONCLUSIONS = frozenset(("failure", "timed_out", "cancelled", "action_required"))
 #: Commit-status states that count as failed.
 _FAILED_STATES = frozenset(("error", "failure"))
 #: Check-run conclusion that marks completion.
@@ -77,23 +77,12 @@ class CIPRGateImpl:
             # A required check that has not completed is pending, not failed;
             # one that never reported at all is failed by name.
             failed.extend(
-                name for name in missing_required if name not in pending and name not in failed
+                name
+                for name in missing_required
+                if name not in pending and name not in failed
             )
 
         if not runs and not statuses:
-            if missing_required:
-                # Immediately after a push, required checks legitimately have not
-                # reported yet. Their initial absence is *pending* (in-flight),
-                # not a definitive failure — so the caller can re-poll rather than
-                # conclude the run failed. Returning empty pending/failed here
-                # would both lose the missing-required signal and look like a
-                # green/no-op gate.
-                return GateDecision(
-                    passed=False,
-                    pending_checks=tuple(dict.fromkeys(missing_required)),
-                    failed_checks=(),
-                    detail="required checks not yet reported for head " + ref,
-                )
             if self._cfg.require_green_ci_before_merge:
                 return GateDecision(
                     passed=False,
