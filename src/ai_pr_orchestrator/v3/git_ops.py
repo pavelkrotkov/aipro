@@ -17,6 +17,7 @@ No vendor, model, or provider name appears in this module.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -34,8 +35,20 @@ class GitWorktreeOps:
     foreman composes the lifecycle and can fake any step in tests.
     """
 
-    def __init__(self, repo_root: str | Path) -> None:
+    def __init__(
+        self, repo_root: str | Path, *, timeout: float = 60.0, git_timeout: float | None = None
+    ) -> None:
         self._root = Path(repo_root)
+        #: Per-invocation subprocess bound. Every git call shares this budget so a
+        #: hung remote (credential prompt, stalled SSH, lock contention) cannot pin
+        #: a lane worker forever; a breach raises GitOpsError naming the command.
+        self._timeout = git_timeout if git_timeout is not None else timeout
+        #: Non-interactive child environment: never prompt for credentials and
+        #: make SSH/host-key interaction fail fast instead of hanging a lane.
+        env = dict(os.environ)
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND", "ssh") + " -o BatchMode=yes"
+        self._env = env
 
     # --- primitives ---------------------------------------------------------
 
@@ -45,6 +58,10 @@ class GitWorktreeOps:
         return out.strip().rsplit("/", 1)[-1]
 
     def create_branch(self, branch: str, from_ref: str) -> None:
+        # Idempotent: re-claiming a requeued item may find the branch already
+        # present from a prior pass; recreating it would exit 1.
+        if self._run("branch", "--list", branch).strip():
+            return
         self._run("branch", branch, from_ref)
 
     def create_worktree(self, path: str, branch: str) -> str:
@@ -54,6 +71,15 @@ class GitWorktreeOps:
 
     def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
         cwd = self._workdir(workdir)
+        # A lane run that made no edits is a no-op, not an error: ``git commit``
+        # with nothing staged exits 1, which would surface as a spurious failure.
+        # Check ``status --porcelain`` (untracked files included, so ``add -A``
+        # semantics) and short-circuit to the current HEAD when the worktree is
+        # clean.
+        porcelain = self._run("-C", str(cwd), "status", "--porcelain", "-uall")
+        if not porcelain.strip():
+            out = self._run("-C", str(cwd), "rev-parse", "HEAD")
+            return out.strip()
         self._run(
             "-C",
             str(cwd),
@@ -103,19 +129,32 @@ class GitWorktreeOps:
 
     def _run(self, *args: str) -> str:
         cmd = ("git", *args)
+        # Non-interactive + bounded: a git call must never hang waiting on a
+        # credential/terminal prompt or a stalled SSH agent. We close stdin and
+        # force batch behaviour so the only way a call ends is success, a clean
+        # failure, or the explicit timeout below (any of which surfaces as
+        # GitOpsError rather than an unbounded block).
+        env = dict(self._env)
         try:
             proc = subprocess.run(
                 cmd,
                 cwd=str(self._root),
                 capture_output=True,
                 text=True,
-                check=True,
+                stdin=subprocess.DEVNULL,
+                env=env,
+                timeout=self._timeout,
             )
         except FileNotFoundError as exc:
             raise GitOpsError(f"git binary not found: {exc}") from exc
-        except subprocess.CalledProcessError as exc:
+        except subprocess.TimeoutExpired as exc:
             raise GitOpsError(
-                f"git {' '.join(args)} failed (exit {exc.returncode}): "
-                f"{exc.stderr.strip() or exc.stdout.strip()}"
+                f"git {' '.join(args)} timed out after {self._timeout}s "
+                f"(stdout: {exc.stdout or 'none'}; stderr: {exc.stderr or 'none'})"
             ) from exc
+        if proc.returncode != 0:
+            raise GitOpsError(
+                f"git {' '.join(args)} failed (exit {proc.returncode}): "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
         return proc.stdout

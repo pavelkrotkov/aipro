@@ -442,3 +442,37 @@ def test_multiple_prs_isolated() -> None:
 
     assert len(client.get_pr_comments(1)) == 1
     assert len(client.get_pr_comments(2)) == 1
+
+
+# --- Issues and PRs share one repo-wide number sequence ---
+
+
+def test_seed_issue_advances_pr_number() -> None:
+    client = _make_client()
+    # Seeding issue 5 must reserve sequence numbers through 6 so a subsequent
+    # create_pr() does not mint a PR that aliases issue 5 (and its labels).
+    client.seed_issue(5, labels=["v3-work"], body="body")
+    pr = client.create_pr("t", "b", head="aipro-issue-5", base="main")
+
+    assert pr.number == 6
+    assert pr.number != 5
+
+
+def test_seed_issue_past_current_pr_number_then_pr() -> None:
+    client = _make_client()
+    client.seed_issue(40)
+    first = client.create_pr("t", "b", head="h", base="m")
+    second = client.create_pr("t", "b", head="h", base="m")
+
+    assert first.number == 41
+    assert second.number == 42
+    assert first.number != 40  # never aliases the seeded issue
+
+
+def test_create_pr_carries_a_nonempty_head_sha() -> None:
+    client = _make_client()
+    client.seed_issue(1)
+    pr = client.create_pr("t", "b", head="aipro-issue-1", base="main")
+
+    assert pr.head_sha
+    assert pr.head_sha != pr.head_ref  # a commit SHA, not the branch name
