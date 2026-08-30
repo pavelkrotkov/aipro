@@ -137,6 +137,27 @@ class GitHubClient:
         )
         return [item["filename"] for item in data if isinstance(item, dict) and "filename" in item]
 
+    def get_issue_body(self, number: int) -> str | None:
+        data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
+        return data.get("body")
+
+    def create_pr(self, title: str, body: str, head: str, base: str) -> models.PullRequest:
+        data = self._post(
+            f"/repos/{self._owner}/{self._repo}/pulls",
+            json={"title": title, "body": body, "head": head, "base": base},
+        )
+        if data is None:
+            raise GitHubClientError("create_pr returned no payload (dry-run client?)")
+        return self.get_pr(data["number"])
+
+    def list_open_prs(self) -> list[models.PullRequest]:
+        data = self._get_paginated(
+            f"/repos/{self._owner}/{self._repo}/pulls",
+            items_key=None,
+        )
+        numbers = [item["number"] for item in data if isinstance(item, dict) and "number" in item]
+        return [self.get_pr(number) for number in numbers]
+
     def post_comment(self, issue_number: int, body: str) -> models.Comment:
         data = self._post(
             f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/comments",
