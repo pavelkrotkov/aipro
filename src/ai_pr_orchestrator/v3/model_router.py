@@ -19,11 +19,11 @@ No vendor, model, or provider name appears in this module.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 from .broker import PolicyBroker
-from .catalog import ModelCatalog
+from .catalog import ModelCatalog, load_model_catalog
 from .config import V3Config
 from .interfaces import ProviderTelemetrySource
 from .telemetry import ProviderResourceSnapshot
@@ -33,19 +33,13 @@ class ModelRouterError(ValueError):
     """Raised when the model-router configuration cannot be resolved."""
 
 
-def resolve_catalog(config: V3Config, *, base_dir: Path | None = None) -> ModelCatalog:
+def resolve_catalog(config: V3Config) -> ModelCatalog:
     """The effective catalog for ``config``.
 
     An inline ``catalog`` and a ``catalog_path`` are mutually exclusive (the
     config validates this too); a section that declares neither yields an
     empty catalog, which the broker handles as "no candidate is dispatchable"
     with named rejections rather than as an error.
-
-    A relative ``catalog_path`` is resolved against ``base_dir`` — the V3
-    config file's directory, mirroring how :func:`load_v3_config` validates
-    the shared catalog — never against the process working directory, which
-    varies with how the broker is launched. Callers that load a config should
-    pass the config file's parent directory.
     """
 
     router = config.model_router
@@ -57,9 +51,7 @@ def resolve_catalog(config: V3Config, *, base_dir: Path | None = None) -> ModelC
     if router.catalog:
         return ModelCatalog(entries=tuple(router.catalog))
     if router.catalog_path:
-        from .config import resolve_model_catalog
-
-        return resolve_model_catalog(config, base_dir=base_dir)
+        return load_model_catalog(Path(router.catalog_path))
     return ModelCatalog()
 
 
@@ -68,7 +60,6 @@ def build_model_broker(
     *,
     telemetry_source: ProviderTelemetrySource | None = None,
     at: datetime | None = None,
-    base_dir: Path | None = None,
 ) -> PolicyBroker:
     """Build a :class:`PolicyBroker` for ``config``.
 
@@ -76,20 +67,12 @@ def build_model_broker(
     telemetry resource is taken at the same instant ``at`` (defaulting to
     now), so the broker evaluates every resource against one consistent
     view. The resource→provider join comes from the telemetry config rows.
-
-    ``base_dir`` anchors a relative ``catalog_path`` (the config file's
-    directory); when omitted the catalog path is resolved against the current
-    working directory, so callers loading a config file should pass its parent.
     """
 
-    catalog = resolve_catalog(config, base_dir=base_dir)
+    catalog = resolve_catalog(config)
     snapshots: list[ProviderResourceSnapshot] = []
     resource_by_provider: dict[str, str] = {}
     if telemetry_source is not None:
-        # Materialize ONE timestamp before the loop: letting each resource
-        # sample its own "now" would give the broker snapshots from
-        # slightly different instants (round-2 #12).
-        at = at or datetime.now(UTC)
         for row in config.telemetry.resources:
             snapshots.append(telemetry_source.snapshot(row.name, at=at))
             resource_by_provider[row.provider] = row.name
