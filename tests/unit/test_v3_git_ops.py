@@ -68,11 +68,22 @@ def test_fake_satisfies_git_operations_protocol():
 def real_repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()
+
     def git(*args: str, cwd: Path = root) -> str:
         subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
         return ""
+
     git("init", "-b", "main")
-    git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "--allow-empty", "-m", "init")
+    git(
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "init",
+    )
     (root / "file.txt").write_text("hello\n")
     git("add", ".")
     git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-m", "add file")
@@ -86,7 +97,11 @@ def test_default_branch_and_branch_creation(real_repo: Path):
     assert ops.default_branch() == "main"
     ops.create_branch("feat/x", "main")
     heads = subprocess.run(
-        ["git", "branch", "--list", "feat/x"], cwd=real_repo, capture_output=True, text=True, check=True
+        ["git", "branch", "--list", "feat/x"],
+        cwd=real_repo,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
     assert "feat/x" in heads
 
