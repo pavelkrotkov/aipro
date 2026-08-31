@@ -428,3 +428,66 @@ def test_reattach_with_conflicting_attribution_is_rejected(fake_cao: FakeCAOServ
     # The original session is untouched.
     assert fake_cao._sessions[expected].terminal_id == first_terminal
     assert fake_cao._sessions[expected].workdir == str(tmp_path)
+
+
+def test_one_shot_fault_is_consumed_after_first_match(
+    fake_cao: FakeCAOServer, tmp_path_factory: pytest.TempPathFactory
+):
+    """Regression for round-2 finding #1 in PR #70: a default ``FaultSpec``
+    must fire exactly once and then retire, so a soak scenario can model
+    a transient failure followed by recovery. ``repeat=True`` keeps the
+    fault in place; ``occurrences=N`` fires N times then retires.
+
+    Three regression assertions in one test: one-shot consumption, the
+    explicit ``repeat=True`` opt-out, and the ``occurrences=N`` counter.
+    """
+
+    from tests.integration._fake_cao_server import FaultSpec
+
+    def _post(name: str) -> httpx.Response:
+        workdir = tmp_path_factory.mktemp(name)
+        return httpx.post(
+            f"{fake_cao.url}/sessions",
+            params={
+                "session_name": name,
+                "working_directory": str(workdir),
+                "agent_profile": "",
+            },
+            json={
+                "metadata": {
+                    "workdir": str(workdir),
+                    "lane": "developer",
+                    "round_id": "1",
+                    "work_item_id": "1",
+                    "run_id": name,
+                }
+            },
+            timeout=5.0,
+        )
+
+    # -- one-shot: 503 fires once, then later sessions succeed
+    fake_cao.add_fault(FaultSpec(method="POST", path_prefix="/sessions", status_code=503))
+    first = _post("oneshot-1")
+    second = _post("oneshot-2")
+    third = _post("oneshot-3")
+    assert first.status_code == 503, "first request must hit the fault"
+    assert second.status_code == 200, "fault must be consumed after first match"
+    assert third.status_code == 200, "subsequent requests must reach the real handler"
+
+    # -- repeat=True: the fault stays armed
+    repeat_spec = FaultSpec(method="POST", path_prefix="/sessions", status_code=429, repeat=True)
+    fake_cao.add_fault(repeat_spec)
+    for i in range(3):
+        r = _post(f"repeat-{i}")
+        assert r.status_code == 429, "repeat=True must keep firing on every match"
+
+    # -- occurrences=N: N transient failures then recovery
+    fake_cao.clear_faults()
+    occ_spec = FaultSpec(
+        method="POST", path_prefix="/sessions", status_code=502, occurrences=2
+    )
+    fake_cao.add_fault(occ_spec)
+    statuses = [_post(f"occ-{i}").status_code for i in range(4)]
+    assert statuses == [502, 502, 200, 200], (
+        f"occurrences=2 must fire twice then retire, got {statuses}"
+    )
