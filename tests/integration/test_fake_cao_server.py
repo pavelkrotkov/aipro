@@ -217,3 +217,36 @@ def test_empty_status_sequence_returns_500_not_indexerror(
     response = httpx.get(f"{fake_cao.url}/terminals/term-empty-0001", timeout=5.0)
     assert response.status_code == 500
     assert "empty status sequence" in response.text
+
+
+def test_terminal_ids_are_monotonic_across_delete_and_relaunch(
+    fake_cao: FakeCAOServer, tmp_path
+):
+    """Regression for findings #2 and #4 in PR #70: terminal IDs are
+    allocated from a monotonic counter, independent of the size of
+    ``self._sessions``. After deleting a session and relaunching it (or
+    launching a brand-new sibling), no terminal id should ever be
+    reused, even though the underlying dictionary length shrinks."""
+
+    run_id_a = f"it-A-{int(time.time() * 1000)}"
+    run_id_b = f"it-B-{int(time.time() * 1000)}"
+    name_a = session_name_for(run_id_a, DEVELOPER_LANE)
+    name_b = session_name_for(run_id_b, DEVELOPER_LANE)
+
+    controller = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
+
+    handle_a1 = controller.start_session(_spec(run_id_a, str(tmp_path)))
+    terminal_a1 = fake_cao._sessions[name_a].terminal_id
+
+    # Delete and relaunch with a different workdir, mirroring a controller
+    # restart that talks to a still-running CAO session.
+    controller.terminate_session(handle_a1)
+    handle_a2 = controller.start_session(_spec(run_id_a, str(tmp_path / "v2")))
+    terminal_a2 = fake_cao._sessions[name_a].terminal_id
+    assert terminal_a2 != terminal_a1, "relaunch must allocate a new terminal id"
+
+    # A sibling session in the same fake must NOT collide with either of
+    # the relaunched terminals.
+    handle_b = controller.start_session(_spec(run_id_b, str(tmp_path)))
+    terminal_b = fake_cao._sessions[name_b].terminal_id
+    assert terminal_b not in {terminal_a1, terminal_a2}
