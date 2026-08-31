@@ -26,7 +26,11 @@ from ai_pr_orchestrator.v3.cao import (
 )
 from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
 from ai_pr_orchestrator.v3.domain import LaneIdentity
-from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, SessionSpec
+from ai_pr_orchestrator.v3.interfaces import (
+    CAOSessionController,
+    LaneExecutionContext,
+    SessionSpec,
+)
 from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
 from tests.integration._fake_cao_server import (
     DEFAULT_STATUS_SEQUENCE,
@@ -477,6 +481,73 @@ def test_execute_surfaces_429_as_classifiable_rate_limit(fake_cao: FakeCAOServer
     # 429 is still a transient error (CaoUnavailableError) so the
     # foreman's general retry-on-unavailable logic continues to work.
     assert isinstance(excinfo.value, CaoUnavailableError)
+
+
+def test_execute_drives_round_2_on_adopted_session(fake_cao: FakeCAOServer, tmp_path):
+    """Regression for round-2 finding #3 in PR #71: a session whose
+    durable metadata is from an earlier round of the same run is still
+    adoptable for a later round. After adoption, the executor calls
+    ``update_turn_context`` so the controller observes the new round.
+    Without this, ``_validate_attribution``'s old round_id check would
+    raise CaoAdoptionMismatchError and the executor could not perform
+    coder round 2 / reviewer round 2 / fix round on a still-live session.
+    """
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    name = session_name_for(run_id, DEVELOPER_LANE)
+    fake_cao.set_output(name, MARKER)
+
+    controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
+    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+
+    # Round 1: creates the session with round-1 context.
+    ctx_round1 = LaneExecutionContext(run_id=run_id, round_id="round-1", work_item_id="wi-1")
+    executor.execute(_lane(), f"echo {MARKER} round-1", str(tmp_path), ctx_round1)
+
+    # Round 2: same lane, same run, NEW round_id and work_item_id.
+    # Must adopt (not raise) and submit a fresh prompt.
+    fake_cao.set_output(name, MARKER + "-round-2")
+    ctx_round2 = LaneExecutionContext(run_id=run_id, round_id="round-2", work_item_id="wi-2")
+    result2 = executor.execute(_lane(), f"echo {MARKER} round-2", str(tmp_path), ctx_round2)
+
+    assert result2.exit_code == 0
+    assert MARKER + "-round-2" in result2.output_summary
+    # Two execute() calls, each one delivery to submit_work.
+    assert fake_cao.submit_count == 2
+    # Still one underlying session — adoption worked, no twin created.
+    assert len(fake_cao._sessions) == 1
+
+
+def test_fake_cao_controller_satisfies_executor_protocol():
+    """Regression for round-2 finding #6 in PR #71: the repo's own
+    ``FakeCAOSessionController`` must satisfy ``CAOSessionController``
+    structurally so the executor's runtime check passes. Before the
+    fix, the fake passed (it had start/poll/terminate) but the executor
+    raised AttributeError on its first ``submit_work`` call. The
+    protocol now lists every operation the executor uses, and the fake
+    implements each one with a recording list.
+    """
+
+    from tests.unit.test_v3_interfaces import FakeCAOSessionController
+
+    fake = FakeCAOSessionController()
+    # Structural check via runtime_checkable Protocol.
+    assert isinstance(fake, CAOSessionController)
+    # Exercise every method the executor would call.
+    spec = _spec("run-protocol", "/tmp", "msg")
+    handle = fake.start_session(spec)
+    fake.submit_work(handle, "msg")
+    obs = fake.adopt_session(handle.session_id, spec)
+    assert obs.state == "started"
+    fake.update_turn_context(handle, _context("run-protocol"))
+    assert fake.poll_session(handle) is not None
+    fake.terminate_session(handle)
+    # Every call recorded.
+    assert fake.started == [spec]
+    assert fake.submitted == [(handle, "msg")]
+    assert fake.adopted == [(handle.session_id, spec)]
+    assert fake.turn_updates == [(handle, _context("run-protocol"))]
+    assert fake.terminated == [handle]
 
 
 def test_execute_does_not_terminate_adopted_session_on_failure(

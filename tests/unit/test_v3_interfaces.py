@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import inspect
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from ai_pr_orchestrator.v3.cao import SessionObservation
 from ai_pr_orchestrator.v3.domain import (
     FindingDisposition,
     GitHubIssueRef,
@@ -72,12 +73,35 @@ class FakeCAOSessionController:
     def __init__(self) -> None:
         self.started: list[SessionSpec] = []
         self.terminated: list[SessionHandle] = []
+        self.submitted: list[tuple[SessionHandle, str]] = []
+        self.adopted: list[tuple[str, SessionSpec | None]] = []
+        self.turn_updates: list[tuple[SessionHandle, LaneExecutionContext]] = []
         self._counter = 0
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
         self.started.append(spec)
         self._counter += 1
         return SessionHandle(session_id=f"s{self._counter}", lane=spec.lane.lane)
+
+    def submit_work(self, handle: SessionHandle, message: str) -> None:
+        # Round-2 finding, PR #71 #6: FakeCAOSessionController must
+        # implement every method the CAOSessionController Protocol lists
+        # or it stops being a valid executor dependency at runtime.
+        self.submitted.append((handle, message))
+
+    def adopt_session(
+        self, session_name: str, spec: SessionSpec | None = None
+    ) -> SessionObservation:
+        self.adopted.append((session_name, spec))
+        self._counter += 1
+        return SessionObservation(
+            metadata=cast("Any", None),
+            state="started",
+            cao_status="started",
+        )
+
+    def update_turn_context(self, handle: SessionHandle, context: LaneExecutionContext) -> None:
+        self.turn_updates.append((handle, context))
 
     def poll_session(self, handle: SessionHandle) -> LaneResult | None:
         return LaneResult(session=handle, exit_code=0, output_summary="ok", changed_files=[])

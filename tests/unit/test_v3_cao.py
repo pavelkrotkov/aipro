@@ -853,8 +853,21 @@ def test_a_session_whose_model_assignment_belongs_to_another_lane_is_not_adopted
     assert SESSION not in controller._sessions
 
 
-def test_a_session_from_an_earlier_review_round_is_not_adopted(respx_mock):
-    controller = make_controller()
+def test_a_session_from_an_earlier_review_round_is_adopted_with_turn_refresh(respx_mock):
+    """Round-2 finding, PR #71 #3: a session whose durable metadata is
+    from an earlier review round of the same run is still adoptable for
+    a later round — round_id and work_item_id are PER-TURN context, not
+    session-level identity. The adoption succeeds and
+    ``update_turn_context`` is then responsible for refreshing the
+    per-turn metadata so downstream attribution reports against the
+    current round. This is what makes coder round 2 / reviewer round 2
+    / fix round work on a still-live session."""
+    from ai_pr_orchestrator.v3.cao import CAOControlPlaneConfig, CaoSessionController
+
+    controller = CaoSessionController(
+        CAOControlPlaneConfig(base_url=BASE, session_timeout_seconds=60),
+        LaneRegistry.default(),
+    )
     respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
         return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
     )
@@ -862,23 +875,32 @@ def test_a_session_from_an_earlier_review_round_is_not_adopted(respx_mock):
     respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
         return_value=httpx.Response(200, json=terminal_payload(metadata=earlier))
     )
+    patch_route = respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+        return_value=httpx.Response(204)
+    )
     spec = make_spec()
     later_round = dataclasses.replace(
         spec, context=LaneExecutionContext(run_id=RUN_ID, round_id="round-3", work_item_id="wi-9")
     )
-    later_item = dataclasses.replace(
-        spec, context=LaneExecutionContext(run_id=RUN_ID, round_id="round-2", work_item_id="wi-10")
-    )
 
-    with pytest.raises(CaoAdoptionMismatchError, match="round_id"):
-        controller.adopt_session(SESSION, later_round)
-    with pytest.raises(CaoAdoptionMismatchError, match="work_item_id"):
-        controller.adopt_session(SESSION, later_item)
+    # Adoption succeeds (no round_id mismatch).
+    controller.adopt_session(SESSION, later_round)
+    handle = cao_module.SessionHandle(session_id=SESSION, lane=DEVELOPER_LANE)
+
+    # update_turn_context refreshes the per-turn metadata via PATCH so
+    # subsequent foreman hosts that re-adopt the same session see the
+    # latest round.
+    controller.update_turn_context(handle, later_round.context)
+    assert patch_route.called
 
 
-def test_a_context_less_request_cannot_drive_a_session_bound_to_a_round(respx_mock):
-    # The durable metadata records round-2/wi-9. A request whose context
-    # omits both must be refused: "the request does not say" is not agreement.
+def test_a_context_less_request_adopts_but_must_refresh_context(respx_mock):
+    """Round-2 finding, PR #71 #3: a context-less request is allowed to
+    adopt (round_id / work_item_id are no longer part of session-level
+    identity) but the caller MUST then call ``update_turn_context`` to
+    set a per-turn round — otherwise findings would be attributed to
+    whatever round the session's launch metadata recorded, which is
+    almost never what a multi-round foreman wants."""
     controller = make_controller()
     respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
         return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
@@ -889,10 +911,16 @@ def test_a_context_less_request_cannot_drive_a_session_bound_to_a_round(respx_mo
     spec = make_spec()
     contextless = dataclasses.replace(spec, context=LaneExecutionContext(run_id=RUN_ID))
 
-    with pytest.raises(CaoAdoptionMismatchError, match="round_id"):
-        controller.adopt_session(SESSION, contextless)
+    # Adoption succeeds; the durable session-level identity (run, lane,
+    # workdir, model) is unchanged. Only per-turn attribution is loose.
+    controller.adopt_session(SESSION, contextless)
 
-    assert SESSION not in controller._sessions
+    # Subsequent update_turn_context call is allowed and persists the
+    # caller's intended round.
+    respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(return_value=httpx.Response(204))
+    handle = cao_module.SessionHandle(session_id=SESSION, lane=DEVELOPER_LANE)
+    new_ctx = LaneExecutionContext(run_id=RUN_ID, round_id="round-2", work_item_id="wi-9")
+    controller.update_turn_context(handle, new_ctx)
 
 
 def test_a_provisioning_session_is_not_treated_as_absent(respx_mock):

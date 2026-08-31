@@ -703,13 +703,24 @@ class CaoSessionController:
 
     @staticmethod
     def _validate_attribution(metadata: CaoSessionMetadata, spec: SessionSpec) -> None:
-        """Refuse adoption unless durable attribution matches the spec's identity.
+        """Refuse adoption unless the durable session-level attribution
+        matches the spec's identity.
 
         A session name can be reconstructed by anything; the metadata CAO
-        stored is what actually attributes the session's work. If it does not
-        agree with the run, lane, workdir, model assignment, or round/work-item
-        context the caller is asking about, adopting would misattribute
-        findings across runs or across review rounds of the same run.
+        stored is what actually attributes the session's work. If it does
+        not agree with the run, lane, workdir, or model assignment the
+        caller is asking about, adopting would misattribute findings across
+        runs or across lanes.
+
+        **Per-turn context (round_id, work_item_id) is NOT part of session
+        identity** (round-2 finding, PR #71 #3). A session lives across
+        multiple rounds of the same run — coder round 1, reviewer round 1,
+        coder round 2 (fix), reviewer round 2, etc. Rejecting adoption on
+        round change would prevent the executor from driving the next round
+        on a still-live session, which is exactly the multi-round case
+        PR #73 scenarios 2-4 need to exercise. Per-turn context is updated
+        via ``update_turn_context`` after adoption so the rest of the
+        system sees the latest round.
         """
         mismatches: list[str] = []
         if metadata.parent_run_id != spec.context.run_id:
@@ -728,24 +739,38 @@ class CaoSessionController:
             mismatches.append(
                 f"model assignment {metadata.model_assignment!r} != requested {expected_model!r}"
             )
-        # A recorded round/work item must match the request whenever EITHER
-        # side carries a value: an execution explicitly tied to round N must
-        # never be driven by a context-less request. Adoption is allowed only
-        # when both sides are absent or they are equal.
-        if metadata.context.round_id != spec.context.round_id:
-            mismatches.append(
-                f"round_id {metadata.context.round_id!r} != requested {spec.context.round_id!r}"
-            )
-        if metadata.context.work_item_id != spec.context.work_item_id:
-            mismatches.append(
-                f"work_item_id {metadata.context.work_item_id!r} != requested "
-                f"{spec.context.work_item_id!r}"
-            )
         if mismatches:
             raise CaoAdoptionMismatchError(
                 f"Session {metadata.session_name!r} attribution does not match the "
                 f"requested spec: {'; '.join(mismatches)}. It will not be adopted."
             )
+
+    def update_turn_context(self, handle: SessionHandle, context: LaneExecutionContext) -> None:
+        """Refresh the per-turn attribution on an adopted session.
+
+        Round-2 finding, PR #71 #3: per-turn context (round_id,
+        work_item_id) is intentionally NOT part of session-level adoption
+        identity, but the controller must still observe the latest turn so
+        downstream attribution (findings, dispositions) reports against
+        the current round, not the session's first launch. The executor
+        calls this on every adoption so ``metadata.context`` always
+        reflects the turn currently being driven.
+
+        Persists through ``PATCH /terminals/{tid}/metadata`` so a
+        subsequent foreman host that re-adopts the same session sees the
+        updated turn context instead of the original launch round.
+        """
+        metadata = self._metadata_for(handle)
+        updated = dataclasses.replace(metadata, context=context)
+        # Update CAO-side metadata so the durable state matches our local
+        # view; the fake persists this and a real CAO must do likewise.
+        response = self._request(
+            "PATCH",
+            f"/terminals/{metadata.terminal_id}/metadata",
+            json=updated.to_dict(),
+        )
+        self._raise_for_status(response, f"update turn context for {metadata.session_name!r}")
+        self._register(updated)
 
     def _metadata_for(self, handle: SessionHandle) -> CaoSessionMetadata:
         metadata = self._sessions.get(handle.session_id)

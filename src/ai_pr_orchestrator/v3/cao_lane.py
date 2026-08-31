@@ -188,6 +188,16 @@ class CaoLaneExecutor:
                 handle = SessionHandle(session_id=name, lane=registered_lane.lane)
                 own_session = False
 
+            # Refresh the per-turn attribution on every entry, whether
+            # the session was created or adopted. Round-2 finding,
+            # PR #71 #3: round_id / work_item_id are intentionally NOT
+            # part of session-level adoption identity, but the
+            # controller must still observe the latest turn so
+            # downstream attribution (findings, dispositions) reports
+            # against the current round. Safe to call on both
+            # own-session and adopted-session paths.
+            self._controller.update_turn_context(handle, context)
+
             # Submit the prompt for this turn so the session actually
             # receives the executor's task, including adopted sessions
             # (the controller's start_session path short-circuits before
