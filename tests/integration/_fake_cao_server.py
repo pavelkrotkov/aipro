@@ -443,6 +443,11 @@ class _FakeHandler(BaseHTTPRequestHandler):
             if state is None or state.deleted:
                 self._write_text(404, f"no terminal {terminal_id}")
                 return
+            if not state.status_sequence:
+                # A misconfigured scripted session with no statuses would
+                # otherwise raise IndexError on the first observe.
+                self._write_text(500, "internal error: empty status sequence")
+                return
             status = state.status_sequence[state.status_index]
             # Advance the cursor so the next observe sees the next status.
             # Once we have walked past the end, the sequence is exhausted and

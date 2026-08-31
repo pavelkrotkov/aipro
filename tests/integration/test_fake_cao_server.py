@@ -187,3 +187,33 @@ def test_fault_injection_returns_injected_status(fake_cao: FakeCAOServer, tmp_pa
     # 5xx (not 404/409) surfaces as a generic CaoControlPlaneError, NOT
     # CaoSessionNotFoundError; the assertion guards against regression.
     assert not isinstance(excinfo.value, CaoSessionNotFoundError)
+
+
+def test_empty_status_sequence_returns_500_not_indexerror(
+    fake_cao: FakeCAOServer, tmp_path
+):
+    """Regression for finding #1 in PR #70: a session scripted with an
+    empty status sequence must surface as an HTTP 500 (an explicit
+    misconfiguration) rather than raising ``IndexError`` inside the
+    handler thread. The controller's HTTP error handling then bubbles up
+    a control-plane error to the caller."""
+    from tests.integration._fake_cao_server import _SessionState
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    expected = session_name_for(run_id, DEVELOPER_LANE)
+
+    # Force-launch a session whose status_sequence is empty.
+    with fake_cao._lock:
+        fake_cao._sessions[expected] = _SessionState(
+            session_name=expected,
+            terminal_id="term-empty-0001",
+            workdir=str(tmp_path),
+            agent_profile="",
+            initial_message=None,
+            metadata={},
+            status_sequence=(),
+        )
+
+    response = httpx.get(f"{fake_cao.url}/terminals/term-empty-0001", timeout=5.0)
+    assert response.status_code == 500
+    assert "empty status sequence" in response.text
