@@ -19,7 +19,7 @@ No vendor, model, or provider name appears in this module.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .broker import PolicyBroker
@@ -86,6 +86,10 @@ def build_model_broker(
     snapshots: list[ProviderResourceSnapshot] = []
     resource_by_provider: dict[str, str] = {}
     if telemetry_source is not None:
+        # Materialize ONE timestamp before the loop: letting each resource
+        # sample its own "now" would give the broker snapshots from
+        # slightly different instants (round-2 #12).
+        at = at or datetime.now(UTC)
         for row in config.telemetry.resources:
             snapshots.append(telemetry_source.snapshot(row.name, at=at))
             resource_by_provider[row.provider] = row.name
