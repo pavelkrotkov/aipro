@@ -156,6 +156,11 @@ class FakeCAOServer:
         self._outputs: dict[str, str] = {}
         # Per-request fault specs.
         self._faults: list[FaultSpec] = []
+        # FIFO queue of consumable faults (finding #9 in PR #72).
+        # Distinct from self._faults because scenarios want to apply
+        # a specific sequence (e.g. 503, then 200) without the fault
+        # becoming permanently registered.
+        self._queued_faults: list[FaultSpec] = []
         # Pre-bound socket so we can read the chosen port back to the caller.
         self._httpd = _FakeHTTPServer(("127.0.0.1", 0), _FakeHandler)
         self._httpd.fake = self
@@ -191,6 +196,54 @@ class FakeCAOServer:
         """Register a per-request fault injected before normal handling."""
         with self._lock:
             self._faults.append(fault)
+
+    def queue_fault(self, fault: FaultSpec) -> None:
+        """Push a fault onto the consumed-fault queue (finding #9 in PR #72).
+
+        The harness exposes this so E2E scenarios can sequence 503 then
+        200 then 200 faults without permanently polluting
+        ``self._faults`` (which would otherwise leak the failure into
+        later tests that share the same fake). Use :meth:`next_fault`
+        to pop them in order."""
+        with self._lock:
+            self._queued_faults.append(fault)
+
+    def next_fault(
+        self, *, method: str | None = None, path_prefix: str | None = None
+    ) -> FaultSpec | None:
+        """Pop the next queued fault matching the request, or ``None``.
+
+        When ``method`` and ``path_prefix`` are both provided, only
+        faults matching the request are returned; non-matching queued
+        faults stay in the queue. Without those filters, the head of
+        the queue is returned regardless of match — scenarios that
+        queue a deterministic sequence usually want the head."""
+        with self._lock:
+            while self._queued_faults:
+                head = self._queued_faults[0]
+                if method is None and path_prefix is None:
+                    self._queued_faults.pop(0)
+                    return head
+                if (method is None or head.method == method) and (
+                    path_prefix is None or head.path_prefix == path_prefix
+                ):
+                    self._queued_faults.pop(0)
+                    return head
+                # Head doesn't match; drop it (queue is FIFO so a
+                # scenario that wants strict ordering should pass
+                # filters that match only when ready).
+                self._queued_faults.pop(0)
+        return None
+
+    def session_names(self) -> list[str]:
+        """Public list of live session names (finding #6 in PR #72).
+
+        Replaces direct access to ``self._sessions.keys()`` so E2E
+        scenarios do not need to reach into private state. Returns a
+        snapshot taken under the server lock so callers see a
+        consistent point-in-time view."""
+        with self._lock:
+            return [s for s, st in self._sessions.items() if not st.deleted]
 
     def _status_sequence_for(self, session_name: str) -> Sequence[str]:
         return self._status_overrides.get(session_name, DEFAULT_STATUS_SEQUENCE)
