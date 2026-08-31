@@ -123,6 +123,27 @@ def _find_by_terminal(sessions: dict[str, _SessionState], terminal_id: str) -> _
     return None
 
 
+def _attribution_matches(
+    existing: _SessionState,
+    workdir: str,
+    agent_profile: str,
+    metadata: dict[str, Any],
+) -> bool:
+    """Identity-bearing fields that must match for a reattach to be
+    considered the same logical session. Differences here mean two
+    concurrent controllers tried to claim the same byte-identical name
+    but they are NOT the same work item; refusing the reattach prevents
+    one controller from silently driving the other's agent."""
+    if existing.workdir != workdir:
+        return False
+    if existing.agent_profile != agent_profile:
+        return False
+    for key in ("lane", "round_id", "work_item_id", "run_id"):
+        if existing.metadata.get(key) != metadata.get(key):
+            return False
+    return True
+
+
 class _FakeHTTPServer(ThreadingHTTPServer):
     """``ThreadingHTTPServer`` subclass that carries a typed reference to
     the :class:`FakeCAOServer` it serves. Avoids the per-request
@@ -458,7 +479,21 @@ class _FakeHandler(BaseHTTPRequestHandler):
         with self._fake._lock:
             existing = self._fake._sessions.get(session_name)
             if existing is not None and not existing.deleted:
-                # Re-attach path: same byte-identical name, same metadata.
+                # Re-attach path: same byte-identical name. Only honour
+                # the reattach if the identity-bearing metadata (workdir,
+                # round, work-item, lane) matches the existing session;
+                # otherwise reject with 409 so the caller cannot
+                # misattribute a sibling controller's session as its own
+                # (finding #8 in PR #70).
+                if not _attribution_matches(existing, workdir, agent_profile, metadata):
+                    self._write_text(
+                        409,
+                        (
+                            f"session {session_name!r} already exists with "
+                            "conflicting attribution; refusing to reattach"
+                        ),
+                    )
+                    return
                 self._write_json(
                     200,
                     {
