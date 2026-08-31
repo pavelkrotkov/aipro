@@ -84,13 +84,21 @@ class FaultSpec:
     """Per-request fault: when ``matches(method, path)`` is true, return
     ``status_code`` (an HTTP status to send instead of the real response) or
     ``transport_reset=True`` (close the connection mid-flight, which CAO's
-    adapter maps to ``CaoTransportError``). ``status_code=200`` is a no-op."""
+    adapter maps to ``CaoTransportError``). ``status_code=200`` is a no-op.
+
+    ``commit_then_reset=True`` extends ``transport_reset``: the handler still
+    applies the normal state mutation (creating the session, advancing the
+    status cursor, etc.) and only then closes the connection without writing
+    a response. This exercises the committed-but-unacknowledged branch where
+    the controller treats the request as uncertain and a retry would
+    duplicate work."""
 
     method: str
     path_prefix: str
     status_code: int | None = None
     transport_reset: bool = False
     delay_seconds: float = 0.0
+    commit_then_reset: bool = False
 
     def matches(self, method: str, path: str) -> bool:
         if self.method != method:
@@ -105,6 +113,7 @@ class _PendingFault:
     status_code: int | None = None
     transport_reset: bool = False
     delay_seconds: float = 0.0
+    commit_then_reset: bool = False
 
 
 def _find_by_terminal(sessions: dict[str, _SessionState], terminal_id: str) -> _SessionState | None:
@@ -205,6 +214,7 @@ class FakeCAOServer:
                 status_code=fault.status_code,
                 transport_reset=fault.transport_reset,
                 delay_seconds=fault.delay_seconds,
+                commit_then_reset=fault.commit_then_reset,
             )
         return None
 
@@ -269,6 +279,8 @@ class _FakeHandler(BaseHTTPRequestHandler):
             return None
 
     def _write_json(self, status: int, body: Any) -> None:
+        if getattr(self, "_commit_then_reset", False):
+            return
         encoded = json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -277,6 +289,8 @@ class _FakeHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _write_text(self, status: int, body: str) -> None:
+        if getattr(self, "_commit_then_reset", False):
+            return
         encoded = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain")
@@ -295,15 +309,22 @@ class _FakeHandler(BaseHTTPRequestHandler):
             import time
 
             time.sleep(fault.delay_seconds)
-        if fault.transport_reset:
+        if fault.transport_reset and not fault.commit_then_reset:
             # Close the underlying socket so the client sees a transport error.
             self.connection.close()
             # Signal the handler to return without writing anything.
             return _PendingFault(transport_reset=True)
-        if fault.status_code is not None and fault.status_code != 200:
+        if (
+            fault.status_code is not None
+            and fault.status_code != 200
+            and not fault.commit_then_reset
+        ):
             self._write_text(fault.status_code, f"injected fault {fault.status_code}")
             return _PendingFault(status_code=fault.status_code)
-        return None
+        # commit_then_reset (with or without transport_reset/status_code):
+        # let the handler perform its normal mutation, then drop the
+        # response at the end of dispatch via _maybe_drop_response.
+        return fault
 
     # -- Dispatch -------------------------------------------------------
 
@@ -311,49 +332,77 @@ class _FakeHandler(BaseHTTPRequestHandler):
         return self.path.split("?", 1)[0]
 
     def do_POST(self) -> None:
-        if self._apply_fault_or(self.command, self.path) is not None:
+        fault = self._apply_fault_or(self.command, self.path)
+        if fault is not None and not fault.commit_then_reset:
             return
-        body = self._read_body()
-        path = self._strip_query()
-        if path == "/sessions":
-            self._handle_launch(body)
-        elif path.endswith("/input"):
-            self._handle_input()
-        else:
-            self._write_text(404, f"unknown POST {self.path}")
+        self._commit_then_reset = bool(fault and fault.commit_then_reset)
+        try:
+            body = self._read_body()
+            path = self._strip_query()
+            if path == "/sessions":
+                self._handle_launch(body)
+            elif path.endswith("/input"):
+                self._handle_input()
+            else:
+                self._write_text(404, f"unknown POST {self.path}")
+        finally:
+            self._maybe_drop_response()
 
     def do_GET(self) -> None:
-        if self._apply_fault_or(self.command, self.path) is not None:
+        fault = self._apply_fault_or(self.command, self.path)
+        if fault is not None and not fault.commit_then_reset:
             return
-        path = self._strip_query()
-        if path.startswith("/sessions/"):
-            self._handle_get_session()
-        elif "/output" in path:
-            self._handle_get_output()
-        elif path.startswith("/terminals/"):
-            self._handle_get_terminal()
-        else:
-            self._write_text(404, f"unknown GET {self.path}")
+        self._commit_then_reset = bool(fault and fault.commit_then_reset)
+        try:
+            path = self._strip_query()
+            if path.startswith("/sessions/"):
+                self._handle_get_session()
+            elif "/output" in path:
+                self._handle_get_output()
+            elif path.startswith("/terminals/"):
+                self._handle_get_terminal()
+            else:
+                self._write_text(404, f"unknown GET {self.path}")
+        finally:
+            self._maybe_drop_response()
 
     def do_PATCH(self) -> None:
-        if self._apply_fault_or(self.command, self.path) is not None:
+        fault = self._apply_fault_or(self.command, self.path)
+        if fault is not None and not fault.commit_then_reset:
             return
-        self._read_body()  # metadata is best-effort persistence in CAO
-        self._write_text(204, "")
+        self._commit_then_reset = bool(fault and fault.commit_then_reset)
+        try:
+            self._read_body()  # metadata is best-effort persistence in CAO
+            self._write_text(204, "")
+        finally:
+            self._maybe_drop_response()
 
     def do_DELETE(self) -> None:
-        if self._apply_fault_or(self.command, self.path) is not None:
+        fault = self._apply_fault_or(self.command, self.path)
+        if fault is not None and not fault.commit_then_reset:
             return
-        if self._strip_query().startswith("/sessions/"):
-            name = self.path[len("/sessions/") :].split("?", 1)[0]
-            with self._fake._lock:
-                state = self._fake._sessions.get(name)
-                if state is not None and not state.deleted:
-                    state.deleted = True
-                    state.exhausted = True
-            self._write_text(204, "")
-        else:
-            self._write_text(404, f"unknown DELETE {self.path}")
+        self._commit_then_reset = bool(fault and fault.commit_then_reset)
+        try:
+            if self._strip_query().startswith("/sessions/"):
+                name = self.path[len("/sessions/") :].split("?", 1)[0]
+                with self._fake._lock:
+                    state = self._fake._sessions.get(name)
+                    if state is not None and not state.deleted:
+                        state.deleted = True
+                        state.exhausted = True
+                self._write_text(204, "")
+            else:
+                self._write_text(404, f"unknown DELETE {self.path}")
+        finally:
+            self._maybe_drop_response()
+
+    def _maybe_drop_response(self) -> None:
+        if getattr(self, "_commit_then_reset", False):
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                self.wfile.flush()
+            self.connection.close()
 
     # -- Handlers -------------------------------------------------------
 
@@ -407,10 +456,13 @@ class _FakeHandler(BaseHTTPRequestHandler):
             for state in self._fake._sessions.values():
                 if state.terminal_id == terminal_id and not state.deleted:
                     # In real CAO, accepted input means the session is
-                    # processing again. Advance the sequence to the next
-                    # status so a follow-up poll sees post-start activity.
-                    if not state.exhausted and state.status_index < len(state.status_sequence) - 1:
-                        state.status_index += 1
+                    # processing again. Replay the scripted lifecycle from
+                    # the start so a follow-up poll sees post-start
+                    # activity evidence (cursor at "processing") before
+                    # the controller clears its seen flag and polls
+                    # forever waiting for non-idle.
+                    state.status_index = 0
+                    state.exhausted = False
                     self._write_text(204, "")
                     return
         self._write_text(404, f"no session for terminal {terminal_id}")
