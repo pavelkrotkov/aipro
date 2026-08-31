@@ -92,8 +92,19 @@ def lane_registry() -> LaneRegistry:
     return LaneRegistry.default()
 
 
+#: Default committer identity the harness passes into the foreman loop.
+#: The foreman writes commits under this identity; E2E scenarios that
+#: assert on the author string should override this with a stable
+#: per-scenario value rather than relying on the author's real name.
+DEFAULT_COMMITTER_NAME = "AIPRO E2E Bot"
+DEFAULT_COMMITTER_EMAIL = "aipro-bot@example.invalid"
+
+
 @pytest.fixture
-def foreman_harness(cao_lane_executor: CaoLaneExecutor, lane_registry: LaneRegistry):
+def foreman_harness(
+    cao_lane_executor: CaoLaneExecutor,
+    lane_registry: LaneRegistry,
+):
     """Factory that wires the foreman loop with a fresh ``FakeGitHubClient``.
 
     Returns a callable ``(seed_issue_numbers=None)`` that builds a
@@ -104,12 +115,16 @@ def foreman_harness(cao_lane_executor: CaoLaneExecutor, lane_registry: LaneRegis
 
     The harness is intentionally minimal: scenarios that need richer
     configuration (a custom broker, a custom gate, a custom git-ops
-    fake) can build their own. The smoke test
-    (``test_e2e_smoke.py``) is the reference for the happy wiring.
+    fake, or a custom committer identity) can build their own. The
+    smoke test (``test_e2e_smoke.py``) is the reference for the happy
+    wiring.
     """
 
     def _build(
         seed_issue_numbers: list[int] | None = None,
+        *,
+        committer_name: str = DEFAULT_COMMITTER_NAME,
+        committer_email: str = DEFAULT_COMMITTER_EMAIL,
     ) -> tuple[ForemanPolicyLoop, GitHubIssueQueue, FakeGitHubClient]:
         fake = FakeGitHubClient()
         if seed_issue_numbers is None:
@@ -128,8 +143,8 @@ def foreman_harness(cao_lane_executor: CaoLaneExecutor, lane_registry: LaneRegis
             V3Config(),
             run_id=f"e2e-{int(time.time() * 1000)}",
             worktree_root="/wt",
-            committer_name="Pavel Krotkov",
-            committer_email="pavel.krotkov@gmail.com",
+            committer_name=committer_name,
+            committer_email=committer_email,
         )
         return loop, queue, fake
 
