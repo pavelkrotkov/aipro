@@ -77,6 +77,8 @@ class FakeGitHubClient:
         self._now = now or datetime.now(UTC)
         self._page_size = page_size
         self._prs: dict[int, models.PullRequest] = {}
+        self._issue_bodies: dict[int, str] = {}
+        self._next_pr_number = 1
         self._comments: dict[int, _MutableComment] = {}
         self._labels: dict[int, list[str]] = {}
         self._threads: dict[str, _MutableThread] = {}
@@ -97,10 +99,20 @@ class FakeGitHubClient:
 
     def seed_pr(self, pr: models.PullRequest) -> None:
         self._prs[pr.number] = pr
+        self._next_pr_number = max(self._next_pr_number, pr.number + 1)
         self._labels[pr.number] = list(pr.labels)
 
-    def seed_issue(self, number: int, labels: list[str] | None = None) -> None:
+    def seed_issue(
+        self, number: int, labels: list[str] | None = None, *, body: str | None = None
+    ) -> None:
         self._labels[number] = list(labels) if labels else []
+        if body is not None:
+            self._issue_bodies[number] = body
+        # Issues and pull requests share one repo-wide number sequence. A seeded
+        # issue must advance ``_next_pr_number`` past it, otherwise a later
+        # create_pr() would mint a PR that aliases this issue's number (and any
+        # labels stored under it).
+        self._next_pr_number = max(self._next_pr_number, number + 1)
 
     def seed_comment(
         self,
@@ -219,6 +231,33 @@ class FakeGitHubClient:
         if list(pr.labels) != current_labels:
             return replace(pr, labels=list(current_labels))
         return pr
+
+    def get_issue_body(self, number: int) -> str | None:
+        return self._issue_bodies.get(number)
+
+    def create_pr(self, title: str, body: str, head: str, base: str) -> models.PullRequest:
+        number = self._next_pr_number
+        self._next_pr_number += 1
+        pr = models.PullRequest(
+            number=number,
+            title=title,
+            body=body,
+            state="open",
+            # A real PR carries an actual commit SHA in ``head_sha``; the fake
+            # synthesizes a deterministic one so callers that rely on the SHA
+            # (e.g. the foreman's PR ref for gating) never see the branch name
+            # or an empty string masquerading as a head.
+            head_sha=f"fake-{number}-sha",
+            head_ref=head,
+            base_ref=base,
+            author="fake-bot",
+        )
+        self._prs[number] = pr
+        self._labels.setdefault(number, [])
+        return pr
+
+    def list_open_prs(self) -> list[models.PullRequest]:
+        return [pr for pr in self._prs.values() if pr.state == "open"]
 
     def get_pr_files(self, pr_number: int) -> list[str]:
         if pr_number not in self._prs:
