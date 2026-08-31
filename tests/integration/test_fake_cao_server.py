@@ -357,3 +357,43 @@ def test_adopt_session_does_not_consume_activity_evidence(
     assert index_after - index_before == 1, (
         "peek during adopt_session must not advance the status cursor"
     )
+
+
+def test_commit_then_reset_commits_state_then_drops_response(
+    fake_cao: FakeCAOServer, tmp_path
+):
+    """Regression for finding #7 in PR #70: a ``commit_then_reset`` fault
+    must apply the normal handler mutation (here: create the session)
+    but drop the response so the client sees a transport error. This
+    exercises the committed-but-unacknowledged branch where the
+    controller treats the request as uncertain. Without this fault
+    mode, foreman recovery tests could only simulate 'no effect on
+    server', which is not the dangerous case."""
+
+    from tests.integration._fake_cao_server import FaultSpec
+
+    fake_cao.add_fault(
+        FaultSpec(
+            method="POST",
+            path_prefix="/sessions",
+            transport_reset=True,
+            commit_then_reset=True,
+        )
+    )
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    expected = session_name_for(run_id, DEVELOPER_LANE)
+    controller = CaoSessionController(
+        _control_plane(fake_cao.url), LaneRegistry.default()
+    )
+
+    with pytest.raises(Exception):
+        controller.start_session(_spec(run_id, str(tmp_path)))
+
+    # The state mutation MUST have happened, even though the client saw
+    # a transport error. A subsequent lookup must find the session.
+    assert expected in fake_cao._sessions, (
+        "commit_then_reset must apply the launch handler's state mutation"
+        " before dropping the response"
+    )
+    assert fake_cao._sessions[expected].deleted is False
