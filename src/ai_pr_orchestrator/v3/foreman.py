@@ -200,8 +200,16 @@ class ForemanPolicyLoop:
         self._worktree_root = worktree_root
         self._name = committer_name
         self._email = committer_email
-        self._prompt_tokens = 0
-        self._head_sha: str = ""
+
+    @property
+    def run_id(self) -> str:
+        """The run identity this foreman instance owns.
+
+        Public so E2E harnesses can script a CAO fake's per-session
+        state against the same run id the controller will derive the
+        deterministic session name from.
+        """
+        return self._run_id
 
     # --- Public API ----------------------------------------------------------
 
