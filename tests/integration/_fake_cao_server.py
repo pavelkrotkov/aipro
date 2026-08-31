@@ -156,6 +156,11 @@ class FakeCAOServer:
         self._outputs: dict[str, str] = {}
         # Per-request fault specs.
         self._faults: list[FaultSpec] = []
+        # Monotonically increasing counter for terminal IDs. Independent
+        # of len(self._sessions) so delete-then-relaunch (or a launch
+        # failing the metadata check, finding #8) cannot reuse or skip
+        # an ID that some other controller might still be talking to.
+        self._next_terminal_seq = 1
         # Pre-bound socket so we can read the chosen port back to the caller.
         self._httpd = _FakeHTTPServer(("127.0.0.1", 0), _FakeHandler)
         self._httpd.fake = self
@@ -381,7 +386,8 @@ class _FakeHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            terminal_id = f"term-{len(self._fake._sessions) + 1:04d}"
+            terminal_id = f"term-{self._fake._next_terminal_seq:04d}"
+            self._fake._next_terminal_seq += 1
             state = _SessionState(
                 session_name=session_name,
                 terminal_id=terminal_id,
