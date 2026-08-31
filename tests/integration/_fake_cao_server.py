@@ -343,7 +343,29 @@ class _FakeHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         if self._apply_fault_or(self.command, self.path) is not None:
             return
-        self._read_body()  # metadata is best-effort persistence in CAO
+        body = self._read_body() or {}
+        # Find the addressed terminal and merge the metadata payload so a
+        # controller created after a restart can observe the updated
+        # activity_seen marker. The real CAO persists this server-side.
+        path = self._strip_query()
+        if not path.startswith("/terminals/"):
+            self._write_text(404, f"unknown PATCH {self.path}")
+            return
+        parts = path.split("/")
+        # Path is /terminals/{tid}/metadata; the terminal id is the third
+        # segment, the literal "metadata" segment must be the fourth.
+        if len(parts) != 4 or parts[3] != "metadata":
+            self._write_text(404, f"unknown terminal PATCH {self.path}")
+            return
+        terminal_id = parts[2]
+        with self._fake._lock:
+            state = _find_by_terminal(self._fake._sessions, terminal_id)
+            if state is None or state.deleted:
+                self._write_text(404, f"no terminal {terminal_id}")
+                return
+            if isinstance(body, dict):
+                for key, value in body.items():
+                    state.metadata[key] = value
         self._write_text(204, "")
 
     def do_DELETE(self) -> None:
