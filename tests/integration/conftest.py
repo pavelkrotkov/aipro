@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -32,7 +33,12 @@ from ai_pr_orchestrator.v3.interfaces import GateDecision
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 from tests.integration._fake_cao_server import FakeCAOServer
-from tests.integration._harness import FakeBroker, FakeGitOperations, StaticGate
+from tests.integration._harness import (
+    FakeBroker,
+    FakeGitOperations,
+    HybridLaneExecutor,
+    StaticGate,
+)
 
 #: Tag used on issues the harness seeds; the queue reads it as the
 #: "enabled" label. Matches :class:`V3Config.github_queue.enabled_label`
@@ -110,6 +116,8 @@ def foreman_harness(cao_lane_executor: CaoLaneExecutor, lane_registry: LaneRegis
 
     def _build(
         seed_issue_numbers: list[int] | None = None,
+        hybrid_findings: dict[int, list[Any]] | None = None,
+        config: V3Config | None = None,
     ) -> tuple[ForemanPolicyLoop, GitHubIssueQueue, FakeGitHubClient]:
         fake = FakeGitHubClient()
         if seed_issue_numbers is None:
@@ -117,15 +125,40 @@ def foreman_harness(cao_lane_executor: CaoLaneExecutor, lane_registry: LaneRegis
         for n in seed_issue_numbers:
             fake.seed_issue(n, labels=[E2E_WORK_TAG])
 
-        queue = GitHubIssueQueue(fake, "owner", "repo", V3Config().github_queue, host_id="host-e2e")
+        cfg = config or V3Config()
+        # Two-review-round scenarios (e.g. #55 scenario 2) need a
+        # wider coder / reviewer budget than the V3Config() default
+        # (1 coder invocation, 3 reviewer triggers) — three reviewer
+        # lanes x one round already hits the default's reviewer cap,
+        # and a fix round needs at least 2 coder invocations. The
+        # scenario tests that want the default behaviour pass
+        # ``config=V3Config()`` explicitly.
+        if config is None and hybrid_findings is not None:
+            from ai_pr_orchestrator.v3.config import SafetyPolicyConfig
+
+            cfg = V3Config(
+                safety=SafetyPolicyConfig(
+                    max_coder_invocations_per_run=5,
+                    max_reviewer_triggers_per_run=20,
+                )
+            )
+
+        executor: Any = cao_lane_executor
+        if hybrid_findings is not None:
+            executor = HybridLaneExecutor(
+                worker=cao_lane_executor,
+                reviewer_findings_by_round=hybrid_findings,
+            )
+
+        queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-e2e")
         loop = ForemanPolicyLoop(
             queue,
             FakeBroker(),
             lane_registry,
-            cao_lane_executor,
+            executor,
             StaticGate(GateDecision(passed=True, pending_checks=(), failed_checks=())),
             FakeGitOperations(),
-            V3Config(),
+            cfg,
             run_id=f"e2e-{int(time.time() * 1000)}",
             worktree_root="/wt",
             committer_name="Pavel Krotkov",
