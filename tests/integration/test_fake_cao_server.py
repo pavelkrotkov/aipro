@@ -397,3 +397,46 @@ def test_commit_then_reset_commits_state_then_drops_response(
         " before dropping the response"
     )
     assert fake_cao._sessions[expected].deleted is False
+
+
+def test_reattach_with_conflicting_attribution_is_rejected(
+    fake_cao: FakeCAOServer, tmp_path
+):
+    """Regression for finding #8 in PR #70: a second launch that hits
+    the reattach path with a different workdir (or round / work-item /
+    lane metadata) must be rejected with 409, not silently succeed.
+    Otherwise a sibling controller could claim the byte-identical
+    session name and drive the first controller's agent while
+    recording its own attribution locally."""
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    expected = session_name_for(run_id, DEVELOPER_LANE)
+
+    controller = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
+
+    # First launch claims the session.
+    controller.start_session(_spec(run_id, str(tmp_path)))
+    first_terminal = fake_cao._sessions[expected].terminal_id
+
+    # Second launch with the same run_id+lane (so same name) but a
+    # DIFFERENT workdir. The fake must reject this with 409 so the
+    # second controller doesn't silently drive the first session.
+    response = httpx.post(
+        f"{fake_cao.url}/sessions",
+        params={
+            "session_name": expected,
+            "working_directory": str(tmp_path / "different"),
+            "agent_profile": "",
+        },
+        json={
+            "initial_message": "hi",
+            "metadata": {"workdir": str(tmp_path / "different"), "lane": "developer"},
+        },
+        timeout=5.0,
+    )
+    assert response.status_code == 409
+    assert "conflicting attribution" in response.text
+
+    # The original session is untouched.
+    assert fake_cao._sessions[expected].terminal_id == first_terminal
+    assert fake_cao._sessions[expected].workdir == str(tmp_path)
