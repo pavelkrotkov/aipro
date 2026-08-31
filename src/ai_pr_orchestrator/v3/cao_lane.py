@@ -28,7 +28,13 @@ Three properties are load-bearing:
 
 from __future__ import annotations
 
-from .cao import CaoSessionController
+import time
+
+from .cao import (
+    CaoSessionController,
+    CaoSessionNotFoundError,
+    SessionIdentityUncertainError,
+)
 from .domain import LaneIdentity
 from .interfaces import (
     LaneExecutionContext,
@@ -95,27 +101,79 @@ class CaoLaneExecutor:
            context and the optional :class:`ModelLease`.
         3. ``start_session`` adopts an existing session if one is alive
            under the same deterministic name; otherwise it creates one.
-        4. Poll ``poll_session`` until the controller reports terminal
+        4. If launch is uncertain (CAO may have created the session
+           before losing the response), reconcile by attempting
+           ``adopt_session`` for the same deterministic name.
+        5. Submit the prompt for this turn so an adopted session also
+           receives work.
+        6. Poll ``poll_session`` until the controller reports terminal
            state or the wall-clock budget is exhausted.
-        5. On any exception, ``terminate_session`` (idempotent) and
-           re-raise so the foreman can classify the failure.
+        7. On any exception, ``terminate_session`` (idempotent) and
+           re-raise so the foreman can classify the failure. If the
+           cleanup itself fails, preserve the original exception via
+           ``__context__`` so the caller still sees the cause.
         """
-        import time
-
         registered_lane = self._lanes.get(lane.lane)
+        if registered_lane is None:
+            # Without this guard, SessionSpec.__post_init__ would
+            # TypeError when the LaneIdentity compares an unset field.
+            raise LookupError(
+                f"lane {lane.lane!r} is not registered in the LaneRegistry; "
+                "the executor refuses to construct a SessionSpec for an "
+                "unbound lane"
+            )
+        env: dict[str, str] = {}
+        if lease is not None:
+            # Forward the broker's model selection into the session
+            # environment so the agent's startup can resolve the same
+            # model the broker reserved. CAO forwards env_vars verbatim
+            # to the agent (see cao.py start_session), so this is the
+            # authoritative channel. We deliberately use an opaque
+            # ``AIPRO_MODEL_REF`` key — never a vendor or model name —
+            # and rely on the catalog to translate the ref to the
+            # concrete provider at startup time.
+            env["AIPRO_MODEL_REF"] = lease.assignment.model_ref
         spec = SessionSpec(
             lane=registered_lane,
             run_id=context.run_id,
             workdir=workdir,
-            env={},
+            env=env,
             context=context,
             command=task_prompt,
             model_lease=lease,
         )
 
-        handle = self._controller.start_session(spec)
         deadline = time.monotonic() + self._max_poll
+        handle = None
         try:
+            try:
+                handle = self._controller.start_session(spec)
+            except SessionIdentityUncertainError:
+                # Launch completion is uncertain: CAO may have created
+                # the session before the response was lost. Reconcile
+                # by adopting the same deterministic name and
+                # constructing a handle from the recovered metadata.
+                # If adoption also fails, the original uncertain
+                # error propagates so the foreman can treat the work
+                # item as un-attributable.
+                from .cao import session_name_for
+                from .interfaces import SessionHandle
+
+                name = session_name_for(spec.run_id, registered_lane.lane)
+                try:
+                    self._controller.adopt_session(name, spec)
+                except CaoSessionNotFoundError:
+                    raise
+                handle = SessionHandle(session_id=name, lane=registered_lane.lane)
+
+            # Submit the prompt for this turn so the session actually
+            # receives the executor's task, including adopted sessions
+            # (the controller's start_session path short-circuits before
+            # delivery when adopting). A submission that races a
+            # session deletion falls through to the poll loop, whose
+            # first observe() will raise a typed error.
+            self._controller.submit_work(handle, task_prompt)
+
             while True:
                 result = self._controller.poll_session(handle)
                 if result is not None:
@@ -131,7 +189,6 @@ class CaoLaneExecutor:
                         dispositions=list(result.dispositions),
                     )
                 if time.monotonic() >= deadline:
-                    self._controller.terminate_session(handle)
                     raise TimeoutError(
                         f"CaoLaneExecutor exceeded its {self._max_poll:.0f}s poll "
                         f"budget waiting for session {handle.session_id!r} on "
@@ -141,11 +198,23 @@ class CaoLaneExecutor:
                         "this executor's max_poll_seconds"
                     )
                 time.sleep(self._poll_interval)
-        except BaseException:
-            # Best-effort teardown so the CAO session is not orphaned; a
-            # session CAO has already forgotten is a no-op here.
-            self._controller.terminate_session(handle)
-            raise
+        except BaseException as primary_exc:
+            # Best-effort teardown so the CAO session is not orphaned. A
+            # session CAO has already forgotten is a no-op here. If the
+            # cleanup itself raises, preserve the original exception as
+            # the caller-visible failure: stash the cleanup error on
+            # ``primary_exc.__context__`` (chained) so the foreman sees
+            # BOTH but can still classify by the primary type.
+            if handle is not None:
+                try:
+                    self._controller.terminate_session(handle)
+                except BaseException as cleanup_exc:
+                    # Catch every cleanup error here so the primary
+                    # exception stays visible to the caller. The type
+                    # is intentionally broad: a failed teardown must
+                    # never displace the typed lane error.
+                    raise primary_exc from cleanup_exc
+            raise primary_exc
 
 
 __all__ = ["CaoLaneExecutor"]
