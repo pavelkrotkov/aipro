@@ -435,9 +435,14 @@ class _FakeHandler(BaseHTTPRequestHandler):
             for state in self._fake._sessions.values():
                 if state.terminal_id == terminal_id and not state.deleted:
                     # In real CAO, accepted input means the session is
-                    # processing again. Advance the sequence to the next
-                    # status so a follow-up poll sees post-start activity.
-                    if not state.exhausted and state.status_index < len(state.status_sequence) - 1:
+                    # processing again. Replay the scripted lifecycle from
+                    # the start so a follow-up observe sees activity
+                    # evidence before the controller clears its seen flag
+                    # and polls forever waiting for non-idle.
+                    if state.exhausted:
+                        state.status_index = 0
+                        state.exhausted = False
+                    elif state.status_index < len(state.status_sequence) - 1:
                         state.status_index += 1
                     self._write_text(204, "")
                     return

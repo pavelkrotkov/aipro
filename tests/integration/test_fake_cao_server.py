@@ -288,3 +288,32 @@ def test_patch_metadata_is_persisted_and_visible_to_later_get(
         timeout=5.0,
     )
     assert bad_resp.status_code == 404
+
+
+def test_submit_work_rearms_lifecycle_for_followup_observe(
+    fake_cao: FakeCAOServer, tmp_path
+):
+    """Regression for finding #5 in PR #70: once the initial status
+    sequence exhausts, an accepted submit_work must replay the script
+    so a follow-up observe sees fresh activity evidence. Without this,
+    the controller would clear its seen-activity flag on the 204 and
+    then poll an idle terminal forever."""
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    controller = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
+    handle = controller.start_session(_spec(run_id, str(tmp_path)))
+    terminal_id = fake_cao._sessions[handle.session_id].terminal_id
+
+    # Walk to exhaustion so subsequent observe() reports idle.
+    for _ in range(len(DEFAULT_STATUS_SEQUENCE) + 2):
+        controller.observe(handle)
+    assert fake_cao._sessions[handle.session_id].exhausted is True
+
+    # submit_work is accepted; the lifecycle must re-arm.
+    controller.submit_work(handle, "follow up")
+
+    assert fake_cao._sessions[handle.session_id].exhausted is False
+    assert fake_cao._sessions[handle.session_id].status_index == 0
+    # The very next observe should see a non-idle status, never idle.
+    next_obs = controller.observe(handle)
+    assert next_obs.cao_status == STATUS_STARTED
