@@ -250,3 +250,41 @@ def test_terminal_ids_are_monotonic_across_delete_and_relaunch(
     handle_b = controller.start_session(_spec(run_id_b, str(tmp_path)))
     terminal_b = fake_cao._sessions[name_b].terminal_id
     assert terminal_b not in {terminal_a1, terminal_a2}
+
+
+def test_patch_metadata_is_persisted_and_visible_to_later_get(
+    fake_cao: FakeCAOServer, tmp_path
+):
+    """Regression for finding #3 in PR #70: a PATCH that flips
+    ``activity_seen=True`` must be persisted on the server side so a
+    controller that adopts the session after a restart can read the
+    updated metadata. Unknown / deleted terminals return 404."""
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    controller = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
+    handle = controller.start_session(_spec(run_id, str(tmp_path)))
+    terminal_id = fake_cao._sessions[handle.session_id].terminal_id
+
+    # PATCH a metadata key.
+    patch_resp = httpx.patch(
+        f"{fake_cao.url}/terminals/{terminal_id}/metadata",
+        json={"activity_seen": True, "round_id": 3},
+        timeout=5.0,
+    )
+    assert patch_resp.status_code == 204
+
+    # The next GET round-trips the merged metadata.
+    get_resp = httpx.get(f"{fake_cao.url}/terminals/{terminal_id}", timeout=5.0)
+    assert get_resp.status_code == 200
+    payload = get_resp.json()
+    assert payload["metadata"].get("activity_seen") is True
+    assert payload["metadata"].get("round_id") == 3
+
+    # PATCH to a deleted terminal must return 404.
+    controller.terminate_session(handle)
+    bad_resp = httpx.patch(
+        f"{fake_cao.url}/terminals/{terminal_id}/metadata",
+        json={"activity_seen": False},
+        timeout=5.0,
+    )
+    assert bad_resp.status_code == 404
