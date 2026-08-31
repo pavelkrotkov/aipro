@@ -188,7 +188,14 @@ def test_start_session_launches_named_session_in_the_lane_profile(respx_mock):
     import json
 
     body = json.loads(request.content)
-    assert body["initial_message"] == "implement the change"
+    # PR #71 #1 (round-2): start_session no longer forwards spec.command as
+    # initial_message. All work delivery (including the first task) goes
+    # through submit_work so a newly created session does not receive the
+    # same prompt twice. The executor's contract is now: launch + submit.
+    assert "initial_message" not in body, (
+        "start_session must not include initial_message; submit_work is "
+        "the single authoritative delivery path"
+    )
     assert body["env_vars"] == {"LANE_HOME": "/lanes/developer"}
     assert body["group"] == [RUN_ID, DEVELOPER_LANE]
     assert body["metadata"]["run_id"] == RUN_ID

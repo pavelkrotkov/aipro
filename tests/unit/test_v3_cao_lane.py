@@ -16,7 +16,9 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import httpx
 import pytest
+import respx
 
 from ai_pr_orchestrator.v3.cao import (
     CAOControlPlaneConfig,
@@ -476,3 +478,109 @@ def test_execute_surfaces_429_as_classifiable_rate_limit(fake_cao: FakeCAOServer
     # 429 is still a transient error (CaoUnavailableError) so the
     # foreman's general retry-on-unavailable logic continues to work.
     assert isinstance(excinfo.value, CaoUnavailableError)
+
+
+def test_execute_does_not_double_deliver_task_prompt(fake_cao: FakeCAOServer, tmp_path):
+    """Regression for round-2 finding #1 in PR #71: ``start_session`` used
+    to forward ``spec.command`` as CAO's ``initial_message`` *and* the
+    executor then unconditionally called ``submit_work`` for the same
+    task. For any session whose first prompt has side effects (most
+    non-trivial coding or reviewer tasks do), this double-delivery is a
+    silent re-execution. The fix: ``start_session`` no longer includes
+    ``initial_message`` in the launch body, so the executor's
+    ``submit_work`` is the single authoritative delivery.
+
+    The regression asserts the observable: exactly one POST to
+    ``/terminals/{tid}/input`` per ``execute`` call.
+    """
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    name = session_name_for(run_id, DEVELOPER_LANE)
+    fake_cao.set_output(name, MARKER)
+
+    # Wrap the fake's input handler to count calls per session.
+    submit_calls: list[str] = []
+
+    original_handle_input = fake_cao._FakeHandler__dict__ if False else None  # noqa: F841
+    # Simpler: instrument by patching the bound method on the running
+    # server's handler class.
+    from tests.integration._fake_cao_server import _FakeHandler as _H
+
+    original = _H._handle_input
+
+    def _counting(self):  # type: ignore[no-untyped-def]
+        # The handler is bound to one session at a time; tag the
+        # session_name so we can correlate with execute() runs.
+        path = self.path.split("?")[0]
+        tid = path.split("/")[2]
+        # Look up session name from the fake's own state.
+        with self._fake._lock:
+            for s in self._fake._sessions.values():
+                if s.terminal_id == tid:
+                    submit_calls.append(s.session_name)
+                    break
+        return original(self)
+
+    _H._handle_input = _counting  # type: ignore[assignment]
+
+    try:
+        controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
+        executor = CaoLaneExecutor(
+            controller, LaneRegistry.default(), poll_interval_seconds=0.01
+        )
+        executor.execute(_lane(), f"echo {MARKER}", str(tmp_path), _context(run_id))
+    finally:
+        _H._handle_input = original  # type: ignore[assignment]
+
+    assert submit_calls == [name], (
+        f"expected exactly one submit_work delivery per execute(); got {submit_calls}. "
+        "A regression that re-adds initial_message would surface as a second "
+        "POST /terminals/{tid}/input."
+    )
+
+
+def test_start_session_does_not_send_initial_message(respx_mock):
+    """Regression for round-2 finding #1 in PR #71: ``start_session``
+    must not include ``initial_message`` in the POST body even when
+    ``spec.command`` is set. ``submit_work`` is the single authoritative
+    delivery path; see ``CaoSessionController.start_session`` docstring."""
+    from ai_pr_orchestrator.v3.cao import (
+        CAOControlPlaneConfig,
+        CaoSessionController,
+    )
+    import json
+    import re
+
+    from tests.unit.test_v3_cao import (
+        RUN_ID as FIXTURE_RUN_ID,
+        SESSION as FIXTURE_SESSION,
+        make_spec as make_fixture_spec,
+        terminal_payload as fixture_terminal_payload,
+    )
+
+    controller = CaoSessionController(
+        CAOControlPlaneConfig(
+            base_url="http://cao",
+            session_timeout_seconds=60,
+            request_timeout_seconds=5,
+        ),
+        LaneRegistry.default(),
+    )
+    respx_mock.get(re.compile(r"http://cao/sessions/.+")).mock(
+        return_value=httpx.Response(404)
+    )
+    route = respx_mock.post("http://cao/sessions").mock(
+        return_value=httpx.Response(
+            200, json={"id": "term-1", "session_name": FIXTURE_SESSION}
+        )
+    )
+
+    spec = make_fixture_spec(command="implement the change")
+    assert spec.command == "implement the change"
+    controller.start_session(spec)
+
+    body = json.loads(route.calls.last.request.content)
+    assert "initial_message" not in body, (
+        "start_session must not include initial_message; submit_work is "
+        "the single authoritative delivery path"
+    )

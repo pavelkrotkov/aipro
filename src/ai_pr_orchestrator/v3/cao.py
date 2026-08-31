@@ -350,11 +350,16 @@ class CaoSessionController:
     def start_session(self, spec: SessionSpec) -> SessionHandle:
         """Launch (or re-attach to) the session for ``spec``'s run and lane.
 
-        ``spec.command`` is the opaque initial work message; when it is empty
-        the session is created idle and work is submitted later with
-        :meth:`submit_work`. ``spec.env`` is forwarded to the session verbatim
-        — it is how the broker's resolved model reaches the agent's startup
-        without this module interpreting it.
+        ``spec.command`` is **not** forwarded to CAO as ``initial_message``:
+        every delivery, including the first task, must go through
+        :meth:`submit_work`. This keeps the launch path free of side-effectful
+        duplication: a session created here has not yet received any work, and
+        the executor's subsequent ``submit_work`` is the single authoritative
+        delivery. (Round-2 review, PR #71 #1.)
+
+        ``spec.env`` is forwarded to the session verbatim — it is how the
+        broker's resolved model reaches the agent's startup without this module
+        interpreting it.
 
         ``spec.image`` is rejected: CAO's ``POST /sessions`` launch parameters
         expose no image override, so the adapter cannot forward it and will
@@ -386,13 +391,16 @@ class CaoSessionController:
                 spec.model_lease.assignment if spec.model_lease is not None else None
             ),
         )
+        # NOTE (PR #71 #1): the launch body deliberately omits
+        # ``initial_message``. Work is delivered via ``submit_work`` so a
+        # newly-created session receives each task exactly once. Callers
+        # that want ``initial_message`` semantics should pass an empty
+        # ``spec.command`` and rely on ``submit_work``.
         body: dict[str, Any] = {
             "env_vars": spec.env or None,
             "group": [spec.run_id, lane.lane],
             "metadata": metadata.to_dict(),
         }
-        if spec.command:
-            body["initial_message"] = spec.command
 
         try:
             response = self._request(
