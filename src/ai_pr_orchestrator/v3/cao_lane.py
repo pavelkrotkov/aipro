@@ -33,7 +33,9 @@ import time
 from .cao import (
     CaoSessionController,
     CaoSessionNotFoundError,
+    SessionBusyError,
     SessionIdentityUncertainError,
+    session_name_for,
 )
 from .domain import LaneIdentity
 from .interfaces import (
@@ -145,9 +147,26 @@ class CaoLaneExecutor:
 
         deadline = time.monotonic() + self._max_poll
         handle = None
+        # Round-2 finding, PR #71 #2: distinguish sessions this call
+        # *created* from sessions it *adopted*. Adopted sessions are
+        # owned by some other caller (or a previous foreman restart);
+        # terminating them on the executor's cleanup path would kill
+        # valid in-flight work. The flag is set True only after we know
+        # we POSTed a brand-new session to CAO (i.e. start_session took
+        # the new-session branch), and stays False for the adopted
+        # branch and for adopt_session reconciliation.
+        own_session = False
         try:
             try:
+                # Probe whether an existing session is alive BEFORE
+                # calling start_session, so we can mark ``own_session``
+                # correctly. The controller's own adopt path is
+                # implicit: if start_session returns a handle without a
+                # POST, we did not create the session.
+                name = session_name_for(spec.run_id, registered_lane.lane)
+                preexisting = self._controller._lookup_session(name) is not None
                 handle = self._controller.start_session(spec)
+                own_session = not preexisting
             except SessionIdentityUncertainError:
                 # Launch completion is uncertain: CAO may have created
                 # the session before the response was lost. Reconcile
@@ -155,8 +174,10 @@ class CaoLaneExecutor:
                 # constructing a handle from the recovered metadata.
                 # If adoption also fails, the original uncertain
                 # error propagates so the foreman can treat the work
-                # item as un-attributable.
-                from .cao import session_name_for
+                # item as un-attributable. Note: ``own_session`` stays
+                # False; CAO MAY have created a session for the
+                # uncertain launch, but we cannot claim ownership of
+                # it and cleanup must not terminate it.
                 from .interfaces import SessionHandle
 
                 name = session_name_for(spec.run_id, registered_lane.lane)
@@ -165,6 +186,7 @@ class CaoLaneExecutor:
                 except CaoSessionNotFoundError:
                     raise
                 handle = SessionHandle(session_id=name, lane=registered_lane.lane)
+                own_session = False
 
             # Submit the prompt for this turn so the session actually
             # receives the executor's task, including adopted sessions
@@ -199,13 +221,20 @@ class CaoLaneExecutor:
                     )
                 time.sleep(self._poll_interval)
         except BaseException as primary_exc:
-            # Best-effort teardown so the CAO session is not orphaned. A
-            # session CAO has already forgotten is a no-op here. If the
-            # cleanup itself raises, preserve the original exception as
-            # the caller-visible failure: stash the cleanup error on
-            # ``primary_exc.__context__`` (chained) so the foreman sees
-            # BOTH but can still classify by the primary type.
-            if handle is not None:
+            # Best-effort teardown, but ONLY for sessions we created
+            # in this call. An adopted session belongs to some other
+            # caller; terminating it on the executor's cleanup path
+            # would kill valid in-flight work (round-2 finding, PR
+            # #71 #2). SessionBusyError in particular is the signal
+            # that the adopted session is mid-work for someone else,
+            # so even for sessions WE created, do not terminate a
+            # session CAO is currently processing — re-raise so the
+            # foreman can decide whether to retry/poll later.
+            should_terminate = (
+                handle is not None and own_session and not isinstance(primary_exc, SessionBusyError)
+            )
+            if should_terminate:
+                assert handle is not None  # narrowing for pyright; should_terminate implies handle
                 try:
                     self._controller.terminate_session(handle)
                 except BaseException as cleanup_exc:

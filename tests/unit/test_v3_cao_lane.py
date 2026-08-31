@@ -18,7 +18,6 @@ from typing import Any
 
 import httpx
 import pytest
-import respx
 
 from ai_pr_orchestrator.v3.cao import (
     CAOControlPlaneConfig,
@@ -480,6 +479,106 @@ def test_execute_surfaces_429_as_classifiable_rate_limit(fake_cao: FakeCAOServer
     assert isinstance(excinfo.value, CaoUnavailableError)
 
 
+def test_execute_does_not_terminate_adopted_session_on_failure(
+    fake_cao: FakeCAOServer, tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Regression for round-2 finding #2 in PR #71: when ``execute``
+    adopts an already-live session (typically from a previous foreman
+    run that was interrupted mid-work) and the current call raises a
+    typed lane error during ``submit_work`` or polling, the executor
+    must NOT terminate the adopted session. Doing so would kill valid
+    in-flight work for the original caller and leave the next foreman
+    restart with no session to reconnect to.
+
+    The same rule applies for sessions recovered via
+    ``SessionIdentityUncertainError`` reconciliation: CAO MAY have
+    created the session, so we cannot claim ownership of it.
+    """
+
+    from ai_pr_orchestrator.v3.cao import SessionBusyError
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    name = session_name_for(run_id, DEVELOPER_LANE)
+    fake_cao.set_output(name, MARKER)
+
+    # Pre-populate an alive session so ``start_session`` will adopt it.
+    controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
+    pre_existing = _spec(run_id, str(tmp_path), "pre-existing work")
+    controller.start_session(pre_existing)
+
+    # Patch submit_work to raise SessionBusyError, simulating the
+    # adopted session being mid-work for some other caller.
+    busy = SessionBusyError(f"session {name!r} is busy")
+
+    def _raise_busy(handle, message):  # type: ignore[no-untyped-def]
+        raise busy
+
+    monkeypatch.setattr(controller, "submit_work", _raise_busy)
+
+    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+
+    with pytest.raises(SessionBusyError) as excinfo:
+        executor.execute(_lane(), "fresh work", str(tmp_path), _context(run_id))
+    assert excinfo.value is busy
+
+    # The adopted session must still be alive in the fake.
+    state = fake_cao._sessions.get(name)
+    assert state is not None, "adopted session must not be deleted"
+    assert state.deleted is False, (
+        "executor must not terminate an adopted session on cleanup; "
+        "doing so kills valid in-flight work for the original caller"
+    )
+
+
+def test_execute_preserves_uncertain_recovery_session_on_failure(
+    fake_cao: FakeCAOServer, tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Regression for round-2 finding #2 in PR #71 (uncertain-launch
+    branch): when launch is uncertain (CAO may have created the
+    session) and a subsequent step raises, the executor must NOT
+    terminate the recovered session. ``own_session`` stays False for
+    the entire call."""
+    from ai_pr_orchestrator.v3.cao import (
+        SessionBusyError,
+    )
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    name = session_name_for(run_id, DEVELOPER_LANE)
+    fake_cao.set_output(name, MARKER)
+    fake_cao.add_fault(
+        FaultSpec(
+            method="POST",
+            path_prefix="/sessions",
+            transport_reset=True,
+            commit_then_reset=True,
+        )
+    )
+
+    controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
+    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+
+    # Patch submit_work to raise SessionBusyError AFTER reconciliation
+    # so we exercise the uncertain-recovery + failed-submit path.
+    busy = SessionBusyError("post-reconcile busy")
+
+    def _raise_busy(handle, message):  # type: ignore[no-untyped-def]
+        raise busy
+
+    monkeypatch.setattr(controller, "submit_work", _raise_busy)
+
+    with pytest.raises(SessionBusyError):
+        executor.execute(_lane(), "echo MARKER", str(tmp_path), _context(run_id))
+
+    # The session CAO created during the uncertain launch must NOT be
+    # terminated by our cleanup path.
+    state = fake_cao._sessions.get(name)
+    assert state is not None, "uncertain-recovery session must be adoptable"
+    assert state.deleted is False, (
+        "executor must not terminate a session recovered via "
+        "SessionIdentityUncertainError; CAO may have just created it"
+    )
+
+
 def test_execute_does_not_double_deliver_task_prompt(fake_cao: FakeCAOServer, tmp_path):
     """Regression for round-2 finding #1 in PR #71: ``start_session`` used
     to forward ``spec.command`` as CAO's ``initial_message`` *and* the
@@ -491,51 +590,22 @@ def test_execute_does_not_double_deliver_task_prompt(fake_cao: FakeCAOServer, tm
     ``submit_work`` is the single authoritative delivery.
 
     The regression asserts the observable: exactly one POST to
-    ``/terminals/{tid}/input`` per ``execute`` call.
+    ``/terminals/{tid}/input`` per ``execute`` call, counted by
+    ``FakeCAOServer.submit_count``.
     """
 
     run_id = f"it-{int(time.time() * 1000)}"
     name = session_name_for(run_id, DEVELOPER_LANE)
     fake_cao.set_output(name, MARKER)
 
-    # Wrap the fake's input handler to count calls per session.
-    submit_calls: list[str] = []
+    controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
+    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+    executor.execute(_lane(), f"echo {MARKER}", str(tmp_path), _context(run_id))
 
-    original_handle_input = fake_cao._FakeHandler__dict__ if False else None  # noqa: F841
-    # Simpler: instrument by patching the bound method on the running
-    # server's handler class.
-    from tests.integration._fake_cao_server import _FakeHandler as _H
-
-    original = _H._handle_input
-
-    def _counting(self):  # type: ignore[no-untyped-def]
-        # The handler is bound to one session at a time; tag the
-        # session_name so we can correlate with execute() runs.
-        path = self.path.split("?")[0]
-        tid = path.split("/")[2]
-        # Look up session name from the fake's own state.
-        with self._fake._lock:
-            for s in self._fake._sessions.values():
-                if s.terminal_id == tid:
-                    submit_calls.append(s.session_name)
-                    break
-        return original(self)
-
-    _H._handle_input = _counting  # type: ignore[assignment]
-
-    try:
-        controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
-        executor = CaoLaneExecutor(
-            controller, LaneRegistry.default(), poll_interval_seconds=0.01
-        )
-        executor.execute(_lane(), f"echo {MARKER}", str(tmp_path), _context(run_id))
-    finally:
-        _H._handle_input = original  # type: ignore[assignment]
-
-    assert submit_calls == [name], (
-        f"expected exactly one submit_work delivery per execute(); got {submit_calls}. "
-        "A regression that re-adds initial_message would surface as a second "
-        "POST /terminals/{tid}/input."
+    assert fake_cao.submit_count == 1, (
+        f"expected exactly one submit_work delivery per execute(); got "
+        f"{fake_cao.submit_count}. A regression that re-adds initial_message "
+        "would surface as submit_count == 2."
     )
 
 
@@ -544,18 +614,18 @@ def test_start_session_does_not_send_initial_message(respx_mock):
     must not include ``initial_message`` in the POST body even when
     ``spec.command`` is set. ``submit_work`` is the single authoritative
     delivery path; see ``CaoSessionController.start_session`` docstring."""
+    import json
+    import re
+
     from ai_pr_orchestrator.v3.cao import (
         CAOControlPlaneConfig,
         CaoSessionController,
     )
-    import json
-    import re
-
     from tests.unit.test_v3_cao import (
-        RUN_ID as FIXTURE_RUN_ID,
         SESSION as FIXTURE_SESSION,
+    )
+    from tests.unit.test_v3_cao import (
         make_spec as make_fixture_spec,
-        terminal_payload as fixture_terminal_payload,
     )
 
     controller = CaoSessionController(
@@ -566,13 +636,9 @@ def test_start_session_does_not_send_initial_message(respx_mock):
         ),
         LaneRegistry.default(),
     )
-    respx_mock.get(re.compile(r"http://cao/sessions/.+")).mock(
-        return_value=httpx.Response(404)
-    )
+    respx_mock.get(re.compile(r"http://cao/sessions/.+")).mock(return_value=httpx.Response(404))
     route = respx_mock.post("http://cao/sessions").mock(
-        return_value=httpx.Response(
-            200, json={"id": "term-1", "session_name": FIXTURE_SESSION}
-        )
+        return_value=httpx.Response(200, json={"id": "term-1", "session_name": FIXTURE_SESSION})
     )
 
     spec = make_fixture_spec(command="implement the change")

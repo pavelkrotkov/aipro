@@ -165,6 +165,10 @@ class FakeCAOServer:
         self._outputs: dict[str, str] = {}
         # Per-request fault specs.
         self._faults: list[FaultSpec] = []
+        # Total POST /terminals/{tid}/input calls handled by this server
+        # since startup. Tests assert the executor's single-delivery
+        # contract (PR #71 #1) against this counter via submit_count.
+        self._submit_count = 0
         # Pre-bound socket so we can read the chosen port back to the caller.
         self._httpd = _FakeHTTPServer(("127.0.0.1", 0), _FakeHandler)
         self._httpd.fake = self
@@ -200,6 +204,13 @@ class FakeCAOServer:
         """Register a per-request fault injected before normal handling."""
         with self._lock:
             self._faults.append(fault)
+
+    @property
+    def submit_count(self) -> int:
+        """Number of POST /terminals/{tid}/input requests handled by
+        this server since startup. Tests assert the executor's
+        single-delivery contract (PR #71 #1) against this counter."""
+        return self._submit_count
 
     def _status_sequence_for(self, session_name: str) -> Sequence[str]:
         return self._status_overrides.get(session_name, DEFAULT_STATUS_SEQUENCE)
@@ -452,6 +463,9 @@ class _FakeHandler(BaseHTTPRequestHandler):
             self._write_text(404, f"unknown input path {self.path}")
             return
         terminal_id = parts[2]
+        # PR #71 #1: count submit_work deliveries so tests can assert
+        # that the executor delivers each task exactly once.
+        self._fake._submit_count += 1
         with self._fake._lock:
             for state in self._fake._sessions.values():
                 if state.terminal_id == terminal_id and not state.deleted:
