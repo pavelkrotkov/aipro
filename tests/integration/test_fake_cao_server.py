@@ -174,7 +174,11 @@ def test_fault_injection_returns_injected_status(fake_cao: FakeCAOServer, tmp_pa
     """A configured ``FaultSpec`` causes the matching request to return the
     injected HTTP status; the controller maps non-2xx to a control-plane
     error."""
-    from ai_pr_orchestrator.v3.cao import CaoSessionNotFoundError
+    from ai_pr_orchestrator.v3.cao import (
+        CaoControlPlaneError,
+        CaoSessionNotFoundError,
+        SessionBusyError,
+    )
     from tests.integration._fake_cao_server import FaultSpec
 
     fake_cao.add_fault(FaultSpec(method="POST", path_prefix="/sessions", status_code=503))
@@ -182,11 +186,22 @@ def test_fault_injection_returns_injected_status(fake_cao: FakeCAOServer, tmp_pa
     controller = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
     run_id = f"it-{int(time.time() * 1000)}"
 
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(CaoControlPlaneError) as excinfo:
         controller.start_session(_spec(run_id, str(tmp_path)))
-    # 5xx (not 404/409) surfaces as a generic CaoControlPlaneError, NOT
-    # CaoSessionNotFoundError; the assertion guards against regression.
+    # 5xx (not 404/409) must surface as the generic CaoControlPlaneError,
+    # NOT a more specific subclass. Otherwise a regression that maps 503
+    # to KeyError, CaoSessionNotFoundError, SessionBusyError, or any other
+    # type would still satisfy the old "not CaoSessionNotFoundError" check
+    # while silently breaking the documented contract.
+    # Round-2 review, PR #70 #3.
     assert not isinstance(excinfo.value, CaoSessionNotFoundError)
+    assert not isinstance(excinfo.value, SessionBusyError)
+    assert type(excinfo.value) is CaoControlPlaneError, (
+        f"expected exactly CaoControlPlaneError, got {type(excinfo.value).__name__}"
+    )
+    assert "503" in str(excinfo.value), (
+        "exception message should include the upstream HTTP status for diagnostics"
+    )
 
 
 def test_empty_status_sequence_returns_500_not_indexerror(fake_cao: FakeCAOServer, tmp_path):
@@ -442,7 +457,7 @@ def test_delayed_handler_does_not_pin_teardown(
     """
 
     import time
-    from tests.integration._fake_cao_server import FaultSpec
+
     from ai_pr_orchestrator.v3.cao import (
         CAOControlPlaneConfig,
         CaoSessionController,
@@ -450,6 +465,7 @@ def test_delayed_handler_does_not_pin_teardown(
     )
     from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, SessionSpec
     from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
+    from tests.integration._fake_cao_server import FaultSpec
 
     delay = 3.0
     # Inject a 3s delay on the launch path while the client uses a 0.5s
@@ -557,9 +573,7 @@ def test_one_shot_fault_is_consumed_after_first_match(
 
     # -- occurrences=N: N transient failures then recovery
     fake_cao.clear_faults()
-    occ_spec = FaultSpec(
-        method="POST", path_prefix="/sessions", status_code=502, occurrences=2
-    )
+    occ_spec = FaultSpec(method="POST", path_prefix="/sessions", status_code=502, occurrences=2)
     fake_cao.add_fault(occ_spec)
     statuses = [_post(f"occ-{i}").status_code for i in range(4)]
     assert statuses == [502, 502, 200, 200], (
