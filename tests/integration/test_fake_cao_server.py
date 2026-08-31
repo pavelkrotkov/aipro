@@ -430,6 +430,80 @@ def test_reattach_with_conflicting_attribution_is_rejected(fake_cao: FakeCAOServ
     assert fake_cao._sessions[expected].workdir == str(tmp_path)
 
 
+def test_delayed_handler_does_not_pin_teardown(
+    fake_cao: FakeCAOServer, tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+):
+    """Regression for round-2 finding #2 in PR #70: a fault-injected
+    ``delay_seconds`` that exceeds the client's request timeout must not
+    stall ``FakeCAOServer.stop()``. ``_FakeHTTPServer`` now sets
+    ``daemon_threads = True`` and ``block_on_close = False`` so the
+    background handler thread dies with the process and ``server_close()``
+    does not block on outstanding handler completion.
+    """
+
+    import time
+    from tests.integration._fake_cao_server import FaultSpec
+    from ai_pr_orchestrator.v3.cao import (
+        CAOControlPlaneConfig,
+        CaoSessionController,
+        SessionIdentityUncertainError,
+    )
+    from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, SessionSpec
+    from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
+
+    delay = 3.0
+    # Inject a 3s delay on the launch path while the client uses a 0.5s
+    # request timeout. The client raises (transport timeout) but the
+    # handler thread keeps sleeping inside time.sleep(delay_seconds).
+    fake_cao.add_fault(FaultSpec(method="POST", path_prefix="/sessions", delay_seconds=delay))
+
+    workdir = str(tmp_path)
+    lane = LaneRegistry.default().get(DEVELOPER_LANE)
+    spec = SessionSpec(
+        lane=lane,
+        run_id="delayed-teardown",
+        workdir=workdir,
+        env={},
+        context=LaneExecutionContext(run_id="delayed-teardown"),
+        command="hello",
+    )
+    cp = CAOControlPlaneConfig(
+        base_url=fake_cao.url,
+        session_timeout_seconds=60,
+        request_timeout_seconds=0.5,
+    )
+    controller = CaoSessionController(cp, LaneRegistry.default())
+
+    with pytest.raises(SessionIdentityUncertainError):
+        controller.start_session(spec)
+
+    # The fix: handler threads spawned by _FakeHTTPServer must be daemon
+    # so the process can exit even while they are still sleeping. We
+    # cannot snapshot the existing handler's daemon flag (it has already
+    # exited by the time stop() returns), so assert the class-level
+    # configuration directly.
+    from tests.integration._fake_cao_server import _FakeHTTPServer
+
+    assert _FakeHTTPServer.daemon_threads is True, (
+        "ThreadingHTTPServer defaults to daemon_threads=False; the fake "
+        "must override so teardown does not block on sleeping handlers"
+    )
+    assert _FakeHTTPServer.block_on_close is False, (
+        "ThreadingHTTPServer defaults to block_on_close=True; the fake "
+        "must override so server_close() returns immediately on stop()"
+    )
+
+    # And verify the live behaviour: stop() must honour its 2-second
+    # join budget even while a delayed handler is still sleeping.
+    t0 = time.monotonic()
+    fake_cao.stop()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.0, (
+        f"stop() took {elapsed:.2f}s with a {delay}s sleeping handler; "
+        "the handler is pinning teardown"
+    )
+
+
 def test_one_shot_fault_is_consumed_after_first_match(
     fake_cao: FakeCAOServer, tmp_path_factory: pytest.TempPathFactory
 ):

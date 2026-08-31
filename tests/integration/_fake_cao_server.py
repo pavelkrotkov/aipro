@@ -167,9 +167,25 @@ class _FakeHTTPServer(ThreadingHTTPServer):
     the :class:`FakeCAOServer` it serves. Avoids the per-request
     ``# type: ignore[attr-defined]`` on ``self.server.fake`` that the
     standard library makes otherwise unavoidable.
+
+    Round-2 finding, PR #70 #2: handler threads must be **daemon** and
+    ``server_close()`` must NOT block on outstanding request handlers.
+    ``ThreadingMixIn`` defaults to ``daemon_threads=False`` and
+    ``block_on_close=True``, so a fault-injected ``delay_seconds``
+    longer than the request timeout would otherwise pin teardown until
+    the artificial sleep finished. Setting both flags lets ``stop()``
+    honour its 2-second join budget even when delayed handlers are
+    still running.
     """
 
     fake: FakeCAOServer | None = None
+    # Round-2 finding, PR #70 #2: handler threads die with the process
+    # instead of pinning shutdown while an injected delay sleeps.
+    daemon_threads = True
+    # Don't wait for in-flight handler threads in server_close(); the
+    # 2-second join in FakeCAOServer.stop() is the actual teardown
+    # budget.
+    block_on_close = False
 
 
 class FakeCAOServer:
