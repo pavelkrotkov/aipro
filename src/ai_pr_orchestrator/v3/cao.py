@@ -580,7 +580,11 @@ class CaoSessionController:
             )
         terminal_id = terminals[0]["id"]
 
-        detail = self._request("GET", f"/terminals/{terminal_id}")
+        # Peek the terminal so adoption does not irreversibly advance the
+        # status cursor. A real CAO server does not consume a status read
+        # just because the client asked for metadata; the fake matches
+        # that contract via ?peek=true.
+        detail = self._request("GET", f"/terminals/{terminal_id}?peek=true")
         if detail.status_code == 404:
             raise CaoSessionNotReadyError(
                 f"CAO session {session_name!r} names terminal {terminal_id!r}, "

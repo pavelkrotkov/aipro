@@ -465,12 +465,17 @@ class _FakeHandler(BaseHTTPRequestHandler):
             )
 
     def _handle_get_terminal(self) -> None:
-        # Path: /terminals/{tid} (no /output or /input suffix)
+        # Path: /terminals/{tid} (no /output or /input suffix). Optional
+        # ?peek=true skips the status-index advance so a metadata-only
+        # lookup (e.g. adoption's _lookup_session) does not consume
+        # activity evidence the next observe() needs.
         parts = self._strip_query().split("/")
         if len(parts) != 3:
             self._write_text(404, f"unknown terminal path {self.path}")
             return
         terminal_id = parts[2]
+        params = self._query_params()
+        peek = params.get("peek", ["false"])[0].lower() == "true"
         with self._fake._lock:
             state = _find_by_terminal(self._fake._sessions, terminal_id)
             if state is None or state.deleted:
@@ -482,14 +487,15 @@ class _FakeHandler(BaseHTTPRequestHandler):
                 self._write_text(500, "internal error: empty status sequence")
                 return
             status = state.status_sequence[state.status_index]
-            # Advance the cursor so the next observe sees the next status.
-            # Once we have walked past the end, the sequence is exhausted and
-            # every subsequent observe reports the last status (a real CAO
-            # terminal that has settled on "idle" keeps reporting "idle").
-            if state.status_index < len(state.status_sequence) - 1:
-                state.status_index += 1
-            else:
-                state.exhausted = True
+            if not peek:
+                # Advance the cursor so the next observe sees the next status.
+                # Once we have walked past the end, the sequence is exhausted and
+                # every subsequent observe reports the last status (a real CAO
+                # terminal that has settled on "idle" keeps reporting "idle").
+                if state.status_index < len(state.status_sequence) - 1:
+                    state.status_index += 1
+                else:
+                    state.exhausted = True
             self._write_json(
                 200,
                 {
