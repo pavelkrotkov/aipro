@@ -79,6 +79,8 @@ class ScriptedExecutor:
     developer_exit: int = 0
     reviewer_exit: int = 0
     developer_files: list[str] = field(default_factory=lambda: ["src/x.py"])
+    reviewer_files: list[str] = field(default_factory=list)
+    developer_sleep: float = 0.0
     calls: list[tuple[str, str]] = field(default_factory=list)
     round_counter: dict[str, int] = field(default_factory=dict)
     prompts: list[str] = field(default_factory=list)
@@ -104,9 +106,13 @@ class ScriptedExecutor:
                 session=HANDLE,
                 exit_code=self.reviewer_exit,
                 output_summary="",
-                changed_files=[],
+                changed_files=list(self.reviewer_files),
                 findings=list(findings),
             )
+        if self.developer_sleep:
+            import time
+
+            time.sleep(self.developer_sleep)
         return LaneResult(
             session=HANDLE,
             exit_code=self.developer_exit,
@@ -161,7 +167,7 @@ def _finding(idx: int, severity: Any = "major") -> ReviewerFinding:
         id=f"f-{idx}",
         lane="requirements-reviewer",
         body=f"finding {idx}",
-        severity=cast(Any, severity),
+        severity=severity,
         run_id="run-1",
         round_id="review-1",
     )
@@ -232,7 +238,14 @@ def test_clean_lifecycle_claim_to_done():
 def test_finding_triggers_fix_round_then_done():
     fake = _ready_fake()
     executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(1)]})
-    config = V3Config(safety=SafetyPolicyConfig(max_coder_invocations_per_run=3))
+    config = V3Config(
+        safety=SafetyPolicyConfig(
+            max_coder_invocations_per_run=3,
+            # Two review rounds x 3 reviewer lanes: the fix round must still
+            # be reviewable (an exhausted trigger budget escalates).
+            max_reviewer_triggers_per_run=6,
+        )
+    )
     loop, queue = _foreman(fake, executor, _gate(), config)
     outcome = loop.run_pass()[0]
 
@@ -378,7 +391,11 @@ def test_stagnation_threshold_escalates():
     # Round 1: findings exist (so we enter a fix round); rounds 2+ empty.
     executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(9)], 2: [], 3: []})
     config = Cfg(
-        safety=SafetyPolicyConfig(max_coder_invocations_per_run=20, max_total_iterations=9),
+        safety=SafetyPolicyConfig(
+            max_coder_invocations_per_run=20,
+            max_total_iterations=9,
+            max_reviewer_triggers_per_run=10,
+        ),
         escalation=EscalationPolicyConfig(stagnation_rounds_threshold=2),
     )
     gate = _gate(GateDecision(passed=False, pending_checks=(), failed_checks=("build",)))
@@ -452,7 +469,12 @@ def test_ci_failure_loops_back_to_coding_then_done():
             GateDecision(passed=True, pending_checks=(), failed_checks=()),
         ]
     )
-    cfg = V3Config(safety=SafetyPolicyConfig(max_coder_invocations_per_run=3))
+    cfg = V3Config(
+        safety=SafetyPolicyConfig(
+            max_coder_invocations_per_run=3,
+            max_reviewer_triggers_per_run=6,  # two rounds x 3 reviewer lanes
+        )
+    )
     loop, _ = _foreman(fake, executor, gate, cfg)
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "done"
@@ -700,3 +722,251 @@ def test_gate_is_committed_and_pushed_before_pr_open():
     loop.run_pass()[0]
     assert git.commits  # lane output was committed
     assert "aipro-issue-1" in git.pushed  # and pushed to the remote branch
+
+
+# --- Round-2 remediation -------------------------------------------------------
+
+
+def test_lease_is_heartbeated_while_lane_runs():
+    """A lane that outlasts the lease interval gets its lease renewed during
+    execution — reclaim_expired cannot hand the issue away mid-edit (#1)."""
+
+    from ai_pr_orchestrator.v3.config import GitHubQueueConfig
+
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    executor.developer_sleep = 0.5
+    cfg = V3Config(github_queue=GitHubQueueConfig(lease_seconds=1))  # interval ≈ 0.33s
+    loop, queue = _foreman(fake, executor, _gate(), cfg)
+    heartbeats: list[WorkflowState] = []
+    original = queue.heartbeat
+
+    def counting_heartbeat(state, *, now=None):
+        refreshed = original(state, now=now)
+        heartbeats.append(refreshed)
+        return refreshed
+
+    queue.heartbeat = counting_heartbeat  # type: ignore[method-assign]
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "done"
+    # One pre-lane heartbeat plus at least one DURING the 0.5s lane (interval
+    # is a third of the 1s lease).
+    assert len(heartbeats) >= 2
+
+
+def test_pending_ci_requeue_goes_straight_to_gate():
+    """A requeued pending-CI item with a retained PR must not relaunch
+    coding/review — it re-evaluates the same head at the CI gate (#2)."""
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    gate = _gate(GateDecision(passed=False, pending_checks=("build",), failed_checks=()))
+    loop, _queue = _foreman(fake, executor, gate)
+    first = loop.run_pass()[0]
+    assert first.final_phase == "ci_gating"
+    assert len([c for c in executor.calls if c[0] == "developer"]) == 1
+
+    second = loop.run_pass()[0]
+    assert second.final_phase == "ci_gating"
+    # No new coding or review lanes on the re-claim pass.
+    assert len([c for c in executor.calls if c[0] == "developer"]) == 1
+    assert len(gate.evaluated) == 2
+
+
+def test_reviewer_budget_exhausted_escalates_not_unreviewed():
+    """With the trigger budget spent, a round that needs reviewers escalates
+    instead of reporting a fake 'no findings' (#3)."""
+    fake = _ready_fake()
+    executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(4)]})
+    cfg = V3Config(
+        safety=SafetyPolicyConfig(max_coder_invocations_per_run=3)  # triggers stay at 3
+    )
+    loop, _ = _foreman(fake, executor, _gate(), cfg)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "reviewer trigger budget" in outcome.reason
+
+
+def test_every_state_write_stamps_a_fresh_updated_at():
+    """_persist_round must advance updated_at so the CAS version moves — a
+    stale concurrent writer may not pass the precondition (#4)."""
+
+    class RecorderQueue:
+        def __init__(self, st):
+            self.state = st
+            self.saved: list[tuple[WorkflowState, object]] = []
+
+        def load_state(self, wid):
+            return self.state
+
+        def save_state(self, state, expected_updated_at):
+            self.saved.append((state, expected_updated_at))
+
+    st = WorkflowState(work_item_id=ISSUE.slug(), run_id="run-1", phase="reviewing")
+    recorder = RecorderQueue(st)
+    queue = cast("ForemanQueue", recorder)
+    loop = ForemanPolicyLoop(
+        queue,
+        FakeBroker(),
+        LaneRegistry.default(),
+        ScriptedExecutor(),
+        _gate(),
+        RecordingGit(),
+        V3Config(),
+        run_id="run-1",
+        worktree_root="/wt",
+        committer_name="N",
+        committer_email="e@x",
+    )
+    loop._persist_round(ISSUE, st, "review-1", FindingRegistry(), [])
+    assert recorder.saved
+    saved, expected = recorder.saved[0]
+    assert expected == st.updated_at  # CAS against the loaded version
+    assert saved.updated_at > st.updated_at  # version advanced
+
+
+def test_pending_ci_beyond_timeout_escalates():
+    """The pending-CI wait start is persisted and, once
+    ci_wait_timeout_seconds is exceeded, the item escalates instead of
+    requeueing forever (#5)."""
+    from datetime import UTC as UTC_
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    gate = _gate(GateDecision(passed=False, pending_checks=("build",), failed_checks=()))
+    loop, queue = _foreman(fake, executor, gate)
+    first = loop.run_pass()[0]
+    assert first.final_phase == "ci_gating"
+    state = queue.load_state("owner/repo#1")
+    assert state is not None and state.extras.get("ci_wait_started_at")  # wait persisted
+
+    # Backdate the wait start beyond the configured 1800s timeout.
+    stale = replace(
+        state,
+        extras={
+            **state.extras,
+            "ci_wait_started_at": (_dt.now(UTC_) - _td(seconds=3600)).isoformat(),
+        },
+    )
+    queue.save_state(stale, expected_updated_at=state.updated_at)
+
+    second = loop.run_pass()[0]
+    assert second.final_phase == "escalated"
+    assert "ci_wait_timeout_seconds" in second.reason
+
+
+def test_coder_cap_is_checked_before_launching():
+    """With open findings and the cap already reached, no further coder
+    invocation is launched — the item escalates first (#6)."""
+    fake = _ready_fake()
+    executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(5)]})
+    cfg = V3Config(
+        safety=SafetyPolicyConfig(
+            max_coder_invocations_per_run=1,
+            max_reviewer_triggers_per_run=6,
+        )
+    )
+    loop, _ = _foreman(fake, executor, _gate(), cfg)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "budget exhausted with open findings" in outcome.reason
+    assert len([c for c in executor.calls if c[0] == "developer"]) == 1  # never relaunched
+
+
+def test_commit_cap_exceeded_escalates_but_noop_passes():
+    """max_commits_per_run is consulted BEFORE committing: a round that would
+    push past the cap escalates; a visit with nothing to commit does not (#7)."""
+
+    class CountingGit(RecordingGit):
+        def __init__(self):
+            super().__init__()
+            self.count = 0
+
+        def commit_count(self, workdir, base_ref):
+            return self.count
+
+    # Cap reached and changes pending -> escalate before committing.
+    fake = _ready_fake()
+    git = CountingGit()
+    git.count = 1  # default cap is 1
+    loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "commit budget exhausted" in outcome.reason
+
+    # Cap reached but nothing to commit -> the no-op commit path still gates.
+    fake = _ready_fake()
+    git = CountingGit()
+    git.count = 1
+    loop, _ = _foreman(fake, ScriptedExecutor(developer_files=[]), _gate(), git=git)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "done"
+
+
+def test_crash_path_cleans_up_worktree():
+    """An unexpected crash is terminal: the worktree is released even though
+    the outcome is None in the crashing frame (#8)."""
+
+    class CrashingExecutor(ScriptedExecutor):
+        def execute(self, lane, task_prompt, workdir, context, lease=None):
+            raise RuntimeError("lane exploded")
+
+    fake = _ready_fake()
+    git = RecordingGit()
+    loop, _ = _foreman(fake, CrashingExecutor(), _gate(), git=git)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "/wt/issue-1" in git.cleanups  # leaked no worktree on the crash path
+
+
+def test_reviewer_workflow_file_change_is_a_policy_violation():
+    """A reviewer lane editing .github/workflows/ hits the same policy check
+    as the coder — it escalates instead of being staged and pushed (#9)."""
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    executor.reviewer_files = [".github/workflows/evil.yml"]
+    loop, _ = _foreman(fake, executor, _gate())
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "policy violation" in outcome.reason
+
+
+def test_coder_reply_is_actually_posted_to_the_review_thread():
+    """require_coder_reply_before_resolve posts the reply to the GitHub
+    thread — the disposition and the thread agree (#10)."""
+    fake = _ready_fake()
+    fake.seed_thread("T-1", pr_number=1)
+    finding = _finding(6)
+    finding = replace(finding, thread_id="T-1")
+    executor = ScriptedExecutor(reviewer_findings_by_round={1: [finding]})
+    cfg = V3Config(
+        safety=SafetyPolicyConfig(
+            max_coder_invocations_per_run=2,
+            max_reviewer_triggers_per_run=6,
+        )
+    )
+    loop, _ = _foreman(fake, executor, _gate(), cfg)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "done"
+    thread = fake._threads["T-1"]
+    assert len(thread.comments) == 1
+    assert thread.comments[0].body  # the canned coder reply reached the thread
+
+
+def test_failed_thread_reply_is_an_escalation():
+    """A review-thread reply that cannot be posted aborts the round as an
+    escalation — never a disposition claiming a reply that was not sent (#10)."""
+    fake = _ready_fake()
+    fake.seed_thread("T-2", pr_number=1)
+    finding = replace(_finding(7), thread_id="T-2")
+    executor = ScriptedExecutor(reviewer_findings_by_round={1: [finding]})
+
+    def _impl(thread_id: str, body: str) -> dict[str, Any] | None:
+        raise RuntimeError("github down")
+
+    setattr(fake, "reply_to_review_thread", _impl)  # noqa: B010
+    loop, _ = _foreman(fake, executor, _gate())
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "reply" in outcome.reason

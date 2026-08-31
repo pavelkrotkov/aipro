@@ -65,9 +65,15 @@ class GitWorktreeOps:
         self._run("branch", branch, from_ref)
 
     def create_worktree(self, path: str, branch: str) -> str:
-        workdir = str(Path(path))
-        self._run("worktree", "add", workdir, branch)
-        return workdir
+        workdir = Path(path)
+        if not workdir.is_absolute():
+            # git resolves a relative <path> against the invocation cwd (the
+            # repo root), but the caller uses the returned path from its own
+            # process cwd: hand back an absolute path rooted at the repo
+            # (round-2 #11).
+            workdir = self._root / workdir
+        self._run("worktree", "add", str(workdir), branch)
+        return str(workdir)
 
     def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
         cwd = self._workdir(workdir)
