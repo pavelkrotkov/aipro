@@ -16,7 +16,9 @@ principle 1) carved out as the only legitimate faking surface.
 from __future__ import annotations
 
 import time
+import uuid
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -125,6 +127,9 @@ def foreman_harness(
         *,
         committer_name: str = DEFAULT_COMMITTER_NAME,
         committer_email: str = DEFAULT_COMMITTER_EMAIL,
+        gate: GateDecision | None = None,
+        broker: Any | None = None,
+        git_ops: Any | None = None,
     ) -> tuple[ForemanPolicyLoop, GitHubIssueQueue, FakeGitHubClient]:
         fake = FakeGitHubClient()
         if seed_issue_numbers is None:
@@ -132,16 +137,29 @@ def foreman_harness(
         for n in seed_issue_numbers:
             fake.seed_issue(n, labels=[E2E_WORK_TAG])
 
+        if gate is None:
+            gate = GateDecision(passed=True, pending_checks=(), failed_checks=())
+        if broker is None:
+            broker = FakeBroker()
+        if git_ops is None:
+            git_ops = FakeGitOperations()
+
         queue = GitHubIssueQueue(fake, "owner", "repo", V3Config().github_queue, host_id="host-e2e")
+        # Collision-proof run id: the millisecond-only counter collides
+        # when two harnesses are constructed in the same tick (which
+        # happens in tests that build several loops in one fixture).
+        # A short uuid suffix is unique across processes and adds no
+        # visible overhead.
+        run_id = f"e2e-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         loop = ForemanPolicyLoop(
             queue,
-            FakeBroker(),
+            broker,
             lane_registry,
             cao_lane_executor,
-            StaticGate(GateDecision(passed=True, pending_checks=(), failed_checks=())),
-            FakeGitOperations(),
+            StaticGate(gate),
+            git_ops,
             V3Config(),
-            run_id=f"e2e-{int(time.time() * 1000)}",
+            run_id=run_id,
             worktree_root="/wt",
             committer_name=committer_name,
             committer_email=committer_email,
