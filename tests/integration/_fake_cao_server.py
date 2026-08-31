@@ -91,7 +91,19 @@ class FaultSpec:
     status cursor, etc.) and only then closes the connection without writing
     a response. This exercises the committed-but-unacknowledged branch where
     the controller treats the request as uncertain and a retry would
-    duplicate work."""
+    duplicate work.
+
+    **Consumption semantics** (round-2 finding, PR #70 #1): a fault is
+    **one-shot by default**: after a request matches this ``FaultSpec``, the
+    spec is removed from the server's fault list so a subsequent matching
+    request no longer sees it and later faults registered for the same
+    route become reachable. A soak scenario that wants to model N
+    transient failures followed by recovery should register N ``FaultSpec``
+    entries; a scenario that wants a permanent override sets
+    ``repeat=True``. The number of matches left to fire is exposed by the
+    remaining ``occurrences`` counter (decremented on each match and
+    reaching 0 when the spec is removed).
+    """
 
     method: str
     path_prefix: str
@@ -99,6 +111,12 @@ class FaultSpec:
     transport_reset: bool = False
     delay_seconds: float = 0.0
     commit_then_reset: bool = False
+    repeat: bool = False
+    #: How many matching requests this fault should fire before retiring.
+    #: Defaults to 1 (one-shot). Ignored when ``repeat=True``. Tests that
+    #: want N transient failures followed by recovery register an
+    #: ``occurrences=N`` ``FaultSpec`` (or stack N default ones).
+    occurrences: int = 1
 
     def matches(self, method: str, path: str) -> bool:
         if self.method != method:
@@ -227,22 +245,47 @@ class FakeCAOServer:
         with self._lock:
             self._faults.append(fault)
 
+    def clear_faults(self) -> None:
+        """Remove every registered fault. Useful for tests that want
+        explicit per-section fault state instead of stacking every
+        scenario's faults into one shared list."""
+        with self._lock:
+            self._faults.clear()
+
     def _status_sequence_for(self, session_name: str) -> Sequence[str]:
         return self._status_overrides.get(session_name, DEFAULT_STATUS_SEQUENCE)
 
     def _match_fault(self, method: str, path: str) -> _PendingFault | None:
+        """Return the first matching fault and either retire it (default)
+        or leave it in place (``repeat=True``).
+
+        Round-2 finding, PR #70 #1: one-shot-by-default consumption. Without
+        it every retry of the same route re-fires the same fault, and later
+        faults registered for the same route are shadowed by the always-on
+        first match.
+        """
         with self._lock:
             faults = list(self._faults)
+        matched: FaultSpec | None = None
         for fault in faults:
-            if not fault.matches(method, path):
-                continue
-            return _PendingFault(
-                status_code=fault.status_code,
-                transport_reset=fault.transport_reset,
-                delay_seconds=fault.delay_seconds,
-                commit_then_reset=fault.commit_then_reset,
-            )
-        return None
+            if fault.matches(method, path):
+                matched = fault
+                break
+        if matched is None:
+            return None
+        if not matched.repeat:
+            # Decrement-and-remove: a one-shot fault with N remaining
+            # occurrences is dropped the moment occurrences hits 0.
+            matched.occurrences -= 1
+            if matched.occurrences <= 0:
+                with self._lock:
+                    self._faults = [f for f in self._faults if f is not matched]
+        return _PendingFault(
+            status_code=matched.status_code,
+            transport_reset=matched.transport_reset,
+            delay_seconds=matched.delay_seconds,
+            commit_then_reset=matched.commit_then_reset,
+        )
 
     def start(self) -> None:
         if self._thread is not None:
