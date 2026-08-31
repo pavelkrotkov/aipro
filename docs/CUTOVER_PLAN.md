@@ -1,7 +1,10 @@
-# aipro V3 Cutover Plan (issue #55) — rev 5
+# aipro V3 Cutover Plan (issue #55) — rev 6
 
-Status: **proposed (rev 5, addressing review round 4)**. Review before any V1
-code is removed. This is the human-authorization gate for retiring V1.
+Status: **adopted (rev 6)**. The plan is the gate; the foreman drives each phase
+behind its own CI/objective gate and reports at phase boundaries. V1 is deleted
+in P6 only when P2–P5 are green on main and the documented rollback path
+(revert P6 then P5 after drain) remains valid. Operator can stop the run at
+any phase boundary; the sign-off line is removed in rev 6.
 
 ## 0. Goal
 
@@ -35,11 +38,11 @@ rollback is always possible but never instantaneous.
 
 | Phase | Deliverable | Adds / removes | Gate to advance |
 | --- | --- | --- | --- |
-| **P1** Plan (rev 5) | this doc | docs only | review sign-off |
+| **P1** Plan (rev 6) | this doc | docs only | merged (P1) |
 | **P2** Production glue | Foreman policy loop (`v3.foreman` over `GitHubWorkflowStateStore`+broker+lanes+lane-registry), `CaoLaneExecutor` (real `CaoSessionController` + Hermes lane), `CIPRGate`+GitHub CI adapter, GitHub `issue-content`/`pr-create` protocol ops, `git` worktree/branch/commit/push interface+impl, catalog-resolver+`PolicyBroker` wiring, **`GitHubIssueQueue.abandon()` (requeue+clear-claim drain op)**, **`v3.cleanup` production TTL sweeper** (owns CAO-session + worktree TTLs, invoked by the foreman) | adds only | `uv run pytest` + new unit tests green |
 | **P3** E2E harness foundation | `tests/e2e/` deterministic harness; **real adapters** ref`d against a `FakeCAOServer` (real CAO HTTP contract) + `FakeGitHub` boundary + scripted telemetry/clock; scenarios 1–4 (clean issue→draft PR→3 reviews→CI→PR-ready — **draft PR created before the CI gate since `CIPRGate.evaluate()` requires a PR ref**; blocking-fix; rebuttal/independent-acceptance; disagreement→adjudication) | adds only | scenarios 1–4 pass repeatedly |
 | **P4** Soak + failure + safety | `tests/e2e/soak.py` runner **exercising the `v3.cleanup` production sweeper (not its own copy)**; scenarios 5–12; **safety-parity scenarios** (fork reject, workflow-file restriction, iteration/commit/invocation budgets, `max_prompt_tokens`, `allowed_pr_author_associations`, credential-stripping) | adds only | full soak pass, no dup side effects, safety enforced |
-| **P5** Default + trigger + docs | V3 thin queue trigger workflow (adds before delete); make Hermes+CAO default; README runbook; **`docs/V1_MIGRATION.md`**; **`examples/v3-config.yml`** (new path, distinct from the V1 sample it supersedes) + update README references | adds, then docs react | P2–P4 green + your sign-off |
+| **P5** Default + trigger + docs | V3 thin queue trigger workflow (adds before delete); make Hermes+CAO default; README runbook; **`docs/V1_MIGRATION.md`**; **`examples/v3-config.yml`** (new path, distinct from the V1 sample it supersedes) + update README references | adds, then docs react | P2–P4 green on CI |
 | **P6** V1 retirement | DELETE `coders/`, `reviewers/`, `runner.py` monolithic loop, V1 `workflow.yml`, and now-unused V1 `models`/`state_*`/`config.py` + **the now-superseded `examples/sample-config.yml` (V1 path only)**; adapt `agents/`, `decision_application.py` consumers; rewire `aipro` CLI to V3; migration notes finalize. **The `examples/v3-config.yml` sample survives.** | removes V1 path | P5 shipped; CI green with notes |
 | **P7** Epic close | close V1 epic #16 pointing to #56; reopen-and-mode notes vs issues **not** handled by a git revert | docs | P6 shipped |
 
