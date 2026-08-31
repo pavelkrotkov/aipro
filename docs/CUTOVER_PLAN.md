@@ -8,8 +8,9 @@ code is removed. This is the human-authorization gate for retiring V1.
 Prove V3 end-to-end against the **real** adapters, then remove superseded V1
 execution plumbing so the repo has one supported autonomous path: **Hermes
 supervisor + CAO session fabric + GitHub-as-authoritative-state + aipro V3
-policy**. V1 stays runnable and CI-tested throughout; fallback is always one
-revertible commit away, and in-flight V3 work is drained before any revert.
+policy**. V1 stays runnable and CI-tested throughout; fallback requires **two
+ordered reverts (P6 then P5)** after draining in-flight V3 work, so a
+rollback is always possible but never instantaneous.
 
 ## 1. Principles (changed in rev 2)
 
@@ -79,9 +80,13 @@ the replacement trigger/sample/docs/migration notes must already be shipped
 - **Safety-parity scenarios (P4)** mirror the V1-permitted operations:
   `disallow_forks`, `disallow_workflow_file_changes`, per-run budgets
   (`max_*`), **`max_prompt_tokens`**, **`allowed_pr_author_associations`**,
-  **opt-in label removal stops active work** (V1's `only_run_on_labeled_prs`
-  parity: `claim()` revalidates the enabled label and the foreman abandons
-  active items when it disappears mid-run), and credential stripping — each is
+  **opt-out label removal stops active work** (V1's `only_run_on_labeled_prs`
+  parity: a separate stable opt-in label — distinct from the per-phase
+  `enabled_label`, which `_apply_phase_labels` always removes once `claim()`
+  moves the issue into the active lifecycle label — is required for the
+  foreman to claim an item, and removal of that opt-in label mid-run
+  causes the foreman to abandon active items via `GitHubIssueQueue.abandon()`),
+  and credential stripping — each is
   exercised as a pass/fail E2E case through the real policy path, not just
   asserted in config. V1's enforcement is not removed (P6) until each passes.
 
