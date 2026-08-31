@@ -317,3 +317,43 @@ def test_submit_work_rearms_lifecycle_for_followup_observe(
     # The very next observe should see a non-idle status, never idle.
     next_obs = controller.observe(handle)
     assert next_obs.cao_status == STATUS_STARTED
+
+
+def test_adopt_session_does_not_consume_activity_evidence(
+    fake_cao: FakeCAOServer, tmp_path
+):
+    """Regression for finding #6 in PR #70: adoption's
+    ``_lookup_session`` would consume the next status, so a fresh
+    observe() right after ``adopt_session`` would miss activity
+    evidence on a script currently parked at ``processing``. With the
+    fix, the lookup peeks via ``?peek=true`` so the next observe() sees
+    the same cursor."""
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    name = session_name_for(run_id, DEVELOPER_LANE)
+    # Script: processing -> idle x 4. The cursor starts at 0 (processing).
+    fake_cao.set_status_sequence(
+        name, [STATUS_PROCESSING, STATUS_IDLE, STATUS_IDLE, STATUS_IDLE, STATUS_IDLE]
+    )
+
+    first = CaoSessionController(
+        _control_plane(fake_cao.url), LaneRegistry.default()
+    )
+    handle = first.start_session(_spec(run_id, str(tmp_path)))
+    # Consume exactly one status so the cursor moves from 0 -> 1.
+    first.observe(handle)
+
+    index_before = fake_cao._sessions[name].status_index
+    assert fake_cao._sessions[name].status_sequence[index_before] == STATUS_IDLE
+
+    # Fresh controller: adopt, then immediately observe. The peek must
+    # NOT advance; the observe() then advances as normal.
+    fresh = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
+    fresh.adopt_session(name)
+
+    # After adopt_session + one observe(), the cursor should have moved
+    # exactly one step (the observe), not two (peek + observe).
+    index_after = fake_cao._sessions[name].status_index
+    assert index_after - index_before == 1, (
+        "peek during adopt_session must not advance the status cursor"
+    )
