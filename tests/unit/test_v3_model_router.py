@@ -132,3 +132,34 @@ def test_empty_catalog_rejects_with_named_reason():
     assert decision.assignment is None
     assert decision.rejected == ()
     assert decision.reason
+
+
+def test_snapshots_share_one_timestamp_when_at_is_omitted():
+    """With ``at=None`` every resource is sampled at ONE materialized
+    timestamp, not each at its own 'now' (#12)."""
+    from datetime import UTC
+
+    class RecordingTelemetry(_StaticTelemetry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ats: list[datetime | None] = []
+
+        def snapshot(self, resource: str, *, at: datetime | None = None):
+            self.ats.append(at)
+            return super().snapshot(resource, at=at)
+
+    config = V3Config(
+        model_router=ModelRouterConfig(catalog=[entry("alpha")]),
+        telemetry=TelemetryConfig(
+            resources=[
+                TelemetryResourceConfig(name="acct-main", provider="prov-main"),
+                TelemetryResourceConfig(name="acct-secondary", provider="prov-secondary"),
+            ]
+        ),
+    )
+    telemetry = RecordingTelemetry()
+    build_model_broker(config, telemetry_source=telemetry)  # at omitted
+    assert len(telemetry.ats) == 2
+    assert telemetry.ats[0] is not None and telemetry.ats[1] is not None
+    assert telemetry.ats[0] == telemetry.ats[1]
+    assert telemetry.ats[0].tzinfo == UTC

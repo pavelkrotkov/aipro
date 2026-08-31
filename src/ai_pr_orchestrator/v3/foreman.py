@@ -33,9 +33,11 @@ fakes. No vendor, model, or provider name appears in this module.
 
 from __future__ import annotations
 
+import contextlib
+import threading
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from .broker import TaskDemand
@@ -151,6 +153,16 @@ class _RoundReport:
     triggers: int
 
 
+def _parse_timestamp(value: object) -> datetime:
+    """Parse a persisted timestamp (ISO string or datetime) to an aware datetime."""
+    if isinstance(value, datetime):
+        return value
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
+
+
 class ForemanPolicyLoop:
     """Drives claimed work items through the V3 lifecycle.
 
@@ -260,11 +272,18 @@ class ForemanPolicyLoop:
         existing = self._load_optional(issue)
         if existing is not None:
             branch = existing.extras.get("branch") or branch
+        # A requeued item that already has a PR (pending-CI path) must go
+        # straight back to the CI gate on re-claim — relaunching coding/review
+        # would redo settled work against the same head (round-2 #2).
+        pr_number = existing.extras.get("pr_number") if existing else None
+        resume_at_gate = existing is not None and (
+            existing.phase in ("queued", "ci_gating") and pr_number is not None
+        )
         state = self._claim(
             issue,
             branch=branch,
             worktree=existing.extras.get("worktree") if existing else None,
-            pr_number=existing.extras.get("pr_number") if existing else None,
+            pr_number=pr_number,
             now=now,
         )
 
@@ -278,13 +297,19 @@ class ForemanPolicyLoop:
                     f"{self._worktree_root}/issue-{issue.number}", branch
                 )
                 state = self._persist_resources(issue, state, branch=branch, worktree=worktree)
-            outcome = self._run_loop(issue, state, worktree, branch, now=now)
+            outcome = self._run_loop(
+                issue, state, worktree, branch, now=now, resume_at_gate=resume_at_gate
+            )
         except _ForemanEscalation as exc:
             outcome = self._escalate(issue, state, exc.reason, now=now)
         finally:
             # Terminal outcomes release the worktree; the pending-CI/requeue
             # path deliberately retains it so a later pass reuses the checkout.
-            if worktree and outcome is not None and outcome.final_phase in TERMINAL_PHASES:
+            # An unexpected crash (outcome still None in this frame) is terminal
+            # too — run_pass persists the escalation — so the checkout is
+            # cleaned up exactly on the paths that end the item (round-2 #8).
+            terminal = outcome is None or outcome.final_phase in TERMINAL_PHASES
+            if worktree and terminal:
                 with suppress(Exception):
                     self._git.cleanup_worktree(worktree)
         assert outcome is not None
@@ -298,6 +323,7 @@ class ForemanPolicyLoop:
         branch: str,
         *,
         now: datetime | None,
+        resume_at_gate: bool = False,
     ) -> WorkItemOutcome:
         safety = self._cfg.safety
         coder_invocations = 0
@@ -307,84 +333,106 @@ class ForemanPolicyLoop:
         reviewer_triggers = 0
         self._prompt_tokens = 0
         fix_findings: tuple[ReviewerFinding, ...] = ()
+        result: LaneResult | None = None
 
         while True:
-            # --- Coding ------------------------------------------------------
-            state = self._transition(issue, state, "coding", now=now)
-            state = self._heartbeat(issue, state, now=now)
-            result = self._run_lane(
-                self._worker_lane(),
-                worktree,
-                state,
-                self._coder_prompt(issue, fix_findings),
-            )
-            coder_invocations += 1
-            if result.exit_code != 0:
-                coder_failures += 1
-                # A failed attempt consumes invocation budget too; it must not
-                # bypass the cap by leaning only on the consecutive-failure
-                # threshold (which counts differently).
-                if coder_invocations >= safety.max_coder_invocations_per_run:
+            if resume_at_gate:
+                # Requeued pending-CI item with a retained PR: skip coding and
+                # review entirely and re-evaluate the retained PR head.
+                resume_at_gate = False
+            else:
+                # --- Coding ---------------------------------------------------
+                # The cap is checked BEFORE launching: once it is reached with
+                # open findings, no further coder invocation may start
+                # (round-2 #6).
+                if fix_findings and coder_invocations >= safety.max_coder_invocations_per_run:
                     return self._escalate(
                         issue,
                         state,
-                        "coder budget exhausted on failing attempts",
+                        "coder invocation budget exhausted with open findings",
                         now=now,
                     )
-                if coder_failures >= self._cfg.escalation.max_consecutive_coder_failures:
-                    return self._escalate(
-                        issue,
-                        state,
-                        f"coder failed {coder_failures}x consecutively",
-                        now=now,
-                    )
-                # Below both thresholds the failure is retried: transient lane
-                # crashes must not kill the item, and every retry stays within
-                # the invocation budget.
-                continue
-            coder_failures = 0
-            violation = self._policy_violation(result)
-            if violation:
-                return self._fail(issue, state, violation, now=now)
-            if coder_invocations >= safety.max_coder_invocations_per_run and fix_findings:
-                return self._escalate(
+                state = self._transition(issue, state, "coding", now=now)
+                state = self._heartbeat(issue, state, now=now)
+                result = self._run_lane(
+                    self._worker_lane(),
+                    worktree,
+                    state,
+                    self._coder_prompt(issue, fix_findings),
+                )
+                coder_invocations += 1
+                if result.exit_code != 0:
+                    coder_failures += 1
+                    # A failed attempt consumes invocation budget too; it must not
+                    # bypass the cap by leaning only on the consecutive-failure
+                    # threshold (which counts differently).
+                    if coder_invocations >= safety.max_coder_invocations_per_run:
+                        return self._escalate(
+                            issue,
+                            state,
+                            "coder budget exhausted on failing attempts",
+                            now=now,
+                        )
+                    if coder_failures >= self._cfg.escalation.max_consecutive_coder_failures:
+                        return self._escalate(
+                            issue,
+                            state,
+                            f"coder failed {coder_failures}x consecutively",
+                            now=now,
+                        )
+                    # Below both thresholds the failure is retried: transient lane
+                    # crashes must not kill the item, and every retry stays within
+                    # the invocation budget.
+                    continue
+                coder_failures = 0
+                # A background lease heartbeat may have advanced the CAS
+                # version while the lane ran: reload before further writes.
+                state = self._load(issue, state)
+                violation = self._policy_violation(result)
+                if violation:
+                    return self._fail(issue, state, violation, now=now)
+
+                # --- Review rounds --------------------------------------------
+                report = self._review(
                     issue,
                     state,
-                    "coder invocation budget exhausted with open findings",
+                    worktree,
+                    review_rounds,
+                    stagnant_rounds,
+                    reviewer_triggers,
                     now=now,
                 )
-
-            # --- Review rounds ----------------------------------------------
-            report = self._review(
-                issue,
-                state,
-                worktree,
-                review_rounds,
-                stagnant_rounds,
-                reviewer_triggers,
-                now=now,
-            )
-            reviewer_triggers = report.triggers
-            review_rounds = report.rounds
-            stagnant_rounds = report.stagnant_rounds
-            state = self._load(issue, state)
-            if report.remaining:
-                if review_rounds >= safety.max_total_iterations:
-                    return self._escalate(
-                        issue,
-                        state,
-                        f"unresolved findings after {review_rounds} review rounds",
-                        now=now,
-                    )
-                fix_findings = report.remaining
-                continue  # fixes dispositioned; run the coder again
+                reviewer_triggers = report.triggers
+                review_rounds = report.rounds
+                stagnant_rounds = report.stagnant_rounds
+                state = self._load(issue, state)
+                if report.remaining:
+                    if review_rounds >= safety.max_total_iterations:
+                        return self._escalate(
+                            issue,
+                            state,
+                            f"unresolved findings after {review_rounds} review rounds",
+                            now=now,
+                        )
+                    fix_findings = report.remaining
+                    continue  # fixes dispositioned; run the coder again
 
             # --- CI gate ------------------------------------------------------
             state = self._transition(issue, state, "ci_gating", now=now)
             state = self._heartbeat(issue, state, now=now)
-            sha = self._commit_and_push(issue, state, worktree, branch)
+            sha = self._commit_and_push(
+                issue,
+                state,
+                worktree,
+                branch,
+                changes_pending=bool(result.changed_files) if result is not None else False,
+            )
             self._head_sha = sha
             pr = self._ensure_pr(issue, state, branch, worktree)
+            # _ensure_pr may persist the recorded PR number (advancing the CAS
+            # version): reload so the subsequent transitions expect the
+            # authoritative state.
+            state = self._load(issue, state)
             decision = self._gate.evaluate(issue, pr)
             if decision.passed:
                 state = self._transition(issue, state, "updating_pr", now=now)
@@ -401,7 +449,30 @@ class ForemanPolicyLoop:
                 # Not a failure and not ours to busy-wait. Requeue onto the
                 # enabled label so a later pass re-selects it (list_ready only
                 # sees the enabled label) and re-evaluates the same head. The
-                # worktree/branch are retained for that reuse.
+                # worktree/branch are retained for that reuse. The wait start
+                # is persisted on the first pending requeue so a head that
+                # never settles cannot pend forever: once
+                # ci_wait_timeout_seconds is exceeded the item escalates
+                # (round-2 #5).
+                now_dt = now or datetime.now(UTC)
+                started = state.extras.get("ci_wait_started_at")
+                if started is not None:
+                    elapsed = (now_dt - _parse_timestamp(started)).total_seconds()
+                    if elapsed > self._cfg.ci_policy.ci_wait_timeout_seconds:
+                        return self._escalate(
+                            issue,
+                            state,
+                            "CI checks pending longer than "
+                            f"ci_wait_timeout_seconds "
+                            f"({self._cfg.ci_policy.ci_wait_timeout_seconds}s)",
+                            now=now,
+                        )
+                else:
+                    state = self._save_fresh(
+                        issue,
+                        state,
+                        extras={**state.extras, "ci_wait_started_at": now_dt.isoformat()},
+                    )
                 state = self._transition(issue, state, "queued", now=now)
                 return WorkItemOutcome(
                     issue=issue,
@@ -414,6 +485,11 @@ class ForemanPolicyLoop:
             # Real CI failures become findings for the next coding round —
             # unless the review budget is spent and reviews keep reporting
             # nothing new: that is stagnation, not fixable work.
+            if state.extras.get("ci_wait_started_at") is not None:
+                # The wait is over (the checks settled): drop the stale wait
+                # start so a later pending requeue measures a fresh window.
+                extras = {k: v for k, v in state.extras.items() if k != "ci_wait_started_at"}
+                state = self._save_fresh(issue, state, extras=extras)
             if stagnant_rounds >= self._cfg.escalation.stagnation_rounds_threshold:
                 return self._escalate(
                     issue,
@@ -474,6 +550,15 @@ class ForemanPolicyLoop:
         active_lanes = list(reviewer_lanes[:budget_left])
         rounds = review_rounds + 1
         round_id = f"review-{rounds}"
+        if not active_lanes:
+            # A round that needs reviewers with no trigger budget left must
+            # never masquerade as an unreviewed "no findings" round: escalate
+            # for a human instead (round-2 #3).
+            raise _ForemanEscalation(
+                f"reviewer trigger budget exhausted ({reviewer_triggers}/"
+                f"{self._cfg.safety.max_reviewer_triggers_per_run}); review round "
+                f"{round_id} cannot run unreviewed"
+            )
         state = self._transition(issue, state, "reviewing", round_id=round_id, now=now)
         state = self._heartbeat(issue, state, now=now)
 
@@ -490,6 +575,12 @@ class ForemanPolicyLoop:
                 raise _ForemanEscalation(
                     f"reviewer lane {lane_name!r} failed (exit {result.exit_code})"
                 )
+            violation = self._policy_violation(result)
+            if violation:
+                # Reviewer lanes are bound by the same workflow-file policy as
+                # the coder — a reviewer editing .github/workflows/ must never
+                # reach a push (round-2 #9).
+                raise _ForemanEscalation(violation)
             for finding in result.findings:
                 registry.register(finding)
         registry.deduplicate()
@@ -532,6 +623,11 @@ class ForemanPolicyLoop:
                 reply_body="coder will address this finding",
             )
             dispositions.append(disposition)
+            if finding.thread_id:
+                # The recorded reply must actually reach the GitHub review
+                # thread the finding came from — a disposition that claims a
+                # reply while the thread gets nothing is a lie (round-2 #10).
+                self._post_thread_reply(finding.thread_id, disposition.reply_body or "")
         # "What the coder must address next": everything dispositioned as
         # ``fix`` (including whole conflict groups), regardless of the
         # settled status — the disposition records the *decision*, the
@@ -568,18 +664,57 @@ class ForemanPolicyLoop:
         merged_findings = self._merge_round_findings(fresh.findings, registry.findings)
         merged_dispositions = self._merge_dispositions(fresh.dispositions, dispositions)
         merged_archived = self._merge_archived(fresh.archived, registry.archived)
-        updated = replace(
-            fresh,
-            round_id=round_id,
-            findings=merged_findings,
-            dispositions=merged_dispositions,
-            archived=merged_archived,
-        )
         try:
-            self._queue.save_state(updated, expected_updated_at=fresh.updated_at)
+            self._save_fresh(
+                issue,
+                fresh,
+                round_id=round_id,
+                findings=merged_findings,
+                dispositions=merged_dispositions,
+                archived=merged_archived,
+            )
         except Exception as exc:
             raise _ForemanEscalation(
                 f"persist review round {round_id} for {issue.slug()} failed: {exc}"
+            ) from exc
+
+    def _save_fresh(
+        self, issue: GitHubIssueRef, state: WorkflowState, **changes: object
+    ) -> WorkflowState:
+        """Load the authoritative state, apply ``changes`` with a FRESH
+        ``updated_at``, and save under the loaded version's CAS precondition.
+
+        Every state write must advance ``updated_at``: a ``replace`` that
+        keeps the loaded timestamp leaves the CAS version unchanged, so a
+        stale concurrent writer could still pass the precondition and
+        clobber this write (round-2 #4).
+        """
+        fresh = self._load(issue, state)
+        if "updated_at" not in changes:
+            changes = {**changes, "updated_at": datetime.now(UTC)}
+        updated = replace(fresh, **changes)  # type: ignore[arg-type]
+        self._queue.save_state(updated, expected_updated_at=fresh.updated_at)
+        return updated
+
+    def _post_thread_reply(self, thread_id: str, body: str) -> None:
+        """Post the recorded coder reply to the GitHub review thread.
+
+        Persistence-critical: a failure to post is a failure of the
+        disposition itself, so it propagates (as an escalation) rather than
+        leaving a disposition that claims a reply the thread never received.
+        """
+        client = getattr(self._queue, "_client", None)
+        reply = getattr(client, "reply_to_review_thread", None)
+        if reply is None:
+            raise _ForemanEscalation(
+                f"cannot reply to review thread {thread_id}: the queue client "
+                "does not support review-thread replies"
+            )
+        try:
+            reply(thread_id, body)
+        except Exception as exc:
+            raise _ForemanEscalation(
+                f"posting coder reply to review thread {thread_id} failed: {exc}"
             ) from exc
 
     @staticmethod
@@ -641,9 +776,48 @@ class ForemanPolicyLoop:
             )
         self._prompt_tokens += estimated
         try:
-            return self._executor.execute(lane, prompt, worktree, context, lease)
+            with self._lease_heartbeat(state):
+                return self._executor.execute(lane, prompt, worktree, context, lease)
         finally:
             self._release(lease)
+
+    @contextlib.contextmanager
+    def _lease_heartbeat(self, state: WorkflowState):
+        """Renew the claim lease while a blocking lane runs (round-2 #1).
+
+        A lane that outlasts ``lease_seconds`` would otherwise let
+        ``reclaim_expired`` hand the issue to another foreman mid-edit. A
+        daemon thread heartbeats at a third of the lease interval; the first
+        heartbeat failure aborts the keeper and the lane's outcome is
+        escalated rather than continued on a lost claim.
+        """
+        heartbeat = getattr(self._queue, "heartbeat", None)
+        interval = max(0.05, self._cfg.github_queue.lease_seconds / 3)
+        if heartbeat is None:
+            yield
+            return
+        stop = threading.Event()
+        failures: list[str] = []
+        current = state
+
+        def _keep() -> None:
+            nonlocal current
+            while not stop.wait(interval):
+                try:
+                    current = heartbeat(current)
+                except Exception as exc:
+                    failures.append(str(exc))
+                    return
+
+        worker = threading.Thread(target=_keep, daemon=True, name="foreman-lease-heartbeat")
+        worker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            worker.join(timeout=5.0)
+            if failures:
+                raise _ForemanEscalation(f"claim lease heartbeat failed: {failures[0]}")
 
     def _reserve(self, lane: LaneIdentity) -> ModelLease:
         ref = self._cfg.model_router.lane_assignments.get(lane.lane)
@@ -750,9 +924,7 @@ class ForemanPolicyLoop:
         extras = dict(fresh.extras)
         extras["branch"] = branch
         extras["worktree"] = worktree
-        updated = replace(fresh, extras=extras)
-        self._queue.save_state(updated, expected_updated_at=fresh.updated_at)
-        return updated
+        return self._save_fresh(issue, fresh, extras=extras)
 
     # --- Policy helpers -------------------------------------------------------------
 
@@ -798,7 +970,13 @@ class ForemanPolicyLoop:
         )
 
     def _commit_and_push(
-        self, issue: GitHubIssueRef, state: WorkflowState, worktree: str, branch: str
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        worktree: str,
+        branch: str,
+        *,
+        changes_pending: bool,
     ) -> str:
         """Commit lane output and push it to the remote branch.
 
@@ -806,7 +984,21 @@ class ForemanPolicyLoop:
         committed, pushed head — never an uncommitted/local branch. A lane
         that made no edits commits nothing (a no-op returning the current
         HEAD) and pushes the branch so it exists remotely.
+
+        ``max_commits_per_run`` is consulted BEFORE committing: when the
+        branch already carries the cap's worth of commits over the default
+        branch and this round still has changes to commit, the budget is
+        exceeded and the item escalates instead of silently growing past the
+        cap (round-2 #7). A visit with nothing to commit consumes no budget.
         """
+        cap = self._cfg.safety.max_commits_per_run
+        if changes_pending:
+            count = self._git.commit_count(worktree, self._git.default_branch())
+            if count >= cap:
+                raise _ForemanEscalation(
+                    f"commit budget exhausted: {count} commits on {branch} already "
+                    f">= max_commits_per_run ({cap})"
+                )
         sha = self._git.commit(
             worktree,
             f"[aipro] work for {issue.slug()} ({self._run_id})",
@@ -880,7 +1072,7 @@ class ForemanPolicyLoop:
         fresh = self._load(issue, state)
         extras = dict(fresh.extras)
         extras["pr_number"] = pr_number
-        self._queue.save_state(replace(fresh, extras=extras), expected_updated_at=fresh.updated_at)
+        self._save_fresh(issue, fresh, extras=extras)
 
     def _escalate(
         self,

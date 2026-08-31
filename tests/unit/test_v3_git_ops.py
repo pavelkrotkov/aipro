@@ -175,3 +175,20 @@ def test_timeout_surfaces_as_gitops_error(real_repo: Path):
     ops = GitWorktreeOps(real_repo, timeout=0.0001)
     with pytest.raises(GitOpsError, match="timed out"):
         ops.default_branch()
+
+
+def test_relative_worktree_path_returns_absolute_path(real_repo: Path):
+    """A relative worktree path is resolved against the repo root and handed
+    back ABSOLUTE, so callers can use the returned path from any cwd (#11)."""
+    import os
+
+    ops = GitWorktreeOps(real_repo)
+    base = ops.default_branch()
+    ops.create_branch("feat/rel", base)
+    returned = ops.create_worktree("rel-wt", "feat/rel")
+    try:
+        assert os.path.isabs(returned)
+        assert Path(returned) == real_repo / "rel-wt"
+        assert Path(returned).is_dir()  # usable from the caller's own cwd
+    finally:
+        ops.cleanup_worktree(returned)
