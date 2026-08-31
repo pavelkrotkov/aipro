@@ -1,6 +1,6 @@
-# aipro V3 Cutover Plan (issue #55) — rev 4
+# aipro V3 Cutover Plan (issue #55) — rev 5
 
-Status: **proposed (rev 4, addressing review round 3)**. Review before any V1
+Status: **proposed (rev 5, addressing review round 4)**. Review before any V1
 code is removed. This is the human-authorization gate for retiring V1.
 
 ## 0. Goal
@@ -35,7 +35,7 @@ rollback is always possible but never instantaneous.
 
 | Phase | Deliverable | Adds / removes | Gate to advance |
 | --- | --- | --- | --- |
-| **P1** Plan (rev 4) | this doc | docs only | review sign-off |
+| **P1** Plan (rev 5) | this doc | docs only | review sign-off |
 | **P2** Production glue | Foreman policy loop (`v3.foreman` over `GitHubWorkflowStateStore`+broker+lanes+lane-registry), `CaoLaneExecutor` (real `CaoSessionController` + Hermes lane), `CIPRGate`+GitHub CI adapter, GitHub `issue-content`/`pr-create` protocol ops, `git` worktree/branch/commit/push interface+impl, catalog-resolver+`PolicyBroker` wiring, **`GitHubIssueQueue.abandon()` (requeue+clear-claim drain op)**, **`v3.cleanup` production TTL sweeper** (owns CAO-session + worktree TTLs, invoked by the foreman) | adds only | `uv run pytest` + new unit tests green |
 | **P3** E2E harness foundation | `tests/e2e/` deterministic harness; **real adapters** ref`d against a `FakeCAOServer` (real CAO HTTP contract) + `FakeGitHub` boundary + scripted telemetry/clock; scenarios 1–4 (clean issue→draft PR→3 reviews→CI→PR-ready — **draft PR created before the CI gate since `CIPRGate.evaluate()` requires a PR ref**; blocking-fix; rebuttal/independent-acceptance; disagreement→adjudication) | adds only | scenarios 1–4 pass repeatedly |
 | **P4** Soak + failure + safety | `tests/e2e/soak.py` runner **exercising the `v3.cleanup` production sweeper (not its own copy)**; scenarios 5–12; **safety-parity scenarios** (fork reject, workflow-file restriction, iteration/commit/invocation budgets, `max_prompt_tokens`, `allowed_pr_author_associations`, credential-stripping) | adds only | full soak pass, no dup side effects, safety enforced |
@@ -48,7 +48,7 @@ the E2E/soak/safety suite must run the real adapters green on CI (P3–P4), and
 the replacement trigger/sample/docs/migration notes must already be shipped
 (P5). P6 then deletes only what is provably superseded.
 
-## 3. Intent of each gate (rev 4)
+## 3. Intent of each gate (rev 5)
 
 - **P2 IS the missing-glue gate.** Rev-2 lesson: P2/P3 must not be tests-only. The
   foreman loop, `CaoLaneExecutor`, `CIPRGate`, broker wiring, and the repo/PR
@@ -79,16 +79,18 @@ the replacement trigger/sample/docs/migration notes must already be shipped
   stops heartbeat renewal and calls `abandon` on each active item.
 - **Safety-parity scenarios (P4)** mirror the V1-permitted operations:
   `disallow_forks`, `disallow_workflow_file_changes`, per-run budgets
-  (`max_*`), **`max_prompt_tokens`**, **`allowed_pr_author_associations`**,
-  **opt-out label removal stops active work** (V1's `only_run_on_labeled_prs`
-  parity: a separate stable opt-in label — distinct from the per-phase
-  `enabled_label`, which `_apply_phase_labels` always removes once `claim()`
-  moves the issue into the active lifecycle label — is required for the
-  foreman to claim an item, and removal of that opt-in label mid-run
-  causes the foreman to abandon active items via `GitHubIssueQueue.abandon()`),
-  and credential stripping — each is
-  exercised as a pass/fail E2E case through the real policy path, not just
-  asserted in config. V1's enforcement is not removed (P6) until each passes.
+  (`max_*`), **`max_prompt_tokens`**, **`allowed_pr_author_associations`**
+  (checked against the **originating issue author's association**, enforced
+  before claim/lane execution — not just on the eventual PR, which the
+  orchestrator itself authors), **opt-out label removal stops active work and
+  cancels the item** (V1's `only_run_on_labeled_prs` parity: a separate stable
+  opt-in label — distinct from the per-phase `enabled_label` — is required
+  for `claim()`, and removal mid-run causes the foreman to run the
+  **terminate-CAO-session → `abandon()`** ordering and route the item to a
+  **non-ready `cancelled` phase/labels** so `list_ready()` does not rediscover
+  and reject it forever), and credential stripping — each is exercised as a
+  pass/fail E2E case through the real policy path, not just asserted in config.
+  V1's enforcement is not removed (P6) until each passes.
 
 ## 4. V1 → V3 inventory (complete, all consumers accounted for)
 
