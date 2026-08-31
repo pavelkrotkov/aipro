@@ -94,6 +94,15 @@ class CaoUnavailableError(CaoControlPlaneError):
     """
 
 
+class CaoRateLimitedError(CaoUnavailableError):
+    """CAO returned HTTP 429 (Too Many Requests) or an equivalent backpressure signal.
+
+    Inherits from :class:`CaoUnavailableError` so the foreman's existing
+    transient-error handling kicks in, but the dedicated subclass lets a
+    backoff scheduler distinguish "rate limited, slow down" from "CAO is
+    down, retry immediately"."""
+
+
 class CaoTransportError(CaoControlPlaneError):
     """The request reached the wire but its outcome is unknown.
 
@@ -777,4 +786,11 @@ class CaoSessionController:
             raise CaoSessionNotFoundError(f"Failed to {action}: {detail}")
         if response.status_code == 409:
             raise SessionBusyError(f"Failed to {action}: {detail}")
+        if response.status_code == 429:
+            # 429 is backpressure, not a hard fault. Surface the dedicated
+            # subclass so callers (and tests) can distinguish "rate limited,
+            # back off" from "CAO is down, retry immediately". Both inherit
+            # from CaoUnavailableError so foreman retry logic works either
+            # way without per-status branching.
+            raise CaoRateLimitedError(f"Failed to {action}: HTTP 429 {detail}")
         raise CaoControlPlaneError(f"Failed to {action}: HTTP {response.status_code} {detail}")
