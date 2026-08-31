@@ -170,6 +170,52 @@ def test_terminate_session_makes_subsequent_lookup_404(fake_cao: FakeCAOServer, 
         controller.adopt_session(expected)
 
 
+def test_patch_metadata_is_persisted_and_visible_to_later_get(
+    fake_cao: FakeCAOServer, tmp_path: Any
+):
+    """Regression for round-2 finding #4 in PR #71: a PATCH that flips
+    ``activity_seen=True`` or updates per-turn context (``round_id``,
+    ``work_item_id``) must be persisted on the server side so a
+    controller that adopts the session after a restart can read the
+    updated metadata. Unknown / deleted terminals return 404.
+
+    The previous fake acknowledged every PATCH with 204 but discarded
+    its body, so activity changes written by ``_mark_active`` and
+    ``_clear_activity`` never reached the session state returned by
+    later GETs and the idle-settle guard never armed during soak
+    recovery tests.
+    """
+
+    run_id = f"it-{int(time.time() * 1000)}"
+    controller = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
+    handle = controller.start_session(_spec(run_id, str(tmp_path)))
+    terminal_id = fake_cao._sessions[handle.session_id].terminal_id
+
+    # PATCH a metadata key.
+    patch_resp = httpx.patch(
+        f"{fake_cao.url}/terminals/{terminal_id}/metadata",
+        json={"activity_seen": True, "round_id": 3},
+        timeout=5.0,
+    )
+    assert patch_resp.status_code == 204
+
+    # The next GET round-trips the merged metadata.
+    get_resp = httpx.get(f"{fake_cao.url}/terminals/{terminal_id}", timeout=5.0)
+    assert get_resp.status_code == 200
+    payload = get_resp.json()
+    assert payload["metadata"].get("activity_seen") is True
+    assert payload["metadata"].get("round_id") == 3
+
+    # PATCH to a deleted terminal must return 404.
+    controller.terminate_session(handle)
+    bad_resp = httpx.patch(
+        f"{fake_cao.url}/terminals/{terminal_id}/metadata",
+        json={"activity_seen": False},
+        timeout=5.0,
+    )
+    assert bad_resp.status_code == 404
+
+
 def test_fault_injection_returns_injected_status(fake_cao: FakeCAOServer, tmp_path):
     """A configured ``FaultSpec`` causes the matching request to return the
     injected HTTP status; the controller maps non-2xx to a control-plane

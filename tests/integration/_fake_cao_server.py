@@ -383,7 +383,34 @@ class _FakeHandler(BaseHTTPRequestHandler):
             return
         self._commit_then_reset = bool(fault and fault.commit_then_reset)
         try:
-            self._read_body()  # metadata is best-effort persistence in CAO
+            body = self._read_body() or {}
+            # Path: /terminals/{tid}/metadata; the terminal id is the
+            # third segment, the literal "metadata" segment must be the
+            # fourth.
+            path = self._strip_query()
+            if not path.startswith("/terminals/"):
+                self._write_text(404, f"unknown PATCH {self.path}")
+                return
+            parts = path.split("/")
+            if len(parts) != 4 or parts[3] != "metadata":
+                self._write_text(404, f"unknown terminal PATCH {self.path}")
+                return
+            terminal_id = parts[2]
+            with self._fake._lock:
+                state = _find_by_terminal(self._fake._sessions, terminal_id)
+                if state is None or state.deleted:
+                    self._write_text(404, f"no terminal {terminal_id}")
+                    return
+                if isinstance(body, dict):
+                    # Round-2 finding, PR #71 #4: persist the merged
+                    # metadata so activity changes (e.g. activity_seen,
+                    # round_id, work_item_id) survive a controller
+                    # restart and are observable in the next
+                    # GET /terminals/{tid}. Without this, recovery and
+                    # soak tests that depend on durable metadata would
+                    # silently regress.
+                    for key, value in body.items():
+                        state.metadata[key] = value
             self._write_text(204, "")
         finally:
             self._maybe_drop_response()
