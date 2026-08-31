@@ -27,8 +27,8 @@ from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, SessionSpec
 from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
 from tests.integration._fake_cao_server import (
     DEFAULT_STATUS_SEQUENCE,
-    STATUS_IDLE,  # noqa: F401
-    STATUS_PROCESSING,  # noqa: F401
+    STATUS_IDLE,
+    STATUS_PROCESSING,
     STATUS_STARTED,
     FakeCAOServer,
 )
@@ -189,9 +189,7 @@ def test_fault_injection_returns_injected_status(fake_cao: FakeCAOServer, tmp_pa
     assert not isinstance(excinfo.value, CaoSessionNotFoundError)
 
 
-def test_empty_status_sequence_returns_500_not_indexerror(
-    fake_cao: FakeCAOServer, tmp_path
-):
+def test_empty_status_sequence_returns_500_not_indexerror(fake_cao: FakeCAOServer, tmp_path):
     """Regression for finding #1 in PR #70: a session scripted with an
     empty status sequence must surface as an HTTP 500 (an explicit
     misconfiguration) rather than raising ``IndexError`` inside the
@@ -219,9 +217,7 @@ def test_empty_status_sequence_returns_500_not_indexerror(
     assert "empty status sequence" in response.text
 
 
-def test_terminal_ids_are_monotonic_across_delete_and_relaunch(
-    fake_cao: FakeCAOServer, tmp_path
-):
+def test_terminal_ids_are_monotonic_across_delete_and_relaunch(fake_cao: FakeCAOServer, tmp_path):
     """Regression for findings #2 and #4 in PR #70: terminal IDs are
     allocated from a monotonic counter, independent of the size of
     ``self._sessions``. After deleting a session and relaunching it (or
@@ -235,26 +231,24 @@ def test_terminal_ids_are_monotonic_across_delete_and_relaunch(
 
     controller = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
 
-    handle_a1 = controller.start_session(_spec(run_id_a, str(tmp_path)))
+    controller.start_session(_spec(run_id_a, str(tmp_path)))
     terminal_a1 = fake_cao._sessions[name_a].terminal_id
 
     # Delete and relaunch with a different workdir, mirroring a controller
     # restart that talks to a still-running CAO session.
-    controller.terminate_session(handle_a1)
-    handle_a2 = controller.start_session(_spec(run_id_a, str(tmp_path / "v2")))
+    controller.terminate_session(controller.start_session(_spec(run_id_a, str(tmp_path))))
+    controller.start_session(_spec(run_id_a, str(tmp_path / "v2")))
     terminal_a2 = fake_cao._sessions[name_a].terminal_id
     assert terminal_a2 != terminal_a1, "relaunch must allocate a new terminal id"
 
     # A sibling session in the same fake must NOT collide with either of
     # the relaunched terminals.
-    handle_b = controller.start_session(_spec(run_id_b, str(tmp_path)))
+    controller.start_session(_spec(run_id_b, str(tmp_path)))
     terminal_b = fake_cao._sessions[name_b].terminal_id
     assert terminal_b not in {terminal_a1, terminal_a2}
 
 
-def test_patch_metadata_is_persisted_and_visible_to_later_get(
-    fake_cao: FakeCAOServer, tmp_path
-):
+def test_patch_metadata_is_persisted_and_visible_to_later_get(fake_cao: FakeCAOServer, tmp_path):
     """Regression for finding #3 in PR #70: a PATCH that flips
     ``activity_seen=True`` must be persisted on the server side so a
     controller that adopts the session after a restart can read the
@@ -290,9 +284,7 @@ def test_patch_metadata_is_persisted_and_visible_to_later_get(
     assert bad_resp.status_code == 404
 
 
-def test_submit_work_rearms_lifecycle_for_followup_observe(
-    fake_cao: FakeCAOServer, tmp_path
-):
+def test_submit_work_rearms_lifecycle_for_followup_observe(fake_cao: FakeCAOServer, tmp_path):
     """Regression for finding #5 in PR #70: once the initial status
     sequence exhausts, an accepted submit_work must replay the script
     so a follow-up observe sees fresh activity evidence. Without this,
@@ -302,7 +294,6 @@ def test_submit_work_rearms_lifecycle_for_followup_observe(
     run_id = f"it-{int(time.time() * 1000)}"
     controller = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
     handle = controller.start_session(_spec(run_id, str(tmp_path)))
-    terminal_id = fake_cao._sessions[handle.session_id].terminal_id
 
     # Walk to exhaustion so subsequent observe() reports idle.
     for _ in range(len(DEFAULT_STATUS_SEQUENCE) + 2):
@@ -319,9 +310,7 @@ def test_submit_work_rearms_lifecycle_for_followup_observe(
     assert next_obs.cao_status == STATUS_STARTED
 
 
-def test_adopt_session_does_not_consume_activity_evidence(
-    fake_cao: FakeCAOServer, tmp_path
-):
+def test_adopt_session_does_not_consume_activity_evidence(fake_cao: FakeCAOServer, tmp_path):
     """Regression for finding #6 in PR #70: adoption's
     ``_lookup_session`` would consume the next status, so a fresh
     observe() right after ``adopt_session`` would miss activity
@@ -336,9 +325,7 @@ def test_adopt_session_does_not_consume_activity_evidence(
         name, [STATUS_PROCESSING, STATUS_IDLE, STATUS_IDLE, STATUS_IDLE, STATUS_IDLE]
     )
 
-    first = CaoSessionController(
-        _control_plane(fake_cao.url), LaneRegistry.default()
-    )
+    first = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
     handle = first.start_session(_spec(run_id, str(tmp_path)))
     # Consume exactly one status so the cursor moves from 0 -> 1.
     first.observe(handle)
@@ -359,9 +346,7 @@ def test_adopt_session_does_not_consume_activity_evidence(
     )
 
 
-def test_commit_then_reset_commits_state_then_drops_response(
-    fake_cao: FakeCAOServer, tmp_path
-):
+def test_commit_then_reset_commits_state_then_drops_response(fake_cao: FakeCAOServer, tmp_path):
     """Regression for finding #7 in PR #70: a ``commit_then_reset`` fault
     must apply the normal handler mutation (here: create the session)
     but drop the response so the client sees a transport error. This
@@ -383,12 +368,17 @@ def test_commit_then_reset_commits_state_then_drops_response(
 
     run_id = f"it-{int(time.time() * 1000)}"
     expected = session_name_for(run_id, DEVELOPER_LANE)
-    controller = CaoSessionController(
-        _control_plane(fake_cao.url), LaneRegistry.default()
-    )
+    controller = CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default())
 
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as excinfo:
         controller.start_session(_spec(run_id, str(tmp_path)))
+    # commit_then_reset surfaces as SessionIdentityUncertainError because
+    # the controller treats a transport failure on launch as uncertain
+    # (CAO may have created the session before the response was lost).
+    # A regression that silently returned 200 would no longer raise.
+    from ai_pr_orchestrator.v3.cao import SessionIdentityUncertainError
+
+    assert isinstance(excinfo.value, SessionIdentityUncertainError)
 
     # The state mutation MUST have happened, even though the client saw
     # a transport error. A subsequent lookup must find the session.
@@ -399,9 +389,7 @@ def test_commit_then_reset_commits_state_then_drops_response(
     assert fake_cao._sessions[expected].deleted is False
 
 
-def test_reattach_with_conflicting_attribution_is_rejected(
-    fake_cao: FakeCAOServer, tmp_path
-):
+def test_reattach_with_conflicting_attribution_is_rejected(fake_cao: FakeCAOServer, tmp_path):
     """Regression for finding #8 in PR #70: a second launch that hits
     the reattach path with a different workdir (or round / work-item /
     lane metadata) must be rejected with 409, not silently succeed.
