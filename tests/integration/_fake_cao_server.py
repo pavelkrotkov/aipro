@@ -302,10 +302,10 @@ class _FakeHandler(BaseHTTPRequestHandler):
             # socket so the client sees a transport error rather than a
             # successful response. If nothing was written yet, this also
             # closes before any response can be sent.
-            try:
+            import contextlib
+
+            with contextlib.suppress(Exception):
                 self.wfile.flush()
-            except Exception:
-                pass
             self.connection.close()
 
     # -- Helpers --------------------------------------------------------
