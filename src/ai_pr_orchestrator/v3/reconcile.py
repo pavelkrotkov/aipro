@@ -1041,7 +1041,11 @@ class ReconcilePlanner:
             "session_terminal_pre_push",
         ):
             # The session whose output we want to collect.
-            target_pool = self._coding_sessions(inputs) if row_name != "post_review_no_findings_recorded" else self._review_sessions(inputs)
+            target_pool = (
+                self._coding_sessions(inputs)
+                if row_name != "post_review_no_findings_recorded"
+                else self._review_sessions(inputs)
+            )
             if target_pool:
                 return max(target_pool, key=lambda s: s.last_activity_at).session_id
             terminal = [s for s in run_sessions if s.is_terminal]

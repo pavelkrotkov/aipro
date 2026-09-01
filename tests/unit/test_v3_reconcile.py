@@ -100,9 +100,10 @@ def make_session(
     *,
     work_item_id: str,
     run_id: str | None,
-    lane: str = "worker-1",
+    lane: str = "developer",
     state: SessionLifecycle = "terminal",
     is_terminal: bool = True,
+    success: bool = True,
     last_activity_at: datetime | None = None,
     session_id: str = "sess-1",
 ) -> SessionObservation:
@@ -114,6 +115,7 @@ def make_session(
         state=state,
         last_activity_at=last_activity_at or frozen_now(),
         is_terminal=is_terminal,
+        success=success,
     )
 
 
@@ -132,7 +134,7 @@ def make_pr(
 def make_finding(*, finding_id: str = "f1", thread_id: str | None = "PRRT_1") -> ReviewerFinding:
     return ReviewerFinding(
         id=finding_id,
-        lane="review-a",
+        lane="architecture-reviewer",
         body="b",
         severity="major",
         run_id="run-1",
@@ -193,6 +195,7 @@ def make_inputs(
     queue: GitHubQueueConfig | None = None,
     now: datetime | None = None,
     issue: GitHubIssueRef | None = None,
+    ci_status: Any = None,
 ) -> ReconciliationInputs:
     now = now or frozen_now()
     claim = make_claim(state) if state is not None else None
@@ -209,6 +212,7 @@ def make_inputs(
         config=cleanup or CleanupConfig(),
         queue_config=queue or GitHubQueueConfig(),
         now=now,
+        ci_status=ci_status,
     )
 
 
@@ -238,6 +242,10 @@ class _CrashScenario:
     state_factory: Any
     expected_kind: ActionKind
     expect_auto_apply: bool = True
+    # Optional helper returning a tuple to merge into the inputs bundle
+    # (e.g. a ``ci_status`` tuple for the post-CI scenarios). ``None``
+    # means "no extra inputs".
+    extras_factory: Any = None
 
 
 def _scenario_no_state() -> _CrashScenario:
@@ -282,7 +290,7 @@ def _scenario_session_started_no_terminal() -> _CrashScenario:
             make_session(
                 work_item_id="owner/repo#1",
                 run_id="run-1",
-                lane="worker-1",
+                lane="developer",
                 state="active",
                 is_terminal=False,
                 session_id="sess-coding",
@@ -305,7 +313,7 @@ def _scenario_terminal_pre_commit() -> _CrashScenario:
             make_session(
                 work_item_id="owner/repo#1",
                 run_id="run-1",
-                lane="worker-1",
+                lane="developer",
                 state="terminal",
                 is_terminal=True,
                 session_id="sess-coding",
@@ -328,7 +336,7 @@ def _scenario_terminal_pre_push() -> _CrashScenario:
             make_session(
                 work_item_id="owner/repo#1",
                 run_id="run-1",
-                lane="worker-1",
+                lane="developer",
                 state="terminal",
                 is_terminal=True,
                 session_id="sess-coding",
@@ -386,7 +394,7 @@ def _scenario_review_no_findings() -> _CrashScenario:
             make_session(
                 work_item_id="owner/repo#1",
                 run_id="run-1",
-                lane="review-a",
+                lane="architecture-reviewer",
                 state="terminal",
                 is_terminal=True,
                 session_id="sess-review",
@@ -414,7 +422,7 @@ def _scenario_findings_no_disposition() -> _CrashScenario:
             make_session(
                 work_item_id="owner/repo#1",
                 run_id="run-1",
-                lane="review-a",
+                lane="architecture-reviewer",
                 state="terminal",
                 is_terminal=True,
                 session_id="sess-review",
@@ -467,10 +475,20 @@ def _scenario_ci_no_pr() -> _CrashScenario:
             ],
         )
 
+    def ci_status() -> tuple[Any, ...]:
+        # Phase ``ci_gating`` alone is no longer proof CI ran; the
+        # scenario passes a GateDecision-style tuple with
+        # ``passed=True`` and empty pending list so the planner sees a
+        # recorded result.
+        from ai_pr_orchestrator.v3.interfaces import GateDecision
+
+        return (GateDecision(passed=True, pending_checks=(), failed_checks=()),)
+
     return _CrashScenario(
         name="crash_after_ci_before_pr",
         state_factory=state,
         expected_kind=ActionKind.RELAUNCH,
+        extras_factory=ci_status,
     )
 
 
@@ -547,7 +565,7 @@ def _scenario_duplicate_sessions() -> _CrashScenario:
             make_session(
                 work_item_id="owner/repo#1",
                 run_id="run-1",
-                lane="worker-1",
+                lane="developer",
                 state="terminal",
                 is_terminal=True,
                 session_id="sess-old",
@@ -555,7 +573,7 @@ def _scenario_duplicate_sessions() -> _CrashScenario:
             make_session(
                 work_item_id="owner/repo#1",
                 run_id="run-1",
-                lane="worker-1",
+                lane="developer",
                 state="active",
                 is_terminal=False,
                 session_id="sess-new",
@@ -619,6 +637,8 @@ class TestCrashPoints:
             kwargs["worktrees"] = worktrees_fn()
         if prs_fn is not None:
             kwargs["pull_requests"] = prs_fn()
+        if scenario.extras_factory is not None:
+            kwargs["ci_status"] = scenario.extras_factory()[0]
         inputs = make_inputs(**kwargs)
         actions = ReconcilePlanner().plan(inputs)
         matched = [a for a in actions if a.kind is scenario.expected_kind]
@@ -647,7 +667,7 @@ def _sessions_crash_after_agent_completion_before_commit() -> tuple[SessionObser
         make_session(
             work_item_id="owner/repo#1",
             run_id="run-1",
-            lane="worker-1",
+            lane="developer",
             state="terminal",
             is_terminal=True,
             session_id="sess-coding",
@@ -660,7 +680,7 @@ def _sessions_crash_during_agent_launch() -> tuple[SessionObservation, ...]:
         make_session(
             work_item_id="owner/repo#1",
             run_id="run-1",
-            lane="worker-1",
+            lane="developer",
             state="active",
             is_terminal=False,
             session_id="sess-coding",
@@ -673,7 +693,7 @@ def _sessions_crash_after_commit_before_push() -> tuple[SessionObservation, ...]
         make_session(
             work_item_id="owner/repo#1",
             run_id="run-1",
-            lane="worker-1",
+            lane="developer",
             state="terminal",
             is_terminal=True,
             session_id="sess-coding",
@@ -710,7 +730,7 @@ def _sessions_crash_after_review_launch_no_findings() -> tuple[SessionObservatio
         make_session(
             work_item_id="owner/repo#1",
             run_id="run-1",
-            lane="review-a",
+            lane="architecture-reviewer",
             state="terminal",
             is_terminal=True,
             session_id="sess-review",
@@ -723,7 +743,7 @@ def _sessions_crash_after_findings_before_disposition() -> tuple[SessionObservat
         make_session(
             work_item_id="owner/repo#1",
             run_id="run-1",
-            lane="review-a",
+            lane="architecture-reviewer",
             state="terminal",
             is_terminal=True,
             session_id="sess-review",
@@ -736,7 +756,7 @@ def _sessions_duplicate_sessions() -> tuple[SessionObservation, ...]:
         make_session(
             work_item_id="owner/repo#1",
             run_id="run-1",
-            lane="worker-1",
+            lane="developer",
             state="terminal",
             is_terminal=True,
             session_id="sess-old",
@@ -744,7 +764,7 @@ def _sessions_duplicate_sessions() -> tuple[SessionObservation, ...]:
         make_session(
             work_item_id="owner/repo#1",
             run_id="run-1",
-            lane="worker-1",
+            lane="developer",
             state="active",
             is_terminal=False,
             session_id="sess-new",
@@ -761,15 +781,12 @@ def _prs_branch_moved() -> tuple[PullRequestObservation, ...]:
 
 class TestNoTwoAuthoritativeBranches:
     """Acceptance property: the planner never emits two branch-creating
-    actions for the same (run_id, branch) pair.
+    actions for the same ``run_id``.
 
-    The spec phrases this as "for any 2 distinct WorkItem states with the
-    same run_id, the planner produces at most one branch-creating action".
-    Because two distinct work items normally have distinct branches, the
-    per-work-item contract is "at most one branch action per call", and
-    that's what these tests exercise. The cross-work-item case is covered
-    by :func:`ReconcilePlanner._finalize`, which dedupes by ``(run_id,
-    branch)`` *within* one plan call.
+    Per finding #5: the dedup key is ``run_id`` alone, not
+    ``(run_id, branch)``. The cross-item dedupe lives in
+    :meth:`ReconcilePlanner._finalize`; per-work-item contract is "at most
+    one branch action per call".
     """
 
     @pytest.mark.parametrize(
@@ -780,13 +797,10 @@ class TestNoTwoAuthoritativeBranches:
             ("aipro-issue-2", "aipro-issue-1"),
         ],
     )
-    def test_no_two_authoritative_branches_for_same_run_and_branch(
-        self, branch_a: str, branch_b: str
-    ) -> None:
+    def test_no_two_authoritative_branches_for_same_run(self, branch_a: str, branch_b: str) -> None:
         """Acceptance: across multiple combinations of (branch_a, branch_b)
         for two distinct work items sharing a run_id, the planner must
-        never produce two branch-creating actions keyed on the same
-        ``(run_id, branch)``.
+        never produce more than one branch-creating action.
 
         Drives :meth:`ReconcilePlanner.plan_many` because the cross-item
         dedupe lives there.
@@ -819,17 +833,23 @@ class TestNoTwoAuthoritativeBranches:
         branch_actions = [
             a for a in planner.plan_many([inputs_a, inputs_b]) if actions_target_branch(a)
         ]
-        # At most one branch-creating action per (run_id, branch) key.
-        keys = [(a.run_id, a.branch) for a in branch_actions]
+        # At most one branch-creating action per run_id.
+        keys = [a.run_id for a in branch_actions]
         assert len(keys) == len(set(keys)), (
-            f"two branch-creating actions for the same (run_id, branch): "
+            f"two branch-creating actions for the same run_id: "
             f"{[(a.run_id, a.branch, a.work_item_id) for a in branch_actions]}"
         )
 
     def test_two_distinct_work_items_with_distinct_branches_both_emit(self) -> None:
         """Two distinct work items with the same run_id but *different*
-        branches each emit their own branch action — both legitimate
-        because they target different refs."""
+        branches produce **at most one** branch-creating action — not two.
+
+        Per finding #5: the dedup key is ``run_id`` alone, not
+        ``(run_id, branch)``. Two distinct work items sharing a run_id is
+        itself the corruption case the dedupe guards against (only one
+        branch may be authoritative per run). A legitimate same-run
+        multi-branch scenario would carry two different run_ids.
+        """
         planner = ReconcilePlanner()
         state_a = make_state(
             work_item_id="owner/repo#1",
@@ -858,9 +878,10 @@ class TestNoTwoAuthoritativeBranches:
         branch_actions = [
             a for a in planner.plan_many([inputs_a, inputs_b]) if actions_target_branch(a)
         ]
-        assert len(branch_actions) == 2
-        keys = {(a.run_id, a.branch) for a in branch_actions}
-        assert len(keys) == 2
+        assert len(branch_actions) == 1
+        # Dedupe is by run_id; the surviving action carries the FIRST
+        # work item's identity (the planner iterates inputs_list in order).
+        assert branch_actions[0].run_id == "run-1"
 
     def test_single_work_item_emits_at_most_one_branch_action(self) -> None:
         """Per-work-item contract: at most one RELAUNCH per call."""
@@ -886,7 +907,7 @@ class TestDeterminism:
                 make_session(
                     work_item_id="owner/repo#1",
                     run_id="run-1",
-                    lane="worker-1",
+                    lane="developer",
                     is_terminal=True,
                 ),
             ),

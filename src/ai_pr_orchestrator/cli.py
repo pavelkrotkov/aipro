@@ -25,7 +25,7 @@ from ai_pr_orchestrator.v3.config import (
     load_v3_config,
     resolve_model_catalog,
 )
-from ai_pr_orchestrator.v3.domain import GitHubIssueRef, VALID_LANE_ROLES
+from ai_pr_orchestrator.v3.domain import VALID_LANE_ROLES, GitHubIssueRef
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 from ai_pr_orchestrator.v3.reconcile import (
     Action as ReconcileAction,
@@ -532,9 +532,7 @@ def _resolve_repo_credentials(
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY") or ""
     if repo:
         if "/" not in repo:
-            raise SystemExit(
-                f"--repo must be 'owner/name', got {repo!r} (missing slash)"
-            )
+            raise SystemExit(f"--repo must be 'owner/name', got {repo!r} (missing slash)")
         owner, _, name = repo.partition("/")
         if not owner or not name:
             raise SystemExit(f"--repo must be 'owner/name', got {repo!r}")
@@ -628,7 +626,7 @@ def _apply_actions(
                     worktree=claim.worktree,
                     pr_number=claim.pr_number,
                 )
-            except Exception as exc:  # noqa: BLE001 — surface but don't crash the CLI
+            except Exception as exc:
                 print(f"recover_stale_lease failed for {issue_ref.slug()}: {exc}")
             continue
         if action.kind is ReconcileActionKind.CLEAN_ORPHAN_SESSION:
@@ -704,9 +702,7 @@ def _build_reconciliation_inputs(
             placeholder = GitHubIssueRef(owner=owner, repo=repo, number=1)
             inputs.append(
                 ReconciliationInputs(
-                    observation=WorkItemObservation(
-                        work_item=placeholder, state=None, claim=None
-                    ),
+                    observation=WorkItemObservation(work_item=placeholder, state=None, claim=None),
                     sessions=(),
                     worktrees=(),
                     pull_requests=(),
