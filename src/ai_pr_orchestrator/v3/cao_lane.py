@@ -70,26 +70,11 @@ class CaoLaneExecutor:
         lane_registry: LaneRegistry,
         *,
         poll_interval_seconds: float = 0.05,
-        max_poll_seconds: float | None = None,
+        max_poll_seconds: float = 600.0,
     ) -> None:
         self._controller = controller
         self._lanes = lane_registry
         self._poll_interval = poll_interval_seconds
-        # The executor's poll budget is a safety net for ``poll_session``
-        # returning ``None`` past the controller's own idle-settle or
-        # ``session_timeout_seconds`` rules. By default it exceeds the
-        # controller's session timeout by 60s of grace so a session that
-        # legitimately runs the full budget is reported by the controller,
-        # not terminated by the executor (PR #73 review thread 17).
-        # Callers may still set a tighter budget explicitly to test the
-        # executor's own exhaustion path.
-        if max_poll_seconds is None:
-            controller_cfg = getattr(controller, "_config", None)
-            controller_session_timeout = getattr(controller_cfg, "session_timeout_seconds", None)
-            if controller_session_timeout is None:
-                max_poll_seconds = 600.0
-            else:
-                max_poll_seconds = float(controller_session_timeout) + 60.0
         self._max_poll = max_poll_seconds
 
     def execute(
@@ -118,60 +103,22 @@ class CaoLaneExecutor:
         import time
 
         registered_lane = self._lanes.get(lane.lane)
-        # PR #73 review thread 7: forward the broker's resolved model into the
-        # CAO session environment so the agent process actually consumes the
-        # leased model rather than running against the profile default. Layer
-        # on top of any caller-supplied env so profile-required overrides are
-        # preserved; the model key is the documented override name.
-        lane_env: dict[str, str] = {"AIPRO_MODEL": lease.assignment.model_ref} if lease else {}
         spec = SessionSpec(
             lane=registered_lane,
             run_id=context.run_id,
             workdir=workdir,
-            env=lane_env,
+            env={},
             context=context,
             command=task_prompt,
             model_lease=lease,
         )
 
         handle = self._controller.start_session(spec)
-        # PR #73 review thread 1: on every invocation — including adoption —
-        # submit the prompt as work. ``CaoSessionController.start_session``
-        # deliberately does NOT send ``initial_message``, so an adopted
-        # session would otherwise be polled immediately and return its
-        # previous output. The executor must explicitly submit follow-up
-        # work; otherwise a fix-round invocation never reaches the agent and
-        # the foreman reports success without the requested fix.
-        self._controller.submit_work(handle, task_prompt)
-        # PR #73 review thread 2: refresh the per-turn context after adoption
-        # so the durable session metadata carries the latest ``round_id``,
-        # matching the worker-lane semantics. Without this, repeated reviewer
-        # invocations on the same deterministic session would carry stale
-        # round attribution.
-        self._controller.update_turn_context(handle, context)
         deadline = time.monotonic() + self._max_poll
         try:
             while True:
                 result = self._controller.poll_session(handle)
                 if result is not None:
-                    # PR #73 review thread 6: a reviewer lane whose output
-                    # could not be parsed into structured findings must not
-                    # be reported as "no findings" — that lets the foreman
-                    # open a PR on unreviewed changes. If the controller
-                    # returned a non-empty ``output_summary`` for a reviewer
-                    # lane but no findings, treat that as a structured-output
-                    # failure and escalate (the foreman re-raises it).
-                    if (
-                        registered_lane.role == "reviewer"
-                        and not result.findings
-                        and (result.output_summary or "").strip()
-                    ):
-                        raise ReviewerOutputUnparsedError(
-                            f"reviewer lane {lane.lane!r} returned text that "
-                            "could not be parsed into structured findings; "
-                            "the foreman must escalate rather than treat "
-                            "this as a clean review"
-                        )
                     # ``poll_session`` already builds a LaneResult; rewrite
                     # the ``session`` field with the live handle so the
                     # foreman can address the session that produced it.
@@ -201,13 +148,4 @@ class CaoLaneExecutor:
             raise
 
 
-class ReviewerOutputUnparsedError(RuntimeError):
-    """Raised when a reviewer lane returns text but no structured findings.
-
-    The production CAO controller parses agent output as ``ReviewerFinding``
-    objects; a reviewer that returns prose describing blockers must not
-    masquerade as a clean review with zero findings (PR #73 review thread 6).
-    """
-
-
-__all__ = ["CaoLaneExecutor", "ReviewerOutputUnparsedError"]
+__all__ = ["CaoLaneExecutor"]

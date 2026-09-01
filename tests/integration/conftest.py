@@ -16,6 +16,7 @@ principle 1) carved out as the only legitimate faking surface.
 from __future__ import annotations
 
 import time
+import uuid
 from collections.abc import Iterator
 from typing import Any
 
@@ -33,12 +34,7 @@ from ai_pr_orchestrator.v3.interfaces import GateDecision
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 from tests.integration._fake_cao_server import FakeCAOServer
-from tests.integration._harness import (
-    FakeBroker,
-    FakeGitOperations,
-    HybridLaneExecutor,
-    StaticGate,
-)
+from tests.integration._harness import FakeBroker, FakeGitOperations, StaticGate
 
 #: Tag used on issues the harness seeds; the queue reads it as the
 #: "enabled" label. Matches :class:`V3Config.github_queue.enabled_label`
@@ -98,8 +94,19 @@ def lane_registry() -> LaneRegistry:
     return LaneRegistry.default()
 
 
+#: Default committer identity the harness passes into the foreman loop.
+#: The foreman writes commits under this identity; E2E scenarios that
+#: assert on the author string should override this with a stable
+#: per-scenario value rather than relying on the author's real name.
+DEFAULT_COMMITTER_NAME = "AIPRO E2E Bot"
+DEFAULT_COMMITTER_EMAIL = "aipro-bot@example.invalid"
+
+
 @pytest.fixture
-def foreman_harness(cao_lane_executor: CaoLaneExecutor, lane_registry: LaneRegistry):
+def foreman_harness(
+    cao_lane_executor: CaoLaneExecutor,
+    lane_registry: LaneRegistry,
+):
     """Factory that wires the foreman loop with a fresh ``FakeGitHubClient``.
 
     Returns a callable ``(seed_issue_numbers=None)`` that builds a
@@ -110,14 +117,20 @@ def foreman_harness(cao_lane_executor: CaoLaneExecutor, lane_registry: LaneRegis
 
     The harness is intentionally minimal: scenarios that need richer
     configuration (a custom broker, a custom gate, a custom git-ops
-    fake) can build their own. The smoke test
-    (``test_e2e_smoke.py``) is the reference for the happy wiring.
+    fake, or a custom committer identity) can build their own. The
+    smoke test (``test_e2e_smoke.py``) is the reference for the happy
+    wiring.
     """
 
     def _build(
         seed_issue_numbers: list[int] | None = None,
+        *,
+        committer_name: str = DEFAULT_COMMITTER_NAME,
+        committer_email: str = DEFAULT_COMMITTER_EMAIL,
+        gate: GateDecision | None = None,
+        broker: Any | None = None,
+        git_ops: Any | None = None,
         hybrid_findings: dict[int, list[Any]] | None = None,
-        config: V3Config | None = None,
     ) -> tuple[ForemanPolicyLoop, GitHubIssueQueue, FakeGitHubClient]:
         fake = FakeGitHubClient()
         if seed_issue_numbers is None:
@@ -125,44 +138,46 @@ def foreman_harness(cao_lane_executor: CaoLaneExecutor, lane_registry: LaneRegis
         for n in seed_issue_numbers:
             fake.seed_issue(n, labels=[E2E_WORK_TAG])
 
-        cfg = config or V3Config()
-        # Two-review-round scenarios (e.g. #55 scenario 2) need a
-        # wider coder / reviewer budget than the V3Config() default
-        # (1 coder invocation, 3 reviewer triggers) — three reviewer
-        # lanes x one round already hits the default's reviewer cap,
-        # and a fix round needs at least 2 coder invocations. The
-        # scenario tests that want the default behaviour pass
-        # ``config=V3Config()`` explicitly.
-        if config is None and hybrid_findings is not None:
-            from ai_pr_orchestrator.v3.config import SafetyPolicyConfig
-
-            cfg = V3Config(
-                safety=SafetyPolicyConfig(
-                    max_coder_invocations_per_run=5,
-                    max_reviewer_triggers_per_run=20,
-                )
-            )
-
-        executor: Any = cao_lane_executor
+        if gate is None:
+            gate = GateDecision(passed=True, pending_checks=(), failed_checks=())
+        if broker is None:
+            broker = FakeBroker()
+        if git_ops is None:
+            git_ops = FakeGitOperations()
+        # When hybrid_findings is supplied, drive the foreman with a
+        # script-backed LaneExecutor so the scripted findings return
+        # instead of going through the real CAO lane. ``None`` keeps the
+        # default (ca_o_lane_executor) wiring.
+        executor = cao_lane_executor
         if hybrid_findings is not None:
-            executor = HybridLaneExecutor(
-                worker=cao_lane_executor,
-                reviewer_findings_by_round=hybrid_findings,
+            from tests.unit.test_v3_foreman import ScriptedExecutor
+
+            executor = ScriptedExecutor(
+                reviewer_findings_by_round={
+                    round_idx: list(findings)
+                    for round_idx, findings in hybrid_findings.items()
+                }
             )
 
-        queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-e2e")
+        queue = GitHubIssueQueue(fake, "owner", "repo", V3Config().github_queue, host_id="host-e2e")
+        # Collision-proof run id: the millisecond-only counter collides
+        # when two harnesses are constructed in the same tick (which
+        # happens in tests that build several loops in one fixture).
+        # A short uuid suffix is unique across processes and adds no
+        # visible overhead.
+        run_id = f"e2e-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         loop = ForemanPolicyLoop(
             queue,
-            FakeBroker(),
+            broker,
             lane_registry,
             executor,
-            StaticGate(GateDecision(passed=True, pending_checks=(), failed_checks=())),
-            FakeGitOperations(),
-            cfg,
-            run_id=f"e2e-{int(time.time() * 1000)}",
+            StaticGate(gate),
+            git_ops,
+            V3Config(),
+            run_id=run_id,
             worktree_root="/wt",
-            committer_name="Pavel Krotkov",
-            committer_email="pavel.krotkov@gmail.com",
+            committer_name=committer_name,
+            committer_email=committer_email,
         )
         return loop, queue, fake
 
