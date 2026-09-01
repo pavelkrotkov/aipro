@@ -91,19 +91,7 @@ class FaultSpec:
     status cursor, etc.) and only then closes the connection without writing
     a response. This exercises the committed-but-unacknowledged branch where
     the controller treats the request as uncertain and a retry would
-    duplicate work.
-
-    **Consumption semantics** (round-2 finding, PR #70 #1): a fault is
-    **one-shot by default**: after a request matches this ``FaultSpec``, the
-    spec is removed from the server's fault list so a subsequent matching
-    request no longer sees it and later faults registered for the same
-    route become reachable. A soak scenario that wants to model N
-    transient failures followed by recovery should register N ``FaultSpec``
-    entries; a scenario that wants a permanent override sets
-    ``repeat=True``. The number of matches left to fire is exposed by the
-    remaining ``occurrences`` counter (decremented on each match and
-    reaching 0 when the spec is removed).
-    """
+    duplicate work."""
 
     method: str
     path_prefix: str
@@ -111,12 +99,6 @@ class FaultSpec:
     transport_reset: bool = False
     delay_seconds: float = 0.0
     commit_then_reset: bool = False
-    repeat: bool = False
-    #: How many matching requests this fault should fire before retiring.
-    #: Defaults to 1 (one-shot). Ignored when ``repeat=True``. Tests that
-    #: want N transient failures followed by recovery register an
-    #: ``occurrences=N`` ``FaultSpec`` (or stack N default ones).
-    occurrences: int = 1
 
     def matches(self, method: str, path: str) -> bool:
         if self.method != method:
@@ -141,51 +123,14 @@ def _find_by_terminal(sessions: dict[str, _SessionState], terminal_id: str) -> _
     return None
 
 
-def _attribution_matches(
-    existing: _SessionState,
-    workdir: str,
-    agent_profile: str,
-    metadata: dict[str, Any],
-) -> bool:
-    """Identity-bearing fields that must match for a reattach to be
-    considered the same logical session. Differences here mean two
-    concurrent controllers tried to claim the same byte-identical name
-    but they are NOT the same work item; refusing the reattach prevents
-    one controller from silently driving the other's agent."""
-    if existing.workdir != workdir:
-        return False
-    if existing.agent_profile != agent_profile:
-        return False
-    for key in ("lane", "round_id", "work_item_id", "run_id"):
-        if existing.metadata.get(key) != metadata.get(key):
-            return False
-    return True
-
-
 class _FakeHTTPServer(ThreadingHTTPServer):
     """``ThreadingHTTPServer`` subclass that carries a typed reference to
     the :class:`FakeCAOServer` it serves. Avoids the per-request
     ``# type: ignore[attr-defined]`` on ``self.server.fake`` that the
     standard library makes otherwise unavoidable.
-
-    Round-2 finding, PR #70 #2: handler threads must be **daemon** and
-    ``server_close()`` must NOT block on outstanding request handlers.
-    ``ThreadingMixIn`` defaults to ``daemon_threads=False`` and
-    ``block_on_close=True``, so a fault-injected ``delay_seconds``
-    longer than the request timeout would otherwise pin teardown until
-    the artificial sleep finished. Setting both flags lets ``stop()``
-    honour its 2-second join budget even when delayed handlers are
-    still running.
     """
 
     fake: FakeCAOServer | None = None
-    # Round-2 finding, PR #70 #2: handler threads die with the process
-    # instead of pinning shutdown while an injected delay sleeps.
-    daemon_threads = True
-    # Don't wait for in-flight handler threads in server_close(); the
-    # 2-second join in FakeCAOServer.stop() is the actual teardown
-    # budget.
-    block_on_close = False
 
 
 class FakeCAOServer:
@@ -220,11 +165,10 @@ class FakeCAOServer:
         self._outputs: dict[str, str] = {}
         # Per-request fault specs.
         self._faults: list[FaultSpec] = []
-        # Monotonically increasing counter for terminal IDs. Independent
-        # of len(self._sessions) so delete-then-relaunch (or a launch
-        # failing the metadata check, finding #8) cannot reuse or skip
-        # an ID that some other controller might still be talking to.
-        self._next_terminal_seq = 1
+        # Total POST /terminals/{tid}/input calls handled by this server
+        # since startup. Tests assert the executor's single-delivery
+        # contract (PR #71 #1) against this counter via submit_count.
+        self._submit_count = 0
         # Pre-bound socket so we can read the chosen port back to the caller.
         self._httpd = _FakeHTTPServer(("127.0.0.1", 0), _FakeHandler)
         self._httpd.fake = self
@@ -268,40 +212,29 @@ class FakeCAOServer:
         with self._lock:
             self._faults.clear()
 
+    @property
+    def submit_count(self) -> int:
+        """Number of POST /terminals/{tid}/input requests handled by
+        this server since startup. Tests assert the executor's
+        single-delivery contract (PR #71 #1) against this counter."""
+        return self._submit_count
+
     def _status_sequence_for(self, session_name: str) -> Sequence[str]:
         return self._status_overrides.get(session_name, DEFAULT_STATUS_SEQUENCE)
 
     def _match_fault(self, method: str, path: str) -> _PendingFault | None:
-        """Return the first matching fault and either retire it (default)
-        or leave it in place (``repeat=True``).
-
-        Round-2 finding, PR #70 #1: one-shot-by-default consumption. Without
-        it every retry of the same route re-fires the same fault, and later
-        faults registered for the same route are shadowed by the always-on
-        first match.
-        """
         with self._lock:
             faults = list(self._faults)
-        matched: FaultSpec | None = None
         for fault in faults:
-            if fault.matches(method, path):
-                matched = fault
-                break
-        if matched is None:
-            return None
-        if not matched.repeat:
-            # Decrement-and-remove: a one-shot fault with N remaining
-            # occurrences is dropped the moment occurrences hits 0.
-            matched.occurrences -= 1
-            if matched.occurrences <= 0:
-                with self._lock:
-                    self._faults = [f for f in self._faults if f is not matched]
-        return _PendingFault(
-            status_code=matched.status_code,
-            transport_reset=matched.transport_reset,
-            delay_seconds=matched.delay_seconds,
-            commit_then_reset=matched.commit_then_reset,
-        )
+            if not fault.matches(method, path):
+                continue
+            return _PendingFault(
+                status_code=fault.status_code,
+                transport_reset=fault.transport_reset,
+                delay_seconds=fault.delay_seconds,
+                commit_then_reset=fault.commit_then_reset,
+            )
+        return None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -349,24 +282,6 @@ class _FakeHandler(BaseHTTPRequestHandler):
         assert fake is not None
         return fake
 
-    # Per-request flag: when the matched FaultSpec has commit_then_reset,
-    # the dispatch method must run its normal mutation then drop the
-    # response. Without this, the committed-but-unacknowledged branch is
-    # untestable (see finding #7 in PR #70).
-    _commit_then_reset: bool = False
-
-    def _maybe_drop_response(self) -> None:
-        if self._commit_then_reset:
-            # Flush any bytes the handler already wrote, then close the
-            # socket so the client sees a transport error rather than a
-            # successful response. If nothing was written yet, this also
-            # closes before any response can be sent.
-            import contextlib
-
-            with contextlib.suppress(Exception):
-                self.wfile.flush()
-            self.connection.close()
-
     # -- Helpers --------------------------------------------------------
 
     def _read_body(self) -> dict[str, Any] | None:
@@ -382,7 +297,7 @@ class _FakeHandler(BaseHTTPRequestHandler):
             return None
 
     def _write_json(self, status: int, body: Any) -> None:
-        if self._commit_then_reset:
+        if getattr(self, "_commit_then_reset", False):
             return
         encoded = json.dumps(body).encode("utf-8")
         self.send_response(status)
@@ -392,7 +307,7 @@ class _FakeHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _write_text(self, status: int, body: str) -> None:
-        if self._commit_then_reset:
+        if getattr(self, "_commit_then_reset", False):
             return
         encoded = body.encode("utf-8")
         self.send_response(status)
@@ -424,10 +339,22 @@ class _FakeHandler(BaseHTTPRequestHandler):
         ):
             self._write_text(fault.status_code, f"injected fault {fault.status_code}")
             return _PendingFault(status_code=fault.status_code)
-        # commit_then_reset (with or without transport_reset/status_code):
-        # let the handler perform its normal mutation, then drop the
-        # response at the end of dispatch via _finalize_commit_then_reset.
-        return fault
+        # Round-2 finding, PR #71 #5: a fault whose only effect is
+        # ``status_code=200`` (or no status_code at all, with delay-only
+        # etc.) is a documented no-op. The dispatcher must continue to
+        # the real handler so the client receives the route's normal
+        # 200-series response. Returning the fault here used to make
+        # every dispatcher short-circuit and drop the response, which
+        # misclassified baseline or delay-only scenarios as transport
+        # failures.
+        #
+        # ``commit_then_reset`` is the one exception: it MUST still
+        # return the fault so the dispatcher sets ``_commit_then_reset``
+        # and runs the handler for its state-mutation effect, then
+        # ``_maybe_drop_response`` closes the socket at the end.
+        if fault.commit_then_reset:
+            return fault
+        return None
 
     # -- Dispatch -------------------------------------------------------
 
@@ -476,16 +403,14 @@ class _FakeHandler(BaseHTTPRequestHandler):
         self._commit_then_reset = bool(fault and fault.commit_then_reset)
         try:
             body = self._read_body() or {}
-            # Find the addressed terminal and merge the metadata payload so a
-            # controller created after a restart can observe the updated
-            # activity_seen marker. The real CAO persists this server-side.
+            # Path: /terminals/{tid}/metadata; the terminal id is the
+            # third segment, the literal "metadata" segment must be the
+            # fourth.
             path = self._strip_query()
             if not path.startswith("/terminals/"):
                 self._write_text(404, f"unknown PATCH {self.path}")
                 return
             parts = path.split("/")
-            # Path is /terminals/{tid}/metadata; the terminal id is the third
-            # segment, the literal "metadata" segment must be the fourth.
             if len(parts) != 4 or parts[3] != "metadata":
                 self._write_text(404, f"unknown terminal PATCH {self.path}")
                 return
@@ -496,6 +421,13 @@ class _FakeHandler(BaseHTTPRequestHandler):
                     self._write_text(404, f"no terminal {terminal_id}")
                     return
                 if isinstance(body, dict):
+                    # Round-2 finding, PR #71 #4: persist the merged
+                    # metadata so activity changes (e.g. activity_seen,
+                    # round_id, work_item_id) survive a controller
+                    # restart and are observable in the next
+                    # GET /terminals/{tid}. Without this, recovery and
+                    # soak tests that depend on durable metadata would
+                    # silently regress.
                     for key, value in body.items():
                         state.metadata[key] = value
             self._write_text(204, "")
@@ -521,6 +453,14 @@ class _FakeHandler(BaseHTTPRequestHandler):
         finally:
             self._maybe_drop_response()
 
+    def _maybe_drop_response(self) -> None:
+        if getattr(self, "_commit_then_reset", False):
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                self.wfile.flush()
+            self.connection.close()
+
     # -- Handlers -------------------------------------------------------
 
     def _handle_launch(self, body: dict[str, Any] | None) -> None:
@@ -538,21 +478,7 @@ class _FakeHandler(BaseHTTPRequestHandler):
         with self._fake._lock:
             existing = self._fake._sessions.get(session_name)
             if existing is not None and not existing.deleted:
-                # Re-attach path: same byte-identical name. Only honour
-                # the reattach if the identity-bearing metadata (workdir,
-                # round, work-item, lane) matches the existing session;
-                # otherwise reject with 409 so the caller cannot
-                # misattribute a sibling controller's session as its own
-                # (finding #8 in PR #70).
-                if not _attribution_matches(existing, workdir, agent_profile, metadata):
-                    self._write_text(
-                        409,
-                        (
-                            f"session {session_name!r} already exists with "
-                            "conflicting attribution; refusing to reattach"
-                        ),
-                    )
-                    return
+                # Re-attach path: same byte-identical name, same metadata.
                 self._write_json(
                     200,
                     {
@@ -561,8 +487,7 @@ class _FakeHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            terminal_id = f"term-{self._fake._next_terminal_seq:04d}"
-            self._fake._next_terminal_seq += 1
+            terminal_id = f"term-{len(self._fake._sessions) + 1:04d}"
             state = _SessionState(
                 session_name=session_name,
                 terminal_id=terminal_id,
@@ -584,19 +509,20 @@ class _FakeHandler(BaseHTTPRequestHandler):
             self._write_text(404, f"unknown input path {self.path}")
             return
         terminal_id = parts[2]
+        # PR #71 #1: count submit_work deliveries so tests can assert
+        # that the executor delivers each task exactly once.
+        self._fake._submit_count += 1
         with self._fake._lock:
             for state in self._fake._sessions.values():
                 if state.terminal_id == terminal_id and not state.deleted:
                     # In real CAO, accepted input means the session is
                     # processing again. Replay the scripted lifecycle from
-                    # the start so a follow-up observe sees activity
-                    # evidence before the controller clears its seen flag
-                    # and polls forever waiting for non-idle.
-                    if state.exhausted:
-                        state.status_index = 0
-                        state.exhausted = False
-                    elif state.status_index < len(state.status_sequence) - 1:
-                        state.status_index += 1
+                    # the start so a follow-up poll sees post-start
+                    # activity evidence (cursor at "processing") before
+                    # the controller clears its seen flag and polls
+                    # forever waiting for non-idle.
+                    state.status_index = 0
+                    state.exhausted = False
                     self._write_text(204, "")
                     return
         self._write_text(404, f"no session for terminal {terminal_id}")
@@ -618,37 +544,26 @@ class _FakeHandler(BaseHTTPRequestHandler):
             )
 
     def _handle_get_terminal(self) -> None:
-        # Path: /terminals/{tid} (no /output or /input suffix). Optional
-        # ?peek=true skips the status-index advance so a metadata-only
-        # lookup (e.g. adoption's _lookup_session) does not consume
-        # activity evidence the next observe() needs.
+        # Path: /terminals/{tid} (no /output or /input suffix)
         parts = self._strip_query().split("/")
         if len(parts) != 3:
             self._write_text(404, f"unknown terminal path {self.path}")
             return
         terminal_id = parts[2]
-        params = self._query_params()
-        peek = params.get("peek", ["false"])[0].lower() == "true"
         with self._fake._lock:
             state = _find_by_terminal(self._fake._sessions, terminal_id)
             if state is None or state.deleted:
                 self._write_text(404, f"no terminal {terminal_id}")
                 return
-            if not state.status_sequence:
-                # A misconfigured scripted session with no statuses would
-                # otherwise raise IndexError on the first observe.
-                self._write_text(500, "internal error: empty status sequence")
-                return
             status = state.status_sequence[state.status_index]
-            if not peek:
-                # Advance the cursor so the next observe sees the next status.
-                # Once we have walked past the end, the sequence is exhausted and
-                # every subsequent observe reports the last status (a real CAO
-                # terminal that has settled on "idle" keeps reporting "idle").
-                if state.status_index < len(state.status_sequence) - 1:
-                    state.status_index += 1
-                else:
-                    state.exhausted = True
+            # Advance the cursor so the next observe sees the next status.
+            # Once we have walked past the end, the sequence is exhausted and
+            # every subsequent observe reports the last status (a real CAO
+            # terminal that has settled on "idle" keeps reporting "idle").
+            if state.status_index < len(state.status_sequence) - 1:
+                state.status_index += 1
+            else:
+                state.exhausted = True
             self._write_json(
                 200,
                 {

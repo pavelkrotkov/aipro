@@ -94,6 +94,15 @@ class CaoUnavailableError(CaoControlPlaneError):
     """
 
 
+class CaoRateLimitedError(CaoUnavailableError):
+    """CAO returned HTTP 429 (Too Many Requests) or an equivalent backpressure signal.
+
+    Inherits from :class:`CaoUnavailableError` so the foreman's existing
+    transient-error handling kicks in, but the dedicated subclass lets a
+    backoff scheduler distinguish "rate limited, slow down" from "CAO is
+    down, retry immediately"."""
+
+
 class CaoTransportError(CaoControlPlaneError):
     """The request reached the wire but its outcome is unknown.
 
@@ -341,11 +350,16 @@ class CaoSessionController:
     def start_session(self, spec: SessionSpec) -> SessionHandle:
         """Launch (or re-attach to) the session for ``spec``'s run and lane.
 
-        ``spec.command`` is the opaque initial work message; when it is empty
-        the session is created idle and work is submitted later with
-        :meth:`submit_work`. ``spec.env`` is forwarded to the session verbatim
-        — it is how the broker's resolved model reaches the agent's startup
-        without this module interpreting it.
+        ``spec.command`` is **not** forwarded to CAO as ``initial_message``:
+        every delivery, including the first task, must go through
+        :meth:`submit_work`. This keeps the launch path free of side-effectful
+        duplication: a session created here has not yet received any work, and
+        the executor's subsequent ``submit_work`` is the single authoritative
+        delivery. (Round-2 review, PR #71 #1.)
+
+        ``spec.env`` is forwarded to the session verbatim — it is how the
+        broker's resolved model reaches the agent's startup without this module
+        interpreting it.
 
         ``spec.image`` is rejected: CAO's ``POST /sessions`` launch parameters
         expose no image override, so the adapter cannot forward it and will
@@ -377,13 +391,16 @@ class CaoSessionController:
                 spec.model_lease.assignment if spec.model_lease is not None else None
             ),
         )
+        # NOTE (PR #71 #1): the launch body deliberately omits
+        # ``initial_message``. Work is delivered via ``submit_work`` so a
+        # newly-created session receives each task exactly once. Callers
+        # that want ``initial_message`` semantics should pass an empty
+        # ``spec.command`` and rely on ``submit_work``.
         body: dict[str, Any] = {
             "env_vars": spec.env or None,
             "group": [spec.run_id, lane.lane],
             "metadata": metadata.to_dict(),
         }
-        if spec.command:
-            body["initial_message"] = spec.command
 
         try:
             response = self._request(
@@ -686,13 +703,24 @@ class CaoSessionController:
 
     @staticmethod
     def _validate_attribution(metadata: CaoSessionMetadata, spec: SessionSpec) -> None:
-        """Refuse adoption unless durable attribution matches the spec's identity.
+        """Refuse adoption unless the durable session-level attribution
+        matches the spec's identity.
 
         A session name can be reconstructed by anything; the metadata CAO
-        stored is what actually attributes the session's work. If it does not
-        agree with the run, lane, workdir, model assignment, or round/work-item
-        context the caller is asking about, adopting would misattribute
-        findings across runs or across review rounds of the same run.
+        stored is what actually attributes the session's work. If it does
+        not agree with the run, lane, workdir, or model assignment the
+        caller is asking about, adopting would misattribute findings across
+        runs or across lanes.
+
+        **Per-turn context (round_id, work_item_id) is NOT part of session
+        identity** (round-2 finding, PR #71 #3). A session lives across
+        multiple rounds of the same run — coder round 1, reviewer round 1,
+        coder round 2 (fix), reviewer round 2, etc. Rejecting adoption on
+        round change would prevent the executor from driving the next round
+        on a still-live session, which is exactly the multi-round case
+        PR #73 scenarios 2-4 need to exercise. Per-turn context is updated
+        via ``update_turn_context`` after adoption so the rest of the
+        system sees the latest round.
         """
         mismatches: list[str] = []
         if metadata.parent_run_id != spec.context.run_id:
@@ -711,24 +739,38 @@ class CaoSessionController:
             mismatches.append(
                 f"model assignment {metadata.model_assignment!r} != requested {expected_model!r}"
             )
-        # A recorded round/work item must match the request whenever EITHER
-        # side carries a value: an execution explicitly tied to round N must
-        # never be driven by a context-less request. Adoption is allowed only
-        # when both sides are absent or they are equal.
-        if metadata.context.round_id != spec.context.round_id:
-            mismatches.append(
-                f"round_id {metadata.context.round_id!r} != requested {spec.context.round_id!r}"
-            )
-        if metadata.context.work_item_id != spec.context.work_item_id:
-            mismatches.append(
-                f"work_item_id {metadata.context.work_item_id!r} != requested "
-                f"{spec.context.work_item_id!r}"
-            )
         if mismatches:
             raise CaoAdoptionMismatchError(
                 f"Session {metadata.session_name!r} attribution does not match the "
                 f"requested spec: {'; '.join(mismatches)}. It will not be adopted."
             )
+
+    def update_turn_context(self, handle: SessionHandle, context: LaneExecutionContext) -> None:
+        """Refresh the per-turn attribution on an adopted session.
+
+        Round-2 finding, PR #71 #3: per-turn context (round_id,
+        work_item_id) is intentionally NOT part of session-level adoption
+        identity, but the controller must still observe the latest turn so
+        downstream attribution (findings, dispositions) reports against
+        the current round, not the session's first launch. The executor
+        calls this on every adoption so ``metadata.context`` always
+        reflects the turn currently being driven.
+
+        Persists through ``PATCH /terminals/{tid}/metadata`` so a
+        subsequent foreman host that re-adopts the same session sees the
+        updated turn context instead of the original launch round.
+        """
+        metadata = self._metadata_for(handle)
+        updated = dataclasses.replace(metadata, context=context)
+        # Update CAO-side metadata so the durable state matches our local
+        # view; the fake persists this and a real CAO must do likewise.
+        response = self._request(
+            "PATCH",
+            f"/terminals/{metadata.terminal_id}/metadata",
+            json=updated.to_dict(),
+        )
+        self._raise_for_status(response, f"update turn context for {metadata.session_name!r}")
+        self._register(updated)
 
     def _metadata_for(self, handle: SessionHandle) -> CaoSessionMetadata:
         metadata = self._sessions.get(handle.session_id)
@@ -777,4 +819,11 @@ class CaoSessionController:
             raise CaoSessionNotFoundError(f"Failed to {action}: {detail}")
         if response.status_code == 409:
             raise SessionBusyError(f"Failed to {action}: {detail}")
+        if response.status_code == 429:
+            # 429 is backpressure, not a hard fault. Surface the dedicated
+            # subclass so callers (and tests) can distinguish "rate limited,
+            # back off" from "CAO is down, retry immediately". Both inherit
+            # from CaoUnavailableError so foreman retry logic works either
+            # way without per-status branching.
+            raise CaoRateLimitedError(f"Failed to {action}: HTTP 429 {detail}")
         raise CaoControlPlaneError(f"Failed to {action}: HTTP {response.status_code} {detail}")
