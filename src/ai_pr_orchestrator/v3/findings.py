@@ -38,12 +38,16 @@ SEVERITY_RANK: dict[str, int] = {
 }
 
 #: Disposition action → the finding status it settles into.
+#: ``rebut`` is deliberately absent: a coder's rebuttal keeps the finding
+#: open until a later reviewer round confirms (accept) or rejects (fix).
+#: See PR #73 review thread 5 / issue #87 for the rebuttal-path design.
 ACTION_TO_STATUS: dict[DispositionAction, FindingStatus] = {
     "fix": "accepted",
     "reject_wont_fix": "rejected",
     "already_addressed": "rejected",
     "reply_deferred": "deferred",
     "escalate_human": "deferred",
+    "accept": "accepted",
 }
 
 _WS = re.compile(r"\s+")
@@ -469,9 +473,18 @@ class FindingRegistry:
             thread_id=effective_thread_id,
             reply_body=reply_body,
         )
+        # ``rebut`` keeps the finding open: a coder's push-back must be
+        # reviewable by an independent round, not settled to a terminal
+        # status. ``ACTION_TO_STATUS`` deliberately omits ``rebut`` so
+        # the lookup below raises if a future caller forgets the
+        # special case here (PR #73 review thread 5 / issue #87).
+        if action == "rebut":
+            new_status: FindingStatus = "open"
+        else:
+            new_status = ACTION_TO_STATUS[action]
         updated = replace(
             finding,
-            status=ACTION_TO_STATUS[action],
+            status=new_status,
             status_reason=f"{action}: {rationale}",
         )
         self.findings[index] = updated

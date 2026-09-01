@@ -48,13 +48,18 @@ def test_pending_check_blocks_and_cannot_pass():
     assert decision.pending_checks == ("build",)
 
 
-def test_missing_required_check_fails_by_name():
+def test_missing_required_check_is_pending_not_failed():
+    """PR #73 review thread 9 / issue #79: a required check that has not
+    yet reported after a push is *pending*, not failed. The foreman must
+    requeue rather than trigger a needless coder round.
+    """
     fake = FakeGitHubClient()
     _green_check(fake, "build")
     gate = CIPRGateImpl(fake, CIPolicyConfig(required_checks=["build", "e2e"]))
     decision = gate.evaluate(_issue(), _pr())
     assert not decision.passed
-    assert decision.failed_checks == ("e2e",)
+    assert decision.pending_checks == ("e2e",)
+    assert decision.failed_checks == ()
 
 
 def test_no_checks_fails_when_green_required():
