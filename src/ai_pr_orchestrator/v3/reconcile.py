@@ -694,11 +694,15 @@ class ReconcilePlanner:
         live_session_ids: set[str],
     ) -> list[Action]:
         # Terminal-phase short-circuit: when the work item is already in a
-        # terminal phase (``done`` / ``failed`` / ``escalated``), the planner
-        # must return NOOP immediately and not evaluate any crash row. The
-        # previous implementation evaluated crash rows first, which fired
-        # spurious RELAUNCH / RESUME_SESSION actions on completed work and
-        # could re-launch a terminal item.
+        # terminal phase (``done`` / ``failed`` / ``escalated`` /
+        # ``cancelled``), the planner must return NOOP immediately and
+        # not evaluate any crash row. The previous implementation
+        # evaluated crash rows first, which fired spurious RELAUNCH /
+        # RESUME_SESSION actions on completed work and could re-launch a
+        # terminal item. ``cancelled`` is not yet a first-class phase in
+        # :data:`ai_pr_orchestrator.v3.domain.VALID_PHASES` but the
+        # planner recognises it explicitly so a future addition does
+        # not silently re-launch cancelled work.
         if inputs.observation.state is not None and inputs.observation.state.phase in (
             *TERMINAL_PHASES,
             "cancelled",
