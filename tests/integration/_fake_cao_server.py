@@ -205,6 +205,13 @@ class FakeCAOServer:
         with self._lock:
             self._faults.append(fault)
 
+    def clear_faults(self) -> None:
+        """Remove every registered fault. Useful for tests that want
+        explicit per-section fault state instead of stacking every
+        scenario's faults into one shared list."""
+        with self._lock:
+            self._faults.clear()
+
     @property
     def submit_count(self) -> int:
         """Number of POST /terminals/{tid}/input requests handled by
@@ -332,10 +339,22 @@ class _FakeHandler(BaseHTTPRequestHandler):
         ):
             self._write_text(fault.status_code, f"injected fault {fault.status_code}")
             return _PendingFault(status_code=fault.status_code)
-        # commit_then_reset (with or without transport_reset/status_code):
-        # let the handler perform its normal mutation, then drop the
-        # response at the end of dispatch via _maybe_drop_response.
-        return fault
+        # Round-2 finding, PR #71 #5: a fault whose only effect is
+        # ``status_code=200`` (or no status_code at all, with delay-only
+        # etc.) is a documented no-op. The dispatcher must continue to
+        # the real handler so the client receives the route's normal
+        # 200-series response. Returning the fault here used to make
+        # every dispatcher short-circuit and drop the response, which
+        # misclassified baseline or delay-only scenarios as transport
+        # failures.
+        #
+        # ``commit_then_reset`` is the one exception: it MUST still
+        # return the fault so the dispatcher sets ``_commit_then_reset``
+        # and runs the handler for its state-mutation effect, then
+        # ``_maybe_drop_response`` closes the socket at the end.
+        if fault.commit_then_reset:
+            return fault
+        return None
 
     # -- Dispatch -------------------------------------------------------
 
