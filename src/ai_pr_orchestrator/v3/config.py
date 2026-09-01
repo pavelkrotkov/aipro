@@ -59,6 +59,12 @@ class GitHubQueueConfig:
     #: Larger payloads are compacted (see ``v3.queue`` compaction docs);
     #: if compaction cannot fit, saving raises.
     max_state_block_chars: int = 60000
+    #: Owner half of the GitHub repo (``owner/name``) the queue reads from
+    #: and writes to. Optional — the CLI can also take ``--repo owner/name``
+    #: on the command line, with this section as the default.
+    owner: str = ""
+    #: Name half of the GitHub repo. Optional, see ``owner``.
+    repo: str = ""
     #: Unknown keys from a newer writer, preserved for forward compatibility.
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -354,6 +360,26 @@ class EscalationPolicyConfig:
     extras: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class CleanupConfig:
+    """TTL policy for orphan detection (issue #44).
+
+    ``session_lease_ttl_seconds`` mirrors :attr:`CAOControlPlaneConfig.session_timeout_seconds`
+    but is the *orphan-detection* budget — a CAO session with no live work-item
+    lease referencing it for longer than this is reclaimed. ``worktree_inactivity_ttl_seconds``
+    bounds how long a git worktree may sit without a live lease referencing its
+    branch before :class:`~ai_pr_orchestrator.v3.reconcile.ReconcilePlanner` flags
+    it for cleanup. Both are evaluated against a deterministic clock passed to
+    the planner; production callers accept ``now=datetime.now(UTC)`` and tests
+    pass an explicit instant.
+    """
+
+    session_lease_ttl_seconds: int = 7200  # 2h, mirrors §3 of CUTOVER_PLAN.md
+    worktree_inactivity_ttl_seconds: int = 86400  # 24h, mirrors §3
+    #: Unknown keys from a newer writer, preserved for forward compatibility.
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
 # --- Section registry (used for dict coercion and deserialization) ---------
 
 _SECTION_TYPES: dict[str, type] = {
@@ -367,6 +393,7 @@ _SECTION_TYPES: dict[str, type] = {
     "ci_policy": CIPolicyConfig,
     "safety": SafetyPolicyConfig,
     "escalation": EscalationPolicyConfig,
+    "cleanup": CleanupConfig,
 }
 
 _NESTED_LIST_FIELDS: dict[tuple[str, str], type] = {
@@ -394,6 +421,7 @@ class V3Config:
     ci_policy: CIPolicyConfig = field(default_factory=CIPolicyConfig)
     safety: SafetyPolicyConfig = field(default_factory=SafetyPolicyConfig)
     escalation: EscalationPolicyConfig = field(default_factory=EscalationPolicyConfig)
+    cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     #: Unknown top-level keys, preserved for forward compatibility.
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -523,6 +551,17 @@ class V3Config:
 
         if self.review_policy.max_review_rounds < 1:
             raise V3ConfigError("max_review_rounds must be >= 1")
+
+        if self.cleanup.session_lease_ttl_seconds < 1:
+            raise V3ConfigError(
+                "cleanup.session_lease_ttl_seconds must be >= 1, "
+                f"got {self.cleanup.session_lease_ttl_seconds}"
+            )
+        if self.cleanup.worktree_inactivity_ttl_seconds < 1:
+            raise V3ConfigError(
+                "cleanup.worktree_inactivity_ttl_seconds must be >= 1, "
+                f"got {self.cleanup.worktree_inactivity_ttl_seconds}"
+            )
 
         b = self.broker
         import math

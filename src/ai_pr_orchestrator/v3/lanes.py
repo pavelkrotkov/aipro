@@ -109,6 +109,22 @@ class LaneRegistry:
                 f"Unknown lane {lane!r}; registered lanes are {sorted(self._lanes)}"
             ) from None
 
+    @property
+    def developer_lane(self) -> LaneName:
+        """The lane name that identifies the coding (developer) agent.
+
+        The registry owns this binding: callers must look it up here rather
+        than hard-coding a literal like ``"developer"`` so a deployment can
+        rename the developer lane (e.g. ``implementer``) without breaking
+        downstream predicates.
+        """
+        for lane in self._lanes.values():
+            if lane.role == "worker":
+                return lane.lane
+        # Fall back to the historical default so legacy callers/tests that
+        # build a registry with only reviewer lanes still get a usable value.
+        return DEVELOPER_LANE
+
     def names(self) -> tuple[LaneName, ...]:
         return tuple(self._lanes)
 
