@@ -84,21 +84,13 @@ class FaultSpec:
     """Per-request fault: when ``matches(method, path)`` is true, return
     ``status_code`` (an HTTP status to send instead of the real response) or
     ``transport_reset=True`` (close the connection mid-flight, which CAO's
-    adapter maps to ``CaoTransportError``). ``status_code=200`` is a no-op.
-
-    ``commit_then_reset=True`` extends ``transport_reset``: the handler still
-    applies the normal state mutation (creating the session, advancing the
-    status cursor, etc.) and only then closes the connection without writing
-    a response. This exercises the committed-but-unacknowledged branch where
-    the controller treats the request as uncertain and a retry would
-    duplicate work."""
+    adapter maps to ``CaoTransportError``). ``status_code=200`` is a no-op."""
 
     method: str
     path_prefix: str
     status_code: int | None = None
     transport_reset: bool = False
     delay_seconds: float = 0.0
-    commit_then_reset: bool = False
 
     def matches(self, method: str, path: str) -> bool:
         if self.method != method:
@@ -113,7 +105,6 @@ class _PendingFault:
     status_code: int | None = None
     transport_reset: bool = False
     delay_seconds: float = 0.0
-    commit_then_reset: bool = False
 
 
 def _find_by_terminal(sessions: dict[str, _SessionState], terminal_id: str) -> _SessionState | None:
@@ -165,10 +156,11 @@ class FakeCAOServer:
         self._outputs: dict[str, str] = {}
         # Per-request fault specs.
         self._faults: list[FaultSpec] = []
-        # Total POST /terminals/{tid}/input calls handled by this server
-        # since startup. Tests assert the executor's single-delivery
-        # contract (PR #71 #1) against this counter via submit_count.
-        self._submit_count = 0
+        # FIFO queue of consumable faults (finding #9 in PR #72).
+        # Distinct from self._faults because scenarios want to apply
+        # a specific sequence (e.g. 503, then 200) without the fault
+        # becoming permanently registered.
+        self._queued_faults: list[FaultSpec] = []
         # Pre-bound socket so we can read the chosen port back to the caller.
         self._httpd = _FakeHTTPServer(("127.0.0.1", 0), _FakeHandler)
         self._httpd.fake = self
@@ -205,19 +197,53 @@ class FakeCAOServer:
         with self._lock:
             self._faults.append(fault)
 
-    def clear_faults(self) -> None:
-        """Remove every registered fault. Useful for tests that want
-        explicit per-section fault state instead of stacking every
-        scenario's faults into one shared list."""
-        with self._lock:
-            self._faults.clear()
+    def queue_fault(self, fault: FaultSpec) -> None:
+        """Push a fault onto the consumed-fault queue (finding #9 in PR #72).
 
-    @property
-    def submit_count(self) -> int:
-        """Number of POST /terminals/{tid}/input requests handled by
-        this server since startup. Tests assert the executor's
-        single-delivery contract (PR #71 #1) against this counter."""
-        return self._submit_count
+        The harness exposes this so E2E scenarios can sequence 503 then
+        200 then 200 faults without permanently polluting
+        ``self._faults`` (which would otherwise leak the failure into
+        later tests that share the same fake). Use :meth:`next_fault`
+        to pop them in order."""
+        with self._lock:
+            self._queued_faults.append(fault)
+
+    def next_fault(
+        self, *, method: str | None = None, path_prefix: str | None = None
+    ) -> FaultSpec | None:
+        """Pop the next queued fault matching the request, or ``None``.
+
+        When ``method`` and ``path_prefix`` are both provided, only
+        faults matching the request are returned; non-matching queued
+        faults stay in the queue. Without those filters, the head of
+        the queue is returned regardless of match — scenarios that
+        queue a deterministic sequence usually want the head."""
+        with self._lock:
+            while self._queued_faults:
+                head = self._queued_faults[0]
+                if method is None and path_prefix is None:
+                    self._queued_faults.pop(0)
+                    return head
+                if (method is None or head.method == method) and (
+                    path_prefix is None or head.path_prefix == path_prefix
+                ):
+                    self._queued_faults.pop(0)
+                    return head
+                # Head doesn't match; drop it (queue is FIFO so a
+                # scenario that wants strict ordering should pass
+                # filters that match only when ready).
+                self._queued_faults.pop(0)
+        return None
+
+    def session_names(self) -> list[str]:
+        """Public list of live session names (finding #6 in PR #72).
+
+        Replaces direct access to ``self._sessions.keys()`` so E2E
+        scenarios do not need to reach into private state. Returns a
+        snapshot taken under the server lock so callers see a
+        consistent point-in-time view."""
+        with self._lock:
+            return [s for s, st in self._sessions.items() if not st.deleted]
 
     def _status_sequence_for(self, session_name: str) -> Sequence[str]:
         return self._status_overrides.get(session_name, DEFAULT_STATUS_SEQUENCE)
@@ -232,7 +258,6 @@ class FakeCAOServer:
                 status_code=fault.status_code,
                 transport_reset=fault.transport_reset,
                 delay_seconds=fault.delay_seconds,
-                commit_then_reset=fault.commit_then_reset,
             )
         return None
 
@@ -297,8 +322,6 @@ class _FakeHandler(BaseHTTPRequestHandler):
             return None
 
     def _write_json(self, status: int, body: Any) -> None:
-        if getattr(self, "_commit_then_reset", False):
-            return
         encoded = json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -307,8 +330,6 @@ class _FakeHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _write_text(self, status: int, body: str) -> None:
-        if getattr(self, "_commit_then_reset", False):
-            return
         encoded = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain")
@@ -327,33 +348,14 @@ class _FakeHandler(BaseHTTPRequestHandler):
             import time
 
             time.sleep(fault.delay_seconds)
-        if fault.transport_reset and not fault.commit_then_reset:
+        if fault.transport_reset:
             # Close the underlying socket so the client sees a transport error.
             self.connection.close()
             # Signal the handler to return without writing anything.
             return _PendingFault(transport_reset=True)
-        if (
-            fault.status_code is not None
-            and fault.status_code != 200
-            and not fault.commit_then_reset
-        ):
+        if fault.status_code is not None and fault.status_code != 200:
             self._write_text(fault.status_code, f"injected fault {fault.status_code}")
             return _PendingFault(status_code=fault.status_code)
-        # Round-2 finding, PR #71 #5: a fault whose only effect is
-        # ``status_code=200`` (or no status_code at all, with delay-only
-        # etc.) is a documented no-op. The dispatcher must continue to
-        # the real handler so the client receives the route's normal
-        # 200-series response. Returning the fault here used to make
-        # every dispatcher short-circuit and drop the response, which
-        # misclassified baseline or delay-only scenarios as transport
-        # failures.
-        #
-        # ``commit_then_reset`` is the one exception: it MUST still
-        # return the fault so the dispatcher sets ``_commit_then_reset``
-        # and runs the handler for its state-mutation effect, then
-        # ``_maybe_drop_response`` closes the socket at the end.
-        if fault.commit_then_reset:
-            return fault
         return None
 
     # -- Dispatch -------------------------------------------------------
@@ -362,104 +364,49 @@ class _FakeHandler(BaseHTTPRequestHandler):
         return self.path.split("?", 1)[0]
 
     def do_POST(self) -> None:
-        fault = self._apply_fault_or(self.command, self.path)
-        if fault is not None and not fault.commit_then_reset:
+        if self._apply_fault_or(self.command, self.path) is not None:
             return
-        self._commit_then_reset = bool(fault and fault.commit_then_reset)
-        try:
-            body = self._read_body()
-            path = self._strip_query()
-            if path == "/sessions":
-                self._handle_launch(body)
-            elif path.endswith("/input"):
-                self._handle_input()
-            else:
-                self._write_text(404, f"unknown POST {self.path}")
-        finally:
-            self._maybe_drop_response()
+        body = self._read_body()
+        path = self._strip_query()
+        if path == "/sessions":
+            self._handle_launch(body)
+        elif path.endswith("/input"):
+            self._handle_input()
+        else:
+            self._write_text(404, f"unknown POST {self.path}")
 
     def do_GET(self) -> None:
-        fault = self._apply_fault_or(self.command, self.path)
-        if fault is not None and not fault.commit_then_reset:
+        if self._apply_fault_or(self.command, self.path) is not None:
             return
-        self._commit_then_reset = bool(fault and fault.commit_then_reset)
-        try:
-            path = self._strip_query()
-            if path.startswith("/sessions/"):
-                self._handle_get_session()
-            elif "/output" in path:
-                self._handle_get_output()
-            elif path.startswith("/terminals/"):
-                self._handle_get_terminal()
-            else:
-                self._write_text(404, f"unknown GET {self.path}")
-        finally:
-            self._maybe_drop_response()
+        path = self._strip_query()
+        if path.startswith("/sessions/"):
+            self._handle_get_session()
+        elif "/output" in path:
+            self._handle_get_output()
+        elif path.startswith("/terminals/"):
+            self._handle_get_terminal()
+        else:
+            self._write_text(404, f"unknown GET {self.path}")
 
     def do_PATCH(self) -> None:
-        fault = self._apply_fault_or(self.command, self.path)
-        if fault is not None and not fault.commit_then_reset:
+        if self._apply_fault_or(self.command, self.path) is not None:
             return
-        self._commit_then_reset = bool(fault and fault.commit_then_reset)
-        try:
-            body = self._read_body() or {}
-            # Path: /terminals/{tid}/metadata; the terminal id is the
-            # third segment, the literal "metadata" segment must be the
-            # fourth.
-            path = self._strip_query()
-            if not path.startswith("/terminals/"):
-                self._write_text(404, f"unknown PATCH {self.path}")
-                return
-            parts = path.split("/")
-            if len(parts) != 4 or parts[3] != "metadata":
-                self._write_text(404, f"unknown terminal PATCH {self.path}")
-                return
-            terminal_id = parts[2]
-            with self._fake._lock:
-                state = _find_by_terminal(self._fake._sessions, terminal_id)
-                if state is None or state.deleted:
-                    self._write_text(404, f"no terminal {terminal_id}")
-                    return
-                if isinstance(body, dict):
-                    # Round-2 finding, PR #71 #4: persist the merged
-                    # metadata so activity changes (e.g. activity_seen,
-                    # round_id, work_item_id) survive a controller
-                    # restart and are observable in the next
-                    # GET /terminals/{tid}. Without this, recovery and
-                    # soak tests that depend on durable metadata would
-                    # silently regress.
-                    for key, value in body.items():
-                        state.metadata[key] = value
-            self._write_text(204, "")
-        finally:
-            self._maybe_drop_response()
+        self._read_body()  # metadata is best-effort persistence in CAO
+        self._write_text(204, "")
 
     def do_DELETE(self) -> None:
-        fault = self._apply_fault_or(self.command, self.path)
-        if fault is not None and not fault.commit_then_reset:
+        if self._apply_fault_or(self.command, self.path) is not None:
             return
-        self._commit_then_reset = bool(fault and fault.commit_then_reset)
-        try:
-            if self._strip_query().startswith("/sessions/"):
-                name = self.path[len("/sessions/") :].split("?", 1)[0]
-                with self._fake._lock:
-                    state = self._fake._sessions.get(name)
-                    if state is not None and not state.deleted:
-                        state.deleted = True
-                        state.exhausted = True
-                self._write_text(204, "")
-            else:
-                self._write_text(404, f"unknown DELETE {self.path}")
-        finally:
-            self._maybe_drop_response()
-
-    def _maybe_drop_response(self) -> None:
-        if getattr(self, "_commit_then_reset", False):
-            import contextlib
-
-            with contextlib.suppress(Exception):
-                self.wfile.flush()
-            self.connection.close()
+        if self._strip_query().startswith("/sessions/"):
+            name = self.path[len("/sessions/") :].split("?", 1)[0]
+            with self._fake._lock:
+                state = self._fake._sessions.get(name)
+                if state is not None and not state.deleted:
+                    state.deleted = True
+                    state.exhausted = True
+            self._write_text(204, "")
+        else:
+            self._write_text(404, f"unknown DELETE {self.path}")
 
     # -- Handlers -------------------------------------------------------
 
@@ -509,20 +456,14 @@ class _FakeHandler(BaseHTTPRequestHandler):
             self._write_text(404, f"unknown input path {self.path}")
             return
         terminal_id = parts[2]
-        # PR #71 #1: count submit_work deliveries so tests can assert
-        # that the executor delivers each task exactly once.
-        self._fake._submit_count += 1
         with self._fake._lock:
             for state in self._fake._sessions.values():
                 if state.terminal_id == terminal_id and not state.deleted:
                     # In real CAO, accepted input means the session is
-                    # processing again. Replay the scripted lifecycle from
-                    # the start so a follow-up poll sees post-start
-                    # activity evidence (cursor at "processing") before
-                    # the controller clears its seen flag and polls
-                    # forever waiting for non-idle.
-                    state.status_index = 0
-                    state.exhausted = False
+                    # processing again. Advance the sequence to the next
+                    # status so a follow-up poll sees post-start activity.
+                    if not state.exhausted and state.status_index < len(state.status_sequence) - 1:
+                        state.status_index += 1
                     self._write_text(204, "")
                     return
         self._write_text(404, f"no session for terminal {terminal_id}")
