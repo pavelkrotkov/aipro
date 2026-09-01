@@ -85,9 +85,7 @@ class CaoLaneExecutor:
         # executor's own exhaustion path.
         if max_poll_seconds is None:
             controller_cfg = getattr(controller, "_config", None)
-            controller_session_timeout = getattr(
-                controller_cfg, "session_timeout_seconds", None
-            )
+            controller_session_timeout = getattr(controller_cfg, "session_timeout_seconds", None)
             if controller_session_timeout is None:
                 max_poll_seconds = 600.0
             else:
@@ -163,14 +161,17 @@ class CaoLaneExecutor:
                     # returned a non-empty ``output_summary`` for a reviewer
                     # lane but no findings, treat that as a structured-output
                     # failure and escalate (the foreman re-raises it).
-                    if registered_lane.role == "reviewer" and not result.findings:
-                        if (result.output_summary or "").strip():
-                            raise ReviewerOutputUnparsedError(
-                                f"reviewer lane {lane.lane!r} returned text that "
-                                "could not be parsed into structured findings; "
-                                "the foreman must escalate rather than treat "
-                                "this as a clean review"
-                            )
+                    if (
+                        registered_lane.role == "reviewer"
+                        and not result.findings
+                        and (result.output_summary or "").strip()
+                    ):
+                        raise ReviewerOutputUnparsedError(
+                            f"reviewer lane {lane.lane!r} returned text that "
+                            "could not be parsed into structured findings; "
+                            "the foreman must escalate rather than treat "
+                            "this as a clean review"
+                        )
                     # ``poll_session`` already builds a LaneResult; rewrite
                     # the ``session`` field with the live handle so the
                     # foreman can address the session that produced it.

@@ -340,13 +340,23 @@ class ForemanPolicyLoop:
         stagnant_rounds = 0
         reviewer_triggers = 0
         self._prompt_tokens = 0
+        # PR #73 review thread 14 / issue #83: fix ids from the previous
+        # round that the next review must verify. Empty at the start of
+        # the run; populated when a round dispositions findings as ``fix``
+        # and consumed (cleared) by the next round that finds them fixed.
+        self._pending_fix_ids_for_review: tuple[str, ...] = ()
         fix_findings: tuple[ReviewerFinding, ...] = ()
         result: LaneResult | None = None
 
         while True:
             if resume_at_gate:
-                # Requeued pending-CI item with a retained PR: skip coding and
-                # review entirely and re-evaluate the retained PR head.
+                # PR #73 review thread 16 / issue #85: requeued pending-CI
+                # items are claimable by a different foreman host whose
+                # local worktree path does not exist. Skip the
+                # commit/push step and re-evaluate the retained PR head
+                # against the recorded PR number — the worktree is not
+                # the source of truth for a CI-only resume.
+                result = None
                 resume_at_gate = False
             else:
                 # --- Coding ---------------------------------------------------
@@ -396,7 +406,7 @@ class ForemanPolicyLoop:
                 # A background lease heartbeat may have advanced the CAS
                 # version while the lane ran: reload before further writes.
                 state = self._load(issue, state)
-                violation = self._policy_violation(result)
+                violation = self._policy_violation(result, worktree=worktree)
                 if violation:
                     return self._fail(issue, state, violation, now=now)
 
@@ -423,19 +433,36 @@ class ForemanPolicyLoop:
                             now=now,
                         )
                     fix_findings = report.remaining
+                    # PR #73 review thread 14 / issue #83: track the
+                    # set of fix ids that must be verified by the next
+                    # review round, so the ``max_review_rounds`` cap
+                    # knows whether it is safe to short-circuit to
+                    # ``done`` or must escalate.
+                    self._pending_fix_ids_for_review = tuple(f.id for f in fix_findings)
                     continue  # fixes dispositioned; run the coder again
 
             # --- CI gate ------------------------------------------------------
             state = self._transition(issue, state, "ci_gating", now=now)
             state = self._heartbeat(issue, state, now=now)
-            sha = self._commit_and_push(
-                issue,
-                state,
-                worktree,
-                branch,
-                changes_pending=bool(result.changed_files) if result is not None else False,
-            )
-            self._head_sha = sha
+            # PR #73 review thread 16 / issue #85: when resuming at the
+            # gate (no fresh coding work), the previous host's local
+            # worktree may not exist on this host. Skip the
+            # commit/push step and use the recorded PR head directly.
+            if result is not None:
+                sha = self._commit_and_push(
+                    issue,
+                    state,
+                    worktree,
+                    branch,
+                    changes_pending=bool(result.changed_files),
+                )
+                self._head_sha = sha
+            else:
+                # Reuse the previously recorded head; if none is recorded,
+                # fall back to ``None`` and let the gate decide (a missing
+                # head will surface as a typed gate failure rather than a
+                # worktree-not-found crash).
+                self._head_sha = self._head_sha or state.extras.get("head_sha")
             pr = self._ensure_pr(issue, state, branch, worktree)
             # _ensure_pr may persist the recorded PR number (advancing the CAS
             # version): reload so the subsequent transitions expect the
@@ -549,7 +576,24 @@ class ForemanPolicyLoop:
         Reviewer triggers are capped at ``max_reviewer_triggers_per_run``.
         """
         policy = self._cfg.review_policy
+        # PR #73 review thread 14 / issue #83: if the previous round
+        # produced ``fix`` findings and the coder has run a fix round,
+        # reaching ``max_review_rounds`` here must escalate rather than
+        # masquerade as an empty no-finding round. A previous empty round
+        # (no fix_ids, just confirmed findings) does not require re-review
+        # — only a follow-up that needs verification must trigger the cap
+        # escalation.
+        had_pending_fixes = bool(getattr(self, "_pending_fix_ids_for_review", ()))
         if review_rounds >= policy.max_review_rounds:
+            if had_pending_fixes:
+                # Use the escalation path so the durable issue is moved to
+                # ``needs_human`` and the operator sees why.
+                raise _ForemanEscalation(
+                    f"review-round cap ({policy.max_review_rounds}) exhausted "
+                    f"while fix findings from the previous round remained "
+                    "unverified; refusing to mark the item done without a "
+                    "reviewer examination"
+                )
             return _RoundReport((), review_rounds, stagnant_rounds, reviewer_triggers)
         reviewer_lanes = policy.reviewer_lanes or [
             lane.lane for lane in self._lanes if lane.role == "reviewer"
@@ -583,7 +627,7 @@ class ForemanPolicyLoop:
                 raise _ForemanEscalation(
                     f"reviewer lane {lane_name!r} failed (exit {result.exit_code})"
                 )
-            violation = self._policy_violation(result)
+            violation = self._policy_violation(result, worktree=worktree)
             if violation:
                 # Reviewer lanes are bound by the same workflow-file policy as
                 # the coder — a reviewer editing .github/workflows/ must never
@@ -944,9 +988,22 @@ class ForemanPolicyLoop:
                 return lane
         return self._lanes.get(DEVELOPER_LANE)
 
-    def _policy_violation(self, result: LaneResult) -> str | None:
+    def _policy_violation(self, result: LaneResult, worktree: str | None = None) -> str | None:
+        # PR #73 review thread 8 / issue #78: the production CAO controller
+        # returns ``changed_files=[]`` for every completed session, so the
+        # workflow-file policy is bypassed in the only production executor
+        # path. Derive the changed paths from the worktree (when the lane
+        # execution surface supplies a worktree to inspect) before applying
+        # the policy, so a coder or reviewer editing ``.github/workflows/``
+        # is caught here rather than at commit time.
+        observed = list(result.changed_files)
+        if not observed and worktree is not None and hasattr(self._git, "changed_files"):
+            try:
+                observed = list(self._git.changed_files(worktree))
+            except Exception:
+                observed = []
         if self._cfg.safety.disallow_workflow_file_changes and any(
-            f.startswith(".github/workflows/") for f in result.changed_files
+            f.startswith(".github/workflows/") for f in observed
         ):
             return "policy violation: lane modified files under .github/workflows/"
         return None
@@ -973,9 +1030,20 @@ class ForemanPolicyLoop:
             return ""
 
     def _reviewer_prompt(self, issue: GitHubIssueRef, round_id: str) -> str:
-        return (
+        # PR #73 review thread 15 / issue #84: the requirements reviewer
+        # cannot determine whether the implementation satisfies the
+        # requested behaviour unless its profile independently fetches
+        # GitHub state — and the lane contract does not include that.
+        # Embed the same authoritative issue description the coder sees so
+        # reviewer findings are grounded in the requirements they actually
+        # need to verify.
+        lines = [
             f"Review the changes for issue {issue.slug()} ({round_id}); report structured findings."
-        )
+        ]
+        description = self._read_issue_description(issue)
+        if description:
+            lines.append(f"Issue description:\n{description}")
+        return "\n".join(lines)
 
     def _commit_and_push(
         self,
@@ -1030,6 +1098,12 @@ class ForemanPolicyLoop:
         must gate against the *same* open PR. ``head_sha`` is the PR's commit
         SHA from the client (F19), refreshed from the live PR on reuse, never
         the branch name.
+
+        PR #73 review thread 11 / issue #81: an unavoidable crash window
+        where ``create_pr()`` succeeds but ``_record_pr()`` fails leaves an
+        open PR whose number is absent from workflow state; on retry this
+        code blindly called ``create_pr()`` again. Search for an existing
+        open PR whose ``head_ref`` matches the branch before creating.
         """
         client = getattr(self._queue, "_client", None)
         pr_number = state.extras.get("pr_number")
@@ -1042,6 +1116,20 @@ class ForemanPolicyLoop:
                     number=int(pr_number),
                     head_sha=live,
                 )
+        # Discovery before creation: if a transient failure erased the
+        # recorded PR number but the open PR is still on the branch,
+        # reusing it avoids GitHub's duplicate-head rejection (which
+        # escalates an otherwise healthy item) and prevents permissive
+        # clients from minting a duplicate.
+        discovered = self._discover_open_pr(client, branch, issue)
+        if discovered is not None:
+            self._record_pr(issue, state, discovered.number)
+            return GitHubPullRequestRef(
+                owner=issue.owner,
+                repo=issue.repo,
+                number=discovered.number,
+                head_sha=discovered.head_sha,
+            )
         if client is not None and hasattr(client, "create_pr"):
             pr = client.create_pr(
                 f"[aipro] issue #{issue.number}: automated change",
@@ -1065,6 +1153,23 @@ class ForemanPolicyLoop:
             number=number,
             head_sha=self._head_sha or f"head-{number}",
         )
+
+    def _discover_open_pr(self, client, branch: str, issue: GitHubIssueRef):
+        """Find an open PR on ``branch`` (by ``head_ref``) if one exists.
+
+        PR #73 review thread 11 / issue #81: prevents duplicate ``create_pr``
+        after a crash window where the PR exists on the branch but is not
+        recorded in workflow state.
+        """
+        if client is None or not hasattr(client, "list_open_prs"):
+            return None
+        try:
+            for pr in client.list_open_prs():
+                if getattr(pr, "head_ref", None) == branch:
+                    return pr
+        except Exception:
+            return None
+        return None
 
     def _live_pr_head(self, client, pr_number: int) -> str | None:
         """The live PR's commit SHA (F19): refresh when the head moves."""
@@ -1090,8 +1195,14 @@ class ForemanPolicyLoop:
         *,
         now: datetime | None = None,
     ) -> WorkItemOutcome:
-        with suppress(Exception):
-            self._queue.mark_needs_human(issue, self._load(issue, state), reason=reason)
+        # PR #73 review thread 10 / issue #80: a transient GitHub or CAS
+        # failure during ``mark_needs_human`` must not be silently dropped —
+        # the durable issue would otherwise remain on its active phase while
+        # the foreman reports success. Raise so the caller can decide
+        # whether to retry; the prior ``with suppress(Exception)`` swallowed
+        # the error and led to worktree cleanup against a non-terminal
+        # state.
+        self._queue.mark_needs_human(issue, self._load(issue, state), reason=reason)
         return WorkItemOutcome(issue=issue, final_phase="escalated", reason=reason, escalated=True)
 
     def _fail(
@@ -1102,6 +1213,8 @@ class ForemanPolicyLoop:
         *,
         now: datetime | None = None,
     ) -> WorkItemOutcome:
-        with suppress(Exception):
-            self._queue.fail(issue, self._load(issue, state), reason=reason)
+        # Same fix as ``_escalate`` (thread 10): a failed ``queue.fail`` is
+        # an authoritative-write failure and must propagate rather than be
+        # silently absorbed.
+        self._queue.fail(issue, self._load(issue, state), reason=reason)
         return WorkItemOutcome(issue=issue, final_phase="failed", reason=reason)

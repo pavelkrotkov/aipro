@@ -111,6 +111,12 @@ class FakeGitOperations:
     def commit_count(self, workdir: str, base_ref: str) -> int:
         return sum(1 for w, _ in self.commits if w == workdir)
 
+    def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
+        # Test-only: no real git state is kept; pretend every committed
+        # touch is in the worktree so policy checks fire if the test
+        # exercises them.
+        return [w for w, _ in self.commits if w == workdir]
+
     def push(self, branch: str) -> None:
         return None
 
