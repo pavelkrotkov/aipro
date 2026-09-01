@@ -407,10 +407,15 @@ class _FakeHandler(BaseHTTPRequestHandler):
             for state in self._fake._sessions.values():
                 if state.terminal_id == terminal_id and not state.deleted:
                     # In real CAO, accepted input means the session is
-                    # processing again. Advance the sequence to the next
-                    # status so a follow-up poll sees post-start activity.
-                    if not state.exhausted and state.status_index < len(state.status_sequence) - 1:
-                        state.status_index += 1
+                    # processing again. Reset the sequence cursor so a
+                    # follow-up poll walks the agent lifecycle from the
+                    # top (PR #73 review thread 1: the executor now submits
+                    # follow-up work on every invocation, and the fake must
+                    # drive the session back through the lifecycle so the
+                    # second execute() can settle via the same idle-settle
+                    # rule the first one did).
+                    state.status_index = 0
+                    state.exhausted = False
                     self._write_text(204, "")
                     return
         self._write_text(404, f"no session for terminal {terminal_id}")
