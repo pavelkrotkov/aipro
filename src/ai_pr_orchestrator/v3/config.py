@@ -59,6 +59,12 @@ class GitHubQueueConfig:
     #: Larger payloads are compacted (see ``v3.queue`` compaction docs);
     #: if compaction cannot fit, saving raises.
     max_state_block_chars: int = 60000
+    #: Owner half of the GitHub repo (``owner/name``) the queue reads from
+    #: and writes to. Optional — the CLI can also take ``--repo owner/name``
+    #: on the command line, with this section as the default.
+    owner: str = ""
+    #: Name half of the GitHub repo. Optional, see ``owner``.
+    repo: str = ""
     #: Unknown keys from a newer writer, preserved for forward compatibility.
     extras: dict[str, Any] = field(default_factory=dict)
 
