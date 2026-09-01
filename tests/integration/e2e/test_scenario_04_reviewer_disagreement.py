@@ -18,8 +18,6 @@ Acceptance (per #55 E2E scenarios, #4, applied when the gap closes):
 
 from __future__ import annotations
 
-import dataclasses
-
 import pytest
 
 from ai_pr_orchestrator.v3.domain import ReviewerFinding
@@ -52,8 +50,12 @@ def test_scenario_4_reviewer_disagreement_picks_stronger(fake_cao, foreman_harne
     """Two reviewer lanes report conflicting findings on the same
     logical issue. The foreman adjudicates the whole conflict group
     as ``fix`` (no averaging) and reaches ``done`` after a fix round."""
-    # The two findings share a ``conflict_group`` so the foreman
-    # treats them as a single conflict.
+    # PR #73 review thread 3 / issue #73: the two findings must share a
+    # ``path`` and overlapping line ranges with incompatible claims so
+    # ``FindingRegistry.detect_conflicts`` (which clears the incoming
+    # ``conflict_group_id`` and recomputes by path + line range) can
+    # actually group them. The previous test preassigned group IDs that
+    # the production code never reads.
     conflicting_a = ReviewerFinding(
         id="f-conflict-a",
         lane="requirements-reviewer",
@@ -61,6 +63,10 @@ def test_scenario_4_reviewer_disagreement_picks_stronger(fake_cao, foreman_harne
         severity="major",
         run_id="ignored-by-hybrid",
         round_id="ignored-by-hybrid",
+        path="src/validation.py",
+        line=10,
+        line_end=20,
+        claim="validation must run eagerly on entry",
     )
     conflicting_b = ReviewerFinding(
         id="f-conflict-b",
@@ -69,11 +75,11 @@ def test_scenario_4_reviewer_disagreement_picks_stronger(fake_cao, foreman_harne
         severity="major",
         run_id="ignored-by-hybrid",
         round_id="ignored-by-hybrid",
+        path="src/validation.py",
+        line=12,
+        line_end=18,
+        claim="validation must run lazily on demand",
     )
-    # Mark them as a conflict group via the ``conflict_group_id`` field;
-    # the foreman reads it to detect reviewer disagreement.
-    conflicting_a = dataclasses.replace(conflicting_a, conflict_group_id="validation-strategy")
-    conflicting_b = dataclasses.replace(conflicting_b, conflict_group_id="validation-strategy")
 
     loop, queue, _fake = foreman_harness(
         seed_issue_numbers=[1],
