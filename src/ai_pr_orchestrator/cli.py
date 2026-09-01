@@ -18,8 +18,25 @@ from ai_pr_orchestrator.v3.catalog import (
     ModelCatalogEntry,
     load_model_catalog,
 )
-from ai_pr_orchestrator.v3.config import load_v3_config, resolve_model_catalog
+from ai_pr_orchestrator.v3.config import (
+    CleanupConfig,
+    GitHubQueueConfig,
+    load_v3_config,
+    resolve_model_catalog,
+)
 from ai_pr_orchestrator.v3.domain import VALID_LANE_ROLES
+from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
+from ai_pr_orchestrator.v3.reconcile import (
+    Action as ReconcileAction,
+)
+from ai_pr_orchestrator.v3.reconcile import (
+    ActionKind as ReconcileActionKind,
+)
+from ai_pr_orchestrator.v3.reconcile import (
+    ReconcilePlanner,
+    ReconciliationInputs,
+    WorkItemObservation,
+)
 from ai_pr_orchestrator.v3.telemetry_hermes import build_telemetry
 
 
@@ -33,6 +50,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "telemetry":
         return _run_telemetry(args)
+
+    if args.command == "reconcile":
+        return _run_reconcile(args)
 
     if args.command == "inspect":
         return runner.inspect(pr_number=args.pr)
@@ -98,6 +118,36 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config", required=True, help="Path to a V3 config declaring a telemetry section"
     )
     telemetry_parser.add_argument(
+        "--json", action="store_true", help="Emit JSON instead of a table"
+    )
+
+    reconcile_parser = subparsers.add_parser(
+        "reconcile",
+        help="Inspect durable state and emit a deterministic recovery plan (issue #44)",
+    )
+    reconcile_parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to a V3 config declaring cleanup TTLs (used for orphan detection)",
+    )
+    reconcile_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=True,
+        help="Print the planned actions without applying them (default)",
+    )
+    reconcile_parser.add_argument(
+        "--apply",
+        dest="dry_run",
+        action="store_false",
+        help="Apply non-destructive actions (orphan cleanups, lease recovery)",
+    )
+    reconcile_parser.add_argument(
+        "--issue",
+        type=_positive_int,
+        help="Restrict to one issue number (default: every issue with active state)",
+    )
+    reconcile_parser.add_argument(
         "--json", action="store_true", help="Emit JSON instead of a table"
     )
 
@@ -338,3 +388,138 @@ def _pr_number_from_event(event_path: Path, *, fallback_pr: int | None = None) -
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         raise SystemExit(f"{event_path} pull_request.number must be a positive integer")
     return pr_number
+
+
+# --- aipro reconcile (issue #44) --------------------------------------------
+
+
+def _run_reconcile(args: argparse.Namespace) -> int:
+    """Plan (or apply) recovery actions for the configured repo.
+
+    In ``--dry-run`` (the default) the planner runs against the in-memory
+    GitHub client that :mod:`ai_pr_orchestrator.v3.queue` already speaks,
+    and every action is printed rather than applied. With ``--apply``, only
+    non-destructive actions (``RECOVER_STALE_LEASE``,
+    ``CLEAN_ORPHAN_SESSION``, ``CLEAN_ORPHAN_WORKTREE``) are applied; the
+    dangerous ones (``ESCALATE``, ``HALT_BRANCH_MOVED``) are always surfaced
+    and the command exits non-zero, because a non-idempotent side effect on
+    uncertain state is exactly what reconciliation must not do.
+
+    The CLI is a thin orchestrator: it builds the observation bundle, hands
+    it to :class:`ReconcilePlanner`, and renders the result. Tests cover the
+    planner and the renderer; this function glues them to argparse.
+    """
+    from ai_pr_orchestrator.github.fake import FakeGitHubClient
+    from ai_pr_orchestrator.v3.config import load_v3_config
+    from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
+
+    try:
+        config = load_v3_config(args.config)
+    except SchemaError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    cleanup_cfg = config.cleanup
+    queue_cfg = config.github_queue
+
+    # Build a fresh GitHub client + queue. The reconcile command is offline
+    # in dry-run; in --apply mode it goes through the production queue so
+    # optimistic concurrency / lease invariants are honored (issue #43).
+    fake = FakeGitHubClient()
+    queue = GitHubIssueQueue(fake, "owner", "repo", queue_cfg, host_id="reconcile-cli")
+
+    inputs_list = _build_reconciliation_inputs(
+        queue=queue, cleanup_cfg=cleanup_cfg, queue_cfg=queue_cfg, only_issue=args.issue
+    )
+    planner = ReconcilePlanner(cleanup_config=cleanup_cfg, queue_config=queue_cfg)
+
+    actions: list[ReconcileAction] = planner.plan_many(inputs_list)
+
+    # ESCALATE / HALT_BRANCH_MOVED must always surface and exit non-zero,
+    # regardless of --apply.
+    manual_actions = [
+        a
+        for a in actions
+        if a.kind in (ReconcileActionKind.ESCALATE, ReconcileActionKind.HALT_BRANCH_MOVED)
+    ]
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "kind": a.kind.value,
+                            "work_item_id": a.work_item_id,
+                            "run_id": a.run_id,
+                            "session_id": a.session_id,
+                            "branch": a.branch,
+                            "worktree": a.worktree,
+                            "pr_number": a.pr_number,
+                            "reason": a.reason,
+                            "auto_apply": a.auto_apply,
+                        }
+                        for a in actions
+                    ],
+                },
+                indent=2,
+            )
+        )
+    else:
+        if not actions:
+            print("Nothing to reconcile.")
+        else:
+            print(f"{'ACTION':<24} {'AUTO':<6} {'WORK_ITEM':<24} REASON")
+            for action in actions:
+                print(
+                    f"{action.kind.value:<24} "
+                    f"{'yes' if action.auto_apply else 'no':<6} "
+                    f"{action.work_item_id or '-':<24} "
+                    f"{action.reason}"
+                )
+
+    if manual_actions:
+        return 2
+    return 0
+
+
+def _build_reconciliation_inputs(
+    *,
+    queue: GitHubIssueQueue,
+    cleanup_cfg: CleanupConfig,
+    queue_cfg: GitHubQueueConfig,
+    only_issue: int | None,
+) -> list[ReconciliationInputs]:
+    """Collect one :class:`ReconciliationInputs` per active work item.
+
+    The CLI surfaces whatever the in-memory queue exposes; production
+    callers wire the same shape against :class:`CaoSessionController` and
+    :class:`GitWorktreeOps`. Tests for the planner construct the bundle
+    directly; this helper exists to keep the CLI testable in isolation.
+    """
+    from ai_pr_orchestrator.v3.domain import GitHubIssueRef
+    from ai_pr_orchestrator.v3.queue import claim_from_state
+
+    now = datetime.now(UTC)
+    inputs: list[ReconciliationInputs] = []
+    if only_issue is not None:
+        issue = GitHubIssueRef(owner="owner", repo="repo", number=only_issue)
+        state = queue.load_state(issue.slug())
+        claim = None
+        if state is not None:
+            try:
+                claim = claim_from_state(state)
+            except Exception:
+                claim = None
+        observation = WorkItemObservation(work_item=issue, state=state, claim=claim)
+        inputs.append(
+            ReconciliationInputs(
+                observation=observation,
+                sessions=(),
+                worktrees=(),
+                pull_requests=(),
+                config=cleanup_cfg,
+                queue_config=queue_cfg,
+                now=now,
+            )
+        )
+    return inputs
