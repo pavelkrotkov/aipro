@@ -97,6 +97,11 @@ class FakeGitOperations:
     def cleanup_worktree(self, path: str) -> None:
         self.worktrees.pop(path, None)
 
+    def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
+        # Test stub: every commit registers a synthetic touched file so the
+        # foreman's workflow-file policy has something to act on.
+        return [f"src/{workdir.strip('/').replace('/', '_') or 'x'}.py"]
+
 
 __all__ = [
     "FakeBroker",

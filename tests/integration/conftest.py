@@ -30,7 +30,7 @@ from ai_pr_orchestrator.v3.cao import (
 from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
 from ai_pr_orchestrator.v3.config import V3Config
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop
-from ai_pr_orchestrator.v3.interfaces import GateDecision
+from ai_pr_orchestrator.v3.interfaces import GateDecision, GitOperations
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 from tests.integration._fake_cao_server import FakeCAOServer
@@ -129,7 +129,7 @@ def foreman_harness(
         committer_email: str = DEFAULT_COMMITTER_EMAIL,
         gate: GateDecision | None = None,
         broker: Any | None = None,
-        git_ops: Any | None = None,
+        git_ops: GitOperations | FakeGitOperations | None = None,
         hybrid_findings: dict[int, list[Any]] | None = None,
     ) -> tuple[ForemanPolicyLoop, GitHubIssueQueue, FakeGitHubClient]:
         fake = FakeGitHubClient()
@@ -154,8 +154,7 @@ def foreman_harness(
 
             executor = ScriptedExecutor(
                 reviewer_findings_by_round={
-                    round_idx: list(findings)
-                    for round_idx, findings in hybrid_findings.items()
+                    round_idx: list(findings) for round_idx, findings in hybrid_findings.items()
                 }
             )
 

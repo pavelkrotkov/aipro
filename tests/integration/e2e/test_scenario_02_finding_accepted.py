@@ -147,9 +147,7 @@ def test_scenario_2_finding_disposition_history_persists(fake_cao, foreman_harne
     # the foreman settles a finding it is moved from ``findings`` into
     # ``archived``, so the persisted disposition's finding_id may live in
     # either list. Correlate by ``finding_id``.
-    persisted_finding_ids = {f.finding_id for f in state.archived} | {
-        f.id for f in state.findings
-    }
+    persisted_finding_ids = {f.finding_id for f in state.archived} | {f.id for f in state.findings}
     disposition_for_f2 = next(
         (d for d in state.dispositions if d.finding_id.startswith("f-2")), None
     )
@@ -161,9 +159,8 @@ def test_scenario_2_finding_disposition_history_persists(fake_cao, foreman_harne
     )
     # The disposition's finding must appear somewhere in the durable state
     # (findings or archived).
-    assert (
-        disposition_for_f2.finding_id in persisted_finding_ids
-        or any(fid.startswith("f-2") for fid in persisted_finding_ids)
+    assert disposition_for_f2.finding_id in persisted_finding_ids or any(
+        fid.startswith("f-2") for fid in persisted_finding_ids
     )
 
 
