@@ -33,6 +33,7 @@ from tests.integration._fake_cao_server import (
     STATUS_ERROR,
     STATUS_IDLE,
     STATUS_PROCESSING,
+    STATUS_STARTED,
     FakeCAOServer,
     FaultSpec,
 )
@@ -126,10 +127,18 @@ def test_execute_adopts_existing_session_by_name(fake_cao: FakeCAOServer, tmp_pa
 def test_execute_clears_previous_idle_evidence_on_new_work(fake_cao: FakeCAOServer, tmp_path):
     """The controller clears idle-settle evidence on accepted input
     (see ``submit_work`` in ``cao.py``). A second ``execute`` therefore
-    starts fresh, not by inheriting the first session's terminal state."""
+    starts fresh, not by inheriting the first session's terminal state.
+
+    PR #73 review thread 1: the executor now submits the lane's prompt on
+    every invocation (adopted or fresh). The fake resets its status cursor
+    on submit so the second walk is identical to the first.
+    """
     run_id = f"it-{int(time.time() * 1000)}"
     name = session_name_for(run_id, DEVELOPER_LANE)
     fake_cao.set_output(name, MARKER)
+    fake_cao.set_status_sequence(
+        name, (STATUS_STARTED, STATUS_PROCESSING, STATUS_IDLE, STATUS_IDLE, STATUS_IDLE)
+    )
 
     controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
     executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)

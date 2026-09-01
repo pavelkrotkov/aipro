@@ -130,6 +130,7 @@ def foreman_harness(
         gate: GateDecision | None = None,
         broker: Any | None = None,
         git_ops: Any | None = None,
+        hybrid_findings: dict[int, list[Any]] | None = None,
     ) -> tuple[ForemanPolicyLoop, GitHubIssueQueue, FakeGitHubClient]:
         fake = FakeGitHubClient()
         if seed_issue_numbers is None:
@@ -143,6 +144,20 @@ def foreman_harness(
             broker = FakeBroker()
         if git_ops is None:
             git_ops = FakeGitOperations()
+        # When hybrid_findings is supplied, drive the foreman with a
+        # script-backed LaneExecutor so the scripted findings return
+        # instead of going through the real CAO lane. ``None`` keeps the
+        # default (ca_o_lane_executor) wiring.
+        executor = cao_lane_executor
+        if hybrid_findings is not None:
+            from tests.unit.test_v3_foreman import ScriptedExecutor
+
+            executor = ScriptedExecutor(
+                reviewer_findings_by_round={
+                    round_idx: list(findings)
+                    for round_idx, findings in hybrid_findings.items()
+                }
+            )
 
         queue = GitHubIssueQueue(fake, "owner", "repo", V3Config().github_queue, host_id="host-e2e")
         # Collision-proof run id: the millisecond-only counter collides
@@ -155,7 +170,7 @@ def foreman_harness(
             queue,
             broker,
             lane_registry,
-            cao_lane_executor,
+            executor,
             StaticGate(gate),
             git_ops,
             V3Config(),

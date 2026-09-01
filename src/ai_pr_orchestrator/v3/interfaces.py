@@ -294,6 +294,15 @@ class GitOperations(Protocol):
 
         ...
 
+    def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
+        """Paths the worktree has touched relative to ``base_ref`` (or, when
+        ``base_ref`` is ``None``, uncommitted + untracked paths in the
+        working tree). Used by the foreman to enforce workflow-file policy
+        and pre-commit budgets before committing (PR #73 review thread 8).
+        """
+
+        ...
+
     def push(self, branch: str) -> None: ...
 
     def cleanup_worktree(self, path: str) -> None: ...

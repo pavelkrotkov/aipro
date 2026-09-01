@@ -74,9 +74,11 @@ class CIPRGateImpl:
 
         missing_required = [name for name in self._cfg.required_checks if name not in by_name]
         if self._cfg.required_checks:
-            # A required check that has not completed is pending, not failed;
-            # one that never reported at all is failed by name.
-            failed.extend(
+            # PR #73 review thread 9 / issue #79: immediately after a push,
+            # some required checks may not have reported yet even though
+            # others have. Classify those as PENDING (not failed) so the
+            # foreman requeues instead of triggering a needless coder round.
+            pending.extend(
                 name for name in missing_required if name not in pending and name not in failed
             )
 

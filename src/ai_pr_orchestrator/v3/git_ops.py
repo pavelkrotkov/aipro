@@ -119,6 +119,54 @@ class GitWorktreeOps:
         )
         return int(out.strip())
 
+    def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
+        """The paths the worktree has touched relative to ``base_ref``.
+
+        PR #73 review thread 8 / issue #78: the production CAO controller
+        reports ``changed_files=[]`` for every completed session, so the
+        foreman's policy and budget checks (``_policy_violation``,
+        ``_commit_and_push``) cannot detect a coder or reviewer editing
+        ``.github/workflows/`` until the commit itself runs. This method
+        derives the changed paths from the worktree so the policy layer
+        sees the real diff, not an empty signal.
+        """
+        cwd = str(self._workdir(workdir))
+        if base_ref is None:
+            # Uncommitted + untracked paths relative to the worktree root;
+            # the foreman must enforce the workflow-file policy *before*
+            # committing (round-2 #9).
+            out = self._run("-C", cwd, "status", "--porcelain", "-uall", "--no-renames", "-z")
+        else:
+            # Committed changes since ``base_ref`` plus any uncommitted
+            # additions in the working tree (so a fix-round commit that
+            # only stages .github/workflows/ is still caught).
+            committed = self._run(
+                "-C", cwd, "diff", "--name-only", "--no-renames", "-z", f"{base_ref}..HEAD"
+            )
+            pending = self._run("-C", cwd, "status", "--porcelain", "-uall", "--no-renames", "-z")
+            out = committed + pending
+        if not out:
+            return []
+        # ``-z`` separates entries with NUL; strip the leading status
+        # columns the porcelain format prefixes status lines with.
+        entries: list[str] = []
+        for chunk in out.split("\x00"):
+            if not chunk:
+                continue
+            if base_ref is None and len(chunk) >= 3 and chunk[2] == " ":
+                entries.append(chunk[3:].strip())
+            else:
+                entries.append(chunk.strip())
+        # De-duplicate while preserving order so the result is stable across
+        # retries of the same lane outcome.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for entry in entries:
+            if entry not in seen:
+                seen.add(entry)
+                unique.append(entry)
+        return unique
+
     def push(self, branch: str) -> None:
         self._run("push", "-u", "origin", branch)
 

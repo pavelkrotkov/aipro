@@ -639,6 +639,22 @@ class V3Config:
         if duplicates:
             raise V3ConfigError(f"Duplicate telemetry resource names: {duplicates}")
 
+        # PR #73 review thread 12 / issue #82: a single provider may not be
+        # claimed by two resources. ``resource_by_provider`` in the model
+        # router is single-valued, so a silent last-write-wins on duplicate
+        # providers would route quota/health against whichever resource
+        # happened to be declared last while both rows contribute snapshots.
+        providers = [resource.provider for resource in telemetry.resources]
+        duplicate_providers = sorted(
+            {provider for provider in providers if providers.count(provider) > 1}
+        )
+        if duplicate_providers:
+            raise V3ConfigError(
+                f"Duplicate telemetry providers: {duplicate_providers}; "
+                "each provider may back only one resource so quota/health "
+                "evaluation matches operator intent"
+            )
+
         for resource in telemetry.resources:
             if not resource.name:
                 raise V3ConfigError("telemetry resource name must be non-empty")

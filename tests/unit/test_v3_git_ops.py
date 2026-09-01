@@ -21,6 +21,10 @@ class FakeGitOperations:
         self.branches = {default}
         self.worktrees: dict[str, str] = {}
         self.commits: dict[str, list[str]] = {}
+        # PR #73 review thread 8: track per-worktree touched paths so the
+        # foreman's ``_policy_violation`` call (which now derives changed
+        # files from the worktree) can be exercised in unit tests.
+        self.touched: dict[str, list[str]] = {}
         self.pushed: list[str] = []
         self._seq = 0
 
@@ -47,6 +51,10 @@ class FakeGitOperations:
     def commit_count(self, workdir: str, base_ref: str) -> int:
         self.calls.append(("commit_count", workdir, base_ref))
         return len(self.commits.get(workdir, []))
+
+    def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
+        self.calls.append(("changed_files", workdir, base_ref))
+        return list(self.touched.get(workdir, []))
 
     def push(self, branch: str) -> None:
         self.calls.append(("push", branch))

@@ -97,9 +97,26 @@ DispositionAction = Literal[
     "reply_deferred",
     "already_addressed",
     "escalate_human",
+    #: A coder's rebuttal to a finding; the finding stays open until a
+    #: later reviewer round confirms (accept) or rejects (fix). The
+    #: rebuttal path requires a real V3 surface (issue #87), which is
+    #: why this literal is in the domain schema but does not yet appear
+    #: in ``ACTION_TO_STATUS``: ``rebut`` keeps the finding open rather
+    #: than settling it, and ``accept`` (added alongside ``rebut`` for
+    #: the rebuttal path's resolution) settles to ``accepted``.
+    "rebut",
+    "accept",
 ]
 VALID_DISPOSITION_ACTIONS: frozenset[str] = frozenset(
-    ("fix", "reject_wont_fix", "reply_deferred", "already_addressed", "escalate_human")
+    (
+        "fix",
+        "reject_wont_fix",
+        "reply_deferred",
+        "already_addressed",
+        "escalate_human",
+        "rebut",
+        "accept",
+    )
 )
 
 FailureKind = Literal[

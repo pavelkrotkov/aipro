@@ -158,6 +158,13 @@ class FakeGitOperations:
     def push(self, branch: str) -> None:
         pass
 
+    def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
+        # PR #73 review thread 8 / issue #78: the foreman's policy layer
+        # now derives changed files from the worktree. The unit-test fake
+        # records no real git state, so it returns an empty list unless
+        # a test sets ``self.touched`` explicitly.
+        return list(getattr(self, "touched", {}).get(workdir, []))
+
     def cleanup_worktree(self, path: str) -> None:
         self.worktrees.pop(path, None)
 
