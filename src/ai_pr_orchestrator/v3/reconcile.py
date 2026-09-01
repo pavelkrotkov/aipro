@@ -35,6 +35,13 @@ non-zero. Actions with ``auto_apply=True`` (``RECOVER_STALE_LEASE``,
 ``CLEAN_ORPHAN_SESSION``, ``CLEAN_ORPHAN_WORKTREE``) are safe to apply once
 each row's precondition holds.
 
+Once the planner emits a *manual* action (``ESCALATE`` or ``HALT_BRANCH_MOVED``)
+for one work item, it emits no further actions for that same work item in
+the same plan call. A manual action means *do not act further* — surfacing
+additional crash-recovery or orphan-cleanup rows next to it would risk
+contradicting the very signal that triggered the escalation. This is the
+"stop on manual" contract documented in the issue.
+
 Orphan detection
 ----------------
 
@@ -53,6 +60,12 @@ A git worktree is *orphaned* when both:
 
 Both checks are pure functions of the observation bundle, so unit tests can
 cover every TTL boundary without any I/O.
+
+Cross-work-item orphan detection (``plan_many``) considers *every* live
+branch across the full inputs list — never just the branches of the work
+item currently being planned. Without that, planning item B would
+incorrectly mark item A's live branch as orphan and the next reconcile
+pass would emit a spurious ``CLEAN_ORPHAN_WORKTREE`` for A's branch.
 
 No vendor or model name appears in this module — V3 owns naming through
 :mod:`ai_pr_orchestrator.v3.catalog`, never through reconcile code.
@@ -74,6 +87,7 @@ from .domain import (
     RunId,
     WorkflowState,
 )
+from .lanes import LaneRegistry
 from .queue import Claim, claim_from_state
 
 # --- Action grammar ---------------------------------------------------------
@@ -170,9 +184,16 @@ class SessionObservation:
     lane: str
     state: SessionLifecycle
     last_activity_at: datetime
-    # Whether the foreman still considers this session alive — a
-    # reconciliation crash may leave ``state='terminal'`` but the controller
-    # not yet aware; the planner must rely on lease ownership, not state.
+    #: Whether the session exited successfully (reviewer/coder round
+    #: produced its result). A "no-op coder" — one whose worktree ended
+    #: unchanged from HEAD — exits with ``success=False`` even when CAO
+    #: reports a clean exit, because the session produced no usable changes.
+    #: Used by ``commit_recorded`` and ``session_succeeded`` predicates so
+    #: the planner does not treat an idle coder as having done work.
+    success: bool = True
+    #: Whether the foreman still considers this session alive — a
+    #: reconciliation crash may leave ``state='terminal'`` but the controller
+    #: not yet aware; the planner must rely on lease ownership, not state.
     is_terminal: bool = False
 
 
@@ -226,7 +247,14 @@ class WorkItemObservation:
 
 @dataclass
 class ReconciliationInputs:
-    """Bundle the planner needs for one work item."""
+    """Bundle the planner needs for one work item.
+
+    ``ci_status`` is the *current* gate snapshot for this work item's PR
+    (or ``None`` if no PR exists / no gate evaluation has happened yet).
+    The planner refuses to treat phase ``ci_gating`` as evidence that CI
+    ran — phase progression only means *we started checking*. The gate
+    snapshot is the durable signal that a check completed.
+    """
 
     observation: WorkItemObservation
     sessions: tuple[SessionObservation, ...]
@@ -235,6 +263,7 @@ class ReconciliationInputs:
     config: CleanupConfig
     queue_config: GitHubQueueConfig
     now: datetime
+    ci_status: Any = None  # GateDecision | None (typed loosely to avoid import cycle)
 
     def sessions_for_work_item(self) -> tuple[SessionObservation, ...]:
         """All sessions whose declared ``work_item_id`` matches."""
@@ -244,6 +273,11 @@ class ReconciliationInputs:
         if run_id is None:
             return ()
         return tuple(s for s in self.sessions if s.run_id == run_id)
+
+    def sessions_for_lane(self, lane: str | None) -> tuple[SessionObservation, ...]:
+        if lane is None:
+            return ()
+        return tuple(s for s in self.sessions if s.lane == lane)
 
     def worktree_for_branch(self, branch: str | None) -> WorktreeObservation | None:
         if branch is None:
@@ -328,11 +362,37 @@ def _findings_published_to_pr(state: WorkflowState | None) -> bool:
     return any(f.thread_id is not None for f in state.findings)
 
 
-def _disposition_recorded(state: WorkflowState | None) -> bool:
-    """The foreman recorded at least one disposition against a finding."""
-    if state is None:
+def _all_findings_dispositioned(state: WorkflowState | None) -> bool:
+    """Every finding has a disposition recorded.
+
+    Single-disposition predicates are racy: a foreman that has only
+    persisted one disposition of three findings still has an in-flight
+    review round; advancing out of ``post_findings_no_disposition`` on
+    that signal would skip the remaining findings. The planner only
+    advances once the entire finding set has been decided.
+    """
+    if state is None or not state.findings:
         return False
-    return len(state.dispositions) > 0
+    dispositioned_ids = {d.finding_id for d in state.dispositions}
+    return all(f.id in dispositioned_ids for f in state.findings)
+
+
+def _ci_recorded(ci_status: Any) -> bool:
+    """CI has actually been evaluated for the relevant PR.
+
+    The phase field tracks *intent* (``ci_gating`` means *we started
+    checking*); only a ``GateDecision`` snapshot (passed OR failed) is
+    durable evidence the check ran. ``None`` or an unknown/unevaluated
+    snapshot is treated as *no CI result yet*.
+    """
+    if ci_status is None:
+        return False
+    # GateDecision is ``passed / failed / pending``; we accept both
+    # passed=True and passed=False as "result is known" — only pending
+    # counts as "not recorded".
+    return bool(getattr(ci_status, "passed", None) is not None) and not (
+        getattr(ci_status, "pending_checks", ()) or ()
+    )
 
 
 def _claim_has_branch(claim: Claim | None) -> bool:
@@ -368,7 +428,7 @@ _CRASH_DECISION_TABLE: tuple[_DecisionRow, ...] = (
     ),
     _DecisionRow(
         name="duplicate_sessions",
-        predicates=(("two_or_more_sessions_for_run", True),),
+        predicates=(("two_or_more_live_sessions_same_lane", True),),
         action=Action(
             kind=ActionKind.ESCALATE,
             reason="More than one live session exists for this work item",
@@ -407,11 +467,11 @@ _CRASH_DECISION_TABLE: tuple[_DecisionRow, ...] = (
             ("has_claim", True),
             ("claim_has_pr", True),
             ("findings_published_to_pr", True),
-            ("disposition_recorded", False),
+            ("all_findings_dispositioned", False),
         ),
         action=Action(
             kind=ActionKind.RELAUNCH,
-            reason="Findings published but no disposition recorded; relaunch at review",
+            reason="Findings published but not all have dispositions; relaunch at review",
         ),
     ),
     _DecisionRow(
@@ -419,19 +479,19 @@ _CRASH_DECISION_TABLE: tuple[_DecisionRow, ...] = (
         predicates=(
             ("has_claim", True),
             ("claim_has_pr", True),
-            ("disposition_recorded", True),
+            ("all_findings_dispositioned", True),
             ("ci_recorded", False),
         ),
         action=Action(
             kind=ActionKind.RESUME_SESSION,
-            reason="Disposition recorded; check CI before proceeding",
+            reason="Disposition recorded for every finding; check CI before proceeding",
         ),
     ),
     _DecisionRow(
         name="post_ci_no_pr",
         predicates=(
             ("has_claim", True),
-            ("disposition_recorded", True),
+            ("all_findings_dispositioned", True),
             ("ci_recorded", True),
             ("claim_has_pr", False),
         ),
@@ -458,6 +518,7 @@ _CRASH_DECISION_TABLE: tuple[_DecisionRow, ...] = (
         predicates=(
             ("has_claim", True),
             ("has_terminal_coding_session", True),
+            ("coder_succeeded", True),
             ("commit_recorded", False),
         ),
         action=Action(
@@ -470,6 +531,7 @@ _CRASH_DECISION_TABLE: tuple[_DecisionRow, ...] = (
         predicates=(
             ("has_claim", True),
             ("has_terminal_coding_session", True),
+            ("coder_succeeded", True),
             ("commit_recorded", True),
             ("branch_pushed", False),
         ),
@@ -567,9 +629,14 @@ class ReconcilePlanner:
         *,
         cleanup_config: CleanupConfig | None = None,
         queue_config: GitHubQueueConfig | None = None,
+        lanes: LaneRegistry | None = None,
     ) -> None:
         self._cleanup = cleanup_config or CleanupConfig()
         self._queue = queue_config or GitHubQueueConfig()
+        # The lane registry binds lane names to roles; the planner uses it
+        # to identify the coding lane (``LaneRegistry.developer_lane``) so
+        # the predicate survives deployments that rename the developer lane.
+        self._lanes = lanes or LaneRegistry.default()
 
     @property
     def cleanup_config(self) -> CleanupConfig:
@@ -578,6 +645,10 @@ class ReconcilePlanner:
     @property
     def queue_config(self) -> GitHubQueueConfig:
         return self._queue
+
+    @property
+    def lanes(self) -> LaneRegistry:
+        return self._lanes
 
     # -- Per-work-item plan -------------------------------------------------
 
@@ -590,31 +661,79 @@ class ReconcilePlanner:
 
         The cross-work-item dedupe :meth:`_finalize` enforces the spec's
         "no two authoritative branches per run" guarantee by collapsing
-        any branch-creating action whose ``(run_id, branch)`` key has
-        already been emitted.
+        any branch-creating action whose ``run_id`` key has already been
+        emitted. Cross-item orphan detection (``_plan_orphan_*``) builds a
+        single live-branch set from *every* input, not just the current
+        one, so item B's plan does not spuriously flag item A's live
+        branches as orphan.
         """
         if any(inputs.now.tzinfo is None for inputs in inputs_list):
             raise DomainError("ReconciliationInputs.now must be timezone-aware")
+        # Cross-item live-branch set, computed once before any per-item
+        # planning so orphan detection sees the whole picture.
+        live_branches = self._collect_live_branches(inputs_list)
+        live_session_ids = self._collect_live_session_ids(inputs_list)
         actions: list[Action] = []
         for inputs in inputs_list:
-            actions.extend(self._plan_one(inputs))
+            actions.extend(
+                self._plan_one(
+                    inputs,
+                    live_branches=live_branches,
+                    live_session_ids=live_session_ids,
+                )
+            )
         if not actions:
             actions.append(Action(kind=ActionKind.NOOP, reason="Nothing to reconcile"))
         return self._finalize(actions)
 
-    def _plan_one(self, inputs: ReconciliationInputs) -> list[Action]:
+    def _plan_one(
+        self,
+        inputs: ReconciliationInputs,
+        *,
+        live_branches: set[str],
+        live_session_ids: set[str],
+    ) -> list[Action]:
+        # Terminal-phase short-circuit: when the work item is already in a
+        # terminal phase (``done`` / ``failed`` / ``escalated``), the planner
+        # must return NOOP immediately and not evaluate any crash row. The
+        # previous implementation evaluated crash rows first, which fired
+        # spurious RELAUNCH / RESUME_SESSION actions on completed work and
+        # could re-launch a terminal item.
+        if inputs.observation.state is not None and inputs.observation.state.phase in (
+            *TERMINAL_PHASES,
+            "cancelled",
+        ):
+            return [
+                Action(
+                    kind=ActionKind.NOOP,
+                    work_item_id=inputs.observation.work_item_id,
+                    run_id=inputs.observation.run_id,
+                    reason=f"Work item is in terminal phase {inputs.observation.state.phase!r}",
+                )
+            ]
+
         actions: list[Action] = []
         # Manual/dangerous observations first (one action per category).
-        actions.extend(self._plan_branch_moved(inputs))
-        actions.extend(self._plan_stale_lease(inputs))
-        actions.extend(self._plan_duplicate_sessions(inputs))
+        # These short-circuit — once any of them fires we do not plan
+        # further actions for this work item.
+        branch_moved = self._plan_branch_moved(inputs)
+        if branch_moved:
+            return branch_moved
+        stale = self._plan_stale_lease(inputs)
+        if stale:
+            return stale
+        duplicate = self._plan_duplicate_sessions(inputs)
+        if duplicate:
+            return duplicate
+
         # Crash-point crash recovery from the table.
         crash_action = self._plan_crash_point(inputs)
         if crash_action is not None:
             actions.append(crash_action)
-        # Orphan cleanups — independent of the work item's own phase.
-        actions.extend(self._plan_orphan_sessions(inputs))
-        actions.extend(self._plan_orphan_worktrees(inputs))
+        # Orphan cleanups — independent of the work item's own phase, but
+        # suppressed once a manual action already fired above (we returned).
+        actions.extend(self._plan_orphan_sessions(inputs, live_session_ids=live_session_ids))
+        actions.extend(self._plan_orphan_worktrees(inputs, live_branches=live_branches))
         return actions
 
     # -- Individual planners -----------------------------------------------
@@ -652,7 +771,9 @@ class ReconcilePlanner:
             # (recover via heartbeat) from an owner the queue already
             # reclaimed (escalate). With no other evidence, the planner
             # escalates: a stale lease means we cannot tell whose work is
-            # about to land on the remote.
+            # about to land on the remote. The caller (``_plan_one``)
+            # short-circuits on this action — see the "stop on manual"
+            # contract at the top of the module.
             return [
                 Action(
                     kind=ActionKind.ESCALATE,
@@ -669,33 +790,75 @@ class ReconcilePlanner:
         return []
 
     def _plan_duplicate_sessions(self, inputs: ReconciliationInputs) -> list[Action]:
-        run_sessions = inputs.sessions_for_run(inputs.observation.run_id)
+        """Emit ESCALATE only when two sessions are actually duplicative.
+
+        The previous implementation treated any ``>= 2`` session count for a
+        run as a duplicate. Two genuine-but-legitimate cases match that
+        count and must NOT escalate:
+
+        - one terminal session + one live session in **different lanes**
+          (e.g. an old coder session + a fresh reviewer session): the
+          planner should COLLECT_RESULT from the terminal one, not escalate.
+
+        Real duplication = at least two live sessions for the same work
+        item in the same lane, OR one live + one terminal in the same lane
+        (the live one inherited state from a session we never observed die
+        and may now be in conflict).
+        """
+        run_id = inputs.observation.run_id
+        run_sessions = inputs.sessions_for_run(run_id)
         if len(run_sessions) < 2:
             return []
+        # Group by lane: a "duplicate" is a within-lane problem. A coder
+        # session and a reviewer session sharing a run is normal (the
+        # reviewer round follows the coder round on the same run).
         live = [s for s in run_sessions if not s.is_terminal]
-        if len(live) >= 2:
+        terminal = [s for s in run_sessions if s.is_terminal]
+        if len(live) >= 2 and len({s.lane for s in live}) == 1:
+            # Two live sessions on the SAME lane: that is unambiguous
+            # duplication, escalate.
             return [
                 Action(
                     kind=ActionKind.ESCALATE,
                     work_item_id=inputs.observation.work_item_id,
-                    run_id=inputs.observation.run_id,
+                    run_id=run_id,
+                    session_id=live[0].session_id,
                     reason=(
-                        f"Found {len(live)} live sessions for run "
-                        f"{inputs.observation.run_id}; refusing to pick a winner"
+                        f"Found {len(live)} live sessions for run {run_id} "
+                        f"in lane {live[0].lane!r}; refusing to pick a winner"
                     ),
                 )
             ]
-        # Exactly one live + at least one terminal — the terminal one is the
-        # result we never recorded.
-        terminal = [s for s in run_sessions if s.is_terminal]
+        if live and terminal and len({s.lane for s in live + terminal}) == 1:
+            # One live + one terminal in the SAME lane: that is genuine
+            # duplication (the live session inherited a session we never
+            # observed die), so escalate.
+            return [
+                Action(
+                    kind=ActionKind.ESCALATE,
+                    work_item_id=inputs.observation.work_item_id,
+                    run_id=run_id,
+                    session_id=terminal[0].session_id,
+                    reason=(
+                        f"Found {len(live)} live + {len(terminal)} terminal sessions "
+                        f"for run {run_id} in lane {live[0].lane!r}; refusing to pick a winner"
+                    ),
+                )
+            ]
         if live and terminal:
+            # One live + one terminal in DIFFERENT lanes: legitimate — the
+            # terminal one is the result we never recorded, in a lane the
+            # live one is no longer running. COLLECT_RESULT.
             return [
                 Action(
                     kind=ActionKind.COLLECT_RESULT,
                     work_item_id=inputs.observation.work_item_id,
-                    run_id=inputs.observation.run_id,
+                    run_id=run_id,
                     session_id=terminal[0].session_id,
-                    reason="One terminal session exists alongside a live one — collect the result",
+                    reason=(
+                        f"Terminal session in lane {terminal[0].lane!r} alongside a live "
+                        f"session in lane {live[0].lane!r} — collect the result"
+                    ),
                 )
             ]
         return []
@@ -711,15 +874,25 @@ class ReconcilePlanner:
             if all(ctx.get(name) == expected for name, expected in row.predicates):
                 action = row.action
                 # Replace the placeholder with a bound copy that carries
-                # the work-item identity so the CLI can group actions.
+                # the work-item identity and the right ``session_id`` for
+                # session-touching actions, so the CLI can group / dispatch
+                # actions without re-deriving identity.
+                session_id = self._session_id_for(inputs, row.name)
+                # Manual actions short-circuit at the _plan_one level;
+                # returning them here keeps them in the action list when
+                # invoked through a lower-level caller (e.g. tests).
+                auto_apply = action.kind not in _MANUAL_ACTIONS
+                if action.kind is ActionKind.NOOP:
+                    auto_apply = True
                 return Action(
                     kind=action.kind,
                     work_item_id=inputs.observation.work_item_id,
                     run_id=inputs.observation.run_id,
+                    session_id=session_id,
                     branch=ctx.get("branch"),
                     pr_number=ctx.get("pr_number"),
                     reason=action.reason or row.name,
-                    auto_apply=action.kind not in _MANUAL_ACTIONS,
+                    auto_apply=auto_apply,
                 )
         return None
 
@@ -730,26 +903,29 @@ class ReconcilePlanner:
         worktrees_for_wi = tuple(
             w for w in inputs.worktrees if w.branch == (claim.branch if claim else None)
         )
-        coding_sessions = tuple(
-            s
-            for s in inputs.sessions_for_work_item()
-            if s.lane.startswith("worker") or s.lane.startswith("coder")
-        )
-        review_sessions = tuple(
-            s for s in inputs.sessions_for_work_item() if s.lane.startswith("review")
-        )
+        coding_sessions = self._coding_sessions(inputs)
+        review_sessions = self._review_sessions(inputs)
+        live_coding = [s for s in coding_sessions if not s.is_terminal]
 
         # 'commit_recorded' is the durable signal that the worker produced
-        # a commit locally. The GitHub lease carries it via ``branch`` +
-        # the worktree's last_commit_at — if the worktree is older than the
-        # lease claim we treat it as 'commit not yet recorded'. Production
-        # callers extend this predicate with a real ``commit_count`` probe.
-        commit_recorded = bool(
+        # a commit locally. Two failure modes must NOT report True:
+        # 1. The worktree's last_commit_at predates the lease claim
+        #    (older commit, new lease — classic "coder no-op" false
+        #    positive).
+        # 2. The coder session itself did not exit successfully
+        #    (``success=False``). A coder that exited cleanly but touched
+        #    nothing is treated as having produced nothing.
+        # We require BOTH "worktree has a newer commit" AND "a coder
+        # session in this run exited successfully" — see finding #11.
+        coder_succeeded = any(s.success and s.is_terminal for s in coding_sessions)
+        commit_is_newer = bool(
             claim is not None
             and claim.branch is not None
             and worktrees_for_wi
             and worktrees_for_wi[0].last_commit_at > (claim.claimed_at if claim else inputs.now)
         )
+        commit_recorded = commit_is_newer and coder_succeeded
+
         # Branch is "pushed" when the worktree records a non-None
         # ``last_push_at`` newer than the lease claim — that is the moment a
         # remote ref was last updated for this branch.
@@ -782,32 +958,116 @@ class ReconcilePlanner:
             "has_terminal_coding_session": any(s.is_terminal for s in coding_sessions),
             "has_terminal_review_session": any(s.is_terminal for s in review_sessions),
             "commit_recorded": commit_recorded,
+            "coder_succeeded": coder_succeeded,
             "branch_pushed": branch_pushed,
             "pr_head_moved": bool(pr_observation is not None and pr_observation.head_moved()),
             "findings_published_to_pr": _findings_published_to_pr(state),
-            "disposition_recorded": _disposition_recorded(state),
-            "ci_recorded": _phase_at_least(state, "ci_gating"),
+            "all_findings_dispositioned": _all_findings_dispositioned(state),
+            "disposition_recorded": _all_findings_dispositioned(state),
+            "ci_recorded": _ci_recorded(inputs.ci_status),
             "final_label_transitioned": _phase_at_least(state, "done"),
-            "two_or_more_sessions_for_run": len(inputs.sessions_for_run(inputs.observation.run_id))
-            >= 2,
+            "two_or_more_live_sessions_same_lane": len(live_coding) >= 2
+            and len({s.lane for s in live_coding}) == 1,
         }
+
+    # -- Lane helpers -------------------------------------------------------
+
+    def _coding_sessions(self, inputs: ReconciliationInputs) -> tuple[SessionObservation, ...]:
+        """Sessions in the coding (developer) lane.
+
+        Lane identity comes from the registry's ``developer_lane`` rather
+        than a hard-coded ``"developer"`` / ``"worker"`` / ``"coder"``
+        literal — a deployment that renames the developer lane must still
+        detect coding sessions. We also include any lane whose registered
+        role is ``worker`` (the registry stores role per-lane, so this
+        matches the intent without caring about the lane's textual name).
+        """
+        return tuple(s for s in inputs.sessions_for_work_item() if self._is_coding_lane(s.lane))
+
+    def _review_sessions(self, inputs: ReconciliationInputs) -> tuple[SessionObservation, ...]:
+        """Sessions in any reviewer lane (role ``reviewer``)."""
+        return tuple(s for s in inputs.sessions_for_work_item() if self._is_reviewer_lane(s.lane))
+
+    def _is_coding_lane(self, lane: str) -> bool:
+        try:
+            identity = self._lanes.get(lane)  # type: ignore[arg-type]
+        except Exception:
+            return False
+        return identity.role == "worker"
+
+    def _is_reviewer_lane(self, lane: str) -> bool:
+        try:
+            identity = self._lanes.get(lane)  # type: ignore[arg-type]
+        except Exception:
+            return False
+        return identity.role == "reviewer"
+
+    def _session_id_for(self, inputs: ReconciliationInputs, row_name: str) -> str | None:
+        """Best-effort session_id for an action row.
+
+        RESUME_SESSION / COLLECT_RESULT / RELAUNCH all target a session the
+        planner can name; tests assert every such row carries a non-None
+        ``session_id`` so the CLI can dispatch. We pick:
+
+        - the most recent live session for ``has_active_or_pending_session``
+          rows,
+        - the most recent terminal session for ``COLLECT_RESULT`` rows,
+        - the prior terminal session for the duplicate-session's terminal
+          one,
+        - the coder session for the coding rows,
+        - ``None`` for rows that don't target a session.
+        """
+        work_item_sessions = inputs.sessions_for_work_item()
+        run_sessions = inputs.sessions_for_run(inputs.observation.run_id)
+        if row_name in (
+            "session_in_flight",
+            "post_push_before_review",
+            "post_push_no_pr",
+            "crash_after_claim_before_branch",
+            "branch_exists_no_session",
+            "post_pr_no_final_label",
+        ):
+            # Resume the most-recent live session if any, otherwise the
+            # most-recent session of any kind so the CLI has something
+            # concrete to dispatch against.
+            live = [s for s in work_item_sessions if not s.is_terminal]
+            if live:
+                return max(live, key=lambda s: s.last_activity_at).session_id
+            if work_item_sessions:
+                return max(work_item_sessions, key=lambda s: s.last_activity_at).session_id
+        if row_name in (
+            "post_review_no_findings_recorded",
+            "session_terminal_pre_commit",
+            "session_terminal_pre_push",
+        ):
+            # The session whose output we want to collect.
+            target_pool = self._coding_sessions(inputs) if row_name != "post_review_no_findings_recorded" else self._review_sessions(inputs)
+            if target_pool:
+                return max(target_pool, key=lambda s: s.last_activity_at).session_id
+            terminal = [s for s in run_sessions if s.is_terminal]
+            if terminal:
+                return terminal[0].session_id
+        if row_name == "duplicate_sessions":
+            terminal = [s for s in run_sessions if s.is_terminal]
+            return terminal[0].session_id if terminal else None
+        return None
 
     # -- Orphan detection --------------------------------------------------
 
-    def _plan_orphan_sessions(self, inputs: ReconciliationInputs) -> Iterable[Action]:
+    def _plan_orphan_sessions(
+        self,
+        inputs: ReconciliationInputs,
+        *,
+        live_session_ids: set[str],
+    ) -> Iterable[Action]:
         ttl = timedelta(seconds=self._cleanup.session_lease_ttl_seconds)
-        live_lease_ids = {
-            s.session_id
-            for s in inputs.sessions
-            if s.work_item_id is not None and self._has_live_lease_for(inputs, s)
-        }
         for session in inputs.sessions:
             if session.work_item_id is None:
                 # Sessions with no declared work item are never reclaimed by
                 # the planner; they are either pre-launch or operator-launched
                 # and ownership is ambiguous.
                 continue
-            if session.session_id in live_lease_ids:
+            if session.session_id in live_session_ids:
                 continue
             age = inputs.now - session.last_activity_at
             if age < ttl:
@@ -824,9 +1084,13 @@ class ReconcilePlanner:
                 auto_apply=True,
             )
 
-    def _plan_orphan_worktrees(self, inputs: ReconciliationInputs) -> Iterable[Action]:
+    def _plan_orphan_worktrees(
+        self,
+        inputs: ReconciliationInputs,
+        *,
+        live_branches: set[str],
+    ) -> Iterable[Action]:
         ttl = timedelta(seconds=self._cleanup.worktree_inactivity_ttl_seconds)
-        live_branches = self._live_branches(inputs)
         for worktree in inputs.worktrees:
             if worktree.is_default_branch:
                 continue
@@ -847,37 +1111,43 @@ class ReconcilePlanner:
                 auto_apply=True,
             )
 
-    def _live_branches(self, inputs: ReconciliationInputs) -> set[str]:
-        """Branches a live lease still claims."""
-        claim = inputs.observation.claim
-        state = inputs.observation.state
+    def _collect_live_branches(self, inputs_list: list[ReconciliationInputs]) -> set[str]:
+        """Branches that *any* work item in ``inputs_list`` still actively claims.
+
+        Computed across the entire inputs list (not per-item) so a follow-up
+        item's plan does not spuriously flag a prior item's live branch as
+        orphan. A branch is "live" only when its claim has a non-stale
+        lease — a stale lease means another foreman may already own the
+        branch.
+        """
         branches: set[str] = set()
-        if claim is not None and claim.branch is not None and not claim.is_stale(inputs.now):
+        for inputs in inputs_list:
+            claim = inputs.observation.claim
+            if claim is None or claim.branch is None:
+                continue
+            if claim.is_stale(inputs.now):
+                continue
             branches.add(claim.branch)
-        # Cross-check: a different work item may own the same branch; the
-        # full reconciliation pass owns that decision. The planner only
-        # declares a branch "live" when *its* observation has a live claim.
-        if state is not None and not _lease_alive(state, inputs.now):
-            pass  # lease already accounted for above
         return branches
 
-    def _has_live_lease_for(
-        self, inputs: ReconciliationInputs, session: SessionObservation
-    ) -> bool:
-        claim = inputs.observation.claim
-        if claim is None or claim.is_stale(inputs.now):
-            return False
-        if (
-            inputs.observation.run_id is not None
-            and session.run_id is not None
-            and claim.run_id != session.run_id
-        ):
-            return False
-        return not (
-            session.work_item_id is not None
-            and inputs.observation.work_item_id is not None
-            and session.work_item_id != inputs.observation.work_item_id
-        )
+    def _collect_live_session_ids(self, inputs_list: list[ReconciliationInputs]) -> set[str]:
+        """Session IDs that *any* work item in ``inputs_list`` still holds a
+        live lease for, used by orphan-session detection (mirror of
+        :meth:`_collect_live_branches`)."""
+        ids: set[str] = set()
+        for inputs in inputs_list:
+            claim = inputs.observation.claim
+            if claim is None:
+                continue
+            if claim.is_stale(inputs.now):
+                continue
+            for session in inputs.sessions:
+                if session.work_item_id != inputs.observation.work_item_id:
+                    continue
+                if session.run_id is not None and claim.run_id != session.run_id:
+                    continue
+                ids.add(session.session_id)
+        return ids
 
     # -- Output post-processing --------------------------------------------
 
@@ -885,16 +1155,23 @@ class ReconcilePlanner:
         """Apply the no-two-branches-per-run invariant.
 
         The acceptance property test proves this; here we defensively enforce
-        it by collapsing RELAUNCH actions that target the same ``branch``
-        across the same ``run_id``. (The planner is invoked per-work-item so
-        collisions across work items do not happen here, but a future caller
-        passing the same observation twice should still be deterministic.)
+        it by collapsing RELAUNCH actions that share the same ``run_id``
+        across the inputs. (The planner is invoked per-work-item so
+        collisions across work items normally do not happen here, but a
+        future caller passing the same observation twice, or two distinct
+        observations with the same ``run_id`` but different branches,
+        should still produce a deterministic plan.)
+
+        Branch identity alone is not enough: the dedupe key is ``run_id``
+        because two RELAUNCH actions for the *same* run (even with
+        different branch names) cannot both be authoritative — only one
+        branch owns a given run.
         """
-        seen: set[tuple[str, str]] = set()
+        seen: set[str] = set()
         out: list[Action] = []
         for action in actions:
             if actions_target_branch(action):
-                key = (action.run_id or "", action.branch or "")
+                key = action.run_id or ""
                 if key in seen:
                     continue
                 seen.add(key)
