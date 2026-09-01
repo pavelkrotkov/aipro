@@ -158,6 +158,9 @@ class TestCliApplyAndRepo:
         sentinel = MagicMock(name="RealGitHubClient")
         monkeypatch.setattr("ai_pr_orchestrator.github.client.GitHubClient", sentinel)
         monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+        # GITHUB_REPOSITORY may be set in CI; the config-file owner/repo
+        # must win for this test, so clear the env-var override.
+        monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
         # Block the queue from doing real network calls by patching it.
         from ai_pr_orchestrator.v3.queue import GitHubIssueQueue as RealQueue
 
