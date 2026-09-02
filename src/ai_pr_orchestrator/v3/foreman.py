@@ -278,8 +278,17 @@ class ForemanPolicyLoop:
         # issue never opens a branch, worktree, or PR. The originating
         # issue is the source of truth — the PR is bot-authored, so its
         # association would vacuously pass every gate.
+        #
+        # Round-1 Codex review fix #11: a rejected issue is removed
+        # from the ``enabled_label`` set before returning so the next
+        # ``run_pass`` does not re-discover it. Without this, a fork
+        # or untrusted-author issue would surface on every pass and
+        # be re-rejected indefinitely (and the foreman would mint
+        # label churn). The label-removal uses the queue's own
+        # ``remove_label`` verb so production / fake clients agree.
         rejection = self._safety_check(issue)
         if rejection is not None:
+            self._remove_enabled_label(issue)
             return WorkItemOutcome(
                 issue=issue,
                 final_phase="failed",
@@ -954,20 +963,41 @@ class ForemanPolicyLoop:
           association is the source of truth, NOT the PR's — the PR is
           bot-authored, so its association would vacuously pass).
 
-        Network / parse errors degrade open: a missing client surfaces
-        as "safe to proceed" so a flaky GitHub fetch does not block
-        eligible items. Tests pass a fake client that always returns
-        the seeded values.
+        Round-1 Codex review fix #4: production must fail CLOSED on
+        metadata errors (rate limit, 5xx, parse error). A transient
+        GitHub outage must NOT silently approve every item that was
+        about to be rejected for a fork / untrusted-author reason.
+        The previous implementation degraded OPEN: a missing client
+        surfaced as "safe to proceed" so a flaky GitHub fetch did
+        not block eligible items. That fallback is too permissive —
+        it would let an attacker bypass the gate by triggering a
+        rate limit. Now: any exception inside the metadata fetch
+        short-circuits to a ``needs-human``-grade rejection so the
+        item is escalated, not silently approved.
+
+        The flip side (for tests) is in the queue's
+        :meth:`GitHubIssueQueue.repair_labels` / the foreman's
+        ``_drive`` flow: a rejected item is removed from the
+        ``enabled_label`` set so ``list_ready()`` does not return it
+        again (round-1 Codex review fix #11).
         """
         safety = self._cfg.safety
         get_issue = getattr(self._queue, "_client", None)
         client = getattr(get_issue, "get_issue", None) if get_issue is not None else None
         if client is None:
+            # No client means a fake / partial queue. Tests inject the
+            # rejection reasons via the seeded issue metadata, so a
+            # missing client is "no metadata to check" rather than a
+            # transient error. The fake path therefore behaves as
+            # before: no gate trips.
             return None
         try:
             issue_view = client(issue.number)
-        except Exception:
-            return None
+        except Exception as exc:
+            # Fail closed: a transient GitHub error must NOT silently
+            # approve a fork or an untrusted-author issue. Escalate so
+            # a human inspects the metadata when GitHub recovers.
+            return f"safety check could not verify issue metadata: {exc}"
         # ``disallow_forks`` — reject if the originating repository is a fork.
         if safety.disallow_forks and getattr(issue_view, "is_fork", False):
             return "origin repository is a fork; disallow_forks rejects forks"
@@ -981,6 +1011,30 @@ class ForemanPolicyLoop:
                 f"allowed_pr_author_associations {allowed!r}"
             )
         return None
+
+    def _remove_enabled_label(self, issue: GitHubIssueRef) -> None:
+        """Remove the enabled label from ``issue`` so it does not return from
+        ``list_ready()`` after a safety rejection (fix #11).
+
+        Best-effort: a transient GitHub failure on this label removal
+        must not crash the foreman pass (the rejection has already
+        been recorded on the ``WorkItemOutcome``). The next pass will
+        surface the rejection again, but the item is no longer
+        claimable from ``list_ready()`` either, so the worst case is
+        a stuck enabled label that ``aipro reconcile --apply`` can
+        clean up.
+        """
+        client = getattr(self._queue, "_client", None)
+        if client is None:
+            return
+        label = self._cfg.github_queue.enabled_label
+        try:
+            labels = list(client.get_labels(issue.number))
+        except Exception:
+            return
+        if label in labels:
+            with contextlib.suppress(Exception):
+                client.remove_label(issue.number, label)
 
     def _heartbeat(
         self, issue: GitHubIssueRef, state: WorkflowState, *, now: datetime | None = None
