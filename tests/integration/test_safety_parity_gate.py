@@ -508,33 +508,72 @@ def test_safety_gate_5_failed_coder_attempts_consume_invocation_budget():
 def test_safety_gate_6_reviewer_trigger_budget_exhaustion_escalates():
     """The reviewer-trigger budget caps how many reviewer lanes run
     across rounds. When the budget is exhausted the foreman refuses
-    to mark the round unreviewed and escalates instead."""
+    to mark the round unreviewed and escalates instead.
+
+    Round-1 Codex review fix #15: the previous test accepted
+    ``done`` after the budget truncated the reviewer round to
+    zero lanes. That was wrong — a round with no reviewers has
+    no way to verify the coder's output, so the foreman must
+    escalate rather than ship unreviewed work. The test now
+    configures two reviewer lanes, a budget of 1, and a
+    reviewer that returns a finding on round 1 — the fix
+    path on round 2 hits the budget cap (``budget_left = 0``)
+    and the foreman MUST escalate, not ``done``.
+    """
     fake = FakeGitHubClient()
     fake.seed_issue(1, labels=["v3-work"])
     from ai_pr_orchestrator.v3.config import ReviewPolicyConfig
+    from ai_pr_orchestrator.v3.domain import ReviewerFinding
 
     cfg = V3Config(
         safety=SafetyPolicyConfig(
             # Tighter than the number of reviewer lanes so the budget
-            # trips on round 1.
+            # trips on round 2 after round 1 used its single trigger.
             max_reviewer_triggers_per_run=1,
             max_coder_invocations_per_run=10,
             max_total_iterations=10,
         ),
         review_policy=ReviewPolicyConfig(max_review_rounds=10),
     )
+    # Two reviewer lanes so the round-1 budget really picks one
+    # and the round-2 budget is exhausted (``budget_left=0``).
+    lane_registry = LaneRegistry(
+        (
+            LaneIdentity(lane="developer", role="worker", profile_template="aipro-developer"),
+            LaneIdentity(
+                lane="code-reviewer", role="reviewer", profile_template="aipro-code-reviewer"
+            ),
+            LaneIdentity(
+                lane="breaker-reviewer",
+                role="reviewer",
+                profile_template="aipro-breaker-reviewer",
+            ),
+        )
+    )
     counter = {"n": 0}
 
-    class _AlwaysReview:
+    class _ReviewerFindsBlocker:
         def execute(self, lane, prompt, workdir, context, lease=None):
             if lane.role == "reviewer":
                 counter["n"] += 1
+                # Always emit a unique blocker so the next round
+                # will be triggered (the foreman only loops back
+                # to coding when at least one finding is fix-actioned).
                 return LaneResult(
                     session=SessionHandle(session_id="x", lane=lane.lane),
                     exit_code=0,
                     output_summary="",
                     changed_files=[],
-                    findings=[],
+                    findings=[
+                        ReviewerFinding(
+                            id=f"blocker-r{counter['n']}",
+                            lane="breaker-reviewer",
+                            body="blocker",
+                            severity="blocker",
+                            run_id="run-gate-6",
+                            round_id="review",
+                        )
+                    ],
                 )
             return LaneResult(
                 session=SessionHandle(session_id="x", lane="developer"),
@@ -544,16 +583,21 @@ def test_safety_gate_6_reviewer_trigger_budget_exhaustion_escalates():
                 findings=[],
             )
 
-    loop = _build(fake, cfg=cfg, executor=_AlwaysReview())
+    loop = _build(
+        fake, cfg=cfg, executor=_ReviewerFindsBlocker(), lane_registry=lane_registry
+    )
     outcome = loop.run_pass()[0]
-    # Round 1 fires one reviewer lane (the budget cap is 1). The
-    # other two reviewer lanes (requirements + breaker) cannot run;
-    # the foreman either escalates with "reviewer trigger budget
-    # exhausted" or completes the round with one reviewer trigger
-    # and proceeds.
-    assert outcome.final_phase in ("escalated", "done")
-    if outcome.final_phase == "escalated":
-        assert "reviewer trigger" in outcome.reason.lower() or "budget" in outcome.reason
+    # Round 1 fires one reviewer lane (the budget cap is 1) and
+    # returns a blocker. Round 2 needs to verify the fix but the
+    # trigger budget is exhausted (budget_left=0) so the foreman
+    # must escalate with "reviewer trigger budget exhausted" rather
+    # than ship an unverified PR. ``done`` is no longer an
+    # acceptable outcome here.
+    assert outcome.final_phase == "escalated", (
+        f"expected escalated (reviewer-trigger budget cannot verify the round), "
+        f"got {outcome.final_phase!r}; reason={outcome.reason!r}"
+    )
+    assert "reviewer trigger" in outcome.reason.lower() or "budget" in outcome.reason.lower()
 
 
 # ---------------------------------------------------------------------------
