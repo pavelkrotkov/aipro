@@ -43,13 +43,10 @@ from ai_pr_orchestrator.v3.cao import (
     CaoSessionController,
     session_name_for,
 )
-from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
 from ai_pr_orchestrator.v3.config import V3Config
 from ai_pr_orchestrator.v3.domain import (
     GitHubIssueRef,
-    LaneIdentity,
     ModelAssignment,
-    WorkflowState,
 )
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop
 from ai_pr_orchestrator.v3.interfaces import (
@@ -61,8 +58,8 @@ from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
 from ai_pr_orchestrator.v3.queue import Claim, GitHubIssueQueue, claim_from_state
 from ai_pr_orchestrator.v3.reconcile import (
     ActionKind,
-    ReconciliationInputs,
     ReconcilePlanner,
+    ReconciliationInputs,
     SessionObservation,
     WorkItemObservation,
 )
@@ -208,7 +205,7 @@ def _build_observations(
     if coder_session is not None:
         sessions = (coder_session,)
     if reviewer_session is not None:
-        sessions = sessions + (reviewer_session,)
+        sessions = (*sessions, reviewer_session)
     claim: Claim | None = None
     if state is not None:
         try:
@@ -233,9 +230,7 @@ def test_scenario_9_reconcile_plan_directs_resume_after_midrun_crash():
     to be re-attached. The foreman acts on the planner's choice and
     the item reaches done without minting a duplicate PR or branch."""
     fake = FakeGitHubClient()
-    queue, git = _seed_partial_state(
-        fake, issue_number=1, run_id="run-s9-pre", phase="coding"
-    )
+    queue, _git = _seed_partial_state(fake, issue_number=1, run_id="run-s9-pre", phase="coding")
 
     # The coder lane finished and is no longer alive; the reviewer
     # session is alive and waiting for follow-up. This is the exact
@@ -250,9 +245,7 @@ def test_scenario_9_reconcile_plan_directs_resume_after_midrun_crash():
         success=True,
         is_terminal=True,
     )
-    inputs = _build_observations(
-        queue, 1, coder_session=coder_obs, reviewer_session=None, now=NOW
-    )
+    inputs = _build_observations(queue, 1, coder_session=coder_obs, reviewer_session=None, now=NOW)
     planner = ReconcilePlanner(
         cleanup_config=V3Config().cleanup, queue_config=V3Config().github_queue
     )
@@ -274,9 +267,7 @@ def test_scenario_9_post_restart_pass_does_not_duplicate_side_effects():
     reviewer round (not a new coder invocation) and reaches done.
     Exactly one PR is opened."""
     fake = FakeGitHubClient()
-    queue, git = _seed_partial_state(
-        fake, issue_number=1, run_id="run-s9-pre", phase="coding"
-    )
+    queue, git = _seed_partial_state(fake, issue_number=1, run_id="run-s9-pre", phase="coding")
 
     cfg = V3Config()
     cfg = V3Config()
@@ -290,7 +281,7 @@ def test_scenario_9_post_restart_pass_does_not_duplicate_side_effects():
     # id; this is the same session the planner's COLLECT_RESULT picked
     # up. We use a ScriptedExecutor below so the lane is deterministic
     # and does not depend on the closed controller.
-    from dataclasses import dataclass, field as _field
+    from dataclasses import dataclass
 
     @dataclass
     class ReviewerOnlyExecutor:
@@ -299,6 +290,7 @@ def test_scenario_9_post_restart_pass_does_not_duplicate_side_effects():
         invocation corresponds to the one the original foreman already
         performed; we mark it as already-completed by skipping it and
         only running the reviewer when asked."""
+
         coder_called: int = 0
         reviewer_called: int = 0
 
@@ -324,7 +316,7 @@ def test_scenario_9_post_restart_pass_does_not_duplicate_side_effects():
                 changed_files=[],
             )
 
-    from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, LaneResult
+    from ai_pr_orchestrator.v3.interfaces import LaneResult
 
     executor = ReviewerOnlyExecutor()
     new_loop = ForemanPolicyLoop(
@@ -349,13 +341,10 @@ def test_scenario_9_post_restart_pass_does_not_duplicate_side_effects():
     # or zero, never two.
     outcomes = new_loop.run_pass()
     assert len(outcomes) == 1
-    outcome = outcomes[0]
     # Outcome is terminal (escalated because the coder "failed" in our
     # simulation); what's important is no duplicate PRs.
     open_prs = fake.list_open_prs()
-    assert len(open_prs) <= 1, (
-        f"second pass minted duplicate PRs after restart: {open_prs}"
-    )
+    assert len(open_prs) <= 1, f"second pass minted duplicate PRs after restart: {open_prs}"
 
 
 def test_scenario_9_cleanup_runner_does_not_clean_a_live_lease():
@@ -365,9 +354,7 @@ def test_scenario_9_cleanup_runner_does_not_clean_a_live_lease():
     cross-work-item live-branch set is what prevents the spurious
     cleanup (PR #73 review thread 6)."""
     fake = FakeGitHubClient()
-    queue, _ = _seed_partial_state(
-        fake, issue_number=1, run_id="run-s9-pre", phase="coding"
-    )
+    queue, _ = _seed_partial_state(fake, issue_number=1, run_id="run-s9-pre", phase="coding")
     # The live session is referenced by a still-active lease, so
     # orphan detection must skip it.
     live_session = SessionObservation(
@@ -393,7 +380,9 @@ def test_scenario_9_cleanup_runner_does_not_clean_a_live_lease():
     )
     plan = planner.plan(inputs)
     cleanup_actions = [
-        a for a in plan if a.kind in (ActionKind.CLEAN_ORPHAN_SESSION, ActionKind.CLEAN_ORPHAN_WORKTREE)
+        a
+        for a in plan
+        if a.kind in (ActionKind.CLEAN_ORPHAN_SESSION, ActionKind.CLEAN_ORPHAN_WORKTREE)
     ]
     assert cleanup_actions == [], (
         f"planner wrongly cleaned a live session: {[a.kind for a in cleanup_actions]}; "

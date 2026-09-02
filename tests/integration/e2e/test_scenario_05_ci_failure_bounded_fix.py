@@ -36,7 +36,6 @@ from ai_pr_orchestrator.v3.domain import (
     GitHubIssueRef,
     LaneIdentity,
     ModelAssignment,
-    ReviewerFinding,
 )
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop
 from ai_pr_orchestrator.v3.interfaces import (
@@ -240,9 +239,7 @@ def test_scenario_5_coder_invocation_budget_caps_fix_round():
     foreman escalates rather than retrying forever."""
     fake = _ready_fake()
     # Always-failing gate with no success path.
-    gate = RecordingGate(
-        [GateDecision(passed=False, pending_checks=(), failed_checks=("build",))]
-    )
+    gate = RecordingGate([GateDecision(passed=False, pending_checks=(), failed_checks=("build",))])
     cfg = V3Config(
         safety=SafetyPolicyConfig(
             max_coder_invocations_per_run=2,

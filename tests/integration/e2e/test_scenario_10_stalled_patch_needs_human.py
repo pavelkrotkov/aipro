@@ -56,7 +56,9 @@ class StaticBroker:
     def select(self, demand: Any) -> BrokerDecision:
         return BrokerDecision(
             demand=demand,
-            evaluated_at=__import__("datetime").datetime(2026, 9, 1, tzinfo=__import__("datetime").UTC),
+            evaluated_at=__import__("datetime").datetime(
+                2026, 9, 1, tzinfo=__import__("datetime").UTC
+            ),
             assignment=ModelAssignment(lane=demand.lane, model_ref=f"ref-{demand.lane}"),
         )
 
@@ -244,10 +246,9 @@ def test_scenario_10_repeated_finding_escalates_on_stagnation_threshold():
     # The escalation must point at *something* the operator can act on
     # — either a budget name or a converging-signal warning.
     reason = outcome.reason.lower()
-    assert any(
-        token in reason
-        for token in ("budget", "converging", "stagnation", "round")
-    ), f"expected reason to name a guard, got {outcome.reason!r}"
+    assert any(token in reason for token in ("budget", "converging", "stagnation", "round")), (
+        f"expected reason to name a guard, got {outcome.reason!r}"
+    )
     # The durable state reflects the escalation and the needs-human label.
     state = queue.load_state("owner/repo#1")
     assert state is not None and state.phase == "escalated"
@@ -302,9 +303,7 @@ def test_scenario_10_repeated_finding_hits_coder_cap_before_stagnation():
 
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "escalated"
-    assert "budget" in outcome.reason, (
-        f"expected budget escalation, got {outcome.reason!r}"
-    )
+    assert "budget" in outcome.reason, f"expected budget escalation, got {outcome.reason!r}"
     # The coder invocation cap is consulted *before* launching the
     # coder when open findings are present, so the final coder
     # invocation count is one less than the cap (the cap is what

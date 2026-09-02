@@ -28,7 +28,6 @@ foreman's clock.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -36,7 +35,6 @@ from ai_pr_orchestrator.v3.broker import PolicyBroker, TaskDemand
 from ai_pr_orchestrator.v3.catalog import ModelCatalog, ModelCatalogEntry
 from ai_pr_orchestrator.v3.config import BrokerConfig, ResourceReserveConfig
 from ai_pr_orchestrator.v3.telemetry import (
-    ProviderHealth,
     ProviderResourceSnapshot,
     QuotaWindow,
 )
@@ -62,9 +60,7 @@ def _entry(ref: str, **overrides) -> ModelCatalogEntry:
 
 
 def _window(label: str, used: float, *, resets_in: timedelta) -> QuotaWindow:
-    return QuotaWindow(
-        label=label, used_fraction=used, reset_at=NOW + resets_in
-    )
+    return QuotaWindow(label=label, used_fraction=used, reset_at=NOW + resets_in)
 
 
 def _snapshot(
@@ -123,9 +119,7 @@ def test_scenario_7_subscription_surplus_is_consumed_above_reserve():
     broker_obj = PolicyBroker(
         catalog, config, snapshots=snapshots, resource_by_provider=resource_by_provider
     )
-    decision = broker_obj.select(
-        TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW
-    )
+    decision = broker_obj.select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
     assert decision.assignment is not None, (
         f"expected a dispatchable subscription assignment, got reason={decision.reason!r}; "
         f"rejected={[c.ref for c in decision.rejected]}"
@@ -166,14 +160,10 @@ def test_scenario_7_surplus_is_not_consumed_when_reserve_is_violated():
     broker_obj = PolicyBroker(
         catalog, config, snapshots=snapshots, resource_by_provider=resource_by_provider
     )
-    decision = broker_obj.select(
-        TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW
-    )
+    decision = broker_obj.select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
     assert decision.assignment is not None
     # The subscription was rejected for violating its reserve.
-    sub_rejection = next(
-        (c.reason for c in decision.rejected if c.ref == "sub-ref"), None
-    )
+    sub_rejection = next((c.reason for c in decision.rejected if c.ref == "sub-ref"), None)
     assert sub_rejection is not None and (
         "reserve" in sub_rejection or "scarce" in sub_rejection
     ), f"expected a reserve-related rejection, got {sub_rejection!r}"
@@ -252,9 +242,7 @@ def test_scenario_8_promotion_expiry_is_per_demand():
     catalog = ModelCatalog(entries=(promo, paid))
     broker_obj = PolicyBroker(catalog, BrokerConfig())
 
-    decision = broker_obj.select(
-        TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW
-    )
+    decision = broker_obj.select(TaskDemand(lane="developer", role="worker", difficulty=3), at=NOW)
     assert decision.assignment is not None
     assert decision.assignment.model_ref == "paid-ref", (
         f"expired promo must not be selected, got {decision.assignment.model_ref}"
@@ -263,6 +251,4 @@ def test_scenario_8_promotion_expiry_is_per_demand():
     # silently down-scores its perishability to zero), it must not be
     # the chosen candidate. The ranked list is observable in dry-run.
     ranked_refs = [c.ref for c in decision.ranked]
-    assert ranked_refs[0] == "paid-ref", (
-        f"expected paid first in ranked list, got {ranked_refs}"
-    )
+    assert ranked_refs[0] == "paid-ref", f"expected paid first in ranked list, got {ranked_refs}"

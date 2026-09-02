@@ -27,7 +27,6 @@ from ai_pr_orchestrator.github.fake import FakeGitHubClient
 from ai_pr_orchestrator.v3.broker import BrokerDecision
 from ai_pr_orchestrator.v3.config import SafetyPolicyConfig, V3Config
 from ai_pr_orchestrator.v3.domain import (
-    GitHubIssueRef,
     LaneIdentity,
     ModelAssignment,
 )
@@ -51,7 +50,9 @@ class StaticBroker:
     def select(self, demand: Any) -> BrokerDecision:
         return BrokerDecision(
             demand=demand,
-            evaluated_at=__import__("datetime").datetime(2026, 9, 1, tzinfo=__import__("datetime").UTC),
+            evaluated_at=__import__("datetime").datetime(
+                2026, 9, 1, tzinfo=__import__("datetime").UTC
+            ),
             assignment=ModelAssignment(lane=demand.lane, model_ref=f"ref-{demand.lane}"),
         )
 
@@ -212,12 +213,8 @@ def test_scenario_12_two_queued_issues_both_reach_done():
     # instead, which is the branch the foreman opened.
     prs_for_1 = [pr for pr in fake.list_open_prs() if pr.head_ref == "aipro-issue-1"]
     prs_for_2 = [pr for pr in fake.list_open_prs() if pr.head_ref == "aipro-issue-2"]
-    assert len(prs_for_1) == 1, (
-        f"expected 1 PR for issue 1's branch, got {prs_for_1}"
-    )
-    assert len(prs_for_2) == 1, (
-        f"expected 1 PR for issue 2's branch, got {prs_for_2}"
-    )
+    assert len(prs_for_1) == 1, f"expected 1 PR for issue 1's branch, got {prs_for_1}"
+    assert len(prs_for_2) == 1, f"expected 1 PR for issue 2's branch, got {prs_for_2}"
     # Exactly one coder invocation per issue (no interleaved retries).
     coder_workdirs = sorted({w for _, w in executor.coder_calls})
     assert coder_workdirs == ["/wt/issue-1", "/wt/issue-2"], (
@@ -267,8 +264,6 @@ def test_scenario_12_repeated_passes_do_not_duplicate_prs():
     first = loop.run_pass()
     assert len(first) == 2
     second = loop.run_pass()
-    assert second == [], (
-        f"second pass should be no-op, got {len(second)} outcomes"
-    )
+    assert second == [], f"second pass should be no-op, got {len(second)} outcomes"
     # Exactly two PRs total (no duplicates).
     assert len(fake.list_open_prs()) == 2

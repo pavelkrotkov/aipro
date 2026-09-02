@@ -28,7 +28,6 @@ from ai_pr_orchestrator.github.fake import FakeGitHubClient
 from ai_pr_orchestrator.v3.broker import BrokerDecision
 from ai_pr_orchestrator.v3.config import V3Config
 from ai_pr_orchestrator.v3.domain import (
-    GitHubIssueRef,
     LaneIdentity,
     ModelAssignment,
 )
@@ -52,7 +51,9 @@ class StaticBroker:
     def select(self, demand: Any) -> BrokerDecision:
         return BrokerDecision(
             demand=demand,
-            evaluated_at=__import__("datetime").datetime(2026, 9, 1, tzinfo=__import__("datetime").UTC),
+            evaluated_at=__import__("datetime").datetime(
+                2026, 9, 1, tzinfo=__import__("datetime").UTC
+            ),
             assignment=ModelAssignment(lane=demand.lane, model_ref=f"ref-{demand.lane}"),
         )
 
@@ -241,7 +242,7 @@ def test_scenario_11_reviewer_mutation_of_workflows_is_a_policy_violation():
     )
     assert "policy violation" in outcome.reason
     assert ".github/workflows" in outcome.reason
-    state = loop._queue.load_state("owner/repo#1")  # noqa: SLF001
+    state = loop._queue.load_state("owner/repo#1")
     assert state is not None and state.phase == "escalated"
     assert "v3-work-needs-human" in fake.get_labels(1)
     # No PR was created.

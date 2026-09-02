@@ -45,7 +45,6 @@ from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
 from ai_pr_orchestrator.v3.config import V3Config
 from ai_pr_orchestrator.v3.domain import (
     GitHubIssueRef,
-    LaneIdentity,
     ModelAssignment,
 )
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop
@@ -72,7 +71,9 @@ class StaticBroker:
     def select(self, demand: Any) -> BrokerDecision:
         return BrokerDecision(
             demand=demand,
-            evaluated_at=__import__("datetime").datetime(2026, 9, 1, tzinfo=__import__("datetime").UTC),
+            evaluated_at=__import__("datetime").datetime(
+                2026, 9, 1, tzinfo=__import__("datetime").UTC
+            ),
             assignment=ModelAssignment(lane=demand.lane, model_ref=f"ref-{demand.lane}"),
         )
 
@@ -153,7 +154,9 @@ def faulted_cao() -> Any:
         yield cao
 
 
-def _foreman(fake: FakeGitHubClient, cao: FakeCAOServer) -> tuple[ForemanPolicyLoop, GitHubIssueQueue]:
+def _foreman(
+    fake: FakeGitHubClient, cao: FakeCAOServer
+) -> tuple[ForemanPolicyLoop, GitHubIssueQueue]:
     cfg = V3Config()
     queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-A")
     controller = CaoSessionController(
@@ -205,14 +208,11 @@ def test_scenario_6_lane_429_does_not_lose_the_phase(faulted_cao: Any):
     assert len(outcomes) == 1
     outcome = outcomes[0]
     assert outcome.final_phase == "escalated", (
-        f"expected escalation (not lost), got {outcome.final_phase!r}; "
-        f"reason={outcome.reason!r}"
+        f"expected escalation (not lost), got {outcome.final_phase!r}; reason={outcome.reason!r}"
     )
     # The work item is marked needs-human and remains on a recoverable phase.
     labels = fake.get_labels(1)
-    assert "v3-work-needs-human" in labels, (
-        f"expected 'v3-work-needs-human', got {labels}"
-    )
+    assert "v3-work-needs-human" in labels, f"expected 'v3-work-needs-human', got {labels}"
     assert "v3-work-done" not in labels
     # The durable claim is retained: a later pass or aipro reconcile can
     # reclaim_expired from here. The workflow state carries the run id and
@@ -244,7 +244,6 @@ def test_scenario_6_transient_429_then_success_does_not_mint_duplicate(
     assert len(first) == 1
     assert first[0].final_phase == "escalated"
     # Re-claim should fail: the item is terminal (escalated).
-    from ai_pr_orchestrator.v3.queue import NoActiveClaimError, ClaimConflictError
 
     issue = GitHubIssueRef(owner="owner", repo="repo", number=1)
     state = queue.load_state("owner/repo#1")
