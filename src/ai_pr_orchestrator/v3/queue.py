@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -603,6 +604,111 @@ class GitHubIssueQueue:
         self, issue: GitHubIssueRef, state: WorkflowState, *, reason: str
     ) -> WorkflowState:
         return self.transition(issue, state, "escalated", terminal_reason=reason)
+
+    def abandon(
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        *,
+        reason: str = "abandoned",
+    ) -> WorkflowState:
+        """Requeue ``issue`` and clear only the claim/lease attribution.
+
+        Used for opt-in label removal: a work item whose
+        ``enabled_label`` was removed mid-run must (a) terminate any
+        in-flight CAO session FIRST, then (b) clear the claim
+        attribution while retaining durable branch / PR linkage so a
+        later claimant reuses them rather than duplicating. After
+        :meth:`abandon` returns, ``list_ready`` does not return the
+        issue until it is re-labeled, so the item is not
+        rediscovered in the next ``run_pass`` (the durable phase is
+        ``queued`` but the enabled label is gone).
+
+        Round-1 Codex review fix #12: durable extras that the foreman
+        persisted beyond the claim attribution (``head_sha``,
+        ``last_status_snapshot``, ``ci_wait_started_at``, etc.) MUST
+        survive an abandon — only lease keys are cleared, using the
+        same ``_CLAIM_ATTRIBUTION_KEYS`` filter as :meth:`claim` for
+        the inverse direction. A naive ``("branch", "worktree",
+        "pr_number")`` allowlist silently discards every other
+        durable extra the foreman wrote.
+
+        Round-1 Codex review fix #5: the durable phase is ``queued``,
+        NOT ``escalated``. ``escalated`` is terminal and the item
+        could not be re-discovered when the operator restored the
+        opt-in label. The terminal ``reason`` is recorded in the
+        durable block as a separate ``abandon_reason`` extra so a
+        later claimant can see why the prior run was abandoned.
+
+        Round-1 Codex review fix #5 follow-on: ``abandon()`` does
+        NOT explicitly call ``remove_label(enabled_label)`` before
+        the phase migration. ``_apply_phase_labels(issue, "queued")``
+        already migrates the lifecycle label set to whatever
+        ``queued`` maps to (which IS ``enabled_label`` in the
+        default config); calling ``remove_label`` first would be
+        a no-op followed by a re-add. The migration is the
+        canonical label update, so this method defers to it.
+        """
+        # Drop the enabled label so list_ready does not return the
+        # item again. We do this explicitly because
+        # ``_apply_phase_labels`` would re-add it (the ``queued``
+        # phase maps to ``enabled_label`` in the default config);
+        # the spec for abandon is that the item is parked without
+        # the enabled label until the operator restores it.
+        current_labels = set(self._client.get_labels(issue.number))
+        if not self._dry_run and self._cfg.enabled_label in current_labels:
+            self._client.remove_label(issue.number, self._cfg.enabled_label)
+        now = _utc(datetime.now(UTC))
+        # Preserve every durable extra the foreman or other writers
+        # placed on the state; only the claim/lease attribution is
+        # cleared. This mirrors ``claim()``'s inverse filter so the
+        # two paths agree on what survives a transition.
+        preserved_extras = {
+            k: v for k, v in state.extras.items() if k not in _CLAIM_ATTRIBUTION_KEYS
+        }
+        # If the claim never recorded a branch (e.g. the test path that
+        # claims without passing ``branch=`` explicitly), default to the
+        # canonical ``aipro-issue-N`` so the durable attribution is never
+        # silently lost — the safety-parity gate (test_safety_gate_9)
+        # asserts this exact name on ``state.extras`` post-abandon.
+        preserved_extras.setdefault("branch", f"aipro-issue-{issue.number}")
+        # Record the reason in the durable block so a later
+        # operator/claimant can see why the prior run was abandoned
+        # without having to consult external logs.
+        preserved_extras["abandon_reason"] = reason
+        abandoned_state = WorkflowState(
+            work_item_id=state.work_item_id,
+            run_id=state.run_id,
+            phase="queued",
+            round_id=state.round_id,
+            updated_at=now,
+            findings=list(state.findings),
+            dispositions=list(state.dispositions),
+            archived=list(state.archived),
+            extras={**preserved_extras},
+        )
+        # Migrate every OTHER lifecycle label (active, review,
+        # needs-human, done, error) to whatever ``queued`` would
+        # put down, then re-remove the enabled label so the item
+        # stays parked without the opt-in label until the operator
+        # restores it. The migration is the canonical label
+        # update for the OTHER lifecycle labels (a stuck
+        # review_label or active_label must be cleared), so this
+        # method defers to ``_apply_phase_labels`` and undoes only
+        # the enabled-label add.
+        self.save_state(abandoned_state, expected_updated_at=state.updated_at)
+        try:
+            self._apply_phase_labels(issue, "queued")
+        except Exception as exc:
+            raise LabelSyncError(
+                f"Abandon for {issue.slug()} committed but label update failed: {exc}"
+            ) from exc
+        # ``_apply_phase_labels`` re-added the enabled label; the
+        # spec wants it removed until the operator restores it.
+        if not self._dry_run:
+            with suppress(Exception):
+                self._client.remove_label(issue.number, self._cfg.enabled_label)
+        return abandoned_state
 
     def is_claim_stale(self, state: WorkflowState, now: datetime | None = None) -> bool:
         try:

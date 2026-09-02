@@ -507,6 +507,14 @@ def _run_reconcile(args: argparse.Namespace) -> int:
     # the git worktree ops (worktree cleanup). Manual actions never apply.
     if not args.dry_run and actions:
         _apply_actions(actions, queue=queue, client=client, dry_run_client=dry_run_client)
+        # Round-1 Codex review fix #2: the reconcile CLI's --apply
+        # path also invokes the production ``v3.cleanup`` sweeper so
+        # orphan sessions / worktrees / stale leases are EXECUTED
+        # in the same command. Previously the CLI stopped at the
+        # planner's auto-apply surface, leaving operators to run a
+        # second command. Now ``aipro reconcile --apply`` performs
+        # the full sweep in one shot.
+        _run_production_cleanup(queue=queue, cleanup_cfg=cleanup_cfg, queue_cfg=queue_cfg)
 
     if manual_actions:
         return 2
@@ -571,6 +579,41 @@ def _build_github_client(
 
     fake = FakeGitHubClient()
     return fake, True
+
+
+def _run_production_cleanup(
+    *,
+    queue: GitHubIssueQueue,
+    cleanup_cfg: CleanupConfig,
+    queue_cfg: GitHubQueueConfig,
+) -> None:
+    """Run the production ``v3.cleanup`` sweeper against ``queue``.
+
+    Round-1 Codex review fix #2: the reconcile CLI's ``--apply`` path
+    now calls the same production sweeper the foreman uses between
+    rounds. Manual reconciliation against the planner's action list
+    is unchanged — this helper runs AFTER ``_apply_actions`` so the
+    CLI's pre-existing recover / clean-orphan printers still surface
+    and the sweep's auto-apply path runs in addition.
+
+    A ``CleanupStateLoadError`` from the sweep is logged so a
+    transient GitHub outage does not silently look like a clean
+    apply. The CLI's exit code is unchanged: it still returns
+    non-zero only for manual actions.
+    """
+    from ai_pr_orchestrator.v3.cleanup import (
+        CleanupPolicy,
+        CleanupStateLoadError,
+        run_cleanup,
+    )
+
+    policy = CleanupPolicy(cleanup_config=cleanup_cfg, queue_config=queue_cfg)
+    try:
+        run_cleanup(queue, cao=None, git=None, policy=policy)
+    except CleanupStateLoadError as exc:
+        print(f"aipro reconcile: production cleanup state-load failed: {exc}")
+    except Exception as exc:  # pragma: no cover - defensive: never let cleanup crash the CLI
+        print(f"aipro reconcile: production cleanup failed: {exc}")
 
 
 def _apply_actions(

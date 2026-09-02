@@ -20,6 +20,25 @@ def stable_check_run_id(context: str) -> int:
 
 
 @dataclass(frozen=True)
+class Issue:
+    """A minimal issue view carrying only the safety-relevant fields.
+
+    The foreman's safety checks (``disallow_forks`` and
+    ``allowed_pr_author_associations``) gate on the *originating*
+    issue's metadata, not on the PR's — the PR is bot-authored, so
+    the bot's association would always be ``OWNER`` and the gate
+    would be vacuous. ``is_fork`` mirrors the property the V1
+    state machine reads on the PR model.
+    """
+
+    number: int
+    is_fork: bool = False
+    author_association: str = ""
+    title: str = ""
+    body: str = ""
+
+
+@dataclass(frozen=True)
 class PullRequest:
     number: int
     title: str

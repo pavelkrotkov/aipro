@@ -141,6 +141,54 @@ class GitHubClient:
         data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
         return data.get("body")
 
+    def get_issue(self, number: int) -> models.Issue:
+        data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
+        # The GitHub Issues API does not return ``is_fork`` directly;
+        # the property lives on the repository, not the issue. Use the
+        # Repositories API so the value is the same for issues and
+        # PRs (round-1 Codex review fix #3). The ``pull_request``
+        # link on the issue is intentionally NOT consulted for the
+        # fork bit — ordinary issues have no such link, and PRs'
+        # link fields do not surface the upstream-vs-fork bit either.
+        # ``author_association`` is reported by GitHub for both issues
+        # and PRs, so it can be read straight off the issue payload.
+        return models.Issue(
+            number=data["number"],
+            is_fork=self.is_repository_fork(),
+            author_association=data.get("author_association") or "",
+            title=data.get("title") or "",
+            body=data.get("body") or "",
+        )
+
+    def is_repository_fork(self) -> bool:
+        """Whether the configured ``owner/repo`` is a fork.
+
+        Round-1 Codex review fix #3: the real GitHub Issues API does
+        not surface ``is_fork`` (ordinary issues have no
+        ``pull_request`` object and the field does not exist on the
+        Issue schema). The Repositories API carries the authoritative
+        ``fork`` boolean; the value is per-repo, so we cache it
+        behind a small memo so the per-issue safety check stays
+        cheap.
+
+        Returns ``False`` on any error fetching the repository — a
+        transient GitHub failure must not silently disable every
+        ``disallow_forks`` check. The foreman's safety gate still
+        fails closed on metadata errors (round-1 Codex review fix #4),
+        so a flapping check is surfaced as ``needs-human`` rather
+        than auto-approving forks.
+        """
+        cached = getattr(self, "_repository_fork_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            data = self._get(f"/repos/{self._owner}/{self._repo}")
+        except Exception:
+            return False
+        is_fork = bool(data.get("fork", False))
+        self._repository_fork_cache = is_fork
+        return is_fork
+
     def create_pr(self, title: str, body: str, head: str, base: str) -> models.PullRequest:
         data = self._post(
             f"/repos/{self._owner}/{self._repo}/pulls",
