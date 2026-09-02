@@ -141,6 +141,24 @@ class GitHubClient:
         data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
         return data.get("body")
 
+    def get_issue(self, number: int) -> models.Issue:
+        data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
+        # The GitHub Issues API does not return ``is_fork`` directly; the
+        # property lives on the linked pull request (a fork is a repo whose
+        # PRs point at a non-equal parent). When the issue carries no
+        # ``pull_request`` link, it is an issue (not a PR) and we treat
+        # it as a non-fork by default.
+        pr_link = data.get("pull_request") or {}
+        # ``author_association`` is reported by GitHub for both issues
+        # and PRs, so it can be read straight off the issue payload.
+        return models.Issue(
+            number=data["number"],
+            is_fork=bool(pr_link) and bool(pr_link.get("head") or {}),
+            author_association=data.get("author_association") or "",
+            title=data.get("title") or "",
+            body=data.get("body") or "",
+        )
+
     def create_pr(self, title: str, body: str, head: str, base: str) -> models.PullRequest:
         data = self._post(
             f"/repos/{self._owner}/{self._repo}/pulls",

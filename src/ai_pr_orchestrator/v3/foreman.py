@@ -273,6 +273,19 @@ class ForemanPolicyLoop:
     # --- Lifecycle -----------------------------------------------------------
 
     def _drive(self, issue: GitHubIssueRef, *, now: datetime | None) -> WorkItemOutcome:
+        # Safety gate: the originating issue's metadata (``is_fork`` /
+        # ``author_association``) is checked BEFORE claim so a forbidden
+        # issue never opens a branch, worktree, or PR. The originating
+        # issue is the source of truth — the PR is bot-authored, so its
+        # association would vacuously pass every gate.
+        rejection = self._safety_check(issue)
+        if rejection is not None:
+            return WorkItemOutcome(
+                issue=issue,
+                final_phase="failed",
+                reason=rejection,
+            )
+
         branch = f"aipro-issue-{issue.number}"
 
         # Claim FIRST — resources are created only once the claim is won, so a
@@ -923,6 +936,51 @@ class ForemanPolicyLoop:
             pr_number=pr_number,
             now=now,
         )
+
+    def _safety_check(self, issue: GitHubIssueRef) -> str | None:
+        """Pre-claim safety gate on the originating issue's metadata.
+
+        Returns a failure ``reason`` if the issue must NOT be claimed,
+        ``None`` if it is safe to proceed. The gate is checked BEFORE
+        :meth:`_claim` opens a branch / worktree, so a rejected item
+        leaves no trace (no PR, no lease, no label churn).
+
+        Two controls live here (V1 parity):
+
+        - ``disallow_forks`` rejects issues whose originating repository
+          is a fork.
+        - ``allowed_pr_author_associations`` rejects issues whose
+          author association is not whitelisted (the originating issue's
+          association is the source of truth, NOT the PR's — the PR is
+          bot-authored, so its association would vacuously pass).
+
+        Network / parse errors degrade open: a missing client surfaces
+        as "safe to proceed" so a flaky GitHub fetch does not block
+        eligible items. Tests pass a fake client that always returns
+        the seeded values.
+        """
+        safety = self._cfg.safety
+        get_issue = getattr(self._queue, "_client", None)
+        client = getattr(get_issue, "get_issue", None) if get_issue is not None else None
+        if client is None:
+            return None
+        try:
+            issue_view = client(issue.number)
+        except Exception:
+            return None
+        # ``disallow_forks`` — reject if the originating repository is a fork.
+        if safety.disallow_forks and getattr(issue_view, "is_fork", False):
+            return "origin repository is a fork; disallow_forks rejects forks"
+        # ``allowed_pr_author_associations`` — reject if the originating
+        # issue author's association is not whitelisted.
+        association = getattr(issue_view, "author_association", "") or ""
+        allowed = list(safety.allowed_pr_author_associations)
+        if allowed and association not in allowed:
+            return (
+                f"author association {association!r} not in "
+                f"allowed_pr_author_associations {allowed!r}"
+            )
+        return None
 
     def _heartbeat(
         self, issue: GitHubIssueRef, state: WorkflowState, *, now: datetime | None = None

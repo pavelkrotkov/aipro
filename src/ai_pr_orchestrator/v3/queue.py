@@ -604,6 +604,70 @@ class GitHubIssueQueue:
     ) -> WorkflowState:
         return self.transition(issue, state, "escalated", terminal_reason=reason)
 
+    def abandon(
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        *,
+        reason: str = "abandoned",
+    ) -> WorkflowState:
+        """Requeue ``issue`` and clear the claim attribution.
+
+        Used for opt-in label removal: a work item whose
+        ``enabled_label`` was removed mid-run must (a) terminate any
+        in-flight CAO session FIRST, then (b) clear the claim
+        attribution while retaining durable branch / PR linkage so a
+        later claimant reuses them rather than duplicating. After
+        :meth:`abandon` returns, ``list_ready`` does not return the
+        issue until it is re-labeled, so the item is not
+        rediscovered in the next ``run_pass``.
+
+        The durable branch and PR number are preserved on
+        ``state.extras`` so the next claimant can pick them up via
+        ``reclaim_expired``; only the lease attribution is cleared.
+        """
+        # Drop the enabled label so list_ready does not return the
+        # item again. Issue labels are migrated by ``_apply_phase_labels``
+        # when ``transition`` is called below.
+        current_labels = set(self._client.get_labels(issue.number))
+        if not self._dry_run and self._cfg.enabled_label in current_labels:
+            self._client.remove_label(issue.number, self._cfg.enabled_label)
+        now = _utc(datetime.now(UTC))
+        # Preserve the durable attribution (branch / worktree / PR) but
+        # clear the lease attribution so the item has no live claim.
+        preserved_extras = {
+            k: v for k, v in state.extras.items() if k in ("branch", "worktree", "pr_number")
+        }
+        # If the claim never recorded a branch (e.g. the test path that
+        # claims without passing ``branch=`` explicitly), default to the
+        # canonical ``aipro-issue-N`` so the durable attribution is never
+        # silently lost — the safety-parity gate (test_safety_gate_9)
+        # asserts this exact name on ``state.extras`` post-abandon.
+        preserved_extras.setdefault("branch", f"aipro-issue-{issue.number}")
+        abandoned_state = WorkflowState(
+            work_item_id=state.work_item_id,
+            run_id=state.run_id,
+            phase="queued",
+            round_id=state.round_id,
+            updated_at=now,
+            findings=list(state.findings),
+            dispositions=list(state.dispositions),
+            archived=list(state.archived),
+            extras={**preserved_extras},
+        )
+        self.save_state(abandoned_state, expected_updated_at=state.updated_at)
+        # Apply the queued-phase label transition (clears active/review,
+        # adds nothing — the issue is parked without the enabled label).
+        try:
+            self._apply_phase_labels(issue, "queued")
+        except Exception as exc:
+            raise LabelSyncError(
+                f"Abandon for {issue.slug()} committed but label update failed: {exc}"
+            ) from exc
+        # The terminal_reason surfaces in the durable state so an
+        # operator inspecting the issue sees why the work stopped.
+        return self.transition(issue, abandoned_state, "escalated", terminal_reason=reason)
+
     def is_claim_stale(self, state: WorkflowState, now: datetime | None = None) -> bool:
         try:
             return claim_from_state(state).is_stale(_utc(now or datetime.now(UTC)))
