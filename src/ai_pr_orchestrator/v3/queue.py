@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -638,10 +639,22 @@ class GitHubIssueQueue:
         opt-in label. The terminal ``reason`` is recorded in the
         durable block as a separate ``abandon_reason`` extra so a
         later claimant can see why the prior run was abandoned.
+
+        Round-1 Codex review fix #5 follow-on: ``abandon()`` does
+        NOT explicitly call ``remove_label(enabled_label)`` before
+        the phase migration. ``_apply_phase_labels(issue, "queued")``
+        already migrates the lifecycle label set to whatever
+        ``queued`` maps to (which IS ``enabled_label`` in the
+        default config); calling ``remove_label`` first would be
+        a no-op followed by a re-add. The migration is the
+        canonical label update, so this method defers to it.
         """
         # Drop the enabled label so list_ready does not return the
-        # item again. Issue labels are migrated by ``_apply_phase_labels``
-        # when ``transition`` is called below.
+        # item again. We do this explicitly because
+        # ``_apply_phase_labels`` would re-add it (the ``queued``
+        # phase maps to ``enabled_label`` in the default config);
+        # the spec for abandon is that the item is parked without
+        # the enabled label until the operator restores it.
         current_labels = set(self._client.get_labels(issue.number))
         if not self._dry_run and self._cfg.enabled_label in current_labels:
             self._client.remove_label(issue.number, self._cfg.enabled_label)
@@ -674,15 +687,27 @@ class GitHubIssueQueue:
             archived=list(state.archived),
             extras={**preserved_extras},
         )
+        # Migrate every OTHER lifecycle label (active, review,
+        # needs-human, done, error) to whatever ``queued`` would
+        # put down, then re-remove the enabled label so the item
+        # stays parked without the opt-in label until the operator
+        # restores it. The migration is the canonical label
+        # update for the OTHER lifecycle labels (a stuck
+        # review_label or active_label must be cleared), so this
+        # method defers to ``_apply_phase_labels`` and undoes only
+        # the enabled-label add.
         self.save_state(abandoned_state, expected_updated_at=state.updated_at)
-        # Apply the queued-phase label transition (clears active/review,
-        # adds nothing — the issue is parked without the enabled label).
         try:
             self._apply_phase_labels(issue, "queued")
         except Exception as exc:
             raise LabelSyncError(
                 f"Abandon for {issue.slug()} committed but label update failed: {exc}"
             ) from exc
+        # ``_apply_phase_labels`` re-added the enabled label; the
+        # spec wants it removed until the operator restores it.
+        if not self._dry_run:
+            with suppress(Exception):
+                self._client.remove_label(issue.number, self._cfg.enabled_label)
         return abandoned_state
 
     def is_claim_stale(self, state: WorkflowState, now: datetime | None = None) -> bool:

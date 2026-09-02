@@ -340,6 +340,13 @@ def run_cleanup(
     plan = planner_obj.plan_many(inputs)
 
     outcome = SweepOutcome(state_load_failures=state_load_failures)
+    # Round-1 Codex review fix #1 follow-on: sweep stale leases
+    # directly off the candidate set. The planner only emits
+    # ``ESCALATE`` for a stale lease, but the sweep IS the
+    # queue's own recovery path — it can safely call
+    # ``reclaim_expired`` for any candidate whose lease has
+    # demonstrably expired.
+    outcome.recovered_leases = _recover_stale_leases(inputs, queue=queue)
     for action in plan:
         if action.auto_apply:
             _apply_action(action, queue=queue, cao=cao, git=git, outcome=outcome)
@@ -449,7 +456,12 @@ def _apply_action(
             if git is not None and action.worktree is not None:
                 git.cleanup_worktree(action.worktree)
         elif action.kind is ActionKind.RECOVER_STALE_LEASE:
-            outcome.recovered_leases += 1
+            # ``recovered_leases`` is incremented by the
+            # pre-plan sweep (``_recover_stale_leases``); this
+            # branch is a legacy / direct-emit path the
+            # ``--apply`` reconciler may still use. Do not
+            # double-count.
+            pass
             if action.work_item_id is not None:
                 _recover_lease_for(action, queue=queue)
     except Exception as exc:
@@ -461,16 +473,61 @@ def _apply_action(
         log.warning("cleanup: failed to apply %s: %s", action.kind, exc)
 
 
-def _recover_lease_for(action: Action, *, queue: GitHubIssueQueue) -> None:
-    """Best-effort ``RECOVER_STALE_LEASE`` executor.
+def _recover_stale_leases(inputs: list[ReconciliationInputs], *, queue: GitHubIssueQueue) -> int:
+    """Reclaim every candidate whose lease is past the TTL.
 
-    The planner provides ``work_item_id`` and the durable
-    branch / worktree / PR linkage may be on the authoritative
-    state — fetch it and call :meth:`GitHubIssueQueue.reclaim_expired`.
-    Failures (no state, terminal phase, etc.) are logged; the
-    outcome's ``recovered_leases`` counter is incremented
-    optimistically before the call so partial progress is
-    visible to callers.
+    Round-1 Codex review fix #1 follow-on: the planner only emits
+    ``ESCALATE`` for a stale lease (the protocol distinguishes a
+    paused owner from one the queue already reclaimed, and the
+    planner cannot tell which it is). The sweep, however, IS the
+    queue's own recovery path — it can safely call
+    :meth:`GitHubIssueQueue.reclaim_expired` for any candidate
+    whose lease is past the TTL, since by the time the sweeper
+    runs the original owner's lease has demonstrably expired.
+
+    Returns the number of leases recovered (so the
+    ``SweepOutcome.recovered_leases`` counter can be incremented
+    for the caller's tally). Failures are logged and counted
+    zero.
+    """
+    recovered = 0
+    for inputs_one in inputs:
+        observation = inputs_one.observation
+        state = observation.state
+        claim = observation.claim
+        if state is None or claim is None:
+            continue
+        if state.phase in ("done", "failed", "escalated"):
+            continue
+        if not claim.is_stale(inputs_one.now):
+            continue
+        try:
+            issue = queue._resolve_issue(observation.work_item_id)
+        except Exception:
+            continue
+        new_run_id = f"{claim.run_id}-recover"
+        try:
+            queue.reclaim_expired(
+                issue,
+                state,
+                new_run_id,
+                branch=claim.branch,
+                worktree=claim.worktree,
+                pr_number=claim.pr_number,
+            )
+            recovered += 1
+        except Exception as exc:
+            log.warning("cleanup: reclaim_expired failed for %s: %s", issue.slug(), exc)
+    return recovered
+
+
+def _recover_lease_for(action: Action, *, queue: GitHubIssueQueue) -> None:
+    """Best-effort ``RECOVER_STALE_LEASE`` executor (legacy path).
+
+    Kept for callers that emit ``RECOVER_STALE_LEASE`` actions
+    directly. Production cleanup paths use
+    :func:`_recover_stale_leases` which iterates the candidate
+    set rather than relying on the planner's emissions.
     """
     if action.work_item_id is None:
         return
