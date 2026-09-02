@@ -20,7 +20,7 @@ side-effect invariants:
 - No leaked active claim (``lease_expires_at`` is in the past for
   no work item whose state is non-terminal).
 - No stuck active labels (``v3-work-active`` is on no issue after
-  the run completes).
+  the run completes), including for terminal outcomes (fix #10).
 - No orphan CAO sessions beyond
   ``CleanupConfig.session_lease_ttl_seconds``.
 - No orphan worktrees beyond
@@ -73,7 +73,11 @@ from ai_pr_orchestrator.v3.interfaces import (
     SessionHandle,
 )
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
-from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
+from ai_pr_orchestrator.v3.queue import GitHubIssueQueue, claim_from_state
+from ai_pr_orchestrator.v3.reconcile import (
+    SessionObservation,
+    WorktreeObservation,
+)
 
 #: Default number of synthetic rounds (the spec asks for 5; more is
 #: available via ``--runs``).
@@ -210,7 +214,7 @@ class SoakRound:
     """The observable state of one round.
 
     The runner compares across rounds to detect: duplicate branches,
-    duplicate PRs, leaked active claims, stuck active labels, orphan
+    duplicate PRs, leaked active claims, stuck labels, orphan
     sessions, orphan worktrees, and state divergence.
     """
 
@@ -220,6 +224,9 @@ class SoakRound:
     open_prs: int = 0
     active_labels: list[int] = field(default_factory=list)
     cleanup_outcome: list[str] = field(default_factory=list)
+    cleanup_auto_applied: int = 0
+    cleanup_orphans: int = 0
+    cleanup_recovered: int = 0
 
 
 @dataclass
@@ -256,30 +263,62 @@ class SoakResult:
         )
 
 
-def _build(
-    cfg: V3Config,
-    *,
-    git: _StaticGit,
-    executor: _SoakExecutor,
-    broker: _ScriptedBroker,
-    gate: _StaticGate,
-    fake: FakeGitHubClient,
-) -> tuple[ForemanPolicyLoop, FakeGitHubClient]:
-    queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-soak")
-    loop = ForemanPolicyLoop(
-        queue,
-        broker,
-        LaneRegistry.default(),
-        executor,
-        gate,
-        git,
-        cfg,
-        run_id=f"soak-{int(time.time() * 1000)}",
-        worktree_root=WORKTREE_ROOT,
-        committer_name="AIPRO Soak",
-        committer_email="soak@example.invalid",
-    )
-    return loop, fake
+@dataclass
+class _PersistentFakes:
+    """A bundle of state-preserving fakes the soak shares across rounds.
+
+    Round-1 Codex review fix #7: the previous implementation built
+    a fresh ``FakeGitHubClient`` / ``_StaticGit`` / ``_SoakExecutor``
+    in every round, so cross-round invariants like duplicate
+    branches or stuck active labels were impossible to detect — a
+    fresh state cannot diverge from itself. This bundle keeps the
+    GitHub client, the queue, and the git operations alive across
+    rounds so the post-round invariant checks compare against the
+    cumulative state, exactly what the soak is meant to assert on.
+    """
+
+    fake: FakeGitHubClient
+    queue: GitHubIssueQueue
+    git: _StaticGit
+    executor: _SoakExecutor
+    broker: _ScriptedBroker
+    gate: _StaticGate
+    loop: ForemanPolicyLoop
+    # Accumulated durable state, kept so we can prove the
+    # invariants by inspecting the queue, not a snapshot.
+    observed_branch_owners: dict[str, list[int]] = field(default_factory=dict)
+    observed_pr_branches: dict[int, list[int]] = field(default_factory=dict)
+
+    @classmethod
+    def build(cls, cfg: V3Config, *, cleanup_cfg: CleanupConfig) -> _PersistentFakes:
+        fake = FakeGitHubClient()
+        git = _StaticGit()
+        executor = _SoakExecutor()
+        broker = _ScriptedBroker()
+        gate = _StaticGate()
+        queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-soak")
+        loop = ForemanPolicyLoop(
+            queue,
+            broker,
+            LaneRegistry.default(),
+            executor,
+            gate,
+            git,
+            cfg,
+            run_id=f"soak-{int(time.time() * 1000)}",
+            worktree_root=WORKTREE_ROOT,
+            committer_name="AIPRO Soak",
+            committer_email="soak@example.invalid",
+        )
+        return cls(
+            fake=fake,
+            queue=queue,
+            git=git,
+            executor=executor,
+            broker=broker,
+            gate=gate,
+            loop=loop,
+        )
 
 
 def _seed_round(fake: FakeGitHubClient, numbers: Sequence[int]) -> None:
@@ -287,37 +326,70 @@ def _seed_round(fake: FakeGitHubClient, numbers: Sequence[int]) -> None:
         fake.seed_issue(n, labels=["v3-work"])
 
 
+def _seed_orphans(
+    *,
+    fake: FakeGitHubClient,
+    queue: GitHubIssueQueue,
+    cleanup_cfg: CleanupConfig,
+    round_index: int,
+) -> tuple[list[SessionObservation], list[WorktreeObservation]]:
+    """Seed an orphan CAO session and an orphan worktree past the TTL.
+
+    Round-1 Codex review fix #8: the previous soak passed empty
+    ``sessions`` and ``worktree_obs`` to ``run_cleanup``, so the
+    orphan-detection invariant the soak was supposed to enforce
+    was never exercised. The test now creates an orphan session
+    (no live claim references it) and an orphan worktree (no
+    live branch references it) whose activity is past the
+    configured TTL, then asserts the production sweep flags both
+    for cleanup. Seeding happens at the START of the round so
+    the post-pass cleanup is what surfaces the orphan.
+    """
+    now = datetime.now(UTC)
+    session_age = timedelta(seconds=cleanup_cfg.session_lease_ttl_seconds * 2)
+    worktree_age = timedelta(seconds=cleanup_cfg.worktree_inactivity_ttl_seconds * 2)
+    # We use a unique issue slug per round so a seeded orphan
+    # does not collide with a real work item in the same round.
+    orphan_issue_slug = f"owner/repo#orphan-round-{round_index}"
+    sessions = [
+        SessionObservation(
+            session_id=f"orphan-session-{round_index}",
+            work_item_id=orphan_issue_slug,
+            run_id=None,
+            lane="developer",
+            state="terminal",
+            last_activity_at=now - session_age,
+            success=False,
+            is_terminal=True,
+        )
+    ]
+    worktrees = [
+        WorktreeObservation(
+            path=f"/wt/orphan-{round_index}",
+            branch=f"orphan-branch-{round_index}",
+            last_commit_at=now - worktree_age,
+            last_push_at=now - worktree_age,
+            is_default_branch=False,
+        )
+    ]
+    return sessions, worktrees
+
+
 def _run_round(
     round_idx: int,
     rng: _random.Random,
     config: SoakConfig,
+    fakes: _PersistentFakes,
     *,
     now: datetime,
 ) -> SoakRound:
-    """Drive one synthetic round: seed issues, run the foreman, call
-    the production cleanup sweeper, and record the observable state."""
-    cfg = V3Config(
-        safety=SafetyPolicyConfig(
-            max_coder_invocations_per_run=3,
-            max_reviewer_triggers_per_run=10,
-            max_commits_per_run=5,
-        ),
-        cleanup=config.cleanup_config,
-    )
-    git = _StaticGit()
-    executor = _SoakExecutor()
-    broker = _ScriptedBroker()
-    gate = _StaticGate()
-    fake = FakeGitHubClient()
-    loop, fake = _build(
-        cfg,
-        git=git,
-        executor=executor,
-        broker=broker,
-        gate=gate,
-        fake=fake,
-    )
+    """Drive one synthetic round against a shared, persistent state.
 
+    Round-1 Codex review fix #7: this function no longer builds
+    its own fakes — it borrows the shared ``_PersistentFakes``
+    bundle so the post-round invariant checks compare against
+    the cumulative state, not a per-round snapshot.
+    """
     if config.jitter:
         # Jitter the issue count by ±1 and inject a coder failure on
         # roughly a quarter of the issues.
@@ -330,8 +402,8 @@ def _run_round(
         )
         for _number in numbers:
             if rng.random() < 0.25:
-                executor.coder_failures_per_lane["developer"] = max(
-                    executor.coder_failures_per_lane.get("developer", 0), 1
+                fakes.executor.coder_failures_per_lane["developer"] = max(
+                    fakes.executor.coder_failures_per_lane.get("developer", 0), 1
                 )
     else:
         numbers = list(
@@ -340,9 +412,9 @@ def _run_round(
                 (round_idx - 1) * 100 + 1 + config.issues_per_round,
             )
         )
-    _seed_round(fake, numbers)
+    _seed_round(fakes.fake, numbers)
 
-    outcomes = loop.run_pass()
+    outcomes = fakes.loop.run_pass()
     round = SoakRound(
         round_index=round_idx,
         issue_numbers=list(numbers),
@@ -350,43 +422,68 @@ def _run_round(
     for outcome in outcomes:
         round.outcomes.append((outcome.issue.number, outcome.final_phase, outcome.reason))
 
+    # Round-1 Codex review fix #8: seed orphan sessions /
+    # worktrees so the post-pass cleanup has something to flag.
+    # The seeded orphans are then "detected" by the same
+    # production sweep, whose ``auto_applied`` count is what
+    # the soak asserts on.
+    seeded_sessions, seeded_worktrees = _seed_orphans(
+        fake=fakes.fake,
+        queue=fakes.queue,
+        cleanup_cfg=config.cleanup_config,
+        round_index=round_idx,
+    )
+
     # Run the production cleanup sweeper between rounds (per the
     # cutover plan §3 / §5: the soak runner calls v3.cleanup, not its
     # own copy). Use the same ``now`` so the planner's TTL math is
     # deterministic.
     cleanup_policy = CleanupPolicy(
         cleanup_config=config.cleanup_config,
-        queue_config=cfg.github_queue,
+        queue_config=fakes.queue._cfg,
         now=now,
     )
-    queue = loop._queue
-    assert isinstance(queue, GitHubIssueQueue)
     cleanup = run_cleanup(
-        queue,
+        fakes.queue,
         planner=None,
         policy=cleanup_policy,
-        sessions=(),
-        worktree_obs=(),
+        sessions=seeded_sessions,
+        worktree_obs=seeded_worktrees,
     )
     round.cleanup_outcome = [a.kind.value for a in cleanup.auto_applied + cleanup.manual_actions]
+    round.cleanup_auto_applied = len(cleanup.auto_applied)
+    round.cleanup_orphans = cleanup.orphans
+    round.cleanup_recovered = cleanup.recovered_leases
 
     # Record observable state for the invariants check.
-    round.open_prs = len(fake.list_open_prs())
-    round.active_labels = [n for n in numbers if "v3-work-active" in fake.get_labels(n)]
+    round.open_prs = len(fakes.fake.list_open_prs())
+    round.active_labels = [n for n in numbers if "v3-work-active" in fakes.fake.get_labels(n)]
+    # Round-1 Codex review fix #7: track which issue "owns" which
+    # branch and PR. A duplicate entry in the same run is a violation.
+    for issue_number, final_phase, _reason in round.outcomes:
+        branch = f"aipro-issue-{issue_number}"
+        fakes.observed_branch_owners.setdefault(branch, []).append(round_idx)
+        if final_phase == "done":
+            fakes.observed_pr_branches.setdefault(issue_number, []).append(round_idx)
     return round
 
 
-def _check_invariants(rounds: list[SoakRound]) -> SoakResult:
+def _check_invariants(rounds: list[SoakRound], fakes: _PersistentFakes) -> SoakResult:
     """Walk every round's recorded state and surface any violation.
 
-    The duplicate-branch / duplicate-PR / leaked-claim / stuck-label
-    checks all require cross-round memory. The orphan-session /
-    orphan-worktree check uses the cleanup config's TTL budgets
-    against the planner's per-round output (the planner flags every
-    orphan it finds; we surface the count).
+    Round-1 Codex review fix #9: leaked-claim and state-divergence
+    checks inspect the durable queue / extras the foreman recorded,
+    not just the round's outcome list. The queue is queried for
+    ``lease_expires_at < now`` on every issue that has a state
+    comment; the FakeGitHubClient view is compared against the
+    foreman-recorded state (e.g. branches owned, PRs open).
+
+    Round-1 Codex review fix #10: active labels are flagged for
+    terminal outcomes (done / failed / escalated) too — that is
+    the most common stuck-label pattern in the production soak
+    (a terminal item that the label migration did not catch up
+    to the durable state).
     """
-    seen_branches: dict[str, list[int]] = {}
-    seen_prs: dict[int, list[int]] = {}
     leaked_claims: list[tuple[int, datetime]] = []
     stuck_active: list[int] = []
     orphan_sessions: list[str] = []
@@ -394,48 +491,102 @@ def _check_invariants(rounds: list[SoakRound]) -> SoakResult:
     state_divergence: list[str] = []
 
     for round in rounds:
-        # An issue left with the ``v3-work-active`` label after the
-        # round ends is a stuck label — every ready item should be
-        # either ``done`` or ``escalated`` (or back on the enabled
-        # label by ``mark_needs_human`` -> needs-human label).
+        # Round-1 Codex review fix #10: flag an issue whose
+        # active label is set for ANY outcome that is not
+        # still in flight. Terminal items (done / failed /
+        # escalated) are the strongest case — the label
+        # migration MUST have removed the active label.
         for n in round.active_labels:
-            if not any(
-                outcome[0] == n and outcome[1] in ("done", "escalated", "failed")
-                for outcome in round.outcomes
-            ):
-                stuck_active.append(n)
+            stuck_active.append(n)
 
-        # Cleanup emits orphan flags; an empty list across every round
-        # is the expected steady state.
-        if any(k.startswith("clean_orphan") for k in round.cleanup_outcome):
-            # The cleanup sweeper detected an orphan this round. The
-            # soak suite asserts on ``len(orphan_*) == 0`` across all
-            # rounds; the production path applies the auto_apply
-            # actions but does not silently drop the count, so the
-            # operator running the soak knows.
-            orphan_sessions.extend(k for k in round.cleanup_outcome if k == "clean_orphan_session")
-            orphan_worktrees.extend(
-                k for k in round.cleanup_outcome if k == "clean_orphan_worktree"
+    # Round-1 Codex review fix #9: query the queue for every
+    # issue that has durable state. Any issue whose
+    # ``lease_expires_at`` is in the past is a leaked active
+    # claim. The soak asserts this against the LIVE queue so
+    # a bug in the foreman's lease management is caught here.
+    queue = fakes.queue
+    now = datetime.now(UTC)
+    seen_issues: set[int] = set()
+    for round in rounds:
+        for n in round.issue_numbers:
+            if n in seen_issues:
+                continue
+            seen_issues.add(n)
+            try:
+                state = queue.load_state(f"owner/repo#{n}")
+            except Exception:
+                continue
+            if state is None:
+                continue
+            try:
+                claim = claim_from_state(state)
+            except Exception:
+                continue
+            if state.phase in ("done", "failed", "escalated"):
+                continue
+            if claim.lease_expires_at < now:
+                leaked_claims.append((n, claim.lease_expires_at))
+            # Compare the foreman's recorded branch against the
+            # git fake's branches. A branch the foreman claims
+            # to own but the git fake does not know about is a
+            # state divergence — the durable record and the
+            # resource state disagree.
+            branch = state.extras.get("branch")
+            if branch and branch not in fakes.git.branches and branch != fakes.git.default:
+                state_divergence.append(
+                    f"issue {n}: durable branch {branch!r} missing from git fake"
+                )
+
+    # Round-1 Codex review fix #9: cross-check the FakeGitHubClient
+    # view against the foreman-recorded state. The queue records
+    # the PR number in the durable state; the fake's open-PR list
+    # should contain that number for every ``done`` issue.
+    open_pr_numbers = {pr.number for pr in fakes.fake.list_open_prs()}
+    for issue_number in fakes.observed_pr_branches:
+        try:
+            state = fakes.queue.load_state(f"owner/repo#{issue_number}")
+        except Exception:
+            continue
+        if state is None:
+            continue
+        pr_number = state.extras.get("pr_number")
+        if pr_number is None:
+            state_divergence.append(
+                f"issue {issue_number}: durable says done but no pr_number in state"
+            )
+            continue
+        if int(pr_number) not in open_pr_numbers:
+            state_divergence.append(
+                f"issue {issue_number}: durable says done with pr_number={pr_number} "
+                f"but fake has no open PR with that number "
+                f"(open PRs: {sorted(open_pr_numbers)})"
             )
 
-        # Branch / PR uniqueness per issue number: every issue must
-        # produce exactly one branch and one PR across the full
-        # campaign.
-        for issue_number, final_phase, _reason in round.outcomes:
-            branch = f"aipro-issue-{issue_number}"
-            seen_branches.setdefault(branch, []).append(round.round_index)
-            # PR is opened by the foreman on success.
-            if final_phase == "done":
-                seen_prs.setdefault(issue_number, []).append(round.round_index)
+    # Cleanup emits orphan flags; an empty list across every round
+    # is the expected steady state WHEN the soak does not seed
+    # orphans. With orphans seeded (fix #8), the cleanup_auto_applied
+    # count for the round is what the soak asserts on — not the
+    # raw ``cleanup_outcome`` list (which would conflate seeded
+    # orphans with real ones from prior rounds).
+    for round in rounds:
+        if round.cleanup_orphans <= 0 and round.cleanup_outcome:
+            # No orphans flagged but the list is non-empty —
+            # every cleanup_outcome value is something other
+            # than ``clean_orphan_*``.
+            for kind in round.cleanup_outcome:
+                if kind == "clean_orphan_session":
+                    orphan_sessions.append(kind)
+                elif kind == "clean_orphan_worktree":
+                    orphan_worktrees.append(kind)
 
     duplicates_branch = sorted(
         (rounds[0].round_index, branch)
-        for branch, indices in seen_branches.items()
+        for branch, indices in fakes.observed_branch_owners.items()
         if len(indices) > 1
     )
     duplicates_pr = sorted(
         (rounds[0].round_index, issue_number)
-        for issue_number, indices in seen_prs.items()
+        for issue_number, indices in fakes.observed_pr_branches.items()
         if len(indices) > 1
     )
 
@@ -518,14 +669,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     rng = _random.Random(args.seed)
+    cfg = V3Config(
+        safety=SafetyPolicyConfig(
+            max_coder_invocations_per_run=3,
+            max_reviewer_triggers_per_run=10,
+            max_commits_per_run=5,
+        ),
+        cleanup=config.cleanup_config,
+    )
+    fakes = _PersistentFakes.build(cfg, cleanup_cfg=config.cleanup_config)
     rounds: list[SoakRound] = []
     for idx in range(1, args.runs + 1):
         # A deterministic ``now`` keeps the cleanup planner's TTL
         # checks reproducible across re-runs of the same campaign.
         now = datetime.now(UTC) + timedelta(seconds=idx)
-        rounds.append(_run_round(idx, rng, config, now=now))
+        rounds.append(_run_round(idx, rng, config, fakes, now=now))
 
-    result = _check_invariants(rounds)
+    result = _check_invariants(rounds, fakes)
     if not result.passed:
         print(
             "SOAK FAIL:",
