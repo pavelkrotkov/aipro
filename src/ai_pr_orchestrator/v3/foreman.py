@@ -223,6 +223,17 @@ class ForemanPolicyLoop:
         One item crashing escalates *that item* only — and persists the crash
         (``mark_needs_human``) so the authoritative issue is never left on an
         active phase with a stranded claim. The pass continues.
+
+        Round-1 Codex review fix #2: the production foreman now
+        invokes :func:`~ai_pr_orchestrator.v3.cleanup.run_cleanup`
+        after the foreman pass completes so orphan sessions /
+        worktrees / stale leases are surfaced and EXECUTED in the
+        same pass. The CAO controller and git operations are wired
+        through the foreman so the sweep can call
+        ``terminate_session`` / ``cleanup_worktree`` /
+        ``reclaim_expired`` directly. A failed sweep (state-load
+        error) is logged but does not crash the foreman — partial
+        progress on the work items is the primary deliverable.
         """
         issues = self._list_ready()
         if max_items is not None:
@@ -242,7 +253,44 @@ class ForemanPolicyLoop:
                         escalated=True,
                     )
                 )
+        self._run_post_pass_cleanup()
         return outcomes
+
+    def _run_post_pass_cleanup(self) -> None:
+        """Invoke the production ``v3.cleanup`` sweeper after the foreman pass.
+
+        Round-1 Codex review fix #2: wiring point. The foreman
+        owns the live CAO controller and git operations, so the
+        sweep is fed real controllers (not the default no-op
+        stubs) and can actually terminate orphan sessions and
+        clean orphan worktrees. A failure (e.g. state load
+        errors) is logged but never propagates — the foreman's
+        contract is to surface work-item outcomes, not to gate
+        the pass on the sweep.
+        """
+        from .cleanup import CleanupPolicy, run_cleanup
+        from .queue import GitHubIssueQueue
+
+        queue = self._queue
+        # ``run_cleanup`` requires a ``GitHubIssueQueue`` (it pokes
+        # at ``_client`` / ``_owner`` / ``_repo`` to discover
+        # candidates and load state). The foreman accepts any
+        # structural queue; the real production wiring passes a
+        # real ``GitHubIssueQueue``, so this is a type narrowing
+        # not a real cast.
+        if not isinstance(queue, GitHubIssueQueue):
+            return
+        cao = getattr(self, "_cao", None)
+        git = self._git
+        policy = CleanupPolicy(
+            cleanup_config=self._cfg.cleanup,
+            queue_config=self._cfg.github_queue,
+        )
+        try:
+            run_cleanup(queue, cao=cao, git=git, policy=policy)
+        except Exception as exc:
+            log = __import__("logging").getLogger(__name__)
+            log.warning("foreman: post-pass cleanup failed: %s", exc)
 
     def _persist_crash(self, issue: GitHubIssueRef, reason: str) -> None:
         """Persist an in-pass crash against the authoritative issue.
