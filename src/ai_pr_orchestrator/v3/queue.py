@@ -611,7 +611,7 @@ class GitHubIssueQueue:
         *,
         reason: str = "abandoned",
     ) -> WorkflowState:
-        """Requeue ``issue`` and clear the claim attribution.
+        """Requeue ``issue`` and clear only the claim/lease attribution.
 
         Used for opt-in label removal: a work item whose
         ``enabled_label`` was removed mid-run must (a) terminate any
@@ -620,11 +620,24 @@ class GitHubIssueQueue:
         later claimant reuses them rather than duplicating. After
         :meth:`abandon` returns, ``list_ready`` does not return the
         issue until it is re-labeled, so the item is not
-        rediscovered in the next ``run_pass``.
+        rediscovered in the next ``run_pass`` (the durable phase is
+        ``queued`` but the enabled label is gone).
 
-        The durable branch and PR number are preserved on
-        ``state.extras`` so the next claimant can pick them up via
-        ``reclaim_expired``; only the lease attribution is cleared.
+        Round-1 Codex review fix #12: durable extras that the foreman
+        persisted beyond the claim attribution (``head_sha``,
+        ``last_status_snapshot``, ``ci_wait_started_at``, etc.) MUST
+        survive an abandon — only lease keys are cleared, using the
+        same ``_CLAIM_ATTRIBUTION_KEYS`` filter as :meth:`claim` for
+        the inverse direction. A naive ``("branch", "worktree",
+        "pr_number")`` allowlist silently discards every other
+        durable extra the foreman wrote.
+
+        Round-1 Codex review fix #5: the durable phase is ``queued``,
+        NOT ``escalated``. ``escalated`` is terminal and the item
+        could not be re-discovered when the operator restored the
+        opt-in label. The terminal ``reason`` is recorded in the
+        durable block as a separate ``abandon_reason`` extra so a
+        later claimant can see why the prior run was abandoned.
         """
         # Drop the enabled label so list_ready does not return the
         # item again. Issue labels are migrated by ``_apply_phase_labels``
@@ -633,10 +646,12 @@ class GitHubIssueQueue:
         if not self._dry_run and self._cfg.enabled_label in current_labels:
             self._client.remove_label(issue.number, self._cfg.enabled_label)
         now = _utc(datetime.now(UTC))
-        # Preserve the durable attribution (branch / worktree / PR) but
-        # clear the lease attribution so the item has no live claim.
+        # Preserve every durable extra the foreman or other writers
+        # placed on the state; only the claim/lease attribution is
+        # cleared. This mirrors ``claim()``'s inverse filter so the
+        # two paths agree on what survives a transition.
         preserved_extras = {
-            k: v for k, v in state.extras.items() if k in ("branch", "worktree", "pr_number")
+            k: v for k, v in state.extras.items() if k not in _CLAIM_ATTRIBUTION_KEYS
         }
         # If the claim never recorded a branch (e.g. the test path that
         # claims without passing ``branch=`` explicitly), default to the
@@ -644,6 +659,10 @@ class GitHubIssueQueue:
         # silently lost — the safety-parity gate (test_safety_gate_9)
         # asserts this exact name on ``state.extras`` post-abandon.
         preserved_extras.setdefault("branch", f"aipro-issue-{issue.number}")
+        # Record the reason in the durable block so a later
+        # operator/claimant can see why the prior run was abandoned
+        # without having to consult external logs.
+        preserved_extras["abandon_reason"] = reason
         abandoned_state = WorkflowState(
             work_item_id=state.work_item_id,
             run_id=state.run_id,
@@ -664,9 +683,7 @@ class GitHubIssueQueue:
             raise LabelSyncError(
                 f"Abandon for {issue.slug()} committed but label update failed: {exc}"
             ) from exc
-        # The terminal_reason surfaces in the durable state so an
-        # operator inspecting the issue sees why the work stopped.
-        return self.transition(issue, abandoned_state, "escalated", terminal_reason=reason)
+        return abandoned_state
 
     def is_claim_stale(self, state: WorkflowState, now: datetime | None = None) -> bool:
         try:
