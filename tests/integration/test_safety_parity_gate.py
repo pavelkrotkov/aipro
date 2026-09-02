@@ -583,9 +583,7 @@ def test_safety_gate_6_reviewer_trigger_budget_exhaustion_escalates():
                 findings=[],
             )
 
-    loop = _build(
-        fake, cfg=cfg, executor=_ReviewerFindsBlocker(), lane_registry=lane_registry
-    )
+    loop = _build(fake, cfg=cfg, executor=_ReviewerFindsBlocker(), lane_registry=lane_registry)
     outcome = loop.run_pass()[0]
     # Round 1 fires one reviewer lane (the budget cap is 1) and
     # returns a blocker. Round 2 needs to verify the fix but the

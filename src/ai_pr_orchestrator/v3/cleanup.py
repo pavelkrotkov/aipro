@@ -358,9 +358,7 @@ def run_cleanup(
         # Round-1 Codex review fix #13: do not silently emit
         # clean actions against items whose state is unknown.
         # Surface the structured failure so the caller can decide.
-        details = "; ".join(
-            f"{slug}: {err}" for slug, err in outcome.state_load_failures
-        )
+        details = "; ".join(f"{slug}: {err}" for slug, err in outcome.state_load_failures)
         raise CleanupStateLoadError(
             f"cleanup state load failed for {len(outcome.state_load_failures)} "
             f"candidate(s): {details}"
