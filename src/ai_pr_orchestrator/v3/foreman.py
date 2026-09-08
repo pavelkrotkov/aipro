@@ -143,6 +143,22 @@ class _ForemanEscalation(RuntimeError):
         self.reason = reason
 
 
+class _SafetyMetadataError(RuntimeError):
+    """Transient failure to fetch origin metadata in :meth:`_safety_check`.
+
+    Distinguished from a *confirmed* policy rejection (fork / untrusted
+    author): when the metadata is UNVERIFIABLE right now (rate limit, 5xx,
+    parse error) the item is escalated via ``mark_needs_human`` so an
+    operator sees the failure and the item stays eligible once GitHub
+    recovers — it is never silently rejected-and-removed the way a
+    confirmed rejection is (round-2 Codex review fix #5).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class _RoundReport:
     """Result of one review round."""
@@ -375,7 +391,27 @@ class ForemanPolicyLoop:
         # be re-rejected indefinitely (and the foreman would mint
         # label churn). The label-removal uses the queue's own
         # ``remove_label`` verb so production / fake clients agree.
-        rejection = self._safety_check(issue)
+        #
+        # Round-2 Codex review fix #8: the opt-in label is revalidated
+        # BEFORE continuing. ``run_pass`` snapshots ``list_ready()`` at the
+        # start; if the operator removed the enabled label between passes
+        # (or mid-snapshot), the foreground would otherwise skip straight to
+        # fork/author checks and claim + continue real work (branch, PR, CI
+        # side effects) on an item the operator explicitly opted out of. The
+        # revalidation terminates any live session and abandons (parks) the
+        # item instead of running it.
+        if not self._revalidate_opt_in(issue):
+            existing = self._load_optional(issue)
+            return self._dropdown_opted_out(issue, existing, now=now)
+        try:
+            rejection = self._safety_check(issue)
+        except _SafetyMetadataError as exc:
+            # Round-2 Codex review fix #5: unverifiable metadata is NOT a
+            # confirmed rejection. The item must not silently lose its
+            # opt-in label / be dropped from later passes; instead persist
+            # ``mark_needs_human`` so an operator can find and adjudicate
+            # it once GitHub recovers.
+            return self._escalate_unverified(issue, str(exc))
         if rejection is not None:
             self._remove_enabled_label(issue)
             return WorkItemOutcome(
@@ -1084,9 +1120,17 @@ class ForemanPolicyLoop:
             issue_view = client(issue.number)
         except Exception as exc:
             # Fail closed: a transient GitHub error must NOT silently
-            # approve a fork or an untrusted-author issue. Escalate so
-            # a human inspects the metadata when GitHub recovers.
-            return f"safety check could not verify issue metadata: {exc}"
+            # approve a fork or an untrusted-author issue. Round-2 Codex
+            # review fix #5: this is an UNVERIFIABLE-metadata condition,
+            # distinct from a CONFIRMED rejection. Raise
+            # ``_SafetyMetadataError`` so ``_drive`` persists
+            # ``mark_needs_human`` (durable, operator-visible) instead of
+            # routing the item through the permanent-rejection branch and
+            # silently removing its opt-in label. Escalation, not
+            # rejection: a human inspects the metadata once GitHub recovers.
+            raise _SafetyMetadataError(
+                f"safety check could not verify issue metadata: {exc}"
+            ) from exc
         # ``disallow_forks`` — reject if the originating repository is a fork.
         if safety.disallow_forks and getattr(issue_view, "is_fork", False):
             return "origin repository is a fork; disallow_forks rejects forks"
@@ -1100,6 +1144,150 @@ class ForemanPolicyLoop:
                 f"allowed_pr_author_associations {allowed!r}"
             )
         return None
+
+    def _revalidate_opt_in(self, issue: GitHubIssueRef) -> bool:
+        """Return whether the operator still wants ``issue`` processed.
+
+        Round-2 Codex review fix #8: ``run_pass`` snapshots
+        ``list_ready()`` once at the start; the opt-in label can be removed
+        between passes (or while a lane runs) without this check. Before
+        claiming / continuing an item we positively confirm the enabled
+        label is still on the issue: if it has been removed, ``_drive``
+        parks the item instead of running branch/PR/CI side effects.
+
+        A *positive* absence stops work; an unreadable label set (transient
+        failure) degrades to *proceed* so a healthy claim is never
+        abandoned on a flapping read — we only drop out on a confirmed
+        opt-out.
+        """
+        client = getattr(self._queue, "_client", None)
+        if client is None:
+            return True
+        label = self._cfg.github_queue.enabled_label
+        try:
+            labels = set(client.get_labels(issue.number))
+        except Exception:
+            return True
+        return label in labels
+
+    def _dropdown_opted_out(
+        self,
+        issue: GitHubIssueRef,
+        existing: WorkflowState | None,
+        *,
+        now: datetime | None,
+    ) -> WorkItemOutcome:
+        """Park an item whose opt-in label vanished (round-2 fix #8).
+
+        Terminates any live session and abandons (requeues + clears the
+        claim) an existing non-terminal item so it is not left half-claimed
+        under a dead lease; a never-claimed item is simply skipped. The
+        item stays requeueable for when the operator restores the label.
+        """
+        reason = "opt-in enabled label removed by operator; not continuing"
+        if existing is not None and existing.phase not in TERMINAL_PHASES:
+            self._terminate_live_sessions(issue)
+            abandon = getattr(self._queue, "abandon", None)
+            if abandon is not None:
+                with contextlib.suppress(Exception):
+                    abandon(issue, existing, reason=reason)
+        return WorkItemOutcome(issue=issue, final_phase="queued", reason=reason)
+
+    def _terminate_live_sessions(self, issue: GitHubIssueRef) -> None:
+        """Best-effort terminate of CAO sessions owned by ``issue``.
+
+        Round-2 fix #8 follow-on: dropping out must terminate the live
+        session before ``abandon()`` so a lane is not left running against
+        item the operator opted out of. Uses the controller's observation
+        surface to find sessions attributed to this work item; absence of a
+        controller / surface is handled gracefully.
+        """
+        cao = getattr(self, "_cao", None)
+        if cao is None:
+            return
+        list_sessions = getattr(cao, "list_session_observations", None)
+        terminate = getattr(cao, "terminate_session", None)
+        if list_sessions is None or terminate is None:
+            return
+        try:
+            from .interfaces import SessionHandle
+
+            target = issue.slug()
+            for obs in list_sessions():
+                if getattr(obs, "work_item_id", None) != target:
+                    continue
+                terminate(SessionHandle(session_id=obs.session_id, lane=getattr(obs, "lane", "-")))
+        except Exception:
+            # Best-effort; the durable abandon is the authoritative signal.
+            return
+
+    def _escalate_unverified(self, issue: GitHubIssueRef, reason: str) -> WorkItemOutcome:
+        """Persist a needs-human escalation for an unverifiable-metadata item.
+
+        Round-2 Codex review fix #5: a transient metadata-fetch failure is
+        NOT a confirmed rejection. Rather than silently dropping the item
+        (removing its opt-in label with no durable record), we persist a
+        needs-human escalation — creating a minimal escalated durable state
+        when the item has none yet — so an operator can find and adjudicate
+        it. The needs-human label migration runs exactly as for any
+        escalation; the durable block carries the reason.
+        """
+        self._persist_needs_human(issue, reason)
+        return WorkItemOutcome(
+            issue=issue,
+            final_phase="escalated",
+            reason=reason,
+            escalated=True,
+        )
+
+    def _persist_needs_human(self, issue: GitHubIssueRef, reason: str) -> WorkflowState | None:
+        """Persist an escalated / needs-human durable state for ``issue``.
+
+        Reuses the queue's ``mark_needs_human`` when durable state already
+        exists; otherwise bootstraps a minimal escalated state (the item was
+        never claimed, so there is no comment to transition). Best-effort: a
+        persistence failure still returns ``None`` but is logged.
+        """
+        queue = self._queue
+        load = getattr(queue, "load_state", None)
+        save = getattr(queue, "save_state", None)
+        mark = getattr(queue, "mark_needs_human", None)
+        apply_labels = getattr(queue, "_apply_phase_labels", None)
+        if load is None or save is None:
+            return None
+        existing = load(issue.slug())
+        if existing is not None:
+            if existing.phase in TERMINAL_PHASES:
+                return existing
+            if mark is not None:
+                try:
+                    mark(issue, existing, reason=reason)
+                except Exception as exc:
+                    log = __import__("logging").getLogger(__name__)
+                    log.warning("foreman: mark_needs_human failed for %s: %s", issue.slug(), exc)
+                    return None
+                return load(issue.slug())
+            return existing
+        state = WorkflowState(
+            work_item_id=issue.slug(),
+            run_id=self._run_id,
+            phase="escalated",
+            terminal_reason=reason,
+            updated_at=datetime.now(UTC),
+            findings=list(),
+            dispositions=list(),
+            archived=list(),
+            extras={"escalation_reason": reason, "host_id": self._run_id},
+        )
+        try:
+            save(state, expected_updated_at=None)
+            if apply_labels is not None:
+                apply_labels(issue, "escalated")
+        except Exception as exc:
+            log = __import__("logging").getLogger(__name__)
+            log.warning("foreman: could not persist needs-human for %s: %s", issue.slug(), exc)
+            return None
+        return state
 
     def _remove_enabled_label(self, issue: GitHubIssueRef) -> None:
         """Remove the enabled label from ``issue`` so it does not return from
