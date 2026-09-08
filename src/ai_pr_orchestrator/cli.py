@@ -505,6 +505,7 @@ def _run_reconcile(args: argparse.Namespace) -> int:
     # --apply wires real I/O: non-destructive actions go through the
     # queue (lease recovery), the CAO controller (session cleanup), and
     # the git worktree ops (worktree cleanup). Manual actions never apply.
+    cleanup_aborted = False
     if not args.dry_run and actions:
         _apply_actions(actions, queue=queue, client=client, dry_run_client=dry_run_client)
         # Round-1 Codex review fix #2: the reconcile CLI's --apply
@@ -514,8 +515,16 @@ def _run_reconcile(args: argparse.Namespace) -> int:
         # planner's auto-apply surface, leaving operators to run a
         # second command. Now ``aipro reconcile --apply`` performs
         # the full sweep in one shot.
-        _run_production_cleanup(queue=queue, cleanup_cfg=cleanup_cfg, queue_cfg=queue_cfg)
+        # Round-2 Codex review fix (failing status): if the sweep
+        # aborts on an authoritative-state load failure, the command
+        # must exit non-zero so automation sees the incomplete,
+        # unsafe cleanup — not mimic a clean apply.
+        cleanup_aborted = _run_production_cleanup(
+            queue=queue, cleanup_cfg=cleanup_cfg, queue_cfg=queue_cfg
+        )
 
+    if cleanup_aborted:
+        return 3
     if manual_actions:
         return 2
     return 0
@@ -586,7 +595,7 @@ def _run_production_cleanup(
     queue: GitHubIssueQueue,
     cleanup_cfg: CleanupConfig,
     queue_cfg: GitHubQueueConfig,
-) -> None:
+) -> bool:
     """Run the production ``v3.cleanup`` sweeper against ``queue``.
 
     Round-1 Codex review fix #2: the reconcile CLI's ``--apply`` path
@@ -596,10 +605,12 @@ def _run_production_cleanup(
     CLI's pre-existing recover / clean-orphan printers still surface
     and the sweep's auto-apply path runs in addition.
 
-    A ``CleanupStateLoadError`` from the sweep is logged so a
-    transient GitHub outage does not silently look like a clean
-    apply. The CLI's exit code is unchanged: it still returns
-    non-zero only for manual actions.
+    Round-2 Codex review fix (failing status): a ``CleanupStateLoadError``
+    from the sweep is surfaced AND the helper returns ``True`` so the CLI
+    exits non-zero. The previous implementation swallowed the abort and
+    let ``_run_reconcile`` return 0 whenever the earlier plan produced no
+    manual action, so automation treated an unsafe, incomplete cleanup as
+    success.
     """
     from ai_pr_orchestrator.v3.cleanup import (
         CleanupPolicy,
@@ -609,11 +620,23 @@ def _run_production_cleanup(
 
     policy = CleanupPolicy(cleanup_config=cleanup_cfg, queue_config=queue_cfg)
     try:
-        run_cleanup(queue, cao=None, git=None, policy=policy)
+        run_cleanup(
+            queue,
+            cao=None,
+            git=None,
+            policy=policy,
+            # Round-2 Codex review fix #4: reclaim stale leases under the
+            # reconcile CLI's identity (the actual runner), never a
+            # fabricated ``<old>-recover`` id no owner resumes.
+            recovery_run_id=getattr(queue, "_host_id", "reconcile-cli"),
+        )
     except CleanupStateLoadError as exc:
         print(f"aipro reconcile: production cleanup state-load failed: {exc}")
+        return True
     except Exception as exc:  # pragma: no cover - defensive: never let cleanup crash the CLI
         print(f"aipro reconcile: production cleanup failed: {exc}")
+        return True
+    return False
 
 
 def _apply_actions(
