@@ -227,6 +227,14 @@ class SoakRound:
     cleanup_auto_applied: int = 0
     cleanup_orphans: int = 0
     cleanup_recovered: int = 0
+    # Round-2 Codex review fix #9: the seeded orphan resource IDs are
+    # recorded per round and compared against the sweep's actually-applied
+    # cleanup actions below, so a miss FAILS the soak instead of the empty
+    # violation list silently passing.
+    seeded_session_ids: list[str] = field(default_factory=list)
+    seeded_worktree_ids: list[str] = field(default_factory=list)
+    cleanup_applied_session_ids: list[str] = field(default_factory=list)
+    cleanup_applied_worktree_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -449,22 +457,40 @@ def _run_round(
         policy=cleanup_policy,
         sessions=seeded_sessions,
         worktree_obs=seeded_worktrees,
+        # Round-2 Codex review fix #4: reclaim stale leases under the
+        # foreman's REAL run identity, never a fabricated ``<old>-recover``
+        # id no owner resumes.
+        recovery_run_id=fakes.loop.run_id,
     )
     round.cleanup_outcome = [a.kind.value for a in cleanup.auto_applied + cleanup.manual_actions]
     round.cleanup_auto_applied = len(cleanup.auto_applied)
     round.cleanup_orphans = cleanup.orphans
     round.cleanup_recovered = cleanup.recovered_leases
+    # Round-2 Codex review fix #9: remember which seeded orphan resources
+    # the sweep actually dispatched a cleanup action for, so the invariant
+    # pass can FAIL when one is missed (the seeded orphans must be removed).
+    round.seeded_session_ids = [s.session_id for s in seeded_sessions]
+    round.seeded_worktree_ids = [w.path for w in seeded_worktrees]
+    round.cleanup_applied_session_ids = [
+        a.session_id
+        for a in cleanup.auto_applied
+        if a.kind.value == "clean_orphan_session" and a.session_id
+    ]
+    round.cleanup_applied_worktree_ids = [
+        a.worktree
+        for a in cleanup.auto_applied
+        if a.kind.value == "clean_orphan_worktree" and a.worktree
+    ]
 
     # Record observable state for the invariants check.
     round.open_prs = len(fakes.fake.list_open_prs())
     round.active_labels = [n for n in numbers if "v3-work-active" in fakes.fake.get_labels(n)]
-    # Round-1 Codex review fix #7: track which issue "owns" which
-    # branch and PR. A duplicate entry in the same run is a violation.
-    for issue_number, final_phase, _reason in round.outcomes:
-        branch = f"aipro-issue-{issue_number}"
-        fakes.observed_branch_owners.setdefault(branch, []).append(round_idx)
-        if final_phase == "done":
-            fakes.observed_pr_branches.setdefault(issue_number, []).append(round_idx)
+    # Round-2 Codex review fix #10: duplicate-branch / duplicate-PR
+    # invariants are NOT recorded here from hardcoded ``aipro-issue-N``
+    # names (every round seeds disjoint numbers, so the old list was always
+    # length one). They are derived below directly from the persistent git
+    # fake's branch list and each PR's actual head branch — the real
+    # resource state the duplicate checks are meant to exercise.
     return round
 
 
