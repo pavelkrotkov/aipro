@@ -38,7 +38,7 @@ import threading
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from .broker import TaskDemand
 from .config import V3Config
@@ -200,6 +200,13 @@ class ForemanPolicyLoop:
         self._worktree_root = worktree_root
         self._name = committer_name
         self._email = committer_email
+        # Round-2 Codex review fix #3: the foreman owns the live CAO
+        # controller, but the constructor never recorded it, so the
+        # post-pass cleanup unconditionally saw ``cao=None`` and could
+        # never terminate real orphan sessions. Declared (default None so
+        # partial test fakes still construct) and wired by the production
+        # runner once a controller exists.
+        self._cao: Any = None
 
     @property
     def run_id(self) -> str:
@@ -286,8 +293,42 @@ class ForemanPolicyLoop:
             cleanup_config=self._cfg.cleanup,
             queue_config=self._cfg.github_queue,
         )
+        # Round-2 Codex review fix #3: feed the sweep REAL resource
+        # observations from the live CAO controller and git ops, not empty
+        # iterables. Orphan actions are derived exclusively from these
+        # observation iterables, so an empty collection meant the post-pass
+        # sweep could never discover a real orphan session or worktree.
+        # Controllers expose optional discovery methods; absence (tests /
+        # partial fakes) degrades to no observations rather than raising.
+        sessions: tuple = ()
+        list_sessions = getattr(cao, "list_session_observations", None)
+        if list_sessions is not None:
+            try:
+                sessions = tuple(list_sessions())
+            except Exception as exc:  # pragma: no cover - defensive
+                log = __import__("logging").getLogger(__name__)
+                log.warning("foreman: could not list CAO sessions: %s", exc)
+        worktrees: tuple = ()
+        list_worktrees = getattr(git, "list_worktree_observations", None)
+        if list_worktrees is not None:
+            try:
+                worktrees = tuple(list_worktrees())
+            except Exception as exc:  # pragma: no cover - defensive
+                log = __import__("logging").getLogger(__name__)
+                log.warning("foreman: could not list git worktrees: %s", exc)
         try:
-            run_cleanup(queue, cao=cao, git=git, policy=policy)
+            run_cleanup(
+                queue,
+                cao=cao,
+                git=git,
+                policy=policy,
+                sessions=sessions,
+                worktree_obs=worktrees,
+                # Round-2 Codex review fix #4: stale-lease recovery re-claims
+                # under THIS foreman's real run identity, never a fabricated
+                # ``<old>-recover`` owner nobody resumes.
+                recovery_run_id=self._run_id,
+            )
         except Exception as exc:
             log = __import__("logging").getLogger(__name__)
             log.warning("foreman: post-pass cleanup failed: %s", exc)
