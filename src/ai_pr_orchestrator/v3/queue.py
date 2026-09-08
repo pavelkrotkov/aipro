@@ -60,7 +60,6 @@ from __future__ import annotations
 
 import json
 import re
-from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -706,8 +705,22 @@ class GitHubIssueQueue:
         # ``_apply_phase_labels`` re-added the enabled label; the
         # spec wants it removed until the operator restores it.
         if not self._dry_run:
-            with suppress(Exception):
+            try:
                 self._client.remove_label(issue.number, self._cfg.enabled_label)
+            except Exception as exc:
+                # Round-2 Codex review fix: the final enabled-label removal
+                # is the very step that parks the item. If it fails after
+                # ``_apply_phase_labels`` re-added the label, the item is
+                # immediately discoverable + claimable again, which would
+                # restart explicitly-abandoned work. The previous
+                # ``suppress(Exception)`` dropped this failure and returned
+                # success. Raise ``LabelSyncError`` like the preceding
+                # phase-label migration so callers know the item was NOT
+                # parked.
+                raise LabelSyncError(
+                    f"Abandon for {issue.slug()} committed but the enabled-label "
+                    f"removal failed; item remains parkable=false: {exc}"
+                ) from exc
         return abandoned_state
 
     def is_claim_stale(self, state: WorkflowState, now: datetime | None = None) -> bool:
