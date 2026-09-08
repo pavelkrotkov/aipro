@@ -251,7 +251,7 @@ class SoakConfig:
 class SoakResult:
     rounds: list[SoakRound]
     duplicates_branch: list[tuple[int, str]]
-    duplicates_pr: list[tuple[int, int]]
+    duplicates_pr: list[tuple[int, str]]
     leaked_claims: list[tuple[int, datetime]]
     stuck_active: list[int]
     orphan_sessions: list[str]
@@ -294,8 +294,9 @@ class _PersistentFakes:
     loop: ForemanPolicyLoop
     # Accumulated durable state, kept so we can prove the
     # invariants by inspecting the queue, not a snapshot.
-    observed_branch_owners: dict[str, list[int]] = field(default_factory=dict)
-    observed_pr_branches: dict[int, list[int]] = field(default_factory=dict)
+    # (Round-2 fix #10: duplicate-branch/duplicate-PR detection reads
+    # ``git.branches`` and each PR's real head branch directly rather than
+    # maintaining owner lists keyed on hardcoded branch names.)
 
     @classmethod
     def build(cls, cfg: V3Config, *, cleanup_cfg: CleanupConfig) -> _PersistentFakes:
@@ -533,6 +534,7 @@ def _check_invariants(rounds: list[SoakRound], fakes: _PersistentFakes) -> SoakR
     queue = fakes.queue
     now = datetime.now(UTC)
     seen_issues: set[int] = set()
+    done_issues: list[int] = []
     for round in rounds:
         for n in round.issue_numbers:
             if n in seen_issues:
@@ -544,31 +546,38 @@ def _check_invariants(rounds: list[SoakRound], fakes: _PersistentFakes) -> SoakR
                 continue
             if state is None:
                 continue
-            try:
-                claim = claim_from_state(state)
-            except Exception:
-                continue
-            if state.phase in ("done", "failed", "escalated"):
-                continue
-            if claim.lease_expires_at < now:
-                leaked_claims.append((n, claim.lease_expires_at))
-            # Compare the foreman's recorded branch against the
-            # git fake's branches. A branch the foreman claims
-            # to own but the git fake does not know about is a
-            # state divergence — the durable record and the
-            # resource state disagree.
+            # Round-2 Codex review fix #14: durable resource consistency
+            # (the branch recorded on the state vs the git fake) is checked
+            # for EVERY item, including terminal `done`/`failed`/`escalated`
+            # ones. The round-1 code skipped the whole block for terminal
+            # items, so a run that persisted a branch in authoritative state
+            # without creating it in git passed the divergence invariant.
             branch = state.extras.get("branch")
             if branch and branch not in fakes.git.branches and branch != fakes.git.default:
                 state_divergence.append(
                     f"issue {n}: durable branch {branch!r} missing from git fake"
                 )
+            # Terminal items are skipped ONLY for the lease-expiry check
+            # (a terminal item may legitimately have no live lease); the
+            # divergence check above already ran for them.
+            if state.phase in ("done", "failed", "escalated"):
+                if state.phase == "done":
+                    done_issues.append(n)
+                continue
+            try:
+                claim = claim_from_state(state)
+            except Exception:
+                continue
+            if claim.lease_expires_at < now:
+                leaked_claims.append((n, claim.lease_expires_at))
 
-    # Round-1 Codex review fix #9: cross-check the FakeGitHubClient
-    # view against the foreman-recorded state. The queue records
-    # the PR number in the durable state; the fake's open-PR list
-    # should contain that number for every ``done`` issue.
+    # Round-1 Codex review fix #9 follow-on: cross-check the
+    # FakeGitHubClient view against the foreman-recorded state. The queue
+    # records the PR number in the durable state; the fake's open-PR list
+    # should contain that number for every ``done`` issue. Terminal branch
+    # divergence was already checked above (round-2 fix #14).
     open_pr_numbers = {pr.number for pr in fakes.fake.list_open_prs()}
-    for issue_number in fakes.observed_pr_branches:
+    for issue_number in done_issues:
         try:
             state = fakes.queue.load_state(f"owner/repo#{issue_number}")
         except Exception:
@@ -588,32 +597,38 @@ def _check_invariants(rounds: list[SoakRound], fakes: _PersistentFakes) -> SoakR
                 f"(open PRs: {sorted(open_pr_numbers)})"
             )
 
-    # Cleanup emits orphan flags; an empty list across every round
-    # is the expected steady state WHEN the soak does not seed
-    # orphans. With orphans seeded (fix #8), the cleanup_auto_applied
-    # count for the round is what the soak asserts on — not the
-    # raw ``cleanup_outcome`` list (which would conflate seeded
-    # orphans with real ones from prior rounds).
+    # Round-2 Codex review fix #9: the seeded orphan resources must
+    # actually have been cleaned. The round-1 check derived orphans from
+    # ``cleanup_outcome`` and skipped whenever ``cleanup_orphans > 0``, so
+    # it passed both when the seeded orphans WERE cleaned AND when they
+    # were MISSED. Compare each seeded resource id against the sweep's
+    # actually-applied cleanup ids instead.
     for round in rounds:
-        if round.cleanup_orphans <= 0 and round.cleanup_outcome:
-            # No orphans flagged but the list is non-empty —
-            # every cleanup_outcome value is something other
-            # than ``clean_orphan_*``.
-            for kind in round.cleanup_outcome:
-                if kind == "clean_orphan_session":
-                    orphan_sessions.append(kind)
-                elif kind == "clean_orphan_worktree":
-                    orphan_worktrees.append(kind)
+        applied_sessions = set(round.cleanup_applied_session_ids)
+        for session_id in round.seeded_session_ids:
+            if session_id not in applied_sessions:
+                orphan_sessions.append(f"{session_id} (round {round.round_index})")
+        applied_worktrees = set(round.cleanup_applied_worktree_ids)
+        for worktree_id in round.seeded_worktree_ids:
+            if worktree_id not in applied_worktrees:
+                orphan_worktrees.append(f"{worktree_id} (round {round.round_index})")
 
+    # Round-2 Codex review fix #10: duplicate invariants are derived from
+    # the REAL resource state, not hardcoded branch/issue names. A branch
+    # created more than once across the campaign (``_StaticGit.branches``
+    # appends per call) and a branch backing more than one open PR are both
+    # resource-duplication failures the soak advertises.
+    from collections import Counter
+
+    branch_counts = Counter(fakes.git.branches)
     duplicates_branch = sorted(
-        (rounds[0].round_index, branch)
-        for branch, indices in fakes.observed_branch_owners.items()
-        if len(indices) > 1
+        (rounds[0].round_index, branch) for branch, count in branch_counts.items() if count > 1
     )
+    pr_heads: dict[str, list[int]] = {}
+    for pr in fakes.fake.list_open_prs():
+        pr_heads.setdefault(pr.head_ref, []).append(pr.number)
     duplicates_pr = sorted(
-        (rounds[0].round_index, issue_number)
-        for issue_number, indices in fakes.observed_pr_branches.items()
-        if len(indices) > 1
+        (rounds[0].round_index, branch) for branch, numbers in pr_heads.items() if len(numbers) > 1
     )
 
     return SoakResult(
