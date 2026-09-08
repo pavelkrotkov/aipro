@@ -1192,9 +1192,20 @@ class ReconcilePlanner:
         identifier — the same one the sweeper would have used
         to dispatch the action — so callers can rely on the
         output list being deduplicated end-to-end.
+
+        Round-2 Codex review fix: orphan deduplication keeps the
+        session and worktree namespaces SEPARATE. The round-1
+        implementation used one ``seen_orphans`` set keyed by a
+        bare string, so a session id that collided with a worktree
+        branch deduplicated against each other; and worktrees were
+        keyed on ``branch`` even though the sweeper dispatches by
+        worktree *path*, collapsing distinct stale worktrees that
+        happen to share a branch. Each type now has its own set and
+        its own dispatch key.
         """
         seen: set[str] = set()
-        seen_orphans: set[str] = set()
+        seen_session_orphans: set[str] = set()
+        seen_worktree_orphans: set[str] = set()
         out: list[Action] = []
         for action in actions:
             if actions_target_branch(action):
@@ -1204,14 +1215,16 @@ class ReconcilePlanner:
                 seen.add(key)
             elif action.kind is ActionKind.CLEAN_ORPHAN_SESSION:
                 key = action.session_id or ""
-                if key in seen_orphans:
+                if key in seen_session_orphans:
                     continue
-                seen_orphans.add(key)
+                seen_session_orphans.add(key)
             elif action.kind is ActionKind.CLEAN_ORPHAN_WORKTREE:
-                key = action.branch or ""
-                if key in seen_orphans:
+                # Dispatch key is the worktree PATH (cleanup removes by
+                # path), falling back to the branch when no path is set.
+                key = action.worktree or action.branch or ""
+                if key in seen_worktree_orphans:
                     continue
-                seen_orphans.add(key)
+                seen_worktree_orphans.add(key)
             out.append(action)
         return out
 
