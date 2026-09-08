@@ -359,11 +359,19 @@ def test_safety_check_fails_closed_on_metadata_error():
         committer_email="y@z",
     )
     outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "failed", (
+    # Round-2 Codex review fix #5: an unverifiable-metadata failure is
+    # escalated (durable needs-human), NOT silently rejected-and-removed.
+    assert outcome.final_phase == "escalated", (
         f"safety_check must fail CLOSED on metadata errors, got {outcome.final_phase!r} "
         f"with reason={outcome.reason!r}"
     )
     assert "metadata" in outcome.reason.lower() or "safety" in outcome.reason.lower()
+    # The failure is persisted to durable state so an operator can find it.
+    persisted = queue.load_state("owner/repo#1")
+    assert persisted is not None, "metadata failure must be persisted as needs-human"
+    assert persisted.phase == "escalated", (
+        f"expected persisted durability to be escalated, got {persisted.phase!r}"
+    )
 
 
 # --- #11: rejected issue is removed from enabled_label ---------------------
@@ -581,12 +589,14 @@ def test_cleanup_executes_recover_stale_lease():
     cleanup_config = CleanupConfig()
     now = datetime.now(UTC)
     policy = cleanup.CleanupPolicy(cleanup_config=cleanup_config, queue_config=queue._cfg, now=now)
-    outcome = cleanup.run_cleanup(queue, policy=policy)
-    # The lease was recovered: the new run_id is the original + "-recover".
+    outcome = cleanup.run_cleanup(queue, policy=policy, recovery_run_id="run-stale-1-recovered")
+    # The lease was recovered under the cleanup runner's REAL identity
+    # (round-2 fix #4): it is NOT minted as ``<old-run>-recover``, because
+    # that synthetic id no foreman owns would strand the item.
     reloaded = queue.load_state("owner/repo#1")
     assert reloaded is not None
-    assert reloaded.run_id == "run-stale-1-recover", (
-        f"expected the lease to be recovered with a new run_id, got {reloaded.run_id!r}"
+    assert reloaded.run_id == "run-stale-1-recovered", (
+        f"expected the lease to be recovered under the caller's run id, got {reloaded.run_id!r}"
     )
     assert outcome.recovered_leases >= 1
 
