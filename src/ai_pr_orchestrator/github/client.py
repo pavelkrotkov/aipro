@@ -171,20 +171,21 @@ class GitHubClient:
         behind a small memo so the per-issue safety check stays
         cheap.
 
-        Returns ``False`` on any error fetching the repository — a
-        transient GitHub failure must not silently disable every
-        ``disallow_forks`` check. The foreman's safety gate still
-        fails closed on metadata errors (round-1 Codex review fix #4),
-        so a flapping check is surfaced as ``needs-human`` rather
-        than auto-approving forks.
+        Round-2 Codex review fix: a rate-limit / 5xx / parse failure on
+        the Repositories call PROPAGATES rather than returning ``False``.
+        The round-1 implementation caught the error here and silently
+        classified the repo as non-fork, so ``get_issue()`` completed
+        and ``_safety_check`` approved the item despite
+        ``disallow_forks=True`` — the newly-added lookup swallowed the
+        very failure the foreman's fail-closed handler was meant to
+        catch. Letting the exception reach ``get_issue`` surfaces it to
+        ``_safety_check``, which fails closed (escalates) on metadata
+        errors.
         """
         cached = getattr(self, "_repository_fork_cache", None)
         if cached is not None:
             return cached
-        try:
-            data = self._get(f"/repos/{self._owner}/{self._repo}")
-        except Exception:
-            return False
+        data = self._get(f"/repos/{self._owner}/{self._repo}")
         is_fork = bool(data.get("fork", False))
         self._repository_fork_cache = is_fork
         return is_fork
