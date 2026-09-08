@@ -50,6 +50,12 @@ from .reconcile import (
 
 log = logging.getLogger(__name__)
 
+#: Reserved "never seeded" issue number for the global orphan-reconciliation
+#: input (round-2 fix #7). It scans far above any real GitHub issue the
+#: orchestration would touch, and is only used when the candidate set is
+#: otherwise empty, so it cannot alias a legitimate work item.
+_GLOBAL_REF_NUMBER = 900_000_001
+
 
 #: Lifecycle labels that signal a work item still has authoritative
 #: state the cleanup sweeper must consider. ``reviewing`` is
@@ -316,13 +322,14 @@ def run_cleanup(
     error from the controller) but do not abort the sweep — the
     remaining actions are still attempted.
 
-    Round-1 Codex review fix #13: when authoritative state cannot
-    be loaded for ANY candidate, the sweep stops with a
-    :class:`CleanupStateLoadError`. The outcome is still
-    populated with the partial result (actions derived from
-    candidates that loaded successfully) so the caller can
-    inspect the survivors, but the error is raised at the end so
-    the CLI / foreman / soak harness exits non-zero.
+    Round-2 Codex review fix (atomic apply): when authoritative state
+    cannot be loaded for ANY candidate, the sweep aborts immediately —
+    raising a :class:`CleanupStateLoadError` before planning or applying
+    anything — so a candidate whose live lease we could not read is never
+    destroyed as an "orphan". The round-1 fix surfaced the failure but
+    only AFTER destructive apply (lease recovery + orphan deletion) had
+    already run. Now an unverifiable candidate blocks the entire sweep
+    until a human reconciles the state.
     """
     now = policy.now if policy is not None else datetime.now(UTC)
     cleanup_cfg = policy.cleanup_config if policy is not None else CleanupConfig()
@@ -330,11 +337,52 @@ def run_cleanup(
     inputs, state_load_failures = _observations_with_failures(
         queue, now=now, cleanup_config=cleanup_cfg
     )
+    # Round-2 Codex review fix (atomic apply): if authoritative state
+    # failed to load for ANY candidate, abort the WHOLE sweep immediately
+    # and apply nothing. The round-1 fix surfaced the failure at the end,
+    # but by then the sweep had already recovered leases and deleted
+    # orphan sessions / worktrees — destructive application preceded the
+    # check, so a candidate whose live lease we could not read could have
+    # its resource cleaned as a "orphan" (the planner's orphan predicate
+    # silently passes when state is unknown). Failing closed before any
+    # apply makes the sweep atomic: an unverifiable candidate blocks all
+    # cleanup until a human reconciles it.
+    if state_load_failures:
+        details = "; ".join(f"{slug}: {err}" for slug, err in state_load_failures)
+        raise CleanupStateLoadError(
+            f"cleanup state load failed for {len(state_load_failures)} candidate(s): {details}"
+        )
     # Round-1 Codex review fix #14: deduplicate the cross-work-item
     # session / worktree observations ONCE so the planner does not
     # emit N copies of the same orphan.
     sessions_tuple = tuple(sessions)
     worktree_tuple = tuple(worktree_obs)
+    # Round-2 Codex review fix #7: orphan detection is GLOBAL — it must
+    # run even when every workflow is terminal, no issue carries a
+    # lifecycle label, or the only candidate's terminal short-circuit
+    # would otherwise suppress its observations. Always append a single
+    # ``_GLOBAL_REF_NUMBER`` reconciliation input carrying the orphan
+    # observations so plan_many plans them independently of any live work
+    # item; the planner's cross-item dedupe collapses the duplicate actions
+    # the real (non-terminal) inputs would otherwise also emit.
+    if sessions_tuple or worktree_tuple:
+        inputs.append(
+            ReconciliationInputs(
+                observation=WorkItemObservation(
+                    work_item=GitHubIssueRef(
+                        owner=queue._owner, repo=queue._repo, number=_GLOBAL_REF_NUMBER
+                    ),
+                    state=None,
+                    claim=None,
+                ),
+                sessions=sessions_tuple,
+                worktrees=worktree_tuple,
+                pull_requests=(),
+                config=cleanup_cfg,
+                queue_config=queue_cfg,
+                now=now,
+            )
+        )
     inputs = _deduplicate_observations(inputs, sessions_tuple, worktree_tuple)
     planner_obj = planner or ReconcilePlanner(cleanup_config=cleanup_cfg, queue_config=queue_cfg)
     plan = planner_obj.plan_many(inputs)
@@ -361,15 +409,6 @@ def run_cleanup(
         len(outcome.manual_actions),
         len(outcome.state_load_failures),
     )
-    if outcome.state_load_failures:
-        # Round-1 Codex review fix #13: do not silently emit
-        # clean actions against items whose state is unknown.
-        # Surface the structured failure so the caller can decide.
-        details = "; ".join(f"{slug}: {err}" for slug, err in outcome.state_load_failures)
-        raise CleanupStateLoadError(
-            f"cleanup state load failed for {len(outcome.state_load_failures)} "
-            f"candidate(s): {details}"
-        )
     return outcome
 
 
