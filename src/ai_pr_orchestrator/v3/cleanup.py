@@ -297,6 +297,7 @@ def run_cleanup(
     policy: CleanupPolicy | None = None,
     sessions: Iterable[SessionObservation] = (),
     worktree_obs: Iterable[WorktreeObservation] = (),
+    recovery_run_id: str | None = None,
 ) -> SweepOutcome:
     """Run one sweep of the production TTL sweeper.
 
@@ -394,10 +395,19 @@ def run_cleanup(
     # queue's own recovery path — it can safely call
     # ``reclaim_expired`` for any candidate whose lease has
     # demonstrably expired.
-    outcome.recovered_leases = _recover_stale_leases(inputs, queue=queue)
+    outcome.recovered_leases = _recover_stale_leases(
+        inputs, queue=queue, recovery_run_id=recovery_run_id
+    )
     for action in plan:
         if action.auto_apply:
-            _apply_action(action, queue=queue, cao=cao, git=git, outcome=outcome)
+            _apply_action(
+                action,
+                queue=queue,
+                cao=cao,
+                git=git,
+                outcome=outcome,
+                recovery_run_id=recovery_run_id,
+            )
         else:
             outcome.manual_actions.append(action)
 
@@ -468,6 +478,7 @@ def _apply_action(
     cao: CaoControllerLike | None,
     git: GitOpsLike | None,
     outcome: SweepOutcome,
+    recovery_run_id: str | None,
 ) -> None:
     """Apply ``action`` through the supplied controllers and record it.
 
@@ -502,7 +513,7 @@ def _apply_action(
             # double-count.
             pass
             if action.work_item_id is not None:
-                _recover_lease_for(action, queue=queue)
+                _recover_lease_for(action, queue=queue, recovery_run_id=recovery_run_id)
     except Exception as exc:
         # The action is already recorded as ``auto_applied``; the
         # error is the second-best signal to the operator. We do
@@ -512,7 +523,12 @@ def _apply_action(
         log.warning("cleanup: failed to apply %s: %s", action.kind, exc)
 
 
-def _recover_stale_leases(inputs: list[ReconciliationInputs], *, queue: GitHubIssueQueue) -> int:
+def _recover_stale_leases(
+    inputs: list[ReconciliationInputs],
+    *,
+    queue: GitHubIssueQueue,
+    recovery_run_id: str | None,
+) -> int:
     """Reclaim every candidate whose lease is past the TTL.
 
     Round-1 Codex review fix #1 follow-on: the planner only emits
@@ -524,11 +540,34 @@ def _recover_stale_leases(inputs: list[ReconciliationInputs], *, queue: GitHubIs
     whose lease is past the TTL, since by the time the sweeper
     runs the original owner's lease has demonstrably expired.
 
+    Round-2 Codex review fix (no fabricated owner): the previous
+    implementation minted a synthetic ``<old-run>-recover`` run id
+    that no foreman owned, so a reclaimed item was stranded under a
+    lease nobody would resume. Recovery now re-claims under the
+    *actual* cleanup runner's identity (``recovery_run_id``); when the
+    caller supplies none (no executing foreman owns the sweep), the
+    stale lease is left untouched and surfaced via the planner's
+    ``ESCALATE`` rather than renewed under a fabricated owner.
+
+    Round-2 Codex review fix (single clock): staleness is decided
+    against ``inputs_one.now``, so the reclaim is validated against
+    that SAME instant (``now=inputs_one.now``) rather than the wall
+    clock. A caller supplying the supported deterministic / future
+    ``CleanupPolicy.now`` could otherwise decide a lease was stale and
+    then have the queue reject the recovery as still active.
+
     Returns the number of leases recovered (so the
     ``SweepOutcome.recovered_leases`` counter can be incremented
     for the caller's tally). Failures are logged and counted
     zero.
     """
+    if recovery_run_id is None:
+        # No executing runner: do NOT fabricate an owner for a stale
+        # lease. The item keeps its active label / state and the planner
+        # already surfaced an ``ESCALATE`` for it, so a real foreman (or
+        # an operator via ``aipro reconcile``) picks it up.
+        log.warning("cleanup: skipping stale-lease recovery (no recovery_run_id supplied)")
+        return 0
     recovered = 0
     for inputs_one in inputs:
         observation = inputs_one.observation
@@ -544,15 +583,15 @@ def _recover_stale_leases(inputs: list[ReconciliationInputs], *, queue: GitHubIs
             issue = queue._resolve_issue(observation.work_item_id)
         except Exception:
             continue
-        new_run_id = f"{claim.run_id}-recover"
         try:
             queue.reclaim_expired(
                 issue,
                 state,
-                new_run_id,
+                recovery_run_id,
                 branch=claim.branch,
                 worktree=claim.worktree,
                 pr_number=claim.pr_number,
+                now=inputs_one.now,
             )
             recovered += 1
         except Exception as exc:
@@ -560,15 +599,28 @@ def _recover_stale_leases(inputs: list[ReconciliationInputs], *, queue: GitHubIs
     return recovered
 
 
-def _recover_lease_for(action: Action, *, queue: GitHubIssueQueue) -> None:
+def _recover_lease_for(
+    action: Action,
+    *,
+    queue: GitHubIssueQueue,
+    recovery_run_id: str | None,
+) -> None:
     """Best-effort ``RECOVER_STALE_LEASE`` executor (legacy path).
 
     Kept for callers that emit ``RECOVER_STALE_LEASE`` actions
     directly. Production cleanup paths use
     :func:`_recover_stale_leases` which iterates the candidate
     set rather than relying on the planner's emissions.
+
+    Round-2 Codex review fix (no fabricated owner): recovery runs
+    under the supplied ``recovery_run_id`` (the actual runner's
+    identity) instead of a synthetic ``<old-run>-recover``; when no
+    real runner identity is available, the lease is left untouched.
     """
     if action.work_item_id is None:
+        return
+    if recovery_run_id is None:
+        log.warning("cleanup: skipping lease-recovery action (no recovery_run_id supplied)")
         return
     try:
         issue = queue._resolve_issue(action.work_item_id)
@@ -583,12 +635,11 @@ def _recover_lease_for(action: Action, *, queue: GitHubIssueQueue) -> None:
         return
     if state.phase in ("done", "failed", "escalated"):
         return
-    new_run_id = f"{claim.run_id}-recover"
     try:
         queue.reclaim_expired(
             issue,
             state,
-            new_run_id,
+            recovery_run_id,
             branch=claim.branch,
             worktree=claim.worktree,
             pr_number=claim.pr_number,
