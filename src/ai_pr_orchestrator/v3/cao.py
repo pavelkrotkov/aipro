@@ -345,6 +345,39 @@ class CaoSessionController:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    # --- Reconcile observation surface -------------------------------------
+
+    def list_session_observations(self) -> tuple[Any, ...]:
+        """Return a live view of every tracked session as reconciliation observations.
+
+        Round-2 Codex review fix #3: the foreman's post-pass cleanup uses
+        this to feed real CAO state into ``v3.cleanup`` (which dispatches
+        ``CLEAN_ORPHAN_SESSION`` actions). Without it the sweeper saw an
+        empty ``sessions`` collection and could never discover a leaked
+        CAO session as an orphan. Returned as the
+        ``v3.reconcile.SessionObservation`` view; imported lazily so the
+        CAO module does not form an import cycle with the planner.
+        """
+        # Lazy import keeps v3.cao decoupled from v3.reconcile (which
+        # itself imports from queue/domain only).
+        from .reconcile import SessionObservation
+
+        out: list[Any] = []
+        for metadata in self._sessions.values():
+            out.append(
+                SessionObservation(
+                    session_id=metadata.session_name,
+                    work_item_id=metadata.context.work_item_id,
+                    run_id=metadata.context.run_id,
+                    lane=metadata.lane.lane,
+                    state="unknown",
+                    last_activity_at=metadata.launched_at,
+                    success=True,
+                    is_terminal=False,
+                )
+            )
+        return tuple(out)
+
     # --- Launch ------------------------------------------------------------
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
