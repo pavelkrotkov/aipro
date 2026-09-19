@@ -1289,7 +1289,7 @@ def test_busy_cao_submission_preserves_active_run_despite_heartbeat_failure(monk
     registry = LaneRegistry.default()
     lane = registry.get("developer")
     git = RecordingGit()
-    name = session_name_for("run-1", lane.lane)
+    name = session_name_for("run-1", lane.lane, ISSUE.slug())
     with FakeCAOServer() as cao, httpx.Client(base_url=cao.url) as client:
         cao.set_status_sequence(name, [STATUS_PROCESSING])
         with CaoSessionController(
@@ -1301,7 +1301,7 @@ def test_busy_cao_submission_preserves_active_run_despite_heartbeat_failure(monk
                     run_id="run-1",
                     workdir="/wt/issue-1",
                     env={},
-                    context=LaneExecutionContext(run_id="run-1"),
+                    context=LaneExecutionContext(run_id="run-1", work_item_id=ISSUE.slug()),
                     model_lease=ModelLease(
                         lease_id="previous",
                         assignment=ModelAssignment(lane=lane.lane, model_ref="ref-developer"),
