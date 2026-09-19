@@ -49,9 +49,8 @@ class CaoLaneExecutor:
     Parameters
     ----------
     controller:
-        A :class:`CaoSessionController` (or anything that satisfies the
-        :class:`~ai_pr_orchestrator.v3.interfaces.CAOSessionController`
-        Protocol). The executor never owns the controller's lifecycle: the
+        A :class:`CaoSessionController`, including its work-submission and
+        turn-context operations. The executor never owns its lifecycle: the
         caller is responsible for opening and closing it.
     lane_registry:
         The :class:`LaneRegistry` that owns the ``lane -> profile``

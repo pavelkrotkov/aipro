@@ -71,6 +71,7 @@ class FakeGitHubStateStore:
 
 class FakeCAOSessionController:
     def __init__(self) -> None:
+        self.session_timeout_seconds = 3600
         self.started: list[SessionSpec] = []
         self.terminated: list[SessionHandle] = []
         self.submitted: list[tuple[SessionHandle, str]] = []
@@ -536,3 +537,10 @@ class TestSessionSpecRunIdAgreement:
             context=LaneExecutionContext(run_id="run-1"),
         )
         assert spec.context.run_id == spec.run_id
+
+
+def test_cao_protocol_requires_authoritative_timeout() -> None:
+    controller = FakeCAOSessionController()
+    assert isinstance(controller, CAOSessionController)
+    del controller.session_timeout_seconds
+    assert not isinstance(controller, CAOSessionController)
