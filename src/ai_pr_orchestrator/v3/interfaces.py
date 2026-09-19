@@ -187,6 +187,11 @@ class GitHubWorkflowStateStore(Protocol):
 class CAOSessionController(Protocol):
     """Starts and stops agent sessions on the CAO execution fabric."""
 
+    @property
+    def session_timeout_seconds(self) -> int:
+        """Authoritative session lifetime used to bound executor safety budgets."""
+        ...
+
     def start_session(self, spec: SessionSpec) -> SessionHandle: ...
 
     def poll_session(self, handle: SessionHandle) -> LaneResult | None:
