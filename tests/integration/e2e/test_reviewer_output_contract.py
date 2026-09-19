@@ -3,11 +3,13 @@
 import pytest
 
 from ai_pr_orchestrator.v3.cao import session_name_for
+from tests.integration._harness import developer_output, developer_session_name
 
 
 @pytest.mark.parametrize("output", ["", "There is a blocking defect in the patch"])
 def test_unstructured_review_escalates_without_creating_pr(fake_cao, foreman_harness, output):
     loop, queue, github = foreman_harness()
+    fake_cao.set_output(developer_session_name(loop.run_id), developer_output())
     name = session_name_for(loop.run_id, "requirements-reviewer")
     fake_cao.set_output(name, output)
 
@@ -22,6 +24,7 @@ def test_unstructured_review_escalates_without_creating_pr(fake_cao, foreman_har
 
 def test_structured_blocker_reaches_real_policy(fake_cao, foreman_harness, lane_registry):
     loop, queue, github = foreman_harness()
+    fake_cao.set_output(developer_session_name(loop.run_id), developer_output())
     for lane in lane_registry:
         if lane.role == "reviewer":
             fake_cao.set_output(session_name_for(loop.run_id, lane.lane), "[]")
