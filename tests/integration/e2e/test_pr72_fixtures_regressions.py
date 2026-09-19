@@ -15,6 +15,7 @@ import pytest
 from ai_pr_orchestrator.v3.cao import session_name_for
 from ai_pr_orchestrator.v3.interfaces import GateDecision
 from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE
+from tests.integration._harness import developer_output, developer_session_name
 from tests.integration._fake_cao_server import (
     STATUS_IDLE,
     STATUS_PROCESSING,
@@ -62,9 +63,9 @@ def test_harness_accepts_pending_or_failed_gate_override(fake_cao, foreman_harne
     pending = GateDecision(passed=False, pending_checks=("lint",), failed_checks=())
     loop, _queue, _fake = foreman_harness(seed_issue_numbers=[1], gate=pending)
     run_id = loop.run_id
-    session_name = session_name_for(run_id, DEVELOPER_LANE)
+    session_name = developer_session_name(run_id)
     fake_cao.set_status_sequence(session_name, _DEFAULT_TERMINAL_SEQUENCE)
-    fake_cao.set_output(session_name, "ok")
+    fake_cao.set_output(session_name, developer_output())
 
     # The fixture must accept the override without error; pin the
     # contract by verifying the loop's gate is wired to the
@@ -137,9 +138,9 @@ def test_harness_outcome_failure_message_references_real_reason(fake_cao, forema
     failed = GateDecision(passed=False, pending_checks=(), failed_checks=("lint",))
     loop, _queue, _fake = foreman_harness(seed_issue_numbers=[1], gate=failed)
     run_id = loop.run_id
-    session_name = session_name_for(run_id, DEVELOPER_LANE)
+    session_name = developer_session_name(run_id)
     fake_cao.set_status_sequence(session_name, _DEFAULT_TERMINAL_SEQUENCE)
-    fake_cao.set_output(session_name, "ok")
+    fake_cao.set_output(session_name, developer_output())
 
     outcomes = loop.run_pass()
     reason = outcomes[0].reason
@@ -160,9 +161,9 @@ def test_harness_inspects_cao_sessions_via_public_api(fake_cao, foreman_harness)
 
     loop, _queue, _fake = foreman_harness(seed_issue_numbers=[1])
     run_id = loop.run_id
-    session_name = session_name_for(run_id, DEVELOPER_LANE)
+    session_name = developer_session_name(run_id)
     fake_cao.set_status_sequence(session_name, _DEFAULT_TERMINAL_SEQUENCE)
-    fake_cao.set_output(session_name, "ok")
+    fake_cao.set_output(session_name, developer_output())
 
     loop.run_pass()
 
@@ -197,9 +198,9 @@ def test_harness_refreshes_claim_state_between_long_lanes(fake_cao, foreman_harn
 
     loop, queue, _fake = foreman_harness(seed_issue_numbers=[1])
     run_id = loop.run_id
-    session_name = session_name_for(run_id, DEVELOPER_LANE)
+    session_name = developer_session_name(run_id)
     fake_cao.set_status_sequence(session_name, _DEFAULT_TERMINAL_SEQUENCE)
-    fake_cao.set_output(session_name, "ok")
+    fake_cao.set_output(session_name, developer_output())
 
     # Force the executor to sleep long enough that a lease heartbeat
     # would fire. Two heartbeats is enough to prove the refresh path.
