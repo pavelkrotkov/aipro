@@ -95,7 +95,8 @@ class CaoLaneExecutor:
            context and the optional :class:`ModelLease`.
         3. ``start_session`` adopts an existing session if one is alive
            under the same deterministic name; otherwise it creates one.
-        4. Poll ``poll_session`` until the controller reports terminal
+        4. Submit this turn's prompt via ``submit_work``, then poll
+           ``poll_session`` until the controller reports terminal
            state or the wall-clock budget is exhausted.
         5. On any exception, ``terminate_session`` (idempotent) and
            re-raise so the foreman can classify the failure.
@@ -116,6 +117,7 @@ class CaoLaneExecutor:
         handle = self._controller.start_session(spec)
         deadline = time.monotonic() + self._max_poll
         try:
+            self._controller.submit_work(handle, task_prompt)
             while True:
                 result = self._controller.poll_session(handle)
                 if result is not None:

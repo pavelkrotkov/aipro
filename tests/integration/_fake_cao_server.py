@@ -35,7 +35,7 @@ import socket
 import threading
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs
@@ -74,6 +74,7 @@ class _SessionState:
     metadata: dict[str, Any]
     status_sequence: Sequence[str]
     output: str = ""
+    submitted_messages: list[str] = field(default_factory=list)
     status_index: int = 0
     exhausted: bool = False
     deleted: bool = False
@@ -459,11 +460,10 @@ class _FakeHandler(BaseHTTPRequestHandler):
         with self._fake._lock:
             for state in self._fake._sessions.values():
                 if state.terminal_id == terminal_id and not state.deleted:
-                    # In real CAO, accepted input means the session is
-                    # processing again. Advance the sequence to the next
-                    # status so a follow-up poll sees post-start activity.
-                    if not state.exhausted and state.status_index < len(state.status_sequence) - 1:
-                        state.status_index += 1
+                    state.submitted_messages.append(self._query_params()["message"][0])
+                    # Each accepted turn walks the scripted lifecycle anew.
+                    state.status_index = 0
+                    state.exhausted = False
                     self._write_text(204, "")
                     return
         self._write_text(404, f"no session for terminal {terminal_id}")
