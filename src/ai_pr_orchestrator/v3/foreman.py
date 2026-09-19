@@ -1241,8 +1241,7 @@ class ForemanPolicyLoop:
         lines = ["Address these review findings:"]
         lines.extend(f"- {f.id} [{f.severity}] {f.body}" for f in findings)
         lines.extend(
-            f"Prior decision for {f.id}: {latest[f.id].rationale}
-"
+            f"Prior decision for {f.id}: {latest[f.id].rationale}"
             for f in findings
             if f.id in latest
         )
@@ -1303,7 +1302,12 @@ class ForemanPolicyLoop:
         if not isinstance(report["dispositions"], list):
             return "invalid developer completion report: dispositions must be an array"
         concern_error = ForemanPolicyLoop._concern_report_violation(report["concerns"])
-        return concern_error or ForemanPolicyLoop._test_report_violation(report["tests"], result)
+        test_error = ForemanPolicyLoop._test_report_violation(report["tests"])
+        return (
+            concern_error
+            or test_error
+            or ForemanPolicyLoop._no_change_violation(report["no_changes"], result)
+        )
 
     @staticmethod
     def _concern_report_violation(concerns: object) -> str | None:
@@ -1314,25 +1318,32 @@ class ForemanPolicyLoop:
         return None
 
     @staticmethod
-    def _test_report_violation(tests: object, result: LaneResult) -> str | None:
+    def _test_report_violation(tests: object) -> str | None:
         if not isinstance(tests, list):
             return "invalid developer completion report: tests must be an array"
         for test in tests:
-            if not isinstance(test, dict) or set(test) != {"command", "result", "notes"}:
-                return "invalid developer completion report: malformed test result"
-            if not isinstance(test["command"], str) or not test["command"].strip():
-                return "invalid developer completion report: test command must be nonempty"
-            if test["result"] not in {"passed", "failed", "not_run"}:
-                return "invalid developer completion report: unknown test result"
-            if not isinstance(test["notes"], str):
-                return "invalid developer completion report: test notes must be a string"
-            if test["result"] == "failed":
-                return f"developer reported failing test: {test['command']}"
-        try:
-            no_changes = json.loads(result.output_summary)["no_changes"]
-        except (json.JSONDecodeError, TypeError, KeyError):
-            return "invalid developer completion report"
-        if not result.changed_files and not no_changes:
+            error = ForemanPolicyLoop._one_test_violation(test)
+            if error:
+                return error
+        return None
+
+    @staticmethod
+    def _one_test_violation(test: object) -> str | None:
+        if not isinstance(test, dict) or set(test) != {"command", "result", "notes"}:
+            return "invalid developer completion report: malformed test result"
+        if not isinstance(test["command"], str) or not test["command"].strip():
+            return "invalid developer completion report: test command must be nonempty"
+        if test["result"] not in {"passed", "failed", "not_run"}:
+            return "invalid developer completion report: unknown test result"
+        if not isinstance(test["notes"], str):
+            return "invalid developer completion report: test notes must be a string"
+        if test["result"] == "failed":
+            return f"developer reported failing test: {test['command']}"
+        return None
+
+    @staticmethod
+    def _no_change_violation(no_changes: object, result: LaneResult) -> str | None:
+        if not result.changed_files and no_changes is not True:
             return "developer made no changes but did not report no_changes=true"
         return None
 
