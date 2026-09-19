@@ -767,7 +767,7 @@ class CaoSessionController:
         response = self._request(
             "PATCH",
             f"/terminals/{metadata.terminal_id}/metadata",
-            json=updated.to_dict(),
+            json={"metadata": updated.to_dict()},
         )
         self._raise_for_status(response, f"update turn context for {metadata.session_name!r}")
         self._register(updated)
