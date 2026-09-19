@@ -34,6 +34,7 @@ fakes. No vendor, model, or provider name appears in this module.
 from __future__ import annotations
 
 import contextlib
+import logging
 import threading
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -262,7 +263,15 @@ class ForemanPolicyLoop:
 
     def _cleanup_terminal_worktree(self, issue: GitHubIssueRef) -> None:
         """Release this run's checkout only after confirming durable termination."""
-        state = self._queue.load_state(issue.slug())
+        try:
+            state = self._queue.load_state(issue.slug())
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Retaining worktree for %s: cleanup state verification failed",
+                issue.slug(),
+                exc_info=True,
+            )
+            return
         if state is None or state.run_id != self._run_id or state.phase not in TERMINAL_PHASES:
             return
         worktree = state.extras.get("worktree")

@@ -1035,3 +1035,28 @@ def test_crash_state_read_failure_propagates_and_retains_worktree(monkeypatch):
     assert state is not None and state.phase == "coding"
     assert git.cleanups == []
     assert state.extras["worktree"] in git.worktrees
+
+
+def test_cleanup_read_failure_retains_worktree_and_continues_pass(monkeypatch, caplog):
+    fake = _ready_fake()
+    fake.seed_issue(2, labels=["v3-work"])
+    git = RecordingGit()
+    loop, queue = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
+    load = queue.load_state
+
+    def reject_first_terminal_read(work_item_id):
+        state = load(work_item_id)
+        if work_item_id == ISSUE.slug() and state is not None and state.phase == "done":
+            raise RuntimeError("cleanup verification unavailable")
+        return state
+
+    monkeypatch.setattr(queue, "load_state", reject_first_terminal_read)
+    outcomes = loop.run_pass()
+    assert [(outcome.issue.number, outcome.final_phase) for outcome in outcomes] == [
+        (1, "done"),
+        (2, "done"),
+    ]
+    assert "/wt/issue-1" in git.worktrees
+    assert git.cleanups == ["/wt/issue-2"]
+    assert "owner/repo#1" in caplog.text
+    assert "cleanup verification unavailable" in caplog.text
