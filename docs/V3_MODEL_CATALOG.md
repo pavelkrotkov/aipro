@@ -167,3 +167,27 @@ and both declare a floor of 2.)
 
 The whole listing is evaluated at a single timestamp, so a promotion expiring
 mid-scan cannot make the filter and the row it produced disagree.
+
+## Explain a hypothetical route
+
+```sh
+aipro route explain --config path/to/v3.yml --role worker --difficulty 3
+aipro route explain --config path/to/v3.yml --role reviewer --difficulty 3 --json
+```
+
+The command uses the existing broker and current telemetry at one observation
+instant. Catalog paths resolve relative to the configuration file. It prints
+primary/fallback choices, ranked score components, and excluded candidates with
+reasons. An empty or entirely ineligible catalog is an explained result, not a
+command failure; invalid configuration exits nonzero.
+
+This is a hypothetical fresh selection with no incumbent, peers, or active lane
+counts. It is not a historical lane decision or proof that capacity is reserved.
+Telemetry may probe configured providers; the command never reserves capacity,
+claims an issue, launches a session, or changes GitHub/workflow state.
+
+JSON has `schema_version: 1`, `hypothetical: true`, and `decision` containing the
+existing broker explanation (including `evaluated_at` and the complete demand).
+Identical inputs and observation time yield identical JSON. Provider environment,
+credentials, and prompts are not serialized; diagnostic strings use the existing
+secret redactor before JSON serialization.
