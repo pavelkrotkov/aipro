@@ -39,7 +39,9 @@ import threading
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, cast
+
+from ai_pr_orchestrator.github.protocol import GitHubClient
 
 from .broker import TaskDemand
 from .cao import SessionBusyError
@@ -127,6 +129,10 @@ class WorkItemOutcome:
 
 class ForemanQueueError(RuntimeError):
     """Raised when the foreman is handed a queue missing the claim verbs."""
+
+
+class PRReconciliationError(RuntimeError):
+    """PR outcome is uncertain; retain the run for GitHub reconciliation."""
 
 
 class _ForemanEscalation(RuntimeError):
@@ -236,8 +242,8 @@ class ForemanPolicyLoop:
         for issue in issues:
             try:
                 outcomes.append(self._drive(issue, now=now))
-            except SessionBusyError:
-                # Earlier work is still running; retain its claim and checkout.
+            except (SessionBusyError, PRReconciliationError):
+                # Uncertain effects require reconciliation, not terminal cleanup.
                 raise
             except Exception as exc:
                 reason = f"foreman error: {exc}"
@@ -465,7 +471,10 @@ class ForemanPolicyLoop:
                 # head will surface as a typed gate failure rather than a
                 # worktree-not-found crash).
                 self._head_sha = self._head_sha or state.extras.get("head_sha")
-            pr = self._ensure_pr(issue, state, branch, worktree)
+            try:
+                pr = self._ensure_pr(issue, state, branch, worktree)
+            except Exception as exc:
+                raise PRReconciliationError(f"PR reconciliation required: {exc}") from exc
             # _ensure_pr may persist the recorded PR number (advancing the CAS
             # version): reload so the subsequent transitions expect the
             # authoritative state.
@@ -1094,53 +1103,27 @@ class ForemanPolicyLoop:
         branch: str,
         worktree: str,
     ) -> GitHubPullRequestRef:
-        """The PR ref for gating; create the PR if the queue's client can.
+        """Refresh a known PR or reconcile by branch before creating one.
 
-        Reuses an already-recorded PR number (F7): a second ``create_pr`` for
-        the same branch is rejected by GitHub, so every later ci_gating visit
-        must gate against the *same* open PR. ``head_sha`` is the PR's commit
-        SHA from the client (F19), refreshed from the live PR on reuse, never
-        the branch name.
-
-        PR #73 review thread 11 / issue #81: an unavoidable crash window
-        where ``create_pr()`` succeeds but ``_record_pr()`` fails leaves an
-        open PR whose number is absent from workflow state; on retry this
-        code blindly called ``create_pr()`` again. Search for an existing
-        open PR whose ``head_ref`` matches the branch before creating.
+        Lookup and persistence failures propagate: a missing response never
+        proves the PR does not exist, including after a successful create.
         """
         client = getattr(self._queue, "_client", None)
         pr_number = state.extras.get("pr_number")
         if pr_number is not None:
-            live = self._live_pr_head(client, int(pr_number))
-            if live is not None:
-                return GitHubPullRequestRef(
-                    owner=issue.owner,
-                    repo=issue.repo,
-                    number=int(pr_number),
-                    head_sha=live,
+            pr = cast(GitHubClient, client).get_pr(int(pr_number))
+        else:
+            pr = self._discover_open_pr(client, branch)
+            if pr is None and hasattr(client, "create_pr"):
+                pr = client.create_pr(
+                    f"[aipro] issue #{issue.number}: automated change",
+                    f"Automated work for {issue.slug()}.",
+                    head=branch,
+                    base=self._git.default_branch(),
                 )
-        # Discovery before creation: if a transient failure erased the
-        # recorded PR number but the open PR is still on the branch,
-        # reusing it avoids GitHub's duplicate-head rejection (which
-        # escalates an otherwise healthy item) and prevents permissive
-        # clients from minting a duplicate.
-        discovered = self._discover_open_pr(client, branch, issue)
-        if discovered is not None:
-            self._record_pr(issue, state, discovered.number)
-            return GitHubPullRequestRef(
-                owner=issue.owner,
-                repo=issue.repo,
-                number=discovered.number,
-                head_sha=discovered.head_sha,
-            )
-        if client is not None and hasattr(client, "create_pr"):
-            pr = client.create_pr(
-                f"[aipro] issue #{issue.number}: automated change",
-                f"Automated work for {issue.slug()}.",
-                head=branch,
-                base=self._git.default_branch(),
-            )
-            self._record_pr(issue, state, pr.number)
+            if pr is not None:
+                self._record_pr(issue, state, pr.number)
+        if pr is not None:
             return GitHubPullRequestRef(
                 owner=issue.owner,
                 repo=issue.repo,
@@ -1157,32 +1140,18 @@ class ForemanPolicyLoop:
             head_sha=self._head_sha or f"head-{number}",
         )
 
-    def _discover_open_pr(self, client, branch: str, issue: GitHubIssueRef):
-        """Find an open PR on ``branch`` (by ``head_ref``) if one exists.
-
-        PR #73 review thread 11 / issue #81: prevents duplicate ``create_pr``
-        after a crash window where the PR exists on the branch but is not
-        recorded in workflow state.
-        """
+    def _discover_open_pr(self, client, branch: str):
+        """Reconcile the authoritative branch, excluding same-named fork PRs."""
         if client is None or not hasattr(client, "list_open_prs"):
             return None
-        try:
-            for pr in client.list_open_prs():
-                if getattr(pr, "head_ref", None) == branch:
-                    return pr
-        except Exception:
-            return None
+        for pr in client.list_open_prs():
+            if (
+                pr.head_ref == branch
+                and pr.base_ref == self._git.default_branch()
+                and not pr.is_fork
+            ):
+                return pr
         return None
-
-    def _live_pr_head(self, client, pr_number: int) -> str | None:
-        """The live PR's commit SHA (F19): refresh when the head moves."""
-        get_pr = getattr(client, "get_pr", None)
-        if get_pr is None:
-            return None
-        try:
-            return get_pr(pr_number).head_sha
-        except Exception:
-            return None
 
     def _record_pr(self, issue: GitHubIssueRef, state: WorkflowState, pr_number: int) -> None:
         fresh = self._load(issue, state)

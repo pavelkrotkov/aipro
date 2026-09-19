@@ -1156,3 +1156,132 @@ def test_successful_lane_cannot_hide_failed_heartbeat(monkeypatch):
         loop._lease_heartbeat(state),
     ):
         assert failed.wait(2)
+
+
+@pytest.mark.parametrize("failure", ["discovery", "create_response", "record"])
+def test_uncertain_pr_outcome_preserves_state_and_reconciles(monkeypatch, failure):
+    from ai_pr_orchestrator.v3.foreman import PRReconciliationError
+
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    gate = RecordingGate([GateDecision(passed=True, pending_checks=(), failed_checks=())])
+    git = RecordingGit()
+    loop, queue = _foreman(fake, executor, gate, git=git)
+    create_pr = fake.create_pr
+    save_state = queue.save_state
+    created = []
+
+    def create(*args, **kwargs):
+        pr = create_pr(*args, **kwargs)
+        created.append(pr)
+        if failure == "create_response":
+            raise RuntimeError("lost PR response")
+        return pr
+
+    def save(state, expected_updated_at):
+        if state.extras.get("pr_number") is not None:
+            raise StateConflictError("lost PR record")
+        return save_state(state, expected_updated_at)
+
+    def unavailable():
+        raise RuntimeError("PR discovery unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fake, "create_pr", create)
+        if failure == "discovery":
+            patch.setattr(fake, "list_open_prs", unavailable)
+        if failure == "record":
+            patch.setattr(queue, "save_state", save)
+        with pytest.raises(PRReconciliationError) as error:
+            loop.run_pass()
+    assert error.value.__cause__ is not None
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None and state.phase == "ci_gating"
+    assert state.extras.get("pr_number") is None
+    assert git.cleanups == []
+    assert gate.seen == []
+    assert len(fake.list_open_prs()) == (0 if failure == "discovery" else 1)
+    calls = list(executor.calls)
+
+    # Recovery policy entry: scheduling/reclaiming the retained run belongs to
+    # the foreman coordinator, not another retry loop in PR creation.
+    outcome = loop._run_loop(
+        ISSUE,
+        state,
+        state.extras["worktree"],
+        state.extras["branch"],
+        now=None,
+        resume_at_gate=True,
+    )
+    assert outcome.final_phase == "done"
+    assert executor.calls == calls
+    prs = fake.list_open_prs()
+    assert len(prs) == 1
+    assert gate.seen == [(prs[0].number, prs[0].head_sha)]
+    persisted = queue.load_state(ISSUE.slug())
+    assert persisted is not None and persisted.extras["pr_number"] == prs[0].number
+    if created:
+        assert prs[0] == created[0]
+
+
+def test_recorded_pr_refresh_failure_never_discovers_or_creates(monkeypatch):
+    from ai_pr_orchestrator.v3.foreman import PRReconciliationError
+
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    gate = RecordingGate(
+        [
+            GateDecision(passed=False, pending_checks=("build",), failed_checks=()),
+            GateDecision(passed=True, pending_checks=(), failed_checks=()),
+        ]
+    )
+    git = RecordingGit()
+    loop, queue = _foreman(fake, executor, gate, git=git)
+    assert loop.run_pass()[0].final_phase == "ci_gating"
+    original = fake.list_open_prs()[0]
+    calls = list(executor.calls)
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("PR refresh unavailable")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("recorded PR identity must not reach discovery or creation")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fake, "get_pr", unavailable)
+        patch.setattr(fake, "list_open_prs", forbidden)
+        patch.setattr(fake, "create_pr", forbidden)
+        with pytest.raises(PRReconciliationError, match="PR refresh unavailable"):
+            loop.run_pass()
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None and state.phase == "ci_gating"
+    assert state.extras["pr_number"] == original.number
+    assert git.cleanups == []
+    fake._prs[original.number] = replace(original, head_sha="updated-head")
+    outcome = loop._run_loop(
+        ISSUE,
+        state,
+        state.extras["worktree"],
+        state.extras["branch"],
+        now=None,
+        resume_at_gate=True,
+    )
+    assert outcome.final_phase == "done"
+    assert executor.calls == calls
+    assert gate.seen[-1] == (original.number, "updated-head")
+    assert len(fake.list_open_prs()) == 1
+
+
+@pytest.mark.parametrize("mismatch", [{"is_fork": True}, {"base_ref": "release"}])
+def test_pr_discovery_excludes_other_repository_or_base(mismatch):
+    fake = _ready_fake()
+    wrong = fake.create_pr("wrong PR", "", head="aipro-issue-1", base="main")
+    fake._prs[wrong.number] = replace(wrong, **mismatch)
+    matching = fake.create_pr("matching PR", "", head="aipro-issue-1", base="main")
+    gate = RecordingGate([GateDecision(passed=True, pending_checks=(), failed_checks=())])
+    loop, queue = _foreman(fake, ScriptedExecutor(), gate)
+    assert loop.run_pass()[0].final_phase == "done"
+    assert gate.seen == [(matching.number, matching.head_sha)]
+    assert len(fake.list_open_prs()) == 2
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None and state.extras["pr_number"] == matching.number
