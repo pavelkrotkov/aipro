@@ -736,8 +736,14 @@ class ReconcilePlanner:
             actions.append(crash_action)
         # Orphan cleanups — independent of the work item's own phase, but
         # suppressed once a manual action already fired above (we returned).
-        actions.extend(self._plan_orphan_sessions(inputs, live_session_ids=live_session_ids))
-        actions.extend(self._plan_orphan_worktrees(inputs, live_branches=live_branches))
+        actions.extend(
+            self._plan_orphan_sessions(
+                inputs.sessions, inputs.now, live_session_ids=live_session_ids
+            )
+        )
+        actions.extend(
+            self._plan_orphan_worktrees(inputs.worktrees, inputs.now, live_branches=live_branches)
+        )
         return actions
 
     # -- Individual planners -----------------------------------------------
@@ -1062,9 +1068,36 @@ class ReconcilePlanner:
 
     # -- Orphan detection --------------------------------------------------
 
+    def plan_orphans(
+        self,
+        observations: list[WorkItemObservation],
+        sessions: tuple[SessionObservation, ...],
+        worktrees: tuple[WorktreeObservation, ...],
+        *,
+        now: datetime,
+    ) -> list[Action]:
+        """Plan global cleanup once, protecting every unfinished work item's resources.
+
+        Expired claims require independent reconciliation, not deletion. Queued
+        checkpoints also retain resources until their owner resumes or abandons them.
+        """
+        protected = {
+            item.work_item_id: item.state
+            for item in observations
+            if item.state is not None and item.state.phase not in TERMINAL_PHASES
+        }
+        branches = {
+            state.extras["branch"] for state in protected.values() if state.extras.get("branch")
+        }
+        session_ids = {s.session_id for s in sessions if s.work_item_id in protected}
+        actions = list(self._plan_orphan_sessions(sessions, now, live_session_ids=session_ids))
+        actions.extend(self._plan_orphan_worktrees(worktrees, now, live_branches=branches))
+        return self._finalize(actions)
+
     def _plan_orphan_sessions(
         self,
-        inputs: ReconciliationInputs,
+        sessions: Iterable[SessionObservation],
+        now: datetime,
         *,
         live_session_ids: set[str],
     ) -> Iterable[Action]:
@@ -1075,7 +1108,7 @@ class ReconcilePlanner:
         # ``_finalize`` collapse on ``session_id``) suppresses
         # duplicate emissions so a single orphan session in the
         # bundle is emitted exactly once across all candidates.
-        for session in inputs.sessions:
+        for session in sessions:
             if session.work_item_id is None:
                 # Sessions with no declared work item are never reclaimed by
                 # the planner; they are either pre-launch or operator-launched
@@ -1083,7 +1116,7 @@ class ReconcilePlanner:
                 continue
             if session.session_id in live_session_ids:
                 continue
-            age = inputs.now - session.last_activity_at
+            age = now - session.last_activity_at
             if age < ttl:
                 continue
             yield Action(
@@ -1100,17 +1133,18 @@ class ReconcilePlanner:
 
     def _plan_orphan_worktrees(
         self,
-        inputs: ReconciliationInputs,
+        worktrees: Iterable[WorktreeObservation],
+        now: datetime,
         *,
         live_branches: set[str],
     ) -> Iterable[Action]:
         ttl = timedelta(seconds=self._cleanup.worktree_inactivity_ttl_seconds)
-        for worktree in inputs.worktrees:
+        for worktree in worktrees:
             if worktree.is_default_branch:
                 continue
             if worktree.branch in live_branches:
                 continue
-            age = inputs.now - worktree.last_commit_at
+            age = now - worktree.last_commit_at
             if age < ttl:
                 continue
             yield Action(

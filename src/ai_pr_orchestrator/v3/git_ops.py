@@ -21,7 +21,8 @@ import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+
+from .reconcile import WorktreeObservation
 
 
 class GitOpsError(RuntimeError):
@@ -173,56 +174,31 @@ class GitWorktreeOps:
         self._run("push", "-u", "origin", branch)
 
     def cleanup_worktree(self, path: str) -> None:
-        self._run("worktree", "remove", str(Path(path)), "--force")
+        self._run("worktree", "remove", str(Path(path)))
 
-    def list_worktree_observations(self) -> tuple[Any, ...]:
-        """Return a live view of every managed worktree as reconciliation observations.
+    def list_worktree_observations(self, worktree_root: str) -> tuple[WorktreeObservation, ...]:
+        """Only clean issue worktrees inside the explicitly owned root are sweepable.
 
-        Round-2 Codex review fix #3: the foreman's post-pass cleanup uses
-        this to feed real git state into ``v3.cleanup`` (which dispatches
-        ``CLEAN_ORPHAN_WORKTREE`` actions). Without it the sweeper saw an
-        empty ``worktree_obs`` collection and could never discover a leaked
-        worktree as an orphan. Returned as the ``v3.reconcile.WorktreeObservation``
-        view; imported lazily so this module stays decoupled from the planner.
-        Parsing ``git worktree list --porcelain`` (each block starts with
-        ``worktree <path>`` and may carry a ``branch refs/heads/<name>``).
+        Filesystem activity bounds inactivity; an inherited old commit does not.
+        Git's non-force removal rechecks dirtiness at the destructive boundary.
         """
-        from .reconcile import WorktreeObservation
-
-        porcelain = self._run("worktree", "list", "--porcelain")
-
-        default = self.default_branch()
-        observations: list[Any] = []
-        for block in porcelain.split("\n\n"):
-            block = block.strip()
-            if not block:
+        root = Path(worktree_root).resolve()
+        observations = []
+        for block in self._run("worktree", "list", "--porcelain").split("\n\n"):
+            fields = dict(line.split(" ", 1) for line in block.splitlines() if " " in line)
+            path = Path(fields.get("worktree", str(self._root))).resolve()
+            branch = fields.get("branch", "").removeprefix("refs/heads/")
+            if not (path.is_relative_to(root) and branch.startswith("aipro-issue-")):
                 continue
-            path = ""
-            branch = ""
-            for line in block.splitlines():
-                if line.startswith("worktree "):
-                    path = line[len("worktree ") :].strip()
-                elif line.startswith("branch "):
-                    branch = line[len("branch ") :].strip()
-                    # ``refs/heads/<name>`` -> ``<name>``
-                    if branch.startswith("refs/heads/"):
-                        branch = branch[len("refs/heads/") :]
-            if not path or not branch:
+            if self._run("-C", str(path), "status", "--porcelain"):
                 continue
-            last_commit_at = datetime.now(UTC)
-            # Derive the branch's last commit date (best-effort).
-            try:
-                out = self._run("log", "-1", "--format=%cI", branch).strip()
-                if out:
-                    last_commit_at = datetime.fromisoformat(out)
-            except GitOpsError:  # no commits yet on the branch -> use now
-                pass
+            git_dir = Path(self._run("-C", str(path), "rev-parse", "--absolute-git-dir").strip())
+            activity = max(p.stat().st_mtime for p in (path, path / ".git", git_dir))
             observations.append(
                 WorktreeObservation(
-                    path=path,
+                    path=str(path),
                     branch=branch,
-                    last_commit_at=last_commit_at,
-                    is_default_branch=branch == default,
+                    last_commit_at=datetime.fromtimestamp(activity, UTC),
                 )
             )
         return tuple(observations)

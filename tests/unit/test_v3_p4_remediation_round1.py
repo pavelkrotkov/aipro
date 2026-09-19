@@ -17,7 +17,7 @@ Findings covered here:
 - ``test_rejected_issue_is_removed_from_enabled_label`` — fix #11
 - ``test_cleanup_executes_orphan_session_through_cao`` — fix #1
 - ``test_cleanup_executes_orphan_worktree_through_git`` — fix #1
-- ``test_cleanup_executes_recover_stale_lease``     — fix #1
+- ``test_cleanup_surfaces_stale_lease_without_reclaim``     — fix #1
 - ``test_cleanup_includes_reviewing_phase_in_candidates`` — fix #6
 - ``test_cleanup_raises_on_state_load_failure``    — fix #13
 - ``test_cleanup_deduplicates_orphan_observations`` — fix #14
@@ -73,7 +73,7 @@ def test_abandon_preserves_durable_extras():
     """
     fake = _ready_fake()
     queue = _queue(fake)
-    state = queue.claim(_issue(), "run-abandon-extras")
+    state = queue.claim(_issue(), "run-abandon-extras", branch="aipro-issue-1")
     queue.heartbeat(state)  # populate the authoritative comment
 
     # Pre-seed durable extras the foreman might have written.
@@ -498,6 +498,9 @@ def test_cleanup_executes_orphan_session_through_cao():
     terminated: list[str] = []
 
     class _Cao:
+        def list_session_observations(self):
+            return ()
+
         def terminate_session(self, handle):
             terminated.append(handle.session_id)
 
@@ -560,7 +563,7 @@ def test_cleanup_executes_orphan_worktree_through_git():
     )
 
 
-def test_cleanup_executes_recover_stale_lease():
+def test_cleanup_surfaces_stale_lease_without_reclaim():
     """Fix #1: ``RECOVER_STALE_LEASE`` actions must EXECUTE
     ``queue.reclaim_expired()`` rather than just recording them.
     """
@@ -589,16 +592,13 @@ def test_cleanup_executes_recover_stale_lease():
     cleanup_config = CleanupConfig()
     now = datetime.now(UTC)
     policy = cleanup.CleanupPolicy(cleanup_config=cleanup_config, queue_config=queue._cfg, now=now)
-    outcome = cleanup.run_cleanup(queue, policy=policy, recovery_run_id="run-stale-1-recovered")
-    # The lease was recovered under the cleanup runner's REAL identity
-    # (round-2 fix #4): it is NOT minted as ``<old-run>-recover``, because
-    # that synthetic id no foreman owns would strand the item.
+    outcome = cleanup.run_cleanup(queue, policy=policy)
     reloaded = queue.load_state("owner/repo#1")
-    assert reloaded is not None
-    assert reloaded.run_id == "run-stale-1-recovered", (
-        f"expected the lease to be recovered under the caller's run id, got {reloaded.run_id!r}"
-    )
-    assert outcome.recovered_leases >= 1
+    assert reloaded == stale
+    assert outcome.auto_applied == []
+    assert len(outcome.manual_actions) == 1
+    assert outcome.manual_actions[0].kind.value == "escalate"
+    assert "Lease expired" in outcome.manual_actions[0].reason
 
 
 # --- #6: cleanup includes reviewing phase ---------------------------------
@@ -700,7 +700,9 @@ def test_cleanup_deduplicates_orphan_observations():
     )
     cleanup_config = CleanupConfig(session_lease_ttl_seconds=60)
     policy = cleanup.CleanupPolicy(cleanup_config=cleanup_config, queue_config=queue._cfg, now=now)
-    outcome = cleanup.run_cleanup(queue, policy=policy, sessions=[session])
+    outcome = cleanup.run_cleanup(
+        queue, cao=MagicMock(), policy=policy, sessions=[session, session]
+    )
     auto_session_actions = [
         a for a in outcome.auto_applied if a.kind.value == "clean_orphan_session"
     ]
@@ -729,6 +731,9 @@ def test_foreman_runs_production_cleanup_after_pass():
     calls: list[tuple[str, ...]] = []
 
     class _Cao:
+        def list_session_observations(self):
+            return ()
+
         def terminate_session(self, handle):
             calls.append(("terminate", handle.session_id))
 
@@ -772,8 +777,8 @@ def test_foreman_runs_production_cleanup_after_pass():
         worktree_root="/wt",
         committer_name="x",
         committer_email="y@z",
+        cao=MagicMock(wraps=_Cao()),
     )
-    loop._cao = _Cao()
     loop.run_pass()
     # The foreman's git fake should have cleanup_worktree called on
     # the worktree path the foreman created (terminal outcome

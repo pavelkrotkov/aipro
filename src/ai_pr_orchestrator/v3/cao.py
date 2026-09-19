@@ -348,35 +348,52 @@ class CaoSessionController:
     # --- Reconcile observation surface -------------------------------------
 
     def list_session_observations(self) -> tuple[Any, ...]:
-        """Return a live view of every tracked session as reconciliation observations.
+        """Discover attributed sessions from CAO, including after a cold restart.
 
-        Round-2 Codex review fix #3: the foreman's post-pass cleanup uses
-        this to feed real CAO state into ``v3.cleanup`` (which dispatches
-        ``CLEAN_ORPHAN_SESSION`` actions). Without it the sweeper saw an
-        empty ``sessions`` collection and could never discover a leaked
-        CAO session as an orphan. Returned as the
-        ``v3.reconcile.SessionObservation`` view; imported lazily so the
-        CAO module does not form an import cycle with the planner.
+        Names are CAO's DELETE /sessions identifiers; terminal IDs are not.
+        Missing activity evidence blocks cleanup instead of substituting launch time.
         """
-        # Lazy import keeps v3.cao decoupled from v3.reconcile (which
-        # itself imports from queue/domain only).
-        from .reconcile import SessionObservation
+        response = self._request("GET", "/sessions")
+        self._raise_for_status(response, "list sessions")
+        sessions = response.json()
+        if not isinstance(sessions, list):
+            raise CaoMetadataError("CAO session inventory must be a list")
+        observations = []
+        for session in sessions:
+            name = session["name"]
+            if name.startswith("cao-aipro-"):
+                observation = self._session_inventory_observation(name)
+                if observation is not None:
+                    observations.append(observation)
+        return tuple(observations)
 
-        out: list[Any] = []
-        for metadata in self._sessions.values():
-            out.append(
-                SessionObservation(
-                    session_id=metadata.session_name,
-                    work_item_id=metadata.context.work_item_id,
-                    run_id=metadata.context.run_id,
-                    lane=metadata.lane.lane,
-                    state="unknown",
-                    last_activity_at=metadata.launched_at,
-                    success=True,
-                    is_terminal=False,
-                )
-            )
-        return tuple(out)
+    def _session_inventory_observation(self, name: str) -> Any:
+        from .reconcile import SessionObservation as RecoverySessionObservation
+
+        metadata = self._lookup_session(name)
+        if metadata is None:
+            return None  # Removed between inventory and detail reads.
+        detail = self._request("GET", f"/terminals/{metadata.terminal_id}?peek=true")
+        self._raise_for_status(detail, f"read activity for {name!r}")
+        data = detail.json()
+        try:
+            activity = datetime.fromisoformat(data["last_active"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CaoMetadataError(f"CAO session {name!r} has no valid last_active") from exc
+        if activity.tzinfo is None:
+            activity = activity.replace(tzinfo=UTC)  # CAO stores UTC timestamps.
+        self._register(metadata)
+        terminal = data.get("status") in ("completed", "error")
+        return RecoverySessionObservation(
+            session_id=name,
+            work_item_id=metadata.context.work_item_id,
+            run_id=metadata.context.run_id,
+            lane=metadata.lane.lane,
+            state="terminal" if terminal else "active",
+            last_activity_at=activity,
+            success=data.get("status") != "error",
+            is_terminal=terminal,
+        )
 
     # --- Launch ------------------------------------------------------------
 

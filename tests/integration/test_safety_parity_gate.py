@@ -700,7 +700,9 @@ def test_safety_gate_9_opt_in_label_removed_mid_run_abandons_via_queue():
     cfg = V3Config()
     queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-gate-9")
     # Simulate a prior claim
-    state = queue.claim(GitHubIssueRef(owner="owner", repo="repo", number=1), "run-gate-9")
+    state = queue.claim(
+        GitHubIssueRef(owner="owner", repo="repo", number=1), "run-gate-9", branch="aipro-issue-1"
+    )
     # Operator removes the opt-in label
     fake.remove_label(1, "v3-work")
     # The lease is now an orphan: list_ready no longer returns the issue.

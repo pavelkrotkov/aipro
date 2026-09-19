@@ -502,32 +502,15 @@ def _run_reconcile(args: argparse.Namespace) -> int:
                     f"{action.reason}"
                 )
 
-    # --apply wires real I/O: non-destructive actions go through the
-    # queue (lease recovery), the CAO controller (session cleanup), and
-    # the git worktree ops (worktree cleanup). Manual actions never apply.
-    cleanup_aborted = False
-    if not args.dry_run and actions:
-        _apply_actions(actions, queue=queue, client=client, dry_run_client=dry_run_client)
-        # Round-1 Codex review fix #2: the reconcile CLI's --apply
-        # path also invokes the production ``v3.cleanup`` sweeper so
-        # orphan sessions / worktrees / stale leases are EXECUTED
-        # in the same command. Previously the CLI stopped at the
-        # planner's auto-apply surface, leaving operators to run a
-        # second command. Now ``aipro reconcile --apply`` performs
-        # the full sweep in one shot.
-        # Round-2 Codex review fix (failing status): if the sweep
-        # aborts on an authoritative-state load failure, the command
-        # must exit non-zero so automation sees the incomplete,
-        # unsafe cleanup — not mimic a clean apply.
-        cleanup_aborted = _run_production_cleanup(
-            queue=queue, cleanup_cfg=cleanup_cfg, queue_cfg=queue_cfg
-        )
-
-    if cleanup_aborted:
-        return 3
-    if manual_actions:
-        return 2
-    return 0
+    if not args.dry_run:
+        if dry_run_client:
+            print("aipro reconcile: --apply requires authenticated GitHub access")
+            return 3
+        actionable = [a for a in actions if a.auto_apply and a.kind is not ReconcileActionKind.NOOP]
+        if actionable:
+            print("aipro reconcile: this CLI has no execution controllers; apply via the foreman")
+            return 3
+    return 2 if manual_actions else 0
 
 
 def _resolve_repo_credentials(
@@ -588,128 +571,6 @@ def _build_github_client(
 
     fake = FakeGitHubClient()
     return fake, True
-
-
-def _run_production_cleanup(
-    *,
-    queue: GitHubIssueQueue,
-    cleanup_cfg: CleanupConfig,
-    queue_cfg: GitHubQueueConfig,
-) -> bool:
-    """Run the production ``v3.cleanup`` sweeper against ``queue``.
-
-    Round-1 Codex review fix #2: the reconcile CLI's ``--apply`` path
-    now calls the same production sweeper the foreman uses between
-    rounds. Manual reconciliation against the planner's action list
-    is unchanged — this helper runs AFTER ``_apply_actions`` so the
-    CLI's pre-existing recover / clean-orphan printers still surface
-    and the sweep's auto-apply path runs in addition.
-
-    Round-2 Codex review fix (failing status): a ``CleanupStateLoadError``
-    from the sweep is surfaced AND the helper returns ``True`` so the CLI
-    exits non-zero. The previous implementation swallowed the abort and
-    let ``_run_reconcile`` return 0 whenever the earlier plan produced no
-    manual action, so automation treated an unsafe, incomplete cleanup as
-    success.
-    """
-    from ai_pr_orchestrator.v3.cleanup import (
-        CleanupPolicy,
-        CleanupStateLoadError,
-        run_cleanup,
-    )
-
-    policy = CleanupPolicy(cleanup_config=cleanup_cfg, queue_config=queue_cfg)
-    try:
-        run_cleanup(
-            queue,
-            cao=None,
-            git=None,
-            policy=policy,
-            # Round-2 Codex review fix #4: reclaim stale leases under the
-            # reconcile CLI's identity (the actual runner), never a
-            # fabricated ``<old>-recover`` id no owner resumes.
-            recovery_run_id=getattr(queue, "_host_id", "reconcile-cli"),
-        )
-    except CleanupStateLoadError as exc:
-        print(f"aipro reconcile: production cleanup state-load failed: {exc}")
-        return True
-    except Exception as exc:  # pragma: no cover - defensive: never let cleanup crash the CLI
-        print(f"aipro reconcile: production cleanup failed: {exc}")
-        return True
-    return False
-
-
-def _apply_actions(
-    actions: list[ReconcileAction],
-    *,
-    queue: GitHubIssueQueue,
-    client: Any,
-    dry_run_client: bool,
-) -> None:
-    """Apply the auto-apply subset of ``actions`` through their controllers.
-
-    Manual actions (ESCALATE / HALT_BRANCH_MOVED) are never applied — they
-    were already surfaced and ``_run_reconcile`` exits non-zero for them.
-    Recover / cleanup actions hit the relevant controller:
-
-    - ``RECOVER_STALE_LEASE``: ``queue.reclaim_expired`` (idempotent on the
-      already-stale lease).
-    - ``CLEAN_ORPHAN_SESSION``: ``queue`` cannot delete a CAO session
-      directly, so we record the intent on the queue's underlying client
-      and emit a structured log so an operator can run the appropriate
-      ``cao`` command. (The full CAO controller wiring lives in a
-      higher-level tool; this CLI is the reconciliation entry point.)
-    - ``CLEAN_ORPHAN_WORKTREE``: same approach — emit a structured log.
-
-    With a fake client we still print the actions but skip the queue
-    write: the fake has no notion of a stale lease.
-    if dry_run_client:
-        return
-    """
-    from ai_pr_orchestrator.v3.queue import claim_from_state
-
-    for action in actions:
-        if not action.auto_apply:
-            continue
-        if action.kind is ReconcileActionKind.RECOVER_STALE_LEASE:
-            issue_ref = _parse_work_item_to_issue(action.work_item_id)
-            if issue_ref is None:
-                continue
-            state = queue.load_state(issue_ref.slug())
-            if state is None:
-                continue
-            try:
-                claim = claim_from_state(state)
-            except Exception:
-                continue
-            new_run_id = f"{claim.run_id}-recover"
-            try:
-                queue.reclaim_expired(
-                    issue_ref,
-                    state,
-                    new_run_id,
-                    branch=claim.branch,
-                    worktree=claim.worktree,
-                    pr_number=claim.pr_number,
-                )
-            except Exception as exc:
-                print(f"recover_stale_lease failed for {issue_ref.slug()}: {exc}")
-            continue
-        if action.kind is ReconcileActionKind.CLEAN_ORPHAN_SESSION:
-            # The CLI's responsibility here is to surface the cleanup intent
-            # with a stable identifier (session_id). The actual session
-            # deletion goes through CaoSessionController in production;
-            # we record a structured log entry so an operator can dispatch.
-            print(
-                f"aipro reconcile: clean_orphan_session "
-                f"session_id={action.session_id} work_item={action.work_item_id}"
-            )
-            continue
-        if action.kind is ReconcileActionKind.CLEAN_ORPHAN_WORKTREE:
-            print(
-                f"aipro reconcile: clean_orphan_worktree "
-                f"branch={action.branch} worktree={action.worktree}"
-            )
 
 
 def _parse_work_item_to_issue(work_item_id: str | None) -> GitHubIssueRef | None:

@@ -180,7 +180,7 @@ def test_cleanup_aborts_atomically_on_state_failure():
 
     now = datetime.now(UTC)
     with pytest.raises(cleanup.CleanupStateLoadError):
-        cleanup.run_cleanup(queue, policy=_policy(queue, now), recovery_run_id="runner-r2")
+        cleanup.run_cleanup(queue, policy=_policy(queue, now))
 
     # issue 1's stale lease must NOT have been reclaimed (atomic abort).
     reloaded = queue.load_state("owner/repo#1")
@@ -240,11 +240,16 @@ def test_foreman_feeds_real_observations_into_cleanup():
         def terminate_session(self, handle):
             terminated.append(handle.session_id)
 
-    class _Git:
+    from ai_pr_orchestrator.v3.git_ops import GitWorktreeOps
+
+    class _Git(GitWorktreeOps):
+        def __init__(self):
+            pass
+
         def default_branch(self):
             return "main"
 
-        def list_worktree_observations(self):
+        def list_worktree_observations(self, worktree_root):
             return [_orphan_worktree(datetime.now(UTC))]
 
         def cleanup_worktree(self, path):
@@ -284,8 +289,8 @@ def test_foreman_feeds_real_observations_into_cleanup():
         worktree_root="/wt",
         committer_name="x",
         committer_email="y@z",
+        cao=MagicMock(wraps=_Cao()),
     )
-    loop._cao = _Cao()
     loop.run_pass()
 
     assert terminated == ["orphan-cao-sess"], (
@@ -341,7 +346,8 @@ def test_cleanup_does_not_fabricate_lease_owner():
 
     # No runner identity -> no fabricated reclaim.
     outcome = cleanup.run_cleanup(queue, policy=policy)
-    assert outcome.recovered_leases == 0
+    assert outcome.auto_applied == []
+    assert outcome.has_manual_actions
     reloaded = queue.load_state("owner/repo#1")
     assert reloaded is not None
     assert reloaded.run_id == "run-orig-4", (
@@ -352,11 +358,12 @@ def test_cleanup_does_not_fabricate_lease_owner():
     # Real runner identity -> reclaimed under THAT id, not ``<old>-recover``.
     queue2 = _queue(_ready_fake(1))
     _stale_state(queue2, "run-orig-4b")
-    outcome2 = cleanup.run_cleanup(queue2, policy=policy, recovery_run_id="real-runner-4")
-    assert outcome2.recovered_leases >= 1
+    outcome2 = cleanup.run_cleanup(queue2, policy=policy)
+    assert outcome2.auto_applied == []
+    assert outcome2.has_manual_actions
     reloaded2 = queue2.load_state("owner/repo#1")
     assert reloaded2 is not None
-    assert reloaded2.run_id == "real-runner-4", (
+    assert reloaded2.run_id == "run-orig-4b", (
         f"lease recovery must use the caller's real run id, got {reloaded2.run_id!r}"
     )
     assert "recover" not in reloaded2.run_id
@@ -445,8 +452,6 @@ def test_abandon_surfaces_park_failure(monkeypatch):
     state = queue.claim(_issue(1), "run-r2-6")
     queue.heartbeat(state)
 
-    from ai_pr_orchestrator.v3.queue import LabelSyncError
-
     loaded = queue.load_state("owner/repo#1")
     assert loaded is not None
     # Trigger the failure ONLY on the final enabled-label removal during
@@ -454,14 +459,15 @@ def test_abandon_surfaces_park_failure(monkeypatch):
     orig_remove = fake.remove_label
 
     def exploding_remove(issue_number, label):
-        if label == "v3-work":
+        if label == "v3-work-active":
             raise RuntimeError("simulated label-sync failure")
         return orig_remove(issue_number, label)
 
     monkeypatch.setattr(fake, "remove_label", exploding_remove)
 
-    with pytest.raises(LabelSyncError):
+    with pytest.raises(RuntimeError, match="simulated label-sync failure"):
         queue.abandon(_issue(1), loaded)
+    assert queue.load_state("owner/repo#1") == loaded
 
 
 # --- fix #7 (#21): orphan observations planned with no active item --------
@@ -662,14 +668,11 @@ def test_cleanup_reclaim_uses_planner_clock():
     now = wall_now + timedelta(seconds=10000)
     cfg = CleanupConfig()
     policy = cleanup.CleanupPolicy(cleanup_config=cfg, queue_config=queue._cfg, now=now)
-    outcome = cleanup.run_cleanup(queue, policy=policy, recovery_run_id="clock-runner-11")
-    assert outcome.recovered_leases >= 1, (
-        f"reclaim must use the planner clock so a policy-future lease is "
-        f"recovered, got recovered={outcome.recovered_leases}"
-    )
-    reloaded = queue.load_state("owner/repo#1")
-    assert reloaded is not None
-    assert reloaded.run_id == "clock-runner-11"
+    outcome = cleanup.run_cleanup(queue, policy=policy)
+    assert outcome.auto_applied == []
+    assert outcome.has_manual_actions
+    assert "Lease expired" in outcome.manual_actions[0].reason
+    assert queue.load_state("owner/repo#1") == patched
 
 
 # --- fix #12 (#26): reconcile CLI returns nonzero on cleanup abort --------
@@ -685,19 +688,10 @@ def _make_reconcile_queue_failing_load():
     return _FailingLoad(fake, "owner", "repo", host_id="host-r2")
 
 
-def test_reconcile_cli_returns_nonzero_on_cleanup_abort():
-    """Fix #12: when the production cleanup aborts on an authoritative-state
-    failure, the reconcile CLI must return a non-zero exit (not mimic a
-    clean apply)."""
+def test_cleanup_read_failure_is_not_hidden_by_cli_wrapper():
     queue = _make_reconcile_queue_failing_load()
-    cleanup_aborted = cli._run_production_cleanup(
-        queue=queue,
-        cleanup_cfg=CleanupConfig(),
-        queue_cfg=queue._cfg,
-    )
-    assert cleanup_aborted is True, (
-        "cleanup abort must be surfaced as a failing result, not swallowed"
-    )
+    with pytest.raises(cleanup.CleanupStateLoadError):
+        cleanup.run_cleanup(queue)
 
 
 def test_reconcile_command_exit_code_surfaces_cleanup_abort(tmp_path, monkeypatch):
@@ -713,7 +707,6 @@ def test_reconcile_command_exit_code_surfaces_cleanup_abort(tmp_path, monkeypatc
 
     monkeypatch.setattr(cli, "_build_reconciliation_inputs", lambda *a, **k: [])
     monkeypatch.setattr(cli, "_build_github_client", lambda **_: (FakeGitHubClient(), True))
-    monkeypatch.setattr(cli, "_run_production_cleanup", lambda **kwargs: True)
 
     import argparse
 

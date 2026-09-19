@@ -226,13 +226,13 @@ class SoakRound:
     cleanup_outcome: list[str] = field(default_factory=list)
     cleanup_auto_applied: int = 0
     cleanup_orphans: int = 0
-    cleanup_recovered: int = 0
     # Round-2 Codex review fix #9: the seeded orphan resource IDs are
     # recorded per round and compared against the sweep's actually-applied
     # cleanup actions below, so a miss FAILS the soak instead of the empty
     # violation list silently passing.
     seeded_session_ids: list[str] = field(default_factory=list)
     seeded_worktree_ids: list[str] = field(default_factory=list)
+    cleanup_failures: list[str] = field(default_factory=list)
     cleanup_applied_session_ids: list[str] = field(default_factory=list)
     cleanup_applied_worktree_ids: list[str] = field(default_factory=list)
 
@@ -292,6 +292,11 @@ class _PersistentFakes:
     broker: _ScriptedBroker
     gate: _StaticGate
     loop: ForemanPolicyLoop
+    sessions: dict[str, SessionObservation] = field(default_factory=dict)
+
+    def terminate_session(self, handle: SessionHandle) -> None:
+        del self.sessions[handle.session_id]
+
     # Accumulated durable state, kept so we can prove the
     # invariants by inspecting the queue, not a snapshot.
     # (Round-2 fix #10: duplicate-branch/duplicate-PR detection reads
@@ -452,8 +457,12 @@ def _run_round(
         queue_config=fakes.queue._cfg,
         now=now,
     )
+    fakes.sessions.update((s.session_id, s) for s in seeded_sessions)
+    fakes.git.worktrees.update((w.path, w.branch) for w in seeded_worktrees)
     cleanup = run_cleanup(
         fakes.queue,
+        cao=fakes,
+        git=fakes.git,
         planner=None,
         policy=cleanup_policy,
         sessions=seeded_sessions,
@@ -461,12 +470,11 @@ def _run_round(
         # Round-2 Codex review fix #4: reclaim stale leases under the
         # foreman's REAL run identity, never a fabricated ``<old>-recover``
         # id no owner resumes.
-        recovery_run_id=fakes.loop.run_id,
     )
+    round.cleanup_failures = [a.reason for a in cleanup.manual_actions]
     round.cleanup_outcome = [a.kind.value for a in cleanup.auto_applied + cleanup.manual_actions]
     round.cleanup_auto_applied = len(cleanup.auto_applied)
     round.cleanup_orphans = cleanup.orphans
-    round.cleanup_recovered = cleanup.recovered_leases
     # Round-2 Codex review fix #9: remember which seeded orphan resources
     # the sweep actually dispatched a cleanup action for, so the invariant
     # pass can FAIL when one is missed (the seeded orphans must be removed).
@@ -525,6 +533,14 @@ def _check_invariants(rounds: list[SoakRound], fakes: _PersistentFakes) -> SoakR
         # migration MUST have removed the active label.
         for n in round.active_labels:
             stuck_active.append(n)
+        outcome_numbers = [n for n, _, _ in round.outcomes]
+        if sorted(outcome_numbers) != sorted(round.issue_numbers):
+            state_divergence.append(f"round {round.round_index}: missing or duplicate outcomes")
+        if any(phase != "done" for _, phase, _ in round.outcomes):
+            state_divergence.append(
+                f"round {round.round_index}: expected bounded failures to recover"
+            )
+        state_divergence.extend(round.cleanup_failures)
 
     # Round-1 Codex review fix #9: query the queue for every
     # issue that has durable state. Any issue whose
@@ -542,9 +558,11 @@ def _check_invariants(rounds: list[SoakRound], fakes: _PersistentFakes) -> SoakR
             seen_issues.add(n)
             try:
                 state = queue.load_state(f"owner/repo#{n}")
-            except Exception:
+            except Exception as exc:
+                state_divergence.append(f"issue {n}: unreadable durable state: {exc}")
                 continue
             if state is None:
+                state_divergence.append(f"issue {n}: missing durable state")
                 continue
             # Round-2 Codex review fix #14: durable resource consistency
             # (the branch recorded on the state vs the git fake) is checked
@@ -566,7 +584,8 @@ def _check_invariants(rounds: list[SoakRound], fakes: _PersistentFakes) -> SoakR
                 continue
             try:
                 claim = claim_from_state(state)
-            except Exception:
+            except Exception as exc:
+                state_divergence.append(f"issue {n}: invalid claim: {exc}")
                 continue
             if claim.lease_expires_at < now:
                 leaked_claims.append((n, claim.lease_expires_at))
@@ -606,11 +625,11 @@ def _check_invariants(rounds: list[SoakRound], fakes: _PersistentFakes) -> SoakR
     for round in rounds:
         applied_sessions = set(round.cleanup_applied_session_ids)
         for session_id in round.seeded_session_ids:
-            if session_id not in applied_sessions:
+            if session_id not in applied_sessions or session_id in fakes.sessions:
                 orphan_sessions.append(f"{session_id} (round {round.round_index})")
         applied_worktrees = set(round.cleanup_applied_worktree_ids)
         for worktree_id in round.seeded_worktree_ids:
-            if worktree_id not in applied_worktrees:
+            if worktree_id not in applied_worktrees or worktree_id in fakes.git.worktrees:
                 orphan_worktrees.append(f"{worktree_id} (round {round.round_index})")
 
     # Round-2 Codex review fix #10: duplicate invariants are derived from

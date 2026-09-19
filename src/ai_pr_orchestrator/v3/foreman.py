@@ -38,9 +38,10 @@ import threading
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Protocol
 
 from .broker import TaskDemand
+from .cao import CaoSessionController
 from .config import V3Config
 from .domain import (
     TERMINAL_PHASES,
@@ -104,6 +105,10 @@ class ForemanQueue(GitHubWorkflowStateStore, Protocol):
     ) -> WorkflowState: ...
 
     def fail(
+        self, issue: GitHubIssueRef, state: WorkflowState, *, reason: str
+    ) -> WorkflowState: ...
+
+    def abandon(
         self, issue: GitHubIssueRef, state: WorkflowState, *, reason: str
     ) -> WorkflowState: ...
 
@@ -204,6 +209,7 @@ class ForemanPolicyLoop:
         worktree_root: str,
         committer_name: str,
         committer_email: str,
+        cao: CaoSessionController | None = None,
     ) -> None:
         self._queue = queue
         self._broker = broker
@@ -216,13 +222,7 @@ class ForemanPolicyLoop:
         self._worktree_root = worktree_root
         self._name = committer_name
         self._email = committer_email
-        # Round-2 Codex review fix #3: the foreman owns the live CAO
-        # controller, but the constructor never recorded it, so the
-        # post-pass cleanup unconditionally saw ``cao=None`` and could
-        # never terminate real orphan sessions. Declared (default None so
-        # partial test fakes still construct) and wired by the production
-        # runner once a controller exists.
-        self._cao: Any = None
+        self._cao = cao
 
     @property
     def run_id(self) -> str:
@@ -280,74 +280,31 @@ class ForemanPolicyLoop:
         return outcomes
 
     def _run_post_pass_cleanup(self) -> None:
-        """Invoke the production ``v3.cleanup`` sweeper after the foreman pass.
-
-        Round-1 Codex review fix #2: wiring point. The foreman
-        owns the live CAO controller and git operations, so the
-        sweep is fed real controllers (not the default no-op
-        stubs) and can actually terminate orphan sessions and
-        clean orphan worktrees. A failure (e.g. state load
-        errors) is logged but never propagates — the foreman's
-        contract is to surface work-item outcomes, not to gate
-        the pass on the sweep.
-        """
+        """Discover resources at the real boundaries; an unreadable inventory aborts."""
         from .cleanup import CleanupPolicy, run_cleanup
+        from .git_ops import GitWorktreeOps
         from .queue import GitHubIssueQueue
 
-        queue = self._queue
-        # ``run_cleanup`` requires a ``GitHubIssueQueue`` (it pokes
-        # at ``_client`` / ``_owner`` / ``_repo`` to discover
-        # candidates and load state). The foreman accepts any
-        # structural queue; the real production wiring passes a
-        # real ``GitHubIssueQueue``, so this is a type narrowing
-        # not a real cast.
-        if not isinstance(queue, GitHubIssueQueue):
+        if not isinstance(self._queue, GitHubIssueQueue):
             return
-        cao = getattr(self, "_cao", None)
-        git = self._git
-        policy = CleanupPolicy(
-            cleanup_config=self._cfg.cleanup,
-            queue_config=self._cfg.github_queue,
+        sessions = self._cao.list_session_observations() if self._cao is not None else ()
+        worktrees = (
+            self._git.list_worktree_observations(self._worktree_root)
+            if isinstance(self._git, GitWorktreeOps)
+            else ()
         )
-        # Round-2 Codex review fix #3: feed the sweep REAL resource
-        # observations from the live CAO controller and git ops, not empty
-        # iterables. Orphan actions are derived exclusively from these
-        # observation iterables, so an empty collection meant the post-pass
-        # sweep could never discover a real orphan session or worktree.
-        # Controllers expose optional discovery methods; absence (tests /
-        # partial fakes) degrades to no observations rather than raising.
-        sessions: tuple = ()
-        list_sessions = getattr(cao, "list_session_observations", None)
-        if list_sessions is not None:
-            try:
-                sessions = tuple(list_sessions())
-            except Exception as exc:  # pragma: no cover - defensive
-                log = __import__("logging").getLogger(__name__)
-                log.warning("foreman: could not list CAO sessions: %s", exc)
-        worktrees: tuple = ()
-        list_worktrees = getattr(git, "list_worktree_observations", None)
-        if list_worktrees is not None:
-            try:
-                worktrees = tuple(list_worktrees())
-            except Exception as exc:  # pragma: no cover - defensive
-                log = __import__("logging").getLogger(__name__)
-                log.warning("foreman: could not list git worktrees: %s", exc)
-        try:
-            run_cleanup(
-                queue,
-                cao=cao,
-                git=git,
-                policy=policy,
-                sessions=sessions,
-                worktree_obs=worktrees,
-                # Round-2 Codex review fix #4: stale-lease recovery re-claims
-                # under THIS foreman's real run identity, never a fabricated
-                # ``<old>-recover`` owner nobody resumes.
-                recovery_run_id=self._run_id,
-            )
-        except Exception as exc:
+        outcome = run_cleanup(
+            self._queue,
+            cao=self._cao,
+            git=self._git,
+            policy=CleanupPolicy(self._cfg.cleanup, self._cfg.github_queue),
+            sessions=sessions,
+            worktree_obs=worktrees,
+        )
+        if outcome.has_manual_actions:
             log = __import__("logging").getLogger(__name__)
-            log.warning("foreman: post-pass cleanup failed: %s", exc)
+            for action in outcome.manual_actions:
+                log.warning("Reconciliation requires attention: %s", action.reason)
 
     def _persist_crash(self, issue: GitHubIssueRef, reason: str) -> None:
         """Persist an in-pass crash against the authoritative issue.
@@ -496,6 +453,8 @@ class ForemanPolicyLoop:
         result: LaneResult | None = None
 
         while True:
+            if not self._revalidate_opt_in(issue):
+                return self._dropdown_opted_out(issue, self._load(issue, state), now=now)
             if resume_at_gate:
                 # PR #73 review thread 16 / issue #85: requeued pending-CI
                 # items are claimable by a different foreman host whose
@@ -526,6 +485,8 @@ class ForemanPolicyLoop:
                     self._coder_prompt(issue, fix_findings),
                 )
                 coder_invocations += 1
+                if not self._revalidate_opt_in(issue):
+                    return self._dropdown_opted_out(issue, self._load(issue, state), now=now)
                 if result.exit_code != 0:
                     coder_failures += 1
                     # A failed attempt consumes invocation budget too; it must not
@@ -587,6 +548,9 @@ class ForemanPolicyLoop:
                     # ``done`` or must escalate.
                     self._pending_fix_ids_for_review = tuple(f.id for f in fix_findings)
                     continue  # fixes dispositioned; run the coder again
+
+            if not self._revalidate_opt_in(issue):
+                return self._dropdown_opted_out(issue, self._load(issue, state), now=now)
 
             # --- CI gate ------------------------------------------------------
             state = self._transition(issue, state, "ci_gating", now=now)
@@ -749,7 +713,7 @@ class ForemanPolicyLoop:
         active_lanes = list(reviewer_lanes[:budget_left])
         rounds = review_rounds + 1
         round_id = f"review-{rounds}"
-        if not active_lanes:
+        if len(active_lanes) != len(reviewer_lanes):
             # A round that needs reviewers with no trigger budget left must
             # never masquerade as an unreviewed "no findings" round: escalate
             # for a human instead (round-2 #3).
@@ -1146,29 +1110,11 @@ class ForemanPolicyLoop:
         return None
 
     def _revalidate_opt_in(self, issue: GitHubIssueRef) -> bool:
-        """Return whether the operator still wants ``issue`` processed.
+        from .queue import GitHubIssueQueue
 
-        Round-2 Codex review fix #8: ``run_pass`` snapshots
-        ``list_ready()`` once at the start; the opt-in label can be removed
-        between passes (or while a lane runs) without this check. Before
-        claiming / continuing an item we positively confirm the enabled
-        label is still on the issue: if it has been removed, ``_drive``
-        parks the item instead of running branch/PR/CI side effects.
-
-        A *positive* absence stops work; an unreadable label set (transient
-        failure) degrades to *proceed* so a healthy claim is never
-        abandoned on a flapping read — we only drop out on a confirmed
-        opt-out.
-        """
-        client = getattr(self._queue, "_client", None)
-        if client is None:
+        if not isinstance(self._queue, GitHubIssueQueue):
             return True
-        label = self._cfg.github_queue.enabled_label
-        try:
-            labels = set(client.get_labels(issue.number))
-        except Exception:
-            return True
-        return label in labels
+        return self._queue.is_enabled(issue, self._load_optional(issue))
 
     def _dropdown_opted_out(
         self,
@@ -1177,49 +1123,23 @@ class ForemanPolicyLoop:
         *,
         now: datetime | None,
     ) -> WorkItemOutcome:
-        """Park an item whose opt-in label vanished (round-2 fix #8).
-
-        Terminates any live session and abandons (requeues + clears the
-        claim) an existing non-terminal item so it is not left half-claimed
-        under a dead lease; a never-claimed item is simply skipped. The
-        item stays requeueable for when the operator restores the label.
-        """
-        reason = "opt-in enabled label removed by operator; not continuing"
+        """Terminate owned sessions before releasing the durable claim."""
+        reason = "opt-in lifecycle label removed by operator; not continuing"
         if existing is not None and existing.phase not in TERMINAL_PHASES:
             self._terminate_live_sessions(issue)
-            abandon = getattr(self._queue, "abandon", None)
-            if abandon is not None:
-                with contextlib.suppress(Exception):
-                    abandon(issue, existing, reason=reason)
+            self._queue.abandon(issue, existing, reason=reason)
         return WorkItemOutcome(issue=issue, final_phase="queued", reason=reason)
 
     def _terminate_live_sessions(self, issue: GitHubIssueRef) -> None:
-        """Best-effort terminate of CAO sessions owned by ``issue``.
+        if self._cao is None:
+            return
+        from .interfaces import SessionHandle
 
-        Round-2 fix #8 follow-on: dropping out must terminate the live
-        session before ``abandon()`` so a lane is not left running against
-        item the operator opted out of. Uses the controller's observation
-        surface to find sessions attributed to this work item; absence of a
-        controller / surface is handled gracefully.
-        """
-        cao = getattr(self, "_cao", None)
-        if cao is None:
-            return
-        list_sessions = getattr(cao, "list_session_observations", None)
-        terminate = getattr(cao, "terminate_session", None)
-        if list_sessions is None or terminate is None:
-            return
-        try:
-            from .interfaces import SessionHandle
-
-            target = issue.slug()
-            for obs in list_sessions():
-                if getattr(obs, "work_item_id", None) != target:
-                    continue
-                terminate(SessionHandle(session_id=obs.session_id, lane=getattr(obs, "lane", "-")))
-        except Exception:
-            # Best-effort; the durable abandon is the authoritative signal.
-            return
+        for observation in self._cao.list_session_observations():
+            if observation.work_item_id == issue.slug():
+                self._cao.terminate_session(
+                    SessionHandle(session_id=observation.session_id, lane=observation.lane)
+                )
 
     def _escalate_unverified(self, issue: GitHubIssueRef, reason: str) -> WorkItemOutcome:
         """Persist a needs-human escalation for an unverifiable-metadata item.
