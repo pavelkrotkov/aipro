@@ -145,7 +145,9 @@ def developer_output(
     )
 
 
-def script_protocol(fake_cao, loop, *, proposal="rebut", decision="accept", reply=None):
+def script_protocol(
+    fake_cao, loop, *, proposal="rebut", decision="accept", reply=None, issue_number: int = 1
+):
     loop._cfg = V3Config(
         safety=SafetyPolicyConfig(
             max_coder_invocations_per_run=3,
@@ -174,7 +176,7 @@ def script_protocol(fake_cao, loop, *, proposal="rebut", decision="accept", repl
         ],
     }
     fake_cao.set_output_sequence(
-        developer_session_name(loop.run_id),
+        developer_session_name(loop.run_id, issue_number),
         [developer_output(), coder],
     )
     fake_cao.set_output_sequence(
