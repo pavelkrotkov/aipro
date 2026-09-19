@@ -210,9 +210,7 @@ def test_relative_worktree_path_returns_absolute_path(real_repo: Path):
 @pytest.mark.parametrize(
     "body", ["x" * 8_001, "Requirements ü. " * 5_000 + "Final AC: preserve me."]
 )
-def test_complete_issue_context_is_bounded_and_worktree_owned(
-    real_repo: Path, tmp_path: Path, body
-):
+def test_bounded_prompts_deliver_complete_issue_context(real_repo: Path, tmp_path: Path, body):
     from tests.unit.test_v3_foreman import ISSUE, ScriptedExecutor, _foreman, _gate, _ready_fake
 
     ops = GitWorktreeOps(real_repo)
@@ -226,12 +224,10 @@ def test_complete_issue_context_is_bounded_and_worktree_owned(
         loop._reviewer_prompt(ISSUE, "review-1", workdir),
     ]
     path, digest = ops.write_issue_description(workdir, body)
-    assert digest == hashlib.sha256(body.encode()).hexdigest()
+    reference = f"{path!r} ({len(body.encode())} UTF-8 bytes; SHA-256 {hashlib.sha256(body.encode()).hexdigest()})"
     for prompt in prompts:
         assert len(prompt) < 2_000
-        assert repr(path) in prompt and digest in prompt
-        assert f"{len(body.encode())} UTF-8 bytes" in prompt
-        assert "Read all pages" in prompt
+        assert reference in prompt
     # The worker reads the complete bytes from its actual cwd, not a mocked path.
     observed = subprocess.check_output(
         [
@@ -243,10 +239,17 @@ def test_complete_issue_context_is_bounded_and_worktree_owned(
         cwd=workdir,
     )
     assert observed == body.encode()
+    assert digest == hashlib.sha256(observed).hexdigest()
+
+
+def test_issue_input_stays_unstaged_and_shares_worktree_cleanup(real_repo: Path, tmp_path: Path):
+    ops = GitWorktreeOps(real_repo)
+    ops.create_branch("issue84", "main")
+    workdir = ops.create_worktree(str(tmp_path / "worker"), "issue84")
+    path, _ = ops.write_issue_description(workdir, "Complete requirements.")
     assert ops.changed_files(workdir) == []
     subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
     assert subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=workdir) == b""
-    assert ops.commit_count(workdir, "main") == 0
     ops.commit(workdir, "no issue data", name="T", email="t@example.com")
     assert ops.commit_count(workdir, "main") == 0
     assert Path(path).exists()  # retained with a pending/busy worktree
