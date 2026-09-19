@@ -385,6 +385,9 @@ class ForemanPolicyLoop:
                     violation = self._policy_violation(result)
                     if violation:
                         return self._fail(issue, state, violation, now=now)
+                    head_violation = self._developer_head_violation(state, worktree)
+                    if head_violation:
+                        return self._escalate(issue, state, head_violation, now=now)
 
                     if requests:
                         state = self._record_proposals(state, result)
@@ -589,6 +592,11 @@ class ForemanPolicyLoop:
             )
             self._queue.save_state(charged, expected_updated_at=state.updated_at)
             state = charged
+            state = self._save_fresh(
+                issue,
+                state,
+                extras={**state.extras, "head_sha": self._git.head_sha(worktree)},
+            )
             result = self._run_lane(
                 self._worker_lane(),
                 worktree,
@@ -599,7 +607,7 @@ class ForemanPolicyLoop:
             )
             state = self._load(issue, state)
             if result.exit_code == 0:
-                violation = self._developer_result_violation(state, worktree, result)
+                violation = self._developer_report_violation(result)
                 if violation:
                     raise _ForemanEscalation(violation)
                 state = self._save_fresh(
@@ -1172,14 +1180,13 @@ class ForemanPolicyLoop:
         self, issue: GitHubIssueRef, state: WorkflowState, branch: str, worktree: str
     ) -> WorkflowState:
         actual = self._git.head_sha(worktree)
-        expected = state.extras.get("head_sha")
-        if expected is not None and expected != actual:
-            raise _ForemanEscalation(
-                f"unexpected developer HEAD movement: expected {expected}, found {actual}"
-            )
-        if expected is None:
-            return self._persist_resources(issue, state, branch=branch, worktree=worktree)
-        return state
+        if (
+            state.extras.get("branch") == branch
+            and state.extras.get("worktree") == worktree
+            and state.extras.get("head_sha") == actual
+        ):
+            return state
+        return self._persist_resources(issue, state, branch=branch, worktree=worktree)
 
     # --- Policy helpers -------------------------------------------------------------
 
@@ -1277,14 +1284,12 @@ class ForemanPolicyLoop:
             "instead of implementing or returning a clean review."
         )
 
-    def _developer_result_violation(
-        self, state: WorkflowState, worktree: str, result: LaneResult
-    ) -> str | None:
+    def _developer_head_violation(self, state: WorkflowState, worktree: str) -> str | None:
         expected = state.extras.get("head_sha")
         actual = self._git.head_sha(worktree)
         if expected is None or actual != expected:
             return f"unexpected developer HEAD movement: expected {expected}, found {actual}"
-        return self._developer_report_violation(result)
+        return None
 
     @staticmethod
     def _developer_report_violation(result: LaneResult) -> str | None:
@@ -1331,14 +1336,15 @@ class ForemanPolicyLoop:
     def _one_test_violation(test: object) -> str | None:
         if not isinstance(test, dict) or set(test) != {"command", "result", "notes"}:
             return "invalid developer completion report: malformed test result"
-        if not isinstance(test["command"], str) or not test["command"].strip():
+        record = cast(dict[str, object], test)
+        if not isinstance(record["command"], str) or not record["command"].strip():
             return "invalid developer completion report: test command must be nonempty"
-        if test["result"] not in {"passed", "failed", "not_run"}:
+        if record["result"] not in {"passed", "failed", "not_run"}:
             return "invalid developer completion report: unknown test result"
-        if not isinstance(test["notes"], str):
+        if not isinstance(record["notes"], str):
             return "invalid developer completion report: test notes must be a string"
-        if test["result"] == "failed":
-            return f"developer reported failing test: {test['command']}"
+        if record["result"] == "failed":
+            return f"developer reported failing test: {record['command']}"
         return None
 
     @staticmethod
