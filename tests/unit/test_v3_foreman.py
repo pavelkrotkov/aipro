@@ -7,6 +7,7 @@ the lane executor, broker, gate, and git ops are faked.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -1073,7 +1074,7 @@ def test_cleanup_read_failure_retains_worktree_and_continues_pass(monkeypatch, c
     assert "cleanup verification unavailable" in caplog.text
 
 
-def test_busy_cao_submission_preserves_active_run_and_worktree():
+def test_busy_cao_submission_preserves_active_run_despite_heartbeat_failure(monkeypatch):
     registry = LaneRegistry.default()
     lane = registry.get("developer")
     git = RecordingGit()
@@ -1106,11 +1107,24 @@ def test_busy_cao_submission_preserves_active_run_and_worktree():
                 )
             )
             executor = CaoLaneExecutor(controller, registry)
-            loop, queue = _foreman(_ready_fake(), executor, _gate(), git=git)
+            cfg = V3Config()
+            cfg = replace(cfg, github_queue=replace(cfg.github_queue, lease_seconds=0.15))
+            loop, queue = _foreman(_ready_fake(), executor, _gate(), config=cfg, git=git)
             before_submission = []
+            heartbeat_failed = threading.Event()
+            heartbeat = queue.heartbeat
+
+            def fail_background_heartbeat(state, **kwargs):
+                if threading.current_thread().name == "foreman-lease-heartbeat":
+                    heartbeat_failed.set()
+                    raise RuntimeError("heartbeat network outage")
+                return heartbeat(state, **kwargs)
+
+            monkeypatch.setattr(queue, "heartbeat", fail_background_heartbeat)
 
             def capture_state(request):
                 if request.url.path.endswith("/input"):
+                    assert heartbeat_failed.wait(2), "background heartbeat must fail before HTTP409"
                     before_submission.append(queue.load_state(ISSUE.slug()))
 
             client.event_hooks["request"].append(capture_state)
@@ -1123,3 +1137,22 @@ def test_busy_cao_submission_preserves_active_run_and_worktree():
     assert before_submission[0].phase == "coding"
     assert before_submission[0].extras["host_id"] == "host-A"
     assert git.worktrees == {"/wt/issue-1": "aipro-issue-1"}
+
+
+def test_successful_lane_cannot_hide_failed_heartbeat(monkeypatch):
+    cfg = V3Config()
+    cfg = replace(cfg, github_queue=replace(cfg.github_queue, lease_seconds=0.15))
+    loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), config=cfg)
+    failed = threading.Event()
+
+    def fail_heartbeat(state):
+        failed.set()
+        raise RuntimeError("heartbeat network outage")
+
+    monkeypatch.setattr(queue, "heartbeat", fail_heartbeat)
+    state = WorkflowState(work_item_id=ISSUE.slug(), run_id="run-1", phase="coding")
+    with (
+        pytest.raises(_ForemanEscalation, match="claim lease heartbeat failed"),
+        loop._lease_heartbeat(state),
+    ):
+        assert failed.wait(2)

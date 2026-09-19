@@ -870,8 +870,9 @@ class ForemanPolicyLoop:
         finally:
             stop.set()
             worker.join(timeout=5.0)
-            if failures:
-                raise _ForemanEscalation(f"claim lease heartbeat failed: {failures[0]}")
+        # A failed heartbeat invalidates success, but must not mask a lane error.
+        if failures:
+            raise _ForemanEscalation(f"claim lease heartbeat failed: {failures[0]}")
 
     def _reserve(self, lane: LaneIdentity) -> ModelLease:
         ref = self._cfg.model_router.lane_assignments.get(lane.lane)
