@@ -84,6 +84,9 @@ class FakeGitOperations:
         self.worktrees[path] = branch
         return path
 
+    def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
+        raise NotImplementedError("use real GitWorktreeOps for issue input delivery tests")
+
     def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
         self.commits.append((workdir, message))
         return "sha"
