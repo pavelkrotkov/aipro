@@ -15,13 +15,13 @@ import pytest
 from ai_pr_orchestrator.v3.cao import session_name_for
 from ai_pr_orchestrator.v3.interfaces import GateDecision
 from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE
-from tests.integration._harness import developer_output, developer_session_name
 from tests.integration._fake_cao_server import (
     STATUS_IDLE,
     STATUS_PROCESSING,
     STATUS_STARTED,
     FaultSpec,
 )
+from tests.integration._harness import developer_output, developer_session_name
 
 _DEFAULT_TERMINAL_SEQUENCE = (
     STATUS_STARTED,
