@@ -77,6 +77,7 @@ class FakeBroker:
             demand=demand,
             evaluated_at=NOW,
             assignment=ModelAssignment(lane=demand.lane, model_ref=f"ref-{demand.lane}"),
+            fallbacks=(f"fallback-{demand.lane}",),
         )
 
     def reserve(self, assignment: ModelAssignment) -> ModelLease:
@@ -100,6 +101,7 @@ class ScriptedExecutor:
     developer_files: list[str] = field(default_factory=lambda: ["src/x.py"])
     reviewer_files: list[str] = field(default_factory=list)
     developer_sleep: float = 0.0
+    developer_test_result: str = "passed"
     calls: list[tuple[str, str]] = field(default_factory=list)
     round_counter: dict[str, int] = field(default_factory=dict)
     prompts: list[str] = field(default_factory=list)
@@ -157,7 +159,9 @@ class ScriptedExecutor:
         ]
         output = {
             "summary": "implemented requested change",
-            "tests": [{"command": "pytest -q", "result": "passed", "notes": ""}],
+            "tests": [
+                {"command": "pytest -q", "result": self.developer_test_result, "notes": ""}
+            ],
             "concerns": [],
             "no_changes": not self.developer_files,
             "dispositions": [
@@ -339,6 +343,91 @@ def test_minor_findings_are_deferred_not_fixed():
     assert outcome.final_phase == "done"
     # a deferred minor finding did not trigger an extra coding round
     assert outcome.coder_invocations == 1
+
+
+def test_developer_no_change_is_explicit_and_can_complete():
+    fake = _ready_fake()
+    executor = ScriptedExecutor(developer_files=[])
+    loop, queue = _foreman(fake, executor, _gate())
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "done"
+    report = queue.load_state("owner/repo#1").extras["developer_report"]
+    assert report["no_changes"] is True
+
+
+def test_developer_reported_test_failure_stops_before_push():
+    fake = _ready_fake()
+    executor = ScriptedExecutor(developer_test_result="failed")
+    git = RecordingGit()
+    loop, _ = _foreman(fake, executor, _gate(), git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "developer reported failing test" in outcome.reason
+    assert git.pushed == []
+
+
+def test_developer_head_movement_is_rejected_before_controller_commit():
+    class MovedHeadGit(RecordingGit):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        def head_sha(self, workdir: str) -> str:
+            self.reads += 1
+            return "sha" if self.reads <= 2 else "agent-commit"
+
+    fake = _ready_fake()
+    git = MovedHeadGit()
+    loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "unexpected developer HEAD movement" in outcome.reason
+    assert git.commits == []
+    assert git.pushed == []
+
+
+def test_developer_resources_and_task_packet_are_durable():
+    class InstructionGit(RecordingGit):
+        def repo_instructions(self, workdir: str) -> str:
+            return "AGENTS.md:\nkeep it small"
+
+    fake = FakeGitHubClient()
+    fake.seed_issue(
+        1,
+        labels=["v3-work"],
+        title="Implement durable developer lane",
+        body="Acceptance: preserve issue context.",
+    )
+    executor = ScriptedExecutor()
+    loop, queue = _foreman(fake, executor, _gate(), git=InstructionGit())
+    assert loop.run_pass()[0].final_phase == "done"
+
+    state = queue.load_state("owner/repo#1")
+    assert state.extras["developer_model"] == {
+        "lane": "developer",
+        "model_ref": "ref-developer",
+    }
+    assert state.extras["developer_fallbacks"] == ["fallback-developer"]
+    assert state.extras["developer_session"] == HANDLE.session_id
+    assert state.extras["branch"] == "aipro-issue-1"
+    assert state.extras["head_sha"] == "sha"
+    prompt = executor.prompts[0]
+    for expected in (
+        "Implement owner/repo#1: Implement durable developer lane",
+        "Acceptance: preserve issue context.",
+        "AGENTS.md:\nkeep it small",
+        "Authoritative branch: aipro-issue-1",
+        "Expected HEAD: sha",
+        "Do not commit or push",
+        "summary",
+        "tests",
+        "concerns",
+        "no_changes",
+    ):
+        assert expected in prompt
 
 
 def test_workflow_file_change_is_a_policy_violation():
