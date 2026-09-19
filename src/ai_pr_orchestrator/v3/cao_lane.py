@@ -28,7 +28,7 @@ Three properties are load-bearing:
 
 from __future__ import annotations
 
-from .cao import CaoSessionController
+from .cao import CaoSessionController, SessionBusyError
 from .domain import LaneIdentity
 from .interfaces import (
     LaneExecutionContext,
@@ -98,8 +98,8 @@ class CaoLaneExecutor:
         4. Submit this turn's prompt via ``submit_work``, then poll
            ``poll_session`` until the controller reports terminal
            state or the wall-clock budget is exhausted.
-        5. On any exception, ``terminate_session`` (idempotent) and
-           re-raise so the foreman can classify the failure.
+        5. Preserve a busy session when CAO rejects input. On other
+           exceptions, terminate and re-raise for the foreman to classify.
         """
         import time
 
@@ -143,6 +143,9 @@ class CaoLaneExecutor:
                         "this executor's max_poll_seconds"
                     )
                 time.sleep(self._poll_interval)
+        except SessionBusyError:
+            # Rejected input does not give us ownership of the work already running.
+            raise
         except BaseException:
             # Best-effort teardown so the CAO session is not orphaned; a
             # session CAO has already forgotten is a no-op here.

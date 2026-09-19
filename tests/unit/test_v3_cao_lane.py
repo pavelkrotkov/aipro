@@ -22,6 +22,7 @@ from ai_pr_orchestrator.v3.cao import (
     CAOControlPlaneConfig,
     CaoSessionController,
     CaoTransportError,
+    SessionBusyError,
     session_name_for,
 )
 from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
@@ -133,6 +134,32 @@ def test_execute_adopts_existing_session_by_name(fake_cao: FakeCAOServer, tmp_pa
     assert result.exit_code == 0
     assert len(fake_cao._sessions) == 1
     assert fake_cao._sessions[name].submitted_messages == ["first task", "follow-up task"]
+
+
+def test_execute_preserves_busy_adopted_session(fake_cao: FakeCAOServer, tmp_path):
+    """Rejected follow-up input must not terminate an earlier in-flight turn."""
+    run_id = "busy-follow-up"
+    name = session_name_for(run_id, DEVELOPER_LANE)
+    registry = LaneRegistry.default()
+    fake_cao.set_status_sequence(name, [STATUS_PROCESSING])
+    with CaoSessionController(_config(fake_cao.url), registry) as controller:
+        handle = controller.start_session(_spec(run_id, str(tmp_path), "first task"))
+        controller.submit_work(handle, "first task")
+        state = fake_cao._sessions[name]
+        fake_cao.add_fault(
+            FaultSpec(
+                method="POST",
+                path_prefix=f"/terminals/{state.terminal_id}/input",
+                status_code=409,
+            )
+        )
+        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        with pytest.raises(SessionBusyError):
+            executor.execute(_lane(), "follow-up task", str(tmp_path), _context(run_id))
+
+        assert controller.observe(handle).state == "running"
+    assert state.submitted_messages == ["first task"]
+    assert not state.deleted
 
 
 def test_execute_surfaces_uncertain_followup_submission(fake_cao: FakeCAOServer, tmp_path):
