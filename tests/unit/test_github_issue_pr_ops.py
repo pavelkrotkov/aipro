@@ -45,5 +45,5 @@ def test_create_pr_assigns_numbers_and_lists():
 
 def test_fake_has_protocol_methods():
     fake = FakeGitHubClient()
-    for name in ("get_issue_body", "create_pr", "list_open_prs"):
+    for name in ("get_issue_title", "get_issue_body", "create_pr", "list_open_prs"):
         assert callable(getattr(fake, name))
