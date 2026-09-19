@@ -24,6 +24,7 @@ from ai_pr_orchestrator.v3.cao import (
     session_name_for,
 )
 from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
+from ai_pr_orchestrator.v3.catalog import ModelCatalog, ModelCatalogEntry
 from ai_pr_orchestrator.v3.config import (
     EscalationPolicyConfig,
     HermesLanesConfig,
@@ -1106,7 +1107,13 @@ def test_busy_cao_submission_preserves_active_run_despite_heartbeat_failure(monk
                     status_code=409,
                 )
             )
-            executor = CaoLaneExecutor(controller, registry)
+            executor = CaoLaneExecutor(
+                controller,
+                registry,
+                catalog=ModelCatalog(
+                    (ModelCatalogEntry("ref-developer", "test-model", provider="test"),)
+                ),
+            )
             cfg = V3Config()
             cfg = replace(cfg, github_queue=replace(cfg.github_queue, lease_seconds=0.15))
             loop, queue = _foreman(_ready_fake(), executor, _gate(), config=cfg, git=git)

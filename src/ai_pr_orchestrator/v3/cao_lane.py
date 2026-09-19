@@ -28,11 +28,15 @@ Three properties are load-bearing:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from .cao import CaoSessionController, SessionBusyError
+from .catalog import ModelCatalog
 from .domain import LaneIdentity
 from .interfaces import (
     LaneExecutionContext,
     LaneResult,
+    ModelLease,
     SessionSpec,
 )
 from .lanes import LaneRegistry
@@ -52,6 +56,11 @@ class CaoLaneExecutor:
         The :class:`LaneRegistry` that owns the ``lane -> profile``
         binding. The executor looks each lane up on every call so a
         reconfigured registry is picked up without re-instantiation.
+    catalog:
+        The same resolved catalog used by the broker. Leased model refs must
+        resolve to a model descriptor and an explicit Hermes provider.
+    env:
+        Optional session defaults, copied before model overrides are applied.
     poll_interval_seconds:
         Wall-clock sleep between ``poll_session`` calls. Defaults to a
         small value suitable for the E2E harness against an in-process
@@ -69,13 +78,32 @@ class CaoLaneExecutor:
         controller: CaoSessionController,
         lane_registry: LaneRegistry,
         *,
+        catalog: ModelCatalog | None = None,
+        env: Mapping[str, str] | None = None,
         poll_interval_seconds: float = 0.05,
         max_poll_seconds: float = 600.0,
     ) -> None:
         self._controller = controller
         self._lanes = lane_registry
+        self._catalog = catalog or ModelCatalog()
+        self._env = dict(env or {})
         self._poll_interval = poll_interval_seconds
         self._max_poll = max_poll_seconds
+
+    def _session_env(self, lease: ModelLease | None) -> dict[str, str]:
+        env = dict(self._env)
+        if lease is None:
+            return env
+        entry = self._catalog.get(lease.assignment.model_ref)
+        if entry is None:
+            raise ValueError(f"Leased model {lease.assignment.model_ref!r} is absent from catalog")
+        if not entry.provider or entry.endpoint is not None:
+            raise ValueError(
+                f"Leased model {entry.ref!r} requires an explicit Hermes provider "
+                "and no custom endpoint; this launcher cannot bind a custom endpoint"
+            )
+        env.update(AIPRO_MODEL=entry.descriptor, AIPRO_PROVIDER=entry.provider)
+        return env
 
     def execute(
         self,
@@ -83,7 +111,7 @@ class CaoLaneExecutor:
         task_prompt: str,
         workdir: str,
         context: LaneExecutionContext,
-        lease=None,
+        lease: ModelLease | None = None,
     ) -> LaneResult:
         """Run one unit of work on a CAO session and return its result.
 
@@ -108,7 +136,7 @@ class CaoLaneExecutor:
             lane=registered_lane,
             run_id=context.run_id,
             workdir=workdir,
-            env={},
+            env=self._session_env(lease),
             context=context,
             command=task_prompt,
             model_lease=lease,

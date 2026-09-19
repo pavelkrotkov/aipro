@@ -72,6 +72,7 @@ class _SessionState:
     agent_profile: str
     initial_message: str | None
     metadata: dict[str, Any]
+    env_vars: dict[str, str]
     status_sequence: Sequence[str]
     output: str = ""
     submitted_messages: list[str] = field(default_factory=list)
@@ -458,6 +459,7 @@ class _FakeHandler(BaseHTTPRequestHandler):
                 agent_profile=agent_profile,
                 initial_message=initial_message,
                 metadata=metadata,
+                env_vars=dict(body.get("env_vars") or {}),
                 status_sequence=self._fake._status_sequence_for(session_name),
                 output=self._fake._output_for(session_name),
             )
