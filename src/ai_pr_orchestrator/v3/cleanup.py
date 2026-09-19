@@ -74,20 +74,41 @@ def _observations(
     )
     slugs = tuple(s.work_item_id for s in sessions if s.work_item_id is not None)
     issues = queue.list_tracked(work_item_ids=slugs, issue_numbers=issue_numbers)
-    return [_observe_item(queue, issue) for issue in issues]
+    observations = [_observe_item(queue, issue) for issue in issues]
+    _require_resource_states(observations, slugs, issue_numbers)
+    _require_worktree_owners(observations, worktrees)
+    return observations
+
+
+def _require_resource_states(
+    observations: list[WorkItemObservation], slugs: tuple[str, ...], numbers: tuple[int, ...]
+) -> None:
+    """Absent resource ownership is unknown, regardless of the issue's labels."""
+    missing = [item.work_item for item in observations if item.state is None]
+    missing_slugs = {issue.slug() for issue in missing}.intersection(slugs)
+    missing_numbers = {issue.number for issue in missing}.intersection(numbers)
+    if missing_slugs or missing_numbers:
+        raise CleanupStateLoadError("Resource owner has no authoritative state")
+
+
+def _require_worktree_owners(
+    observations: list[WorkItemObservation], worktrees: tuple[WorktreeObservation, ...]
+) -> None:
+    """A managed-looking branch name alone is not durable ownership evidence."""
+    branches = {item.state.extras.get("branch") for item in observations if item.state is not None}
+    if {worktree.branch for worktree in worktrees} - branches:
+        raise CleanupStateLoadError("Worktree has no authoritative branch owner")
 
 
 def _observe_item(queue: GitHubIssueQueue, issue: GitHubIssueRef) -> WorkItemObservation:
     """Read state and claim atomically from the sweep's perspective.
 
-    A malformed active claim or missing state behind a lifecycle label is
-    unknown ownership, not proof that its resources can be deleted.
+    Malformed active claims fail closed. The caller separately requires durable
+    state for every attributed resource, including ready and unlabeled issues.
     """
     try:
         state = queue.load_state(issue.slug())
         if state is None:
-            if not queue.is_enabled(issue) and queue.load_work_item(issue).labels:
-                raise ValueError("lifecycle item has no authoritative state")
             return WorkItemObservation(issue, None, None)
         claim = None if state.phase in (*TERMINAL_PHASES, "queued") else claim_from_state(state)
         return WorkItemObservation(issue, state, claim)

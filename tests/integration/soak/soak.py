@@ -64,6 +64,7 @@ from ai_pr_orchestrator.v3.config import (
 from ai_pr_orchestrator.v3.domain import (
     LaneIdentity,
     ModelAssignment,
+    WorkflowState,
 )
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop
 from ai_pr_orchestrator.v3.interfaces import (
@@ -366,6 +367,19 @@ def _seed_orphans(
     # We use a unique issue slug per round so a seeded orphan
     # does not collide with a real work item in the same round.
     orphan_issue_slug = f"owner/repo#{900000 + round_index}"
+    orphan_branch = f"aipro-issue-{900000 + round_index}"
+    fake.seed_issue(900000 + round_index, labels=["v3-work-error"])
+    queue.save_state(
+        WorkflowState(
+            work_item_id=orphan_issue_slug,
+            run_id=f"orphan-{round_index}",
+            phase="failed",
+            terminal_reason="completed synthetic failure fixture",
+            extras={"branch": orphan_branch, "worktree": f"/wt/orphan-{round_index}"},
+        ),
+        expected_updated_at=None,
+    )
+
     sessions = [
         SessionObservation(
             session_id=f"orphan-session-{round_index}",
@@ -381,7 +395,7 @@ def _seed_orphans(
     worktrees = [
         WorktreeObservation(
             path=f"/wt/orphan-{round_index}",
-            branch=f"orphan-branch-{round_index}",
+            branch=orphan_branch,
             last_commit_at=now - worktree_age,
             last_push_at=now - worktree_age,
             is_default_branch=False,
@@ -460,6 +474,7 @@ def _run_round(
     )
     fakes.sessions.update((s.session_id, s) for s in seeded_sessions)
     fakes.git.worktrees.update((w.path, w.branch) for w in seeded_worktrees)
+    fakes.git.branches.extend(w.branch for w in seeded_worktrees)
     cleanup = run_cleanup(
         fakes.queue,
         cao=fakes,

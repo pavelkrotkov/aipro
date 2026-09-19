@@ -35,6 +35,20 @@ OLD = NOW - timedelta(days=10)
 ISSUE = GitHubIssueRef("owner", "repo", 1)
 
 
+def _seed_terminal_owner(queue, number=999, branch="orphan-branch"):
+    from ai_pr_orchestrator.v3.domain import GitHubIssueRef, WorkflowState
+
+    state = WorkflowState(
+        work_item_id=f"owner/repo#{number}",
+        run_id=f"terminal-{number}",
+        phase="failed",
+        terminal_reason="finished cleanup fixture",
+        extras={"branch": branch},
+    )
+    queue.save_state(state, expected_updated_at=None)
+    queue.repair_labels(GitHubIssueRef("owner", "repo", number), state)
+
+
 def queue():
     client = FakeGitHubClient()
     client.seed_issue(1, labels=["v3-work"])
@@ -85,6 +99,7 @@ def test_unknown_active_state_blocks_every_deletion(missing):
 )
 def test_unconfirmed_removal_is_not_success(controller):
     _, q = queue()
+    _seed_terminal_owner(q, 1, "aipro-issue-1")
     session, _ = resources()
     result = run_cleanup(q, cao=controller, sessions=[session])
     assert result.auto_applied == []
@@ -94,6 +109,7 @@ def test_unconfirmed_removal_is_not_success(controller):
 
 def test_two_paths_on_same_branch_both_cleaned():
     _, q = queue()
+    _seed_terminal_owner(q, 1, "aipro-issue-1")
     _, worktree = resources()
     git = Mock()
     result = run_cleanup(
@@ -147,6 +163,7 @@ def test_actual_git_preserves_unowned_dirty_and_fresh_worktrees(tmp_path):
     observed = ops.list_worktree_observations(str(owned_root))
     assert [o.path for o in observed] == [str(clean)]
     _, q = queue()
+    _seed_terminal_owner(q, 2, "aipro-issue-2")
     run_cleanup(q, git=ops, worktree_obs=observed)
     assert human.exists() and dirty.exists() and clean.exists()
     with pytest.raises(GitOpsError):
@@ -250,4 +267,33 @@ def test_parked_unlabeled_checkpoint_retains_resources():
     assert result.auto_applied == []
     assert q.load_state(ISSUE.slug()) == parked
     cao.terminate_session.assert_not_called()
+    git.cleanup_worktree.assert_not_called()
+
+
+@pytest.mark.parametrize("labels", [[], ["v3-work"]])
+def test_missing_ready_or_unlabeled_owner_never_authorizes_cleanup(labels):
+    client, q = queue()
+    client.seed_issue(1, labels=labels)
+    session, worktree = resources()
+    cao, git = Mock(), Mock()
+    with pytest.raises(CleanupStateLoadError, match="no authoritative state"):
+        run_cleanup(q, cao=cao, git=git, sessions=[session], worktree_obs=[worktree])
+    cao.terminate_session.assert_not_called()
+    git.cleanup_worktree.assert_not_called()
+
+
+def test_unclaimed_ready_issue_without_resources_does_not_block_sweep():
+    _, q = queue()
+    result = run_cleanup(q)
+    assert result.auto_applied == []
+    assert result.manual_actions == []
+
+
+def test_managed_looking_worktree_without_durable_branch_owner_is_preserved():
+    _, q = queue()
+    _seed_terminal_owner(q, 1, "aipro-issue-1")
+    _, worktree = resources()
+    git = Mock()
+    with pytest.raises(CleanupStateLoadError, match="branch owner"):
+        run_cleanup(q, git=git, worktree_obs=[replace(worktree, branch="aipro-issue-unrecorded")])
     git.cleanup_worktree.assert_not_called()

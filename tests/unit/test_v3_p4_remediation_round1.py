@@ -47,6 +47,20 @@ from ai_pr_orchestrator.v3.queue import (
 # --- helpers ---------------------------------------------------------------
 
 
+def _seed_terminal_owner(queue, number=999, branch="orphan-branch"):
+    from ai_pr_orchestrator.v3.domain import GitHubIssueRef, WorkflowState
+
+    state = WorkflowState(
+        work_item_id=f"owner/repo#{number}",
+        run_id=f"terminal-{number}",
+        phase="failed",
+        terminal_reason="finished cleanup fixture",
+        extras={"branch": branch},
+    )
+    queue.save_state(state, expected_updated_at=None)
+    queue.repair_labels(GitHubIssueRef("owner", "repo", number), state)
+
+
 def _issue(number: int = 1) -> GitHubIssueRef:
     return GitHubIssueRef(owner="owner", repo="repo", number=number)
 
@@ -487,6 +501,7 @@ def test_cleanup_executes_orphan_session_through_cao():
     # no live claim — that's what makes the session "orphan".
     fake.seed_issue(1, labels=["v3-work"])
     queue = _queue(fake)
+    _seed_terminal_owner(queue)
     # A real, claimed work item is NOT orphan; its claim is
     # live. So we need a different work item to anchor the
     # orphan session. The candidate set includes issue 1 (via
@@ -537,6 +552,7 @@ def test_cleanup_executes_orphan_worktree_through_git():
     # orphan).
     fake.seed_issue(1, labels=["v3-work"])
     queue = _queue(fake)
+    _seed_terminal_owner(queue, branch="orphan-branch-1")
     from ai_pr_orchestrator.v3.reconcile import WorktreeObservation
 
     cleaned: list[str] = []
@@ -681,6 +697,7 @@ def test_cleanup_deduplicates_orphan_observations():
     fake.seed_issue(2, labels=["v3-work"])
     fake.seed_issue(3, labels=["v3-work"])
     queue = _queue(fake)
+    _seed_terminal_owner(queue)
     # Claim all three so the planner sees real live work items.
     for n in (1, 2, 3):
         queue.claim(_issue(n), f"run-dedup-{n}", branch=f"aipro-issue-{n}")

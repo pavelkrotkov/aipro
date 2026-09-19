@@ -157,7 +157,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--apply",
         dest="dry_run",
         action="store_false",
-        help="Apply non-destructive actions (orphan cleanups, lease recovery)",
+        help="Unsupported: requires runtime controllers and complete inventory",
     )
     reconcile_parser.add_argument(
         "--issue",
@@ -411,23 +411,13 @@ def _pr_number_from_event(event_path: Path, *, fallback_pr: int | None = None) -
 
 
 def _run_reconcile(args: argparse.Namespace) -> int:
-    """Plan (or apply) recovery actions for the configured repo.
+    """Render a recovery plan; this CLI has no complete runtime apply boundary."""
+    if not args.dry_run:
+        print(
+            "aipro reconcile: --apply is unsupported; runtime controllers and inventory are required"
+        )
+        return 3
 
-    In ``--dry-run`` (the default) the planner runs against the GitHub
-    client the queue already speaks — the real :class:`GitHubClient` when a
-    token is available, the in-memory fake otherwise — and every action is
-    printed rather than applied. With ``--apply``, only non-destructive
-    actions (``RECOVER_STALE_LEASE``, ``CLEAN_ORPHAN_SESSION``,
-    ``CLEAN_ORPHAN_WORKTREE``) are applied through the queue / CAO
-    controller / git ops; the dangerous ones (``ESCALATE``,
-    ``HALT_BRANCH_MOVED``) are always surfaced and the command exits
-    non-zero, because a non-idempotent side effect on uncertain state is
-    exactly what reconciliation must not do.
-
-    The CLI is a thin orchestrator: it builds the observation bundle, hands
-    it to :class:`ReconcilePlanner`, and renders the result. Tests cover the
-    planner and the renderer; this function glues them to argparse.
-    """
     from ai_pr_orchestrator.v3.config import load_v3_config
     from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 
@@ -440,7 +430,7 @@ def _run_reconcile(args: argparse.Namespace) -> int:
     queue_cfg = config.github_queue
 
     owner, repo, github_token = _resolve_repo_credentials(args, queue_cfg)
-    client, dry_run_client = _build_github_client(
+    client, _ = _build_github_client(
         owner=owner, repo=repo, token=github_token, queue_dry_run=args.dry_run
     )
     queue = GitHubIssueQueue(
@@ -459,8 +449,7 @@ def _run_reconcile(args: argparse.Namespace) -> int:
 
     actions: list[ReconcileAction] = planner.plan_many(inputs_list)
 
-    # ESCALATE / HALT_BRANCH_MOVED must always surface and exit non-zero,
-    # regardless of --apply.
+    # Manual recovery decisions are visible as a non-zero planning result.
     manual_actions = [
         a
         for a in actions
@@ -502,14 +491,6 @@ def _run_reconcile(args: argparse.Namespace) -> int:
                     f"{action.reason}"
                 )
 
-    if not args.dry_run:
-        if dry_run_client:
-            print("aipro reconcile: --apply requires authenticated GitHub access")
-            return 3
-        actionable = [a for a in actions if a.auto_apply and a.kind is not ReconcileActionKind.NOOP]
-        if actionable:
-            print("aipro reconcile: this CLI has no execution controllers; apply via the foreman")
-            return 3
     return 2 if manual_actions else 0
 
 
@@ -559,9 +540,8 @@ def _build_github_client(
 
     Production callers always pass a real :class:`GitHubClient`; the
     dry-run path substitutes the in-memory fake so the CLI is testable
-    without a token. ``dry_run_client`` is reported back so ``--apply``
-    can refuse to run with a fake client (it would silently mutate
-    nothing).
+    without a token. The returned flag identifies whether evidence came from
+    that fake; neither path authorizes execution by the planning-only CLI.
     """
     if token:
         from ai_pr_orchestrator.github.client import GitHubClient

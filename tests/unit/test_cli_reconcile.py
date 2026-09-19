@@ -60,3 +60,20 @@ def test_reconcile_invalid_issue_arg(tmp_path: Path) -> None:
 def test_reconcile_missing_config(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         cli.main(["reconcile", "--config", str(tmp_path / "missing.yml")])
+
+
+def test_apply_rejects_even_authenticated_noop_before_incomplete_inventory(
+    tmp_path, monkeypatch, capsys
+):
+    from unittest.mock import Mock
+
+    from ai_pr_orchestrator.github.fake import FakeGitHubClient
+
+    client_factory = Mock(return_value=(FakeGitHubClient(), False))
+    monkeypatch.setattr(cli, "_build_github_client", client_factory)
+    result = cli.main(
+        ["reconcile", "--config", str(write_config(tmp_path)), "--apply", "--token", "test-token"]
+    )
+    assert result == 3
+    assert "--apply is unsupported" in capsys.readouterr().out
+    client_factory.assert_not_called()

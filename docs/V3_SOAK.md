@@ -6,7 +6,9 @@ coder failures are bounded and must still reach `done`. A successful run require
 an outcome and readable durable state for every seeded issue, no duplicate
 branches/PRs, no stuck claims/active labels, consistent persisted branch/PR links,
 and actual removal of seeded resources from persistent resource stores. Missing
-or failing cleanup controllers cannot count as successful removal.
+or failing cleanup controllers cannot count as successful removal. Attributed
+resources require readable durable ownership records even when their issues are
+ready or unlabeled; the soak seeds terminal records for its cleanup fixtures.
 
 This deterministic policy harness uses fake GitHub, Git, CI, broker and lane
 boundaries. It does **not** certify production CAO/Hermes execution or replace
@@ -45,9 +47,9 @@ The independent execution-boundary tests remain required before retiring V1.
 
 The foreman now accepts the CAO controller explicitly. The supported external
 Hermes runner must supply it; there is no in-repository production constructor
-wiring to certify yet (#53 integration). `aipro reconcile --apply` rejects missing
-GitHub credentials and execution actions because this CLI has no runtime
-controllers/local-worktree binding. Previous output-only recovery/cleanup was not
+wiring to certify yet (#53 integration). `aipro reconcile --apply` is always rejected because this CLI has no complete
+runtime inventory or execution-controller/local-worktree binding. Authentication
+or a NOOP from the planning-only view does not authorize successful apply. Previous output-only recovery/cleanup was not
 real application. Dry-run planning remains available; use the configured foreman
 for supported cleanup, and explicit reconciliation for manual actions.
 

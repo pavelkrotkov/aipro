@@ -43,6 +43,20 @@ from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 
 
+def _seed_terminal_owner(queue, number=999, branch="orphan-branch"):
+    from ai_pr_orchestrator.v3.domain import GitHubIssueRef, WorkflowState
+
+    state = WorkflowState(
+        work_item_id=f"owner/repo#{number}",
+        run_id=f"terminal-{number}",
+        phase="failed",
+        terminal_reason="finished cleanup fixture",
+        extras={"branch": branch},
+    )
+    queue.save_state(state, expected_updated_at=None)
+    queue.repair_labels(GitHubIssueRef("owner", "repo", number), state)
+
+
 def _load_soak():
     """Dynamically import the soak harness module (it is run as a script)."""
     name = "aipro_soak_harness"
@@ -208,6 +222,7 @@ def test_foreman_feeds_real_observations_into_cleanup():
 
     fake = _ready_fake(1)
     queue = _queue(fake)
+    _seed_terminal_owner(queue, branch="orphan-branch-3")
     queue.claim(_issue(1), "run-r2-3", branch="aipro-issue-1")
 
     def _orphan_session(now):
@@ -479,6 +494,7 @@ def test_cleanup_plans_orphans_without_active_items():
     cleaned (they were dropped when the candidate set was empty)."""
     fake = FakeGitHubClient()  # no labels -> empty candidate set
     queue = _queue(fake)
+    _seed_terminal_owner(queue, branch="orphan-branch-7")
     now = datetime.now(UTC)
     session = _orphan_session("orphan-7", now=now, slug="owner/repo#999")
     worktree = _orphan_worktree("/wt/orphan-7", now=now, branch="orphan-branch-7")

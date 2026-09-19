@@ -137,7 +137,7 @@ class TestCliApplyAndRepo:
         # No authenticated execution client: refuse apply, still show manual plan.
         assert exit_code == 3
         out = capsys.readouterr().out
-        assert "ESCALATE" in out or "escalate" in out
+        assert "--apply is unsupported" in out
 
     def test_cli_uses_real_client_with_token(self, tmp_path, monkeypatch, capsys) -> None:
         """When ``GITHUB_TOKEN`` is set, the CLI builds the real
