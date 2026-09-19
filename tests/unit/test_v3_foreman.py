@@ -55,6 +55,7 @@ from ai_pr_orchestrator.v3.interfaces import (
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 from tests.integration._fake_cao_server import STATUS_PROCESSING, FakeCAOServer, FaultSpec
+from tests.unit.test_v3_git_ops import real_repo as real_repo
 
 ISSUE = GitHubIssueRef(owner="owner", repo="repo", number=1)
 NOW = datetime(2026, 8, 29, tzinfo=UTC)
@@ -1408,6 +1409,7 @@ def test_cold_ci_resume_needs_only_recorded_pr(monkeypatch, tmp_path, retained_p
     expected = {"green": "done", "pending": "ci_gating", "failed": "escalated"}
     assert outcome.final_phase == expected[settled]
     assert gate.seen == [(original.number, "live-pr-head")]
+    assert git.cleanups == []
     assert executor.calls == []
     persisted = resumed_queue.load_state(ISSUE.slug())
     assert persisted.extras["pr_number"] == original.number
@@ -1449,3 +1451,66 @@ def test_cold_ci_resume_missing_pr_escalates_only_on_definite_404(monkeypatch, s
     assert gate.seen == []
     assert executor.calls == []
     assert queue.load_state(ISSUE.slug()).phase == ("escalated" if status == 404 else "ci_gating")
+
+
+@pytest.mark.parametrize("settled", ["green", "failed", "missing-pr", "timeout"])
+def test_ci_resume_preserves_unrelated_real_worktree(monkeypatch, real_repo, tmp_path, settled):
+    from ai_pr_orchestrator.v3.git_ops import GitWorktreeOps
+
+    git = GitWorktreeOps(real_repo)
+    git.create_branch("human-work", "main")
+    checkout = tmp_path / "human-work"
+    git.create_worktree(str(checkout), "human-work")
+    (checkout / "file.txt").write_text("unsaved tracked change")
+    (checkout / "unsaved-human-work").write_text("irreplaceable")
+    fake = _ready_fake()
+    first, queue = _foreman(
+        fake,
+        ScriptedExecutor(),
+        _gate(GateDecision(passed=False, pending_checks=("build",), failed_checks=())),
+    )
+    first.run_pass()
+    state = queue.load_state(ISSUE.slug())
+    extras = {**state.extras, "worktree": str(checkout)}
+    if settled == "timeout":
+        extras["ci_wait_started_at"] = "2000-01-01T00:00:00+00:00"
+    queue.save_state(replace(state, extras=extras), expected_updated_at=state.updated_at)
+    gate = _gate(
+        GateDecision(
+            passed=settled == "green",
+            pending_checks=("build",) if settled == "timeout" else (),
+            failed_checks=("build",) if settled == "failed" else (),
+        )
+    )
+    resumed, queue = _foreman(fake, ScriptedExecutor(), gate, git=git)
+    queue._host_id = "host-B"
+    if settled == "missing-pr":
+
+        def missing(number):
+            response = httpx.Response(
+                404, request=httpx.Request("GET", f"https://api.github.com/pulls/{number}")
+            )
+            response.raise_for_status()
+
+        monkeypatch.setattr(fake, "get_pr", missing)
+    outcome = resumed.run_pass()[0]
+    assert outcome.final_phase == ("done" if settled == "green" else "escalated")
+    assert (checkout / "file.txt").read_text() == "unsaved tracked change"
+    assert (checkout / "unsaved-human-work").read_text() == "irreplaceable"
+    assert queue.load_state(ISSUE.slug()).extras["worktree"] == str(checkout)
+    assert resumed._executor.calls == []
+
+
+def test_initial_state_read_failure_cannot_authorize_cleanup(monkeypatch):
+    git = RecordingGit()
+    loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), git=git)
+
+    def unavailable(work_item_id):
+        raise RuntimeError("initial authoritative read failed")
+
+    monkeypatch.setattr(queue, "load_state", unavailable)
+    with pytest.raises(RuntimeError, match="initial authoritative read failed"):
+        loop.run_pass()
+    assert git.cleanups == []
+    assert git.worktrees == {}
+    assert loop._executor.calls == []
