@@ -99,11 +99,7 @@ DispositionAction = Literal[
     "escalate_human",
     #: A coder's rebuttal to a finding; the finding stays open until a
     #: later reviewer round confirms (accept) or rejects (fix). The
-    #: rebuttal path requires a real V3 surface (issue #87), which is
-    #: why this literal is in the domain schema but does not yet appear
-    #: in ``ACTION_TO_STATUS``: ``rebut`` keeps the finding open rather
-    #: than settling it, and ``accept`` (added alongside ``rebut`` for
-    #: the rebuttal path's resolution) settles to ``accepted``.
+    #: proposal remains open; only independent acceptance settles it.
     "rebut",
     "accept",
 ]
@@ -820,11 +816,14 @@ class FindingDisposition:
     decided_by: LaneName
     thread_id: str | None = None
     reply_body: str | None = None
+    run_id: RunId | None = None
+    round_id: RoundId | None = None
+    response_to_round_id: RoundId | None = None
 
     def __post_init__(self) -> None:
         if self.action not in VALID_DISPOSITION_ACTIONS:
             raise DomainError(f"Invalid disposition action {self.action!r}")
-        if not self.rationale:
+        if not self.rationale.strip():
             raise DomainError("FindingDisposition.rationale must be non-empty")
 
     def to_dict(self) -> dict[str, Any]:

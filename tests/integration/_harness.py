@@ -13,11 +13,14 @@ replacement for the lane executor.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from ai_pr_orchestrator.v3.broker import BrokerDecision
+from ai_pr_orchestrator.v3.cao import session_name_for
+from ai_pr_orchestrator.v3.config import SafetyPolicyConfig, V3Config
 from ai_pr_orchestrator.v3.domain import ModelAssignment
 from ai_pr_orchestrator.v3.interfaces import GateDecision, ModelLease
 
@@ -111,3 +114,44 @@ __all__ = [
     "FakeGitOperations",
     "StaticGate",
 ]
+
+
+def script_protocol(fake_cao, loop, *, proposal="rebut", decision="accept", reply=None):
+    loop._cfg = V3Config(
+        safety=SafetyPolicyConfig(
+            max_coder_invocations_per_run=3,
+            max_reviewer_triggers_per_run=9,
+        )
+    )
+    coder = {
+        "dispositions": [
+            {
+                "finding_id": "guard",
+                "action": proposal,
+                "rationale": "test_guard proves the premise cannot occur",
+            }
+        ]
+    }
+    reviewer = {
+        "findings": [],
+        "dispositions": [
+            {
+                "finding_id": "guard",
+                "action": decision,
+                "rationale": "Independent reproduction confirms the coder evidence",
+                "response_to_round_id": "response-1",
+            }
+        ],
+    }
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "developer"), ["implemented", json.dumps(coder)]
+    )
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "requirements-reviewer"),
+        [
+            '[{"id":"guard","body":"Alleged missing guard","severity":"major"}]',
+            json.dumps(reviewer) if reply is None else reply,
+        ],
+    )
+    for lane in ("breaker-reviewer", "architecture-reviewer"):
+        fake_cao.set_output(session_name_for(loop.run_id, lane), "[]")

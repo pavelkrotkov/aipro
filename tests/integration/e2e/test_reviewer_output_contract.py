@@ -36,4 +36,5 @@ def test_structured_blocker_reaches_real_policy(fake_cao, foreman_harness, lane_
     assert github.list_open_prs() == []
     assert "coder invocation budget exhausted with open findings" in outcome.reason
     state = queue.load_state("owner/repo#1")
-    assert any(d.finding_id == "guard" and d.action == "fix" for d in state.dispositions)
+    assert [(f.id, f.status) for f in state.findings] == [("guard", "open")]
+    assert state.dispositions == []  # No coder response exists at the exhausted budget.

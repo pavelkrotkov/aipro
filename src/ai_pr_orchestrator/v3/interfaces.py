@@ -59,6 +59,40 @@ class LaneExecutionContext:
     run_id: RunId
     round_id: RoundId | None = None
     work_item_id: WorkItemId | None = None
+    # Finding id and proposal turn to adjudicate; None requests a coder proposal.
+    disposition_requests: tuple[tuple[str, str | None], ...] = ()
+
+    def __post_init__(self) -> None:
+        seen = set()
+        for request in self.disposition_requests:
+            if len(request) != 2:
+                raise ValueError("disposition request requires finding id and proposal turn")
+            finding_id, proposal_turn = request
+            if not isinstance(finding_id, str) or not finding_id.strip() or finding_id in seen:
+                raise ValueError("disposition request ids must be unique nonempty strings")
+            if proposal_turn is not None and (
+                not isinstance(proposal_turn, str) or not proposal_turn.strip()
+            ):
+                raise ValueError("proposal turn must be a nonempty string")
+            seen.add(finding_id)
+
+    def validate_dispositions(
+        self, decisions: list[FindingDisposition], lane: LaneIdentity
+    ) -> None:
+        """One authoritative correlation check for parsed and alternate executor results."""
+        expected = sorted(self.disposition_requests)
+        received = sorted((d.finding_id, d.response_to_round_id) for d in decisions)
+        if received != expected:
+            raise ValueError(
+                "exactly one disposition referencing each requested proposal turn is required"
+            )
+        allowed = {"reviewer": {"accept", "fix"}, "worker": {"fix", "rebut"}}[lane.role]
+        for decision in decisions:
+            identity = (decision.run_id, decision.round_id, decision.decided_by)
+            if identity != (self.run_id, self.round_id, lane.lane):
+                raise ValueError("disposition has forged or stale turn attribution")
+            if decision.action not in allowed:
+                raise ValueError("disposition action is not permitted for this lane")
 
 
 @dataclass(frozen=True)

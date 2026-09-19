@@ -34,6 +34,7 @@ from ai_pr_orchestrator.v3.config import (
     V3Config,
 )
 from ai_pr_orchestrator.v3.domain import (
+    FindingDisposition,
     GitHubIssueRef,
     LaneIdentity,
     ModelAssignment,
@@ -125,6 +126,18 @@ class ScriptedExecutor:
                 output_summary="",
                 changed_files=list(self.reviewer_files),
                 findings=list(findings),
+                dispositions=[
+                    FindingDisposition(
+                        finding_id=fid,
+                        action="accept",
+                        rationale="independently verified coder correction",
+                        decided_by=lane.lane,
+                        run_id=context.run_id,
+                        round_id=context.round_id,
+                        response_to_round_id=turn,
+                    )
+                    for fid, turn in context.disposition_requests
+                ],
             )
         if self.developer_sleep:
             import time
@@ -135,6 +148,17 @@ class ScriptedExecutor:
             exit_code=self.developer_exit,
             output_summary="",
             changed_files=list(self.developer_files),
+            dispositions=[
+                FindingDisposition(
+                    finding_id=fid,
+                    action="fix",
+                    rationale="fixed guard; regression test passes",
+                    decided_by=lane.lane,
+                    run_id=context.run_id,
+                    round_id=context.round_id,
+                )
+                for fid, _ in context.disposition_requests
+            ],
         )
 
 
@@ -424,8 +448,9 @@ def test_stagnation_threshold_escalates():
         safety=SafetyPolicyConfig(
             max_coder_invocations_per_run=20,
             max_total_iterations=9,
-            max_reviewer_triggers_per_run=10,
+            max_reviewer_triggers_per_run=15,
         ),
+        review_policy=ReviewPolicyConfig(max_review_rounds=5),
         escalation=EscalationPolicyConfig(stagnation_rounds_threshold=2),
     )
     gate = _gate(GateDecision(passed=False, pending_checks=(), failed_checks=("build",)))
@@ -1056,7 +1081,7 @@ def test_coder_reply_is_actually_posted_to_the_review_thread():
     assert outcome.final_phase == "done"
     thread = fake._threads["T-1"]
     assert len(thread.comments) == 1
-    assert thread.comments[0].body  # the canned coder reply reached the thread
+    assert thread.comments[0].body == "fixed guard; regression test passes"
 
 
 def test_failed_thread_reply_is_an_escalation():
@@ -1071,7 +1096,8 @@ def test_failed_thread_reply_is_an_escalation():
         raise RuntimeError("github down")
 
     setattr(fake, "reply_to_review_thread", _impl)  # noqa: B010
-    loop, _ = _foreman(fake, executor, _gate())
+    config = V3Config(safety=SafetyPolicyConfig(max_coder_invocations_per_run=2))
+    loop, _ = _foreman(fake, executor, _gate(), config)
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "escalated"
     assert "reply" in outcome.reason

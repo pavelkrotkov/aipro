@@ -1,0 +1,374 @@
+"""Real CAO HTTP -> parser -> foreman -> serialized GitHub state decisions."""
+
+import json
+from dataclasses import replace
+
+import pytest
+
+from ai_pr_orchestrator.v3.cao import session_name_for
+from ai_pr_orchestrator.v3.domain import WorkflowState
+from ai_pr_orchestrator.v3.findings import FindingRegistry
+from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop, _ForemanEscalation
+from tests.integration._harness import script_protocol
+
+
+@pytest.mark.parametrize("proposal", ["fix", "rebut"])
+def test_explicit_independent_acceptance_retains_proposal(fake_cao, foreman_harness, proposal):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop, proposal=proposal)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "done", outcome.reason
+    assert outcome.coder_invocations == 2
+    assert outcome.review_rounds == 2
+    state = queue.load_state("owner/repo#1")
+    assert state.findings == []
+    assert [a.finding_id for a in state.archived] == ["guard"]
+    assert [d.action for d in state.dispositions] == [proposal, "accept"]
+    response, acceptance = state.dispositions
+    assert response.decided_by == "developer"
+    assert acceptance.decided_by == "requirements-reviewer"
+    assert acceptance.response_to_round_id == response.round_id == "response-1"
+    assert response.rationale == "test_guard proves the premise cannot occur"
+    assert len(github.list_open_prs()) == 1
+    # Deserialization/object loss retains immutable decision identity and evidence.
+    restored = WorkflowState.from_dict(state.to_dict())
+    assert (
+        ForemanPolicyLoop._merge_dispositions(restored.dispositions, state.dispositions)
+        == state.dispositions
+    )
+    assert loop._pending_proposals(restored) == {}
+    assert loop._saved_review_round(restored) == 2
+    with pytest.raises(_ForemanEscalation, match="conflicting replay"):
+        loop._merge_dispositions(
+            restored.dispositions, [replace(response, rationale="changed evidence")]
+        )
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "[]",
+        "clean review",
+        '{"findings":[],"dispositions":[]}',
+        '{"findings":[],"dispositions":[{"finding_id":"guard","action":"accept","rationale":"proof","response_to_round_id":"response-0"}]}',
+        '{"findings":[],"dispositions":[{"finding_id":"foreign","action":"accept","rationale":"proof","response_to_round_id":"response-1"}]}',
+        '{"findings":[],"dispositions":[{"finding_id":"guard","action":"accept","rationale":"proof","response_to_round_id":"response-1","decided_by":"developer"}]}',
+    ],
+)
+def test_invalid_or_stale_acceptance_never_gates(fake_cao, foreman_harness, reply):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop, reply=reply)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "Invalid disposition output" in outcome.reason
+    state = queue.load_state("owner/repo#1")
+    assert [(f.id, f.status) for f in state.findings] == [("guard", "open")]
+    assert [d.action for d in state.dispositions] == ["rebut"]
+    assert not state.archived
+    assert not github.list_open_prs()
+
+
+def test_rejected_rebuttal_returns_actual_reason_to_coder(fake_cao, foreman_harness):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop, decision="fix")
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"  # Third coder response is missing, never clean.
+    state = queue.load_state("owner/repo#1")
+    assert [d.action for d in state.dispositions] == ["rebut", "fix"]
+    assert state.findings[0].status == "open"
+    coder = fake_cao._sessions[session_name_for(loop.run_id, "developer")]
+    assert "Independent reproduction confirms the coder evidence" in coder.submitted_messages[2]
+    assert not github.list_open_prs()
+
+
+@pytest.mark.parametrize("action", ["accept", "reply_deferred", "escalate_human"])
+def test_coder_cannot_settle_own_finding(fake_cao, foreman_harness, action):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop, proposal=action)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "Invalid disposition output" in outcome.reason
+    state = queue.load_state("owner/repo#1")
+    assert state.dispositions == []
+    assert state.findings[0].status == "open"
+    assert not github.list_open_prs()
+
+
+def test_proposal_save_failure_prevents_next_review(fake_cao, foreman_harness, monkeypatch):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+    save = queue.save_state
+
+    def fail_proposal(state, **kwargs):
+        if state.dispositions:
+            raise RuntimeError("proposal persistence unavailable")
+        return save(state, **kwargs)
+
+    monkeypatch.setattr(queue, "save_state", fail_proposal)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "proposal persistence unavailable" in outcome.reason
+    reviewer = fake_cao._sessions[session_name_for(loop.run_id, "requirements-reviewer")]
+    assert len(reviewer.submitted_messages) == 1
+    assert not github.list_open_prs()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"dispositions": []},
+        {"dispositions": [{"finding_id": "other", "action": "rebut", "rationale": "evidence"}]},
+        {"dispositions": [{"finding_id": "guard", "action": "rebut", "rationale": " "}]},
+        {"dispositions": [{"finding_id": "guard", "action": "rebut", "rationale": 7}]},
+        {
+            "dispositions": [
+                {
+                    "finding_id": "guard",
+                    "action": "rebut",
+                    "rationale": "evidence",
+                    "run_id": "forged",
+                }
+            ]
+        },
+        {"dispositions": [{"finding_id": "guard", "action": "rebut", "rationale": "evidence"}] * 2},
+    ],
+)
+def test_incomplete_or_forged_coder_response_fails_closed(fake_cao, foreman_harness, payload):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "developer"), ["initial", json.dumps(payload)]
+    )
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "Invalid disposition output" in outcome.reason
+    assert queue.load_state("owner/repo#1").dispositions == []
+    assert not github.list_open_prs()
+
+
+@pytest.mark.parametrize("origin_available", [True, False])
+def test_saved_proposal_survives_foreman_and_controller_loss(
+    fake_cao, foreman_harness, monkeypatch, origin_available
+):
+    from ai_pr_orchestrator.v3.cao import CaoSessionController
+    from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
+    from ai_pr_orchestrator.v3.domain import GitHubIssueRef
+
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+    save = queue.save_state
+
+    def crash_after_proposal(state, **kwargs):
+        save(state, **kwargs)
+        if state.dispositions:
+            raise KeyboardInterrupt("process lost after durable proposal")
+
+    monkeypatch.setattr(queue, "save_state", crash_after_proposal)
+    with pytest.raises(KeyboardInterrupt):
+        loop.run_pass()
+    monkeypatch.setattr(queue, "save_state", save)
+    state = WorkflowState.from_dict(queue.load_state("owner/repo#1").to_dict())
+    if not origin_available:
+        from ai_pr_orchestrator.v3.config import ReviewPolicyConfig
+
+        loop._cfg = replace(
+            loop._cfg,
+            review_policy=ReviewPolicyConfig(
+                reviewer_lanes=["breaker-reviewer", "architecture-reviewer"]
+            ),
+        )
+        fake_cao.set_output(
+            session_name_for(loop.run_id, "breaker-reviewer"),
+            json.dumps(
+                {
+                    "findings": [],
+                    "dispositions": [
+                        {
+                            "finding_id": "guard",
+                            "action": "accept",
+                            "rationale": "Independent fallback reproduced the evidence",
+                            "response_to_round_id": "response-1",
+                        }
+                    ],
+                }
+            ),
+        )
+    # A changed configured coder cannot reuse the saved proposal turn under another actor.
+    worker = loop._worker_lane()
+    with monkeypatch.context() as changed_config:
+        changed_config.setattr(
+            loop, "_worker_lane", lambda: replace(worker, lane="other-developer")
+        )
+        with pytest.raises(_ForemanEscalation, match="provenance"):
+            loop._pending_proposals(state)
+    original = loop._executor
+    with CaoSessionController(original._controller._config, loop._lanes) as controller:
+        executor = CaoLaneExecutor(
+            controller, loop._lanes, git=original._git, catalog=original._catalog
+        )
+        fresh = ForemanPolicyLoop(
+            queue,
+            loop._broker,
+            loop._lanes,
+            executor,
+            loop._gate,
+            loop._git,
+            loop._cfg,
+            run_id=loop.run_id,
+            worktree_root="/wt",
+            committer_name="test",
+            committer_email="test@invalid",
+        )
+        outcome = fresh._run_loop(
+            GitHubIssueRef("owner", "repo", 1),
+            state,
+            state.extras["worktree"],
+            state.extras["branch"],
+            now=None,
+        )
+    assert outcome.final_phase == "done", outcome.reason
+    assert outcome.coder_invocations == 0  # Durable proposal is reviewed directly.
+    restored = queue.load_state("owner/repo#1")
+    assert [d.action for d in restored.dispositions] == ["rebut", "accept"]
+    assert not restored.findings
+    assert len(github.list_open_prs()) == 1
+    assert (
+        len(fake_cao._sessions[session_name_for(loop.run_id, "developer")].submitted_messages) == 2
+    )
+
+
+def test_acceptance_save_failure_never_gates(fake_cao, foreman_harness, monkeypatch):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+    save = queue.save_state
+
+    def fail_acceptance(state, **kwargs):
+        if any(d.action == "accept" for d in state.dispositions):
+            raise RuntimeError("acceptance persistence unavailable")
+        return save(state, **kwargs)
+
+    monkeypatch.setattr(queue, "save_state", fail_acceptance)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    state = queue.load_state("owner/repo#1")
+    assert [d.action for d in state.dispositions] == ["rebut"]
+    assert state.findings[0].status == "open"
+    assert not state.archived
+    assert not github.list_open_prs()
+
+
+def test_mixed_proposals_preserve_partial_adjudication(fake_cao, foreman_harness):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+    findings = [
+        {"id": fid, "body": body, "severity": "major"}
+        for fid, body in [("guard", "missing guard"), ("race", "race condition")]
+    ]
+    proposals = [
+        {"finding_id": fid, "action": action, "rationale": "specific regression evidence"}
+        for fid, action in [("guard", "fix"), ("race", "rebut")]
+    ]
+    decisions = [
+        {
+            "finding_id": fid,
+            "action": action,
+            "rationale": "independent result",
+            "response_to_round_id": "response-1",
+        }
+        for fid, action in [("guard", "accept"), ("race", "fix")]
+    ]
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "developer"),
+        ["initial", json.dumps({"dispositions": proposals})],
+    )
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "requirements-reviewer"),
+        [json.dumps(findings), json.dumps({"findings": [], "dispositions": decisions})],
+    )
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    state = queue.load_state("owner/repo#1")
+    assert [(f.id, f.status) for f in state.findings] == [("race", "open")]
+    assert [f.finding_id for f in state.archived] == ["guard"]
+    assert [d.action for d in state.dispositions] == ["fix", "rebut", "accept", "fix"]
+    assert not github.list_open_prs()
+
+
+def test_rebuttal_at_round_cap_stays_open(fake_cao, foreman_harness):
+    from ai_pr_orchestrator.v3.config import ReviewPolicyConfig
+
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+    loop._cfg = replace(loop._cfg, review_policy=ReviewPolicyConfig(max_review_rounds=1))
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "review-round cap" in outcome.reason
+    state = queue.load_state("owner/repo#1")
+    assert state.findings[0].status == "open"
+    assert [d.action for d in state.dispositions] == ["rebut"]
+    assert not github.list_open_prs()
+
+
+def test_acceptance_cas_then_object_loss_replays_without_resurrection(
+    fake_cao, foreman_harness, monkeypatch
+):
+    from ai_pr_orchestrator.v3.domain import GitHubIssueRef
+    from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
+
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+    save = queue.save_state
+
+    def crash_after_acceptance(state, **kwargs):
+        save(state, **kwargs)
+        if any(d.action == "accept" for d in state.dispositions):
+            raise KeyboardInterrupt("acceptance CAS succeeded; process lost")
+
+    monkeypatch.setattr(queue, "save_state", crash_after_acceptance)
+    with pytest.raises(KeyboardInterrupt):
+        loop.run_pass()
+    fresh_queue = GitHubIssueQueue(
+        github, "owner", "repo", loop._cfg.github_queue, host_id="host-e2e"
+    )
+    fresh = ForemanPolicyLoop(
+        fresh_queue,
+        loop._broker,
+        loop._lanes,
+        loop._executor,
+        loop._gate,
+        loop._git,
+        loop._cfg,
+        run_id=loop.run_id,
+        worktree_root="/wt",
+        committer_name="test",
+        committer_email="test@invalid",
+    )
+    state = fresh_queue.load_state("owner/repo#1")
+    assert state is not None
+    assert state.findings == []
+    assert [d.action for d in state.dispositions] == ["rebut", "accept"]
+    assert [f.finding_id for f in state.archived] == ["guard"]
+    issue = GitHubIssueRef("owner", "repo", 1)
+    registry = FindingRegistry(
+        findings=list(state.findings),
+        archived=list(state.archived),
+        quarantine_unknown_head_sha=False,
+    )
+    fresh._persist_round(issue, state, "review-2", registry, [state.dispositions[-1]])
+    replayed = fresh_queue.load_state(issue.slug())
+    assert replayed is not None
+    assert replayed.dispositions == state.dispositions
+    assert replayed.archived == state.archived
+    assert replayed.findings == []
+    version = replayed.updated_at
+    with pytest.raises(_ForemanEscalation, match="conflicting replay"):
+        fresh._persist_round(
+            issue,
+            replayed,
+            "review-2",
+            registry,
+            [replace(state.dispositions[-1], rationale="different decision content")],
+        )
+    unchanged = fresh_queue.load_state(issue.slug())
+    assert unchanged is not None and unchanged.updated_at == version
+    assert not github.list_open_prs()  # Interrupted before the gate.
