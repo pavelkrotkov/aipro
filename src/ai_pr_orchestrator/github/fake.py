@@ -77,6 +77,7 @@ class FakeGitHubClient:
         self._now = now or datetime.now(UTC)
         self._page_size = page_size
         self._prs: dict[int, models.PullRequest] = {}
+        self._issue_titles: dict[int, str] = {}
         self._issue_bodies: dict[int, str] = {}
         self._next_pr_number = 1
         self._comments: dict[int, _MutableComment] = {}
@@ -103,9 +104,16 @@ class FakeGitHubClient:
         self._labels[pr.number] = list(pr.labels)
 
     def seed_issue(
-        self, number: int, labels: list[str] | None = None, *, body: str | None = None
+        self,
+        number: int,
+        labels: list[str] | None = None,
+        *,
+        body: str | None = None,
+        title: str | None = None,
     ) -> None:
         self._labels[number] = list(labels) if labels else []
+        if title is not None:
+            self._issue_titles[number] = title
         if body is not None:
             self._issue_bodies[number] = body
         # Issues and pull requests share one repo-wide number sequence. A seeded
@@ -231,6 +239,9 @@ class FakeGitHubClient:
         if list(pr.labels) != current_labels:
             return replace(pr, labels=list(current_labels))
         return pr
+
+    def get_issue_title(self, number: int) -> str | None:
+        return self._issue_titles.get(number)
 
     def get_issue_body(self, number: int) -> str | None:
         return self._issue_bodies.get(number)
