@@ -25,6 +25,11 @@ from tests.integration._fake_cao_server import FakeCAOServer
 from tests.unit.test_v3_git_ops import FakeGitOperations
 
 WRAPPER = Path(__file__).resolve().parents[2] / "scripts" / "aipro-hermes"
+PUSH_GUARD = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "remote.origin.pushurl",
+    "GIT_CONFIG_VALUE_0": "aipro-no-push://authoritative-branch",
+}
 
 
 def _launch_wrapper(tmp_path: Path, env: dict[str, str]) -> dict:
@@ -79,6 +84,7 @@ def test_leased_model_reaches_hermes_without_losing_session_env(tmp_path, lane_n
         session = cao._sessions[result.session.session_id]
         assert session.env_vars == {
             **defaults,
+            **PUSH_GUARD,
             "AIPRO_MODEL": entry.descriptor,
             "AIPRO_PROVIDER": entry.provider,
         }
@@ -181,7 +187,7 @@ def test_unleased_session_preserves_base_env_and_wrapper_arguments(tmp_path):
         result = executor.execute(
             lanes.get("developer"), "task", str(tmp_path), LaneExecutionContext("run")
         )
-        assert cao._sessions[result.session.session_id].env_vars == env
+        assert cao._sessions[result.session.session_id].env_vars == {**env, **PUSH_GUARD}
     assert _launch_wrapper(tmp_path, env) == {
         "argv": ["chat", "--yolo", "--source", "cao"],
         "home": env["HERMES_HOME"],
