@@ -1365,3 +1365,85 @@ def test_pr_discovery_excludes_other_repository_or_base(mismatch):
     assert len(fake.list_open_prs()) == 2
     state = queue.load_state(ISSUE.slug())
     assert state is not None and state.extras["pr_number"] == matching.number
+
+
+@pytest.mark.parametrize("retained_path", [True, False])
+@pytest.mark.parametrize("settled", ["green", "pending", "failed"])
+def test_cold_ci_resume_needs_only_recorded_pr(monkeypatch, tmp_path, retained_path, settled):
+    fake = _ready_fake()
+    first, queue = _foreman(
+        fake,
+        ScriptedExecutor(),
+        _gate(GateDecision(passed=False, pending_checks=("build",), failed_checks=())),
+    )
+    assert first.run_pass()[0].final_phase == "ci_gating"
+    state = queue.load_state(ISSUE.slug())
+    extras = {k: v for k, v in state.extras.items() if k != "worktree"}
+    if retained_path:
+        extras["worktree"] = str(tmp_path / "other-host-checkout")
+    queue.save_state(replace(state, extras=extras), expected_updated_at=state.updated_at)
+    original = fake.get_pr(extras["pr_number"])
+    fake._prs[original.number] = replace(original, head_sha="live-pr-head")
+    decision = GateDecision(
+        passed=settled == "green",
+        pending_checks=("build",) if settled == "pending" else (),
+        failed_checks=("build",) if settled == "failed" else (),
+    )
+    gate = RecordingGate([decision])
+    executor = ScriptedExecutor()
+    git = RecordingGit()
+    resumed, resumed_queue = _foreman(fake, executor, gate, git=git)
+    resumed_queue._host_id = "host-B"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("CI-only resume must not materialize, commit, push, or recreate a PR")
+
+    for method in ("default_branch", "create_branch", "create_worktree", "commit", "push"):
+        monkeypatch.setattr(git, method, forbidden)
+    monkeypatch.setattr(fake, "create_pr", forbidden)
+    monkeypatch.setattr(fake, "list_open_prs", forbidden)
+    outcome = resumed.run_pass()[0]
+    expected = {"green": "done", "pending": "ci_gating", "failed": "escalated"}
+    assert outcome.final_phase == expected[settled]
+    assert gate.seen == [(original.number, "live-pr-head")]
+    assert executor.calls == []
+    persisted = resumed_queue.load_state(ISSUE.slug())
+    assert persisted.extras["pr_number"] == original.number
+    assert persisted.extras["host_id"] == "host-B"
+
+
+@pytest.mark.parametrize("status", [404, 403])
+def test_cold_ci_resume_missing_pr_escalates_only_on_definite_404(monkeypatch, status):
+    from ai_pr_orchestrator.github.client import GitHubClient
+    from ai_pr_orchestrator.v3.foreman import PRReconciliationError
+
+    fake = _ready_fake()
+    first, _ = _foreman(
+        fake,
+        ScriptedExecutor(),
+        _gate(GateDecision(passed=False, pending_checks=("build",), failed_checks=())),
+    )
+    first.run_pass()
+    gate = RecordingGate([])
+    executor = ScriptedExecutor()
+    resumed, queue = _foreman(fake, executor, gate)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("known PR lookup must never discover or create another PR")
+
+    monkeypatch.setattr(fake, "create_pr", forbidden)
+    monkeypatch.setattr(fake, "list_open_prs", forbidden)
+    transport = httpx.MockTransport(lambda request: httpx.Response(status, json={}))
+    with httpx.Client(transport=transport) as http:
+        client = GitHubClient("test", "owner", "repo", http_client=http)
+        monkeypatch.setattr(fake, "get_pr", client.get_pr)
+        if status == 404:
+            outcome = resumed.run_pass()[0]
+            assert outcome.final_phase == "escalated"
+            assert "could not be found" in outcome.reason
+        else:
+            with pytest.raises(PRReconciliationError):
+                resumed.run_pass()
+    assert gate.seen == []
+    assert executor.calls == []
+    assert queue.load_state(ISSUE.slug()).phase == ("escalated" if status == 404 else "ci_gating")

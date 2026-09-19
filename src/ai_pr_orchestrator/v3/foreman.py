@@ -39,7 +39,10 @@ import threading
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol, cast
+
+import httpx
 
 from ai_pr_orchestrator.github.protocol import GitHubClient
 
@@ -318,7 +321,7 @@ class ForemanPolicyLoop:
 
         worktree: str | None = state.extras.get("worktree")
         try:
-            if not worktree:
+            if not worktree and not resume_at_gate:
                 base = self._git.default_branch()
                 self._git.create_branch(branch, base)
                 worktree = self._git.create_worktree(
@@ -335,7 +338,7 @@ class ForemanPolicyLoop:
         self,
         issue: GitHubIssueRef,
         state: WorkflowState,
-        worktree: str,
+        worktree: str | None,
         branch: str,
         *,
         now: datetime | None,
@@ -350,6 +353,7 @@ class ForemanPolicyLoop:
         self._prompt_tokens = 0
         fix_findings: tuple[ReviewerFinding, ...] = ()
         result: LaneResult | None = None
+        head_sha: str | None = None
 
         while True:
             if resume_at_gate:
@@ -362,6 +366,8 @@ class ForemanPolicyLoop:
                 result = None
                 resume_at_gate = False
             else:
+                if worktree is None:
+                    raise _ForemanEscalation("coding requires a local worktree")
                 # --- Coding ---------------------------------------------------
                 # The cap is checked BEFORE launching: once it is reached with
                 # open findings, no further coder invocation may start
@@ -441,27 +447,23 @@ class ForemanPolicyLoop:
             # --- CI gate ------------------------------------------------------
             state = self._transition(issue, state, "ci_gating", now=now)
             state = self._heartbeat(issue, state, now=now)
-            # PR #73 review thread 16 / issue #85: when resuming at the
-            # gate (no fresh coding work), the previous host's local
-            # worktree may not exist on this host. Skip the
-            # commit/push step and use the recorded PR head directly.
             if result is not None:
-                sha = self._commit_and_push(
+                assert worktree is not None  # Coding requires a checkout above.
+                head_sha = self._commit_and_push(
                     issue,
                     state,
                     worktree,
                     branch,
                     changes_pending=bool(result.changed_files),
                 )
-                self._head_sha = sha
-            else:
-                # Reuse the previously recorded head; if none is recorded,
-                # fall back to ``None`` and let the gate decide (a missing
-                # head will surface as a typed gate failure rather than a
-                # worktree-not-found crash).
-                self._head_sha = self._head_sha or state.extras.get("head_sha")
             try:
-                pr = self._ensure_pr(issue, state, branch, worktree)
+                pr = self._ensure_pr(issue, state, branch, head_sha)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404 and state.extras.get("pr_number") is not None:
+                    raise _ForemanEscalation(
+                        f"recorded PR #{state.extras['pr_number']} could not be found"
+                    ) from exc
+                raise PRReconciliationError(f"PR reconciliation required: {exc}") from exc
             except Exception as exc:
                 raise PRReconciliationError(f"PR reconciliation required: {exc}") from exc
             # _ensure_pr may persist the recorded PR number (advancing the CAS
@@ -516,6 +518,10 @@ class ForemanPolicyLoop:
                     review_rounds=review_rounds,
                     coder_invocations=coder_invocations,
                     gate=decision,
+                )
+            if result is None and (worktree is None or not Path(worktree).is_dir()):
+                return self._escalate(
+                    issue, state, "CI remediation requires a local worktree", now=now
                 )
             # Real CI failures become findings for the next coding round —
             # unless the review budget is spent and reviews keep reporting
@@ -1083,7 +1089,7 @@ class ForemanPolicyLoop:
         issue: GitHubIssueRef,
         state: WorkflowState,
         branch: str,
-        worktree: str,
+        head_sha: str | None,
     ) -> GitHubPullRequestRef:
         """Refresh a known PR or reconcile by branch before creating one.
 
@@ -1119,7 +1125,7 @@ class ForemanPolicyLoop:
             owner=issue.owner,
             repo=issue.repo,
             number=number,
-            head_sha=self._head_sha or f"head-{number}",
+            head_sha=head_sha or f"head-{number}",
         )
 
     def _discover_open_pr(self, client, branch: str):
