@@ -17,13 +17,13 @@ from __future__ import annotations
 import pytest
 
 from ai_pr_orchestrator.v3.cao import session_name_for
-from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
-from tests.integration._harness import developer_output, developer_session_name
+from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from tests.integration._fake_cao_server import (
     STATUS_IDLE,
     STATUS_PROCESSING,
     STATUS_STARTED,
 )
+from tests.integration._harness import developer_output, developer_session_name
 
 #: Status sequence the developer's CAO session walks through. The
 #: controller's idle-settle rule maps it onto ``completed``.
