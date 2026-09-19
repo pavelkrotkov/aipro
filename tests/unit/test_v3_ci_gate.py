@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+import respx
+
+from ai_pr_orchestrator.github.client import GitHubClient
 from ai_pr_orchestrator.github.fake import FakeGitHubClient
 from ai_pr_orchestrator.v3.ci_gate import CIPRGateImpl
 from ai_pr_orchestrator.v3.config import CIPolicyConfig
@@ -130,3 +134,78 @@ def test_commit_statuses_classify_via_status_and_conclusion_fields():
     decision = CIPRGateImpl(fake).evaluate(_issue(), _pr())
     assert not decision.passed
     assert decision.failed_checks == ("ci/lint",)
+
+
+@pytest.mark.parametrize(
+    ("conclusion", "passed"),
+    [
+        ("success", True),
+        ("neutral", True),
+        ("skipped", True),
+        ("failure", False),
+        ("timed_out", False),
+        ("cancelled", False),
+        ("action_required", False),
+        ("stale", False),
+        ("unknown-conclusion", False),
+        (None, False),
+        ("", False),
+        ([], False),
+    ],
+)
+@respx.mock
+def test_check_conclusions_through_real_github_client(conclusion, passed):
+    base = f"https://api.github.com/repos/owner/repo/commits/{SHA}"
+    respx.get(f"{base}/check-runs").respond(
+        200,
+        json={
+            "check_runs": [
+                {"id": 1, "name": "build", "status": "completed", "conclusion": conclusion}
+            ]
+        },
+    )
+    respx.get(f"{base}/statuses").respond(200, json=[])
+    with GitHubClient(token="test", owner="owner", repo="repo") as client:
+        decision = CIPRGateImpl(client, CIPolicyConfig(required_checks=["build"])).evaluate(
+            _issue(), _pr()
+        )
+    assert decision.passed is passed
+    assert decision.failed_checks == (() if passed else ("build",))
+    assert decision.pending_checks == ()
+
+
+@pytest.mark.parametrize(
+    ("state", "passed", "failed", "pending"),
+    [
+        ("success", True, (), ()),
+        ("failure", False, ("build",), ()),
+        ("error", False, ("build",), ()),
+        ("pending", False, (), ("build",)),
+        ("unknown-state", False, (), ("build",)),
+        (None, False, (), ("build",)),
+    ],
+)
+@respx.mock
+def test_legacy_status_normalization_remains_fail_closed(state, passed, failed, pending):
+    base = f"https://api.github.com/repos/owner/repo/commits/{SHA}"
+    respx.get(f"{base}/check-runs").respond(200, json={"check_runs": []})
+    respx.get(f"{base}/statuses").respond(200, json=[{"context": "build", "state": state}])
+    with GitHubClient(token="test", owner="owner", repo="repo") as client:
+        decision = CIPRGateImpl(client, CIPolicyConfig(required_checks=["build"])).evaluate(
+            _issue(), _pr()
+        )
+    assert decision.passed is passed
+    assert decision.failed_checks == failed
+    assert decision.pending_checks == pending
+
+
+@pytest.mark.parametrize("conclusion", ["unknown-conclusion", None, "", "neutral", "skipped"])
+def test_malformed_completed_adapted_status_cannot_pass(conclusion):
+    fake = FakeGitHubClient()
+    fake.seed_commit_status(SHA, "build", "completed", conclusion)
+    decision = CIPRGateImpl(fake, CIPolicyConfig(required_checks=["build"])).evaluate(
+        _issue(), _pr()
+    )
+    assert not decision.passed
+    assert decision.failed_checks == ("build",)
+    assert decision.pending_checks == ()
