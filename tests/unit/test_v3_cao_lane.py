@@ -14,6 +14,7 @@ The tests run in plain CI: no real ``cao-server`` required.
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -274,46 +275,75 @@ def test_execute_returns_failure_on_terminal_error(fake_cao: FakeCAOServer, tmp_
 # --- Executor budget ---------------------------------------------------
 
 
-def test_execute_raises_after_poll_budget_exhausted(fake_cao: FakeCAOServer, tmp_path):
-    """A session that never reaches terminal state within the executor's
-    ``max_poll_seconds`` budget raises :class:`TimeoutError` and
-    terminates the session so it does not leak."""
-    run_id = f"it-{int(time.time() * 1000)}"
-    name = session_name_for(run_id, DEVELOPER_LANE)
-    # A sequence that never reaches terminal: the controller keeps
-    # reporting "processing" forever (in practice the controller's
-    # own session_timeout_seconds would also fire, but here we set
-    # that high enough to exercise the executor's own budget).
-    fake_cao.set_status_sequence(name, [STATUS_PROCESSING] * 1000)
+@pytest.fixture
+def accelerated_time(monkeypatch):
+    """Advance both executor and controller clocks without wall-clock waits."""
+    elapsed = [0.0]
+    started = datetime.now(UTC)
 
-    controller = CaoSessionController(
-        CAOControlPlaneConfig(
-            base_url=fake_cao.url,
-            session_timeout_seconds=60,
-            request_timeout_seconds=5,
-        ),
-        LaneRegistry.default(),
-    )
-    executor = CaoLaneExecutor(
-        controller,
-        LaneRegistry.default(),
-        poll_interval_seconds=0.01,
-        max_poll_seconds=0.05,  # budget tighter than the fake's sequence
-    )
+    class ClockDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (started + timedelta(seconds=elapsed[0])).astimezone(tz)
 
-    with pytest.raises(TimeoutError):
-        executor.execute(
-            _lane(),
-            f"echo {MARKER}",
-            str(tmp_path),
-            _context(run_id),
+    def advance(_seconds):
+        elapsed[0] += 200.0
+
+    monkeypatch.setattr(time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(time, "sleep", advance)
+    monkeypatch.setattr("ai_pr_orchestrator.v3.cao.datetime", ClockDateTime)
+    return elapsed
+
+
+def test_execute_allows_work_beyond_old_600_second_budget(fake_cao, tmp_path, accelerated_time):
+    name = session_name_for("long-work", DEVELOPER_LANE)
+    fake_cao.set_output(name, MARKER)
+    fake_cao.set_status_sequence(name, [STATUS_PROCESSING] * 5 + [STATUS_IDLE] * 3)
+    with CaoSessionController(CAOControlPlaneConfig(base_url=fake_cao.url)) as controller:
+        result = CaoLaneExecutor(controller, LaneRegistry.default()).execute(
+            _lane(), "long task", str(tmp_path), _context("long-work")
         )
+    assert 600 < accelerated_time[0] < 3600
+    assert result.exit_code == 0
+    assert result.output_summary == MARKER
+    assert not fake_cao._sessions[name].deleted
 
-    # The session was terminated by the executor's cleanup path.
-    state = fake_cao._sessions.get(name)
-    assert state is not None and state.deleted, (
-        "executor must terminate the half-finished session on TimeoutError"
-    )
+
+@pytest.mark.parametrize("budget", [0.05, 60, float("nan"), float("inf"), -float("inf")])
+def test_executor_rejects_invalid_override(fake_cao, budget):
+    with (
+        CaoSessionController(_config(fake_cao.url)) as controller,
+        pytest.raises(ValueError, match="exceed session_timeout_seconds"),
+    ):
+        CaoLaneExecutor(controller, LaneRegistry.default(), max_poll_seconds=budget)
+    assert not fake_cao._sessions
+
+
+def test_controller_timeout_remains_authoritative(fake_cao, tmp_path, accelerated_time):
+    name = session_name_for("expired-work", DEVELOPER_LANE)
+    fake_cao.set_status_sequence(name, [STATUS_PROCESSING] * 20)
+    with CaoSessionController(_config(fake_cao.url)) as controller:
+        result = CaoLaneExecutor(controller, LaneRegistry.default()).execute(
+            _lane(), "task", str(tmp_path), _context("expired-work")
+        )
+    assert result.exit_code != 0
+    assert "session exceeded 60s" in result.output_summary
+    assert fake_cao._sessions[name].deleted
+
+
+@pytest.mark.parametrize("override", [None, 500.0])
+def test_execute_raises_when_observer_never_finishes(
+    fake_cao, tmp_path, accelerated_time, monkeypatch, override
+):
+    name = session_name_for("stuck-observer", DEVELOPER_LANE)
+    with CaoSessionController(_config(fake_cao.url)) as controller:
+        # Deliberately break only the observation boundary to exercise the guard.
+        monkeypatch.setattr(controller, "poll_session", lambda _handle: None)
+        executor = CaoLaneExecutor(controller, LaneRegistry.default(), max_poll_seconds=override)
+        with pytest.raises(TimeoutError):
+            executor.execute(_lane(), "task", str(tmp_path), _context("stuck-observer"))
+    assert accelerated_time[0] >= (90 if override is None else override)
+    assert fake_cao._sessions[name].deleted
 
 
 # --- Lane registry resolution ------------------------------------------

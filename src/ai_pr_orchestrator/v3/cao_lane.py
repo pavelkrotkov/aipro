@@ -20,7 +20,7 @@ Three properties are load-bearing:
   can classify it (transient vs permanent).
 - **The poll loop honors the controller's own idle-settle and timeout
   rules**: this module never invents its own timeout; it just calls
-  ``poll_session`` in a loop with a small wall-clock budget and reports
+  ``poll_session`` in a loop with a derived safety budget and reports
   the controller's normalized lifecycle. The controller already maps
   ``observed terminal-status`` onto ``LaneResult.exit_code`` (0 on
   completed, 1 otherwise).
@@ -29,6 +29,7 @@ Three properties are load-bearing:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import isfinite
 
 from .cao import CaoSessionController, SessionBusyError
 from .catalog import ModelCatalog
@@ -48,9 +49,8 @@ class CaoLaneExecutor:
     Parameters
     ----------
     controller:
-        A :class:`CaoSessionController` (or anything that satisfies the
-        :class:`~ai_pr_orchestrator.v3.interfaces.CAOSessionController`
-        Protocol). The executor never owns the controller's lifecycle: the
+        A :class:`CaoSessionController`, including its work-submission and
+        turn-context operations. The executor never owns its lifecycle: the
         caller is responsible for opening and closing it.
     lane_registry:
         The :class:`LaneRegistry` that owns the ``lane -> profile``
@@ -70,7 +70,9 @@ class CaoLaneExecutor:
         own ``session_timeout_seconds`` is the authoritative cap on the
         session's life; this budget is the executor's own safety net to
         avoid an infinite poll loop if the controller's idle-settle
-        never trips. The controller's timeout always fires first.
+        never trips. Defaults to the controller timeout plus 30 seconds;
+        explicit overrides must exceed the controller timeout. This cannot
+        interrupt a blocked HTTP call, which has its own request timeout.
     """
 
     def __init__(
@@ -81,14 +83,17 @@ class CaoLaneExecutor:
         catalog: ModelCatalog | None = None,
         env: Mapping[str, str] | None = None,
         poll_interval_seconds: float = 0.05,
-        max_poll_seconds: float = 600.0,
+        max_poll_seconds: float | None = None,
     ) -> None:
         self._controller = controller
         self._lanes = lane_registry
         self._catalog = catalog or ModelCatalog()
         self._env = dict(env or {})
         self._poll_interval = poll_interval_seconds
-        self._max_poll = max_poll_seconds
+        timeout = controller.session_timeout_seconds
+        self._max_poll = timeout + 30.0 if max_poll_seconds is None else max_poll_seconds
+        if not isfinite(self._max_poll) or self._max_poll <= timeout:
+            raise ValueError("max_poll_seconds must be finite and exceed session_timeout_seconds")
 
     def _session_env(self, lease: ModelLease | None) -> dict[str, str]:
         env = dict(self._env)
@@ -162,7 +167,6 @@ class CaoLaneExecutor:
                         dispositions=list(result.dispositions),
                     )
                 if time.monotonic() >= deadline:
-                    self._controller.terminate_session(handle)
                     raise TimeoutError(
                         f"CaoLaneExecutor exceeded its {self._max_poll:.0f}s poll "
                         f"budget waiting for session {handle.session_id!r} on "
