@@ -101,7 +101,13 @@ class GitHubClient:
         head_data = data.get("head") or {}
         base_data = data.get("base") or {}
         head_repo = head_data.get("repo") or {}
-        is_fork = bool(head_repo.get("fork", False))
+        # Fork ancestry does not identify a cross-repository PR: the target
+        # repository itself may be a fork with ordinary same-repository branches.
+        head_full_name = head_repo.get("full_name")
+        is_fork = (
+            not head_full_name
+            or head_full_name.casefold() != f"{self._owner}/{self._repo}".casefold()
+        )
         head_sha = head_data.get("sha") or ""
         # Fetch changed files for safety checks (e.g. disallow_workflow_file_changes).
         # The runner refetches the PR on every transition/poll iteration, but the
@@ -142,9 +148,11 @@ class GitHubClient:
         return data.get("body")
 
     def create_pr(self, title: str, body: str, head: str, base: str) -> models.PullRequest:
+        # An uncertain POST may already have created the PR; reconcile before retrying.
         data = self._post(
             f"/repos/{self._owner}/{self._repo}/pulls",
             json={"title": title, "body": body, "head": head, "base": base},
+            max_attempts=1,
         )
         if data is None:
             raise GitHubClientError("create_pr returned no payload (dry-run client?)")
@@ -409,11 +417,11 @@ class GitHubClient:
     def _get(self, path: str) -> dict[str, Any]:
         return self._request("GET", path).json()
 
-    def _post(self, path: str, *, json: Any) -> Any:
+    def _post(self, path: str, *, json: Any, max_attempts: int = _MAX_RETRIES) -> Any:
         if self._dry_run:
             logger.info("DRY-RUN: would POST %s", path)
             return None
-        return self._request("POST", path, json=json).json()
+        return self._request("POST", path, json=json, max_attempts=max_attempts).json()
 
     def _patch(self, path: str, *, json: Any) -> Any:
         if self._dry_run:
@@ -468,26 +476,27 @@ class GitHubClient:
         *,
         json: Any = None,
         absolute_url: bool = False,
+        max_attempts: int = _MAX_RETRIES,
     ) -> httpx.Response:
         full_url = url if absolute_url else f"{self._base_url}{url}"
 
-        for attempt in range(_MAX_RETRIES):
+        for attempt in range(max_attempts):
             try:
                 response = self._client.request(method, full_url, json=json)
             except httpx.RequestError as exc:
-                if attempt < _MAX_RETRIES - 1:
+                if attempt < max_attempts - 1:
                     wait = _INITIAL_BACKOFF * (2**attempt)
                     logger.warning(
                         "Network error (%s), retrying in %.1fs (attempt %d/%d)",
                         exc,
                         wait,
                         attempt + 1,
-                        _MAX_RETRIES,
+                        max_attempts,
                     )
                     time.sleep(wait)
                     continue
                 raise GitHubClientError(
-                    f"Network error after {_MAX_RETRIES} retries: {exc}"
+                    f"Network error after {max_attempts} attempts: {exc}"
                 ) from exc
 
             logger.debug(
@@ -501,25 +510,27 @@ class GitHubClient:
                 response.status_code == 403 and _is_rate_limited(response)
             ):
                 wait = _retry_wait(response, attempt)
-                if attempt < _MAX_RETRIES - 1:
+                if attempt < max_attempts - 1:
                     logger.warning(
                         "Transient error (%d), retrying in %.1fs (attempt %d/%d)",
                         response.status_code,
                         wait,
                         attempt + 1,
-                        _MAX_RETRIES,
+                        max_attempts,
                     )
                     time.sleep(wait)
                     continue
                 raise GitHubClientError(
-                    f"Request failed after {_MAX_RETRIES} retries: "
+                    f"Request failed after {max_attempts} attempts: "
                     f"{method} {full_url} -> {response.status_code}"
                 )
 
             response.raise_for_status()
             return response
 
-        raise GitHubClientError(f"Request failed after {_MAX_RETRIES} retries: {method} {full_url}")
+        raise GitHubClientError(
+            f"Request failed after {max_attempts} attempts: {method} {full_url}"
+        )
 
 
 def _parse_comment(data: dict[str, Any]) -> models.Comment:
