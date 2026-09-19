@@ -21,6 +21,8 @@ import pytest
 from ai_pr_orchestrator.v3.cao import (
     CAOControlPlaneConfig,
     CaoSessionController,
+    CaoTransportError,
+    SessionBusyError,
     session_name_for,
 )
 from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
@@ -106,22 +108,81 @@ def test_execute_returns_lane_result_on_completed_session(fake_cao: FakeCAOServe
     # The controller's final_output returns the marker; the executor
     # copies it into LaneResult.output_summary.
     assert MARKER in handle.output_summary
+    state = fake_cao._sessions[name]
+    assert state.initial_message is None
+    assert state.submitted_messages == [f"Reply with exactly: {MARKER}"]
 
 
-def test_execute_adopts_existing_session_by_name(fake_cao: FakeCAOServer, tmp_path):
-    """A pre-existing CAO session under the deterministic name is adopted,
-    not duplicated, on a second ``execute`` for the same run/lane."""
-    run_id = f"it-{int(time.time() * 1000)}"
+@pytest.mark.parametrize("restart", [False, True])
+def test_execute_adopts_existing_session_by_name(fake_cao: FakeCAOServer, tmp_path, restart):
+    """Retained and restarted controllers deliver the new prompt exactly once."""
+    run_id = "follow-up"
     name = session_name_for(run_id, DEVELOPER_LANE)
-    fake_cao.set_output(name, MARKER)
+    registry = LaneRegistry.default()
+    with CaoSessionController(_config(fake_cao.url), registry) as controller:
+        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        executor.execute(_lane(), "first task", str(tmp_path), _context(run_id))
+        if restart:
+            with CaoSessionController(_config(fake_cao.url), registry) as restarted:
+                executor = CaoLaneExecutor(restarted, registry, poll_interval_seconds=0.01)
+                result = executor.execute(
+                    _lane(), "follow-up task", str(tmp_path), _context(run_id)
+                )
+        else:
+            result = executor.execute(_lane(), "follow-up task", str(tmp_path), _context(run_id))
 
-    controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
-    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+    assert result.exit_code == 0
+    assert len(fake_cao._sessions) == 1
+    assert fake_cao._sessions[name].submitted_messages == ["first task", "follow-up task"]
 
-    executor.execute(_lane(), f"Reply with exactly: {MARKER}", str(tmp_path), _context(run_id))
-    executor.execute(_lane(), f"Reply with exactly: {MARKER}", str(tmp_path), _context(run_id))
 
-    assert len(fake_cao._sessions) == 1, "second execute must adopt, not create a twin"
+def test_execute_preserves_busy_adopted_session(fake_cao: FakeCAOServer, tmp_path):
+    """Rejected follow-up input must not terminate an earlier in-flight turn."""
+    run_id = "busy-follow-up"
+    name = session_name_for(run_id, DEVELOPER_LANE)
+    registry = LaneRegistry.default()
+    fake_cao.set_status_sequence(name, [STATUS_PROCESSING])
+    with CaoSessionController(_config(fake_cao.url), registry) as controller:
+        handle = controller.start_session(_spec(run_id, str(tmp_path), "first task"))
+        controller.submit_work(handle, "first task")
+        state = fake_cao._sessions[name]
+        fake_cao.add_fault(
+            FaultSpec(
+                method="POST",
+                path_prefix=f"/terminals/{state.terminal_id}/input",
+                status_code=409,
+            )
+        )
+        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        with pytest.raises(SessionBusyError):
+            executor.execute(_lane(), "follow-up task", str(tmp_path), _context(run_id))
+
+        assert controller.observe(handle).state == "running"
+    assert state.submitted_messages == ["first task"]
+    assert not state.deleted
+
+
+def test_execute_surfaces_uncertain_followup_submission(fake_cao: FakeCAOServer, tmp_path):
+    """A dropped submission response cannot return the previous successful result."""
+    run_id = "uncertain-follow-up"
+    name = session_name_for(run_id, DEVELOPER_LANE)
+    registry = LaneRegistry.default()
+    with CaoSessionController(_config(fake_cao.url), registry) as controller:
+        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        executor.execute(_lane(), "first task", str(tmp_path), _context(run_id))
+        state = fake_cao._sessions[name]
+        fake_cao.add_fault(
+            FaultSpec(
+                method="POST",
+                path_prefix=f"/terminals/{state.terminal_id}/input",
+                transport_reset=True,
+            )
+        )
+        with pytest.raises(CaoTransportError):
+            executor.execute(_lane(), "follow-up task", str(tmp_path), _context(run_id))
+
+    assert state.submitted_messages == ["first task"]
+    assert state.deleted
 
 
 def test_execute_clears_previous_idle_evidence_on_new_work(fake_cao: FakeCAOServer, tmp_path):

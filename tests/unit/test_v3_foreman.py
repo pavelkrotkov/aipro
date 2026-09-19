@@ -7,14 +7,23 @@ the lane executor, broker, gate, and git ops are faked.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, cast
 
+import httpx
 import pytest
 
 from ai_pr_orchestrator.github.fake import FakeGitHubClient
 from ai_pr_orchestrator.v3.broker import BrokerDecision
+from ai_pr_orchestrator.v3.cao import (
+    CAOControlPlaneConfig,
+    CaoSessionController,
+    SessionBusyError,
+    session_name_for,
+)
+from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
 from ai_pr_orchestrator.v3.config import (
     EscalationPolicyConfig,
     HermesLanesConfig,
@@ -34,13 +43,16 @@ from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop, ForemanQueue, _Fore
 from ai_pr_orchestrator.v3.interfaces import (
     GateDecision,
     LaneExecutionContext,
+    LaneExecutor,
     LaneResult,
     ModelLease,
     SessionHandle,
+    SessionSpec,
     StateConflictError,
 )
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
+from tests.integration._fake_cao_server import STATUS_PROCESSING, FakeCAOServer, FaultSpec
 
 ISSUE = GitHubIssueRef(owner="owner", repo="repo", number=1)
 NOW = datetime(2026, 8, 29, tzinfo=UTC)
@@ -188,7 +200,7 @@ def _gate(decision: GateDecision | None = None) -> StaticGate:
 
 def _foreman(
     fake: FakeGitHubClient,
-    executor: ScriptedExecutor,
+    executor: LaneExecutor,
     gate: Any,
     config: V3Config | None = None,
     git: Any = None,
@@ -1060,3 +1072,87 @@ def test_cleanup_read_failure_retains_worktree_and_continues_pass(monkeypatch, c
     assert git.cleanups == ["/wt/issue-2"]
     assert "owner/repo#1" in caplog.text
     assert "cleanup verification unavailable" in caplog.text
+
+
+def test_busy_cao_submission_preserves_active_run_despite_heartbeat_failure(monkeypatch):
+    registry = LaneRegistry.default()
+    lane = registry.get("developer")
+    git = RecordingGit()
+    name = session_name_for("run-1", lane.lane)
+    with FakeCAOServer() as cao, httpx.Client(base_url=cao.url) as client:
+        cao.set_status_sequence(name, [STATUS_PROCESSING])
+        with CaoSessionController(
+            CAOControlPlaneConfig(base_url=cao.url), registry, client=client
+        ) as controller:
+            handle = controller.start_session(
+                SessionSpec(
+                    lane=lane,
+                    run_id="run-1",
+                    workdir="/wt/issue-1",
+                    env={},
+                    context=LaneExecutionContext(run_id="run-1"),
+                    model_lease=ModelLease(
+                        lease_id="previous",
+                        assignment=ModelAssignment(lane=lane.lane, model_ref="ref-developer"),
+                    ),
+                )
+            )
+            controller.submit_work(handle, "earlier in-flight task")
+            session = cao._sessions[name]
+            cao.add_fault(
+                FaultSpec(
+                    method="POST",
+                    path_prefix=f"/terminals/{session.terminal_id}/input",
+                    status_code=409,
+                )
+            )
+            executor = CaoLaneExecutor(controller, registry)
+            cfg = V3Config()
+            cfg = replace(cfg, github_queue=replace(cfg.github_queue, lease_seconds=0.15))
+            loop, queue = _foreman(_ready_fake(), executor, _gate(), config=cfg, git=git)
+            before_submission = []
+            heartbeat_failed = threading.Event()
+            heartbeat = queue.heartbeat
+
+            def fail_background_heartbeat(state, **kwargs):
+                if threading.current_thread().name == "foreman-lease-heartbeat":
+                    heartbeat_failed.set()
+                    raise RuntimeError("heartbeat network outage")
+                return heartbeat(state, **kwargs)
+
+            monkeypatch.setattr(queue, "heartbeat", fail_background_heartbeat)
+
+            def capture_state(request):
+                if request.url.path.endswith("/input"):
+                    assert heartbeat_failed.wait(2), "background heartbeat must fail before HTTP409"
+                    before_submission.append(queue.load_state(ISSUE.slug()))
+
+            client.event_hooks["request"].append(capture_state)
+            with pytest.raises(SessionBusyError):
+                loop.run_pass()
+
+            assert controller.observe(handle).state == "running"
+            assert session.submitted_messages == ["earlier in-flight task"]
+            assert queue.load_state(ISSUE.slug()) == before_submission[0]
+    assert before_submission[0].phase == "coding"
+    assert before_submission[0].extras["host_id"] == "host-A"
+    assert git.worktrees == {"/wt/issue-1": "aipro-issue-1"}
+
+
+def test_successful_lane_cannot_hide_failed_heartbeat(monkeypatch):
+    cfg = V3Config()
+    cfg = replace(cfg, github_queue=replace(cfg.github_queue, lease_seconds=0.15))
+    loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), config=cfg)
+    failed = threading.Event()
+
+    def fail_heartbeat(state):
+        failed.set()
+        raise RuntimeError("heartbeat network outage")
+
+    monkeypatch.setattr(queue, "heartbeat", fail_heartbeat)
+    state = WorkflowState(work_item_id=ISSUE.slug(), run_id="run-1", phase="coding")
+    with (
+        pytest.raises(_ForemanEscalation, match="claim lease heartbeat failed"),
+        loop._lease_heartbeat(state),
+    ):
+        assert failed.wait(2)
