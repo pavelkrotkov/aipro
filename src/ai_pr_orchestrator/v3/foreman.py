@@ -337,7 +337,8 @@ class ForemanPolicyLoop:
                 worktree = self._git.create_worktree(
                     f"{self._worktree_root}/issue-{issue.number}", branch
                 )
-                state = self._persist_resources(issue, state, branch=branch, worktree=worktree)
+            if worktree and not resume_at_gate:
+                state = self._verify_checkout(issue, state, branch, worktree)
             return self._run_loop(
                 issue, state, worktree, branch, now=now, resume_at_gate=resume_at_gate
             )
@@ -423,6 +424,7 @@ class ForemanPolicyLoop:
                     worktree,
                     branch,
                 )
+                state = self._persist_resources(issue, state, branch=branch, worktree=worktree)
             try:
                 pr = self._ensure_pr(issue, state, branch, head_sha)
             except httpx.HTTPStatusError as exc:
@@ -591,12 +593,21 @@ class ForemanPolicyLoop:
                 self._worker_lane(),
                 worktree,
                 state,
-                self._coder_prompt(issue, findings, worktree, state.dispositions),
+                self._coder_prompt(issue, findings, worktree, state.dispositions, state),
                 requests,
+                issue=issue,
             )
+            state = self._load(issue, state)
             if result.exit_code == 0:
-                # The background heartbeat may have advanced the CAS version.
-                return self._load(issue, state), result, invocations
+                violation = self._developer_result_violation(state, worktree, result)
+                if violation:
+                    raise _ForemanEscalation(violation)
+                state = self._save_fresh(
+                    issue,
+                    state,
+                    extras={**state.extras, "developer_report": json.loads(result.output_summary)},
+                )
+                return state, result, invocations
             failures += 1
             if invocations >= cap:
                 raise _ForemanEscalation("coder budget exhausted on failing attempts")
@@ -951,8 +962,10 @@ class ForemanPolicyLoop:
         state: WorkflowState,
         prompt: str,
         disposition_requests: tuple[tuple[str, str | None], ...] = (),
+        *,
+        issue: GitHubIssueRef | None = None,
     ) -> LaneResult:
-        lease = self._reserve(lane)
+        lease, fallbacks = self._reserve(lane, state)
         context = LaneExecutionContext(
             run_id=self._run_id,
             round_id=state.round_id,
@@ -970,8 +983,26 @@ class ForemanPolicyLoop:
             )
         self._prompt_tokens += estimated
         try:
+            if issue is not None and lane.role == "worker":
+                state = self._save_fresh(
+                    issue,
+                    state,
+                    extras={
+                        **state.extras,
+                        "developer_model": lease.assignment.to_dict(),
+                        "developer_fallbacks": list(fallbacks),
+                    },
+                )
             with self._lease_heartbeat(state):
-                return self._executor.execute(lane, prompt, worktree, context, lease)
+                result = self._executor.execute(lane, prompt, worktree, context, lease)
+            if issue is not None and lane.role == "worker":
+                fresh = self._load(issue, state)
+                self._save_fresh(
+                    issue,
+                    fresh,
+                    extras={**fresh.extras, "developer_session": result.session.session_id},
+                )
+            return result
         finally:
             self._release(lease)
 
@@ -1014,17 +1045,41 @@ class ForemanPolicyLoop:
         if failures:
             raise _ForemanEscalation(f"claim lease heartbeat failed: {failures[0]}")
 
-    def _reserve(self, lane: LaneIdentity) -> ModelLease:
+    def _reserve(
+        self, lane: LaneIdentity, state: WorkflowState
+    ) -> tuple[ModelLease, tuple[str, ...]]:
+        saved = self._saved_worker_route(lane, state)
+        if saved is not None:
+            assignment, fallbacks = saved
+            return self._broker.reserve(assignment), fallbacks
         ref = self._cfg.model_router.lane_assignments.get(lane.lane)
         if ref:
-            return self._broker.reserve(ModelAssignment(lane=lane.lane, model_ref=ref))
-        decision = getattr(self._broker, "select", None)
-        if decision is None:
+            assignment = ModelAssignment(lane=lane.lane, model_ref=ref)
+            return self._broker.reserve(assignment), ()
+        select = getattr(self._broker, "select", None)
+        if select is None:
             raise ForemanQueueError(f"broker cannot resolve a model for lane {lane.lane!r}")
-        d = decision(TaskDemand(lane=lane.lane, role=lane.role))
-        if d.assignment is None:
-            raise ForemanQueueError(f"no model available for lane {lane.lane!r}: {d.reason}")
-        return self._broker.reserve(d.assignment)
+        decision = select(TaskDemand(lane=lane.lane, role=lane.role))
+        if decision.assignment is None:
+            raise ForemanQueueError(
+                f"no model available for lane {lane.lane!r}: {decision.reason}"
+            )
+        return self._broker.reserve(decision.assignment), tuple(decision.fallbacks)
+
+    @staticmethod
+    def _saved_worker_route(
+        lane: LaneIdentity, state: WorkflowState
+    ) -> tuple[ModelAssignment, tuple[str, ...]] | None:
+        raw = state.extras.get("developer_model") if lane.role == "worker" else None
+        if raw is None:
+            return None
+        assignment = ModelAssignment.from_dict(raw)
+        if assignment.lane != lane.lane:
+            raise ForemanQueueError("durable developer model belongs to another lane")
+        fallbacks = state.extras.get("developer_fallbacks", [])
+        if not isinstance(fallbacks, list) or not all(isinstance(ref, str) for ref in fallbacks):
+            raise ForemanQueueError("malformed durable developer fallback chain")
+        return assignment, tuple(fallbacks)
 
     def _release(self, lease: ModelLease) -> None:
         self._broker.release(lease)
@@ -1110,7 +1165,21 @@ class ForemanPolicyLoop:
         extras = dict(fresh.extras)
         extras["branch"] = branch
         extras["worktree"] = worktree
+        extras["head_sha"] = self._git.head_sha(worktree)
         return self._save_fresh(issue, fresh, extras=extras)
+
+    def _verify_checkout(
+        self, issue: GitHubIssueRef, state: WorkflowState, branch: str, worktree: str
+    ) -> WorkflowState:
+        actual = self._git.head_sha(worktree)
+        expected = state.extras.get("head_sha")
+        if expected is not None and expected != actual:
+            raise _ForemanEscalation(
+                f"unexpected developer HEAD movement: expected {expected}, found {actual}"
+            )
+        if expected is None:
+            return self._persist_resources(issue, state, branch=branch, worktree=worktree)
+        return state
 
     # --- Policy helpers -------------------------------------------------------------
 
@@ -1135,27 +1204,61 @@ class ForemanPolicyLoop:
         findings: tuple[ReviewerFinding, ...],
         worktree: str,
         dispositions: list[FindingDisposition] | None = None,
+        state: WorkflowState | None = None,
     ) -> str:
-        lines = [f"Implement issue {issue.slug()} in the current worktree."]
+        title = self._read_issue_title(issue)
         description = self._read_issue_description(issue, worktree)
+        instructions = self._git.repo_instructions(worktree)
+        extras = state.extras if state is not None else {}
+        lines = [
+            f"Implement {issue.slug()}: {title}",
+            f"Authoritative branch: {extras.get('branch', 'unknown')}",
+            f"Expected HEAD: {extras.get('head_sha', 'unknown')}",
+            "Do not commit or push; aipro validates, commits and pushes after your turn.",
+            "Run the relevant focused tests and repository checks before reporting success.",
+            "Return only JSON with exactly: summary (nonempty string), tests (array of "
+            "{command,result,notes}; result is passed|failed|not_run), concerns (string array), "
+            "no_changes (boolean), dispositions (array). Set no_changes=true only when this "
+            "turn requires no edits and explain why in summary.",
+        ]
+        if instructions:
+            lines.append(f"Repository instructions:\n{instructions}")
         if description:
             lines.append(f"Issue description:\n{description}")
-        if findings:
-            lines.append("Address these review findings:")
-            lines.extend(f"- {f.id} [{f.severity}] {f.body}" for f in findings)
-            latest = {d.finding_id: d for d in dispositions or []}
-            lines.extend(
-                f"Prior decision for {f.id}: {latest[f.id].rationale}"
-                for f in findings
-                if f.id in latest
-            )
-            if any(f.lane != "ci" for f in findings):
-                lines.append(
-                    'Return only {"dispositions":[{"finding_id":"...","action":"fix",'
-                    '"rationale":"change/test or falsifiable rebuttal evidence"}]}. '
-                    "Exactly one fix or rebut per requested review finding; you cannot accept your own response."
-                )
+        finding_text = self._finding_prompt(findings, dispositions)
+        if finding_text:
+            lines.append(finding_text)
         return "\n".join(lines)
+
+    @staticmethod
+    def _finding_prompt(
+        findings: tuple[ReviewerFinding, ...],
+        dispositions: list[FindingDisposition] | None,
+    ) -> str:
+        if not findings:
+            return ""
+        latest = {d.finding_id: d for d in dispositions or []}
+        lines = ["Address these review findings:"]
+        lines.extend(f"- {f.id} [{f.severity}] {f.body}" for f in findings)
+        lines.extend(
+            f"Prior decision for {f.id}: {latest[f.id].rationale}
+"
+            for f in findings
+            if f.id in latest
+        )
+        if any(f.lane != "ci" for f in findings):
+            lines.append(
+                "For every requested review finding, include exactly one disposition with "
+                "finding_id, action=fix|rebut, and a falsifiable rationale; you cannot accept "
+                "your own response."
+            )
+        return "\n".join(lines)
+
+    def _read_issue_title(self, issue: GitHubIssueRef) -> str:
+        client = getattr(self._queue, "_client", None)
+        get_title = getattr(client, "get_issue_title", None)
+        title = get_title(issue.number) if get_title is not None else None
+        return title or issue.slug()
 
     def _read_issue_description(self, issue: GitHubIssueRef, worktree: str) -> str:
         """Shared complete requirements, inline up to 8,000 characters, else file-linked."""
@@ -1174,6 +1277,64 @@ class ForemanPolicyLoop:
             "If the file cannot be read completely or its digest differs, report that failure "
             "instead of implementing or returning a clean review."
         )
+
+    def _developer_result_violation(
+        self, state: WorkflowState, worktree: str, result: LaneResult
+    ) -> str | None:
+        expected = state.extras.get("head_sha")
+        actual = self._git.head_sha(worktree)
+        if expected is None or actual != expected:
+            return f"unexpected developer HEAD movement: expected {expected}, found {actual}"
+        return self._developer_report_violation(result)
+
+    @staticmethod
+    def _developer_report_violation(result: LaneResult) -> str | None:
+        try:
+            report = json.loads(result.output_summary)
+        except (json.JSONDecodeError, TypeError) as exc:
+            return f"invalid developer completion report: {exc}"
+        keys = {"summary", "tests", "concerns", "no_changes", "dispositions"}
+        if not isinstance(report, dict) or set(report) != keys:
+            return f"invalid developer completion report: expected exactly {sorted(keys)}"
+        if not isinstance(report["summary"], str) or not report["summary"].strip():
+            return "invalid developer completion report: summary must be nonempty"
+        if not isinstance(report["no_changes"], bool):
+            return "invalid developer completion report: no_changes must be boolean"
+        if not isinstance(report["dispositions"], list):
+            return "invalid developer completion report: dispositions must be an array"
+        concern_error = ForemanPolicyLoop._concern_report_violation(report["concerns"])
+        return concern_error or ForemanPolicyLoop._test_report_violation(report["tests"], result)
+
+    @staticmethod
+    def _concern_report_violation(concerns: object) -> str | None:
+        if not isinstance(concerns, list) or any(
+            not isinstance(item, str) or not item.strip() for item in concerns
+        ):
+            return "invalid developer completion report: concerns must be nonempty strings"
+        return None
+
+    @staticmethod
+    def _test_report_violation(tests: object, result: LaneResult) -> str | None:
+        if not isinstance(tests, list):
+            return "invalid developer completion report: tests must be an array"
+        for test in tests:
+            if not isinstance(test, dict) or set(test) != {"command", "result", "notes"}:
+                return "invalid developer completion report: malformed test result"
+            if not isinstance(test["command"], str) or not test["command"].strip():
+                return "invalid developer completion report: test command must be nonempty"
+            if test["result"] not in {"passed", "failed", "not_run"}:
+                return "invalid developer completion report: unknown test result"
+            if not isinstance(test["notes"], str):
+                return "invalid developer completion report: test notes must be a string"
+            if test["result"] == "failed":
+                return f"developer reported failing test: {test['command']}"
+        try:
+            no_changes = json.loads(result.output_summary)["no_changes"]
+        except (json.JSONDecodeError, TypeError, KeyError):
+            return "invalid developer completion report"
+        if not result.changed_files and not no_changes:
+            return "developer made no changes but did not report no_changes=true"
+        return None
 
     def _reviewer_prompt(self, issue: GitHubIssueRef, round_id: str, worktree: str) -> str:
         lines = [
