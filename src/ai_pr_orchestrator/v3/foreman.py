@@ -348,11 +348,6 @@ class ForemanPolicyLoop:
         stagnant_rounds = 0
         reviewer_triggers = 0
         self._prompt_tokens = 0
-        # PR #73 review thread 14 / issue #83: fix ids from the previous
-        # round that the next review must verify. Empty at the start of
-        # the run; populated when a round dispositions findings as ``fix``
-        # and consumed (cleared) by the next round that finds them fixed.
-        self._pending_fix_ids_for_review: tuple[str, ...] = ()
         fix_findings: tuple[ReviewerFinding, ...] = ()
         result: LaneResult | None = None
 
@@ -441,12 +436,6 @@ class ForemanPolicyLoop:
                             now=now,
                         )
                     fix_findings = report.remaining
-                    # PR #73 review thread 14 / issue #83: track the
-                    # set of fix ids that must be verified by the next
-                    # review round, so the ``max_review_rounds`` cap
-                    # knows whether it is safe to short-circuit to
-                    # ``done`` or must escalate.
-                    self._pending_fix_ids_for_review = tuple(f.id for f in fix_findings)
                     continue  # fixes dispositioned; run the coder again
 
             # --- CI gate ------------------------------------------------------
@@ -587,40 +576,24 @@ class ForemanPolicyLoop:
         Reviewer triggers are capped at ``max_reviewer_triggers_per_run``.
         """
         policy = self._cfg.review_policy
-        # PR #73 review thread 14 / issue #83: if the previous round
-        # produced ``fix`` findings and the coder has run a fix round,
-        # reaching ``max_review_rounds`` here must escalate rather than
-        # masquerade as an empty no-finding round. A previous empty round
-        # (no fix_ids, just confirmed findings) does not require re-review
-        # — only a follow-up that needs verification must trigger the cap
-        # escalation.
-        had_pending_fixes = bool(getattr(self, "_pending_fix_ids_for_review", ()))
+        # Every call follows coder work, including CI fixes, and requires review.
         if review_rounds >= policy.max_review_rounds:
-            if had_pending_fixes:
-                # Use the escalation path so the durable issue is moved to
-                # ``needs_human`` and the operator sees why.
-                raise _ForemanEscalation(
-                    f"review-round cap ({policy.max_review_rounds}) exhausted "
-                    f"while fix findings from the previous round remained "
-                    "unverified; refusing to mark the item done without a "
-                    "reviewer examination"
-                )
-            return _RoundReport((), review_rounds, stagnant_rounds, reviewer_triggers)
+            raise _ForemanEscalation(
+                "review-round cap exhausted while fix findings pending "
+                f"(limit {policy.max_review_rounds}); refusing unverified changes"
+            )
         reviewer_lanes = policy.reviewer_lanes or [
             lane.lane for lane in self._lanes if lane.role == "reviewer"
         ]
         budget_left = max(0, self._cfg.safety.max_reviewer_triggers_per_run - reviewer_triggers)
-        active_lanes = list(reviewer_lanes[:budget_left])
         rounds = review_rounds + 1
         round_id = f"review-{rounds}"
-        if not active_lanes:
-            # A round that needs reviewers with no trigger budget left must
-            # never masquerade as an unreviewed "no findings" round: escalate
-            # for a human instead (round-2 #3).
+        if not reviewer_lanes or budget_left < len(reviewer_lanes):
+            # Partial reviewer coverage cannot establish a clean review.
             raise _ForemanEscalation(
                 f"reviewer trigger budget exhausted ({reviewer_triggers}/"
                 f"{self._cfg.safety.max_reviewer_triggers_per_run}); review round "
-                f"{round_id} cannot run unreviewed"
+                f"{round_id} requires all {len(reviewer_lanes)} reviewer lanes"
             )
         state = self._transition(issue, state, "reviewing", round_id=round_id, now=now)
         state = self._heartbeat(issue, state, now=now)
@@ -630,7 +603,7 @@ class ForemanPolicyLoop:
             quarantine_unknown_head_sha=False,
         )
         triggers = reviewer_triggers
-        for lane_name in active_lanes:
+        for lane_name in reviewer_lanes:
             lane = self._lanes.get(lane_name)
             result = self._run_lane(lane, worktree, state, self._reviewer_prompt(issue, round_id))
             triggers += 1
