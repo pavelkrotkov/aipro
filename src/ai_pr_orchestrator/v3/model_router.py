@@ -82,6 +82,7 @@ def build_model_broker(
     working directory, so callers loading a config file should pass its parent.
     """
 
+    config.validate()
     catalog = resolve_catalog(config, base_dir=base_dir)
     snapshots: list[ProviderResourceSnapshot] = []
     resource_by_provider: dict[str, str] = {}

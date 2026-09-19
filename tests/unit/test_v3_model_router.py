@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 import yaml
 
 from ai_pr_orchestrator.v3.broker import PolicyBroker, TaskDemand
@@ -14,6 +15,7 @@ from ai_pr_orchestrator.v3.config import (
     TelemetryConfig,
     TelemetryResourceConfig,
     V3Config,
+    V3ConfigError,
 )
 from ai_pr_orchestrator.v3.model_router import ModelRouterError, build_model_broker, resolve_catalog
 from ai_pr_orchestrator.v3.telemetry import ProviderResourceSnapshot
@@ -124,6 +126,24 @@ def test_build_broker_without_telemetry_still_works():
     broker = build_model_broker(config)
     decision = broker.select(TaskDemand(lane="developer", role="worker"), at=NOW)
     assert decision.assignment is not None
+
+
+def test_duplicate_providers_rejected_before_collecting_telemetry():
+    telemetry = _StaticTelemetry()
+    config = V3Config(
+        model_router=ModelRouterConfig(catalog=[entry("alpha")]),
+        telemetry=TelemetryConfig(
+            resources=[
+                TelemetryResourceConfig(name="acct-main", provider="alpha"),
+                TelemetryResourceConfig(name="acct-other", provider="alpha"),
+            ]
+        ),
+    )
+
+    with pytest.raises(V3ConfigError, match=r"Duplicate telemetry providers:.*alpha"):
+        build_model_broker(config, telemetry_source=telemetry, at=NOW)
+
+    assert telemetry.requested == []
 
 
 def test_empty_catalog_rejects_with_named_reason():
