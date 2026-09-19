@@ -291,6 +291,13 @@ class SessionObservation:
         return self.state in TERMINAL_LIFECYCLE_STATES
 
 
+def _worker_scope(lane: LaneIdentity, context: LaneExecutionContext) -> str | None:
+    work_item_id = context.work_item_id
+    if lane.role != "worker" or not work_item_id:
+        return None
+    return work_item_id if "/" in work_item_id and "#" in work_item_id else None
+
+
 def session_name_for(run_id: RunId, lane: LaneName, work_item_id: str | None = None) -> str:
     """Return the deterministic CAO session name for a run's lane and optional work item.
 
@@ -533,8 +540,7 @@ class CaoSessionController:
                 "Remove the image or extend the control plane first."
             )
         lane = self._registered_lane(spec.lane)
-        work_item_id = spec.context.work_item_id if lane.role == "worker" else None
-        name = session_name_for(spec.run_id, lane.lane, work_item_id)
+        name = session_name_for(spec.run_id, lane.lane, _worker_scope(lane, spec.context))
 
         adopted = self._lookup_session(name)
         if adopted is not None:
@@ -896,7 +902,9 @@ class CaoSessionController:
             mismatches.append(f"lane {metadata.lane} != requested {spec.lane}")
         if metadata.workdir != spec.workdir:
             mismatches.append(f"workdir {metadata.workdir!r} != requested {spec.workdir!r}")
-        if metadata.lane.role == "worker" and metadata.context.work_item_id != spec.context.work_item_id:
+        expected_work_item = _worker_scope(spec.lane, spec.context)
+        observed_work_item = _worker_scope(metadata.lane, metadata.context)
+        if expected_work_item is not None and observed_work_item != expected_work_item:
             mismatches.append(
                 f"work_item_id {metadata.context.work_item_id!r} != requested "
                 f"{spec.context.work_item_id!r}"
