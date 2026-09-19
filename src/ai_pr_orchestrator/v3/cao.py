@@ -436,6 +436,11 @@ class CaoSessionController:
         # persistence attempt is retried instead of silently lost at restart.
         self._durable_activity_confirmed: set[str] = set()
 
+    @property
+    def session_timeout_seconds(self) -> int:
+        """Authoritative session lifetime, including time before adoption."""
+        return self._config.session_timeout_seconds
+
     @staticmethod
     def _build_client(config: CAOControlPlaneConfig) -> httpx.Client:
         return httpx.Client(
