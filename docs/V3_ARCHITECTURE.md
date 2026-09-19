@@ -127,3 +127,25 @@ and single-repo setups. Declaring both is rejected as ambiguous.
   adapter arrived separately in issue #42; see `docs/V3_CAO.md`.)
 - No V1 behavior is deleted yet.
 - CAO and Hermes internals are not redesigned.
+
+### Complete issue input for coding and review
+
+The foreman fetches the authoritative issue body for both lane roles; retrieval
+failures stop the run rather than substitute empty requirements. Bodies up to
+8,000 characters are included verbatim. Larger bodies are linked in the prompt
+as a complete UTF-8 file with byte length and SHA-256, without sentence truncation
+or omission of trailing acceptance criteria.
+
+`GitWorktreeOps` caches that input in the linked worktree's private Git metadata,
+using a content-addressed filename. It cannot enter `git add -A` or a commit;
+retained worktrees retain the input, and normal worktree removal deletes it.
+The cache is disposable input, never authoritative workflow state. Updated issue
+bodies receive distinct files so an existing prompt's input is not overwritten.
+
+CAO/Hermes must share the worktree and its Git metadata filesystem with the
+foreman. Profiles must enable file/terminal tools and read the complete input,
+using pagination or terminal byte-range reads for oversized lines. An inaccessible
+or mismatched file must be reported as a failure, never a clean review. A remote
+or container backend mounting only tracked worktree content does not satisfy
+this contract; it must expose the linked Git metadata too. No GitHub credentials
+are needed in the worker to read these inputs.

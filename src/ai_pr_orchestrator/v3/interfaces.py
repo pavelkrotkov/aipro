@@ -284,6 +284,14 @@ class GitOperations(Protocol):
 
         ...
 
+    def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
+        """Cache full issue input outside tracked files; return readable path and SHA-256.
+
+        The cache shares the worktree lifecycle and filesystem with its lane.
+        """
+
+        ...
+
     def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
         """Commit all changes in ``workdir``; return the new head SHA."""
 

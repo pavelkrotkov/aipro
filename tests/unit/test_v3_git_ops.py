@@ -3,7 +3,9 @@ subprocess implementation against a real throwaway repository."""
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,9 @@ class FakeGitOperations:
         self.calls.append(("create_worktree", path, branch))
         self.worktrees[path] = branch
         return path
+
+    def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
+        raise NotImplementedError("use real GitWorktreeOps for issue input delivery tests")
 
     def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
         self.calls.append(("commit", workdir, message, name, email))
@@ -200,3 +205,67 @@ def test_relative_worktree_path_returns_absolute_path(real_repo: Path):
         assert Path(returned).is_dir()  # usable from the caller's own cwd
     finally:
         ops.cleanup_worktree(returned)
+
+
+@pytest.mark.parametrize(
+    "body", ["x" * 8_001, "Requirements ü. " * 5_000 + "Final AC: preserve me."]
+)
+def test_bounded_prompts_deliver_complete_issue_context(real_repo: Path, tmp_path: Path, body):
+    from tests.unit.test_v3_foreman import ISSUE, ScriptedExecutor, _foreman, _gate, _ready_fake
+
+    ops = GitWorktreeOps(real_repo)
+    ops.create_branch("issue84", "main")
+    workdir = ops.create_worktree(str(tmp_path / "worker"), "issue84")
+    fake = _ready_fake()
+    fake._issue_bodies[1] = body
+    loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=ops)
+    prompts = [
+        loop._coder_prompt(ISSUE, (), workdir),
+        loop._reviewer_prompt(ISSUE, "review-1", workdir),
+    ]
+    path, digest = ops.write_issue_description(workdir, body)
+    reference = f"{path!r} ({len(body.encode())} UTF-8 bytes; SHA-256 {hashlib.sha256(body.encode()).hexdigest()})"
+    for prompt in prompts:
+        assert len(prompt) < 2_000
+        assert reference in prompt
+    # The worker reads the complete bytes from its actual cwd, not a mocked path.
+    observed = subprocess.check_output(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib,sys; sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())",
+            path,
+        ],
+        cwd=workdir,
+    )
+    assert observed == body.encode()
+    assert digest == hashlib.sha256(observed).hexdigest()
+
+
+def test_issue_input_stays_unstaged_and_shares_worktree_cleanup(real_repo: Path, tmp_path: Path):
+    ops = GitWorktreeOps(real_repo)
+    ops.create_branch("issue84", "main")
+    workdir = ops.create_worktree(str(tmp_path / "worker"), "issue84")
+    path, _ = ops.write_issue_description(workdir, "Complete requirements.")
+    assert ops.changed_files(workdir) == []
+    subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
+    assert subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=workdir) == b""
+    ops.commit(workdir, "no issue data", name="T", email="t@example.com")
+    assert ops.commit_count(workdir, "main") == 0
+    assert Path(path).exists()  # retained with a pending/busy worktree
+    ops.cleanup_worktree(workdir)
+    assert not Path(path).exists()
+
+
+def test_issue_input_versions_do_not_replace_inflight_context(real_repo: Path, tmp_path: Path):
+    ops = GitWorktreeOps(real_repo)
+    ops.create_branch("issue84", "main")
+    workdir = ops.create_worktree(str(tmp_path / "worker"), "issue84")
+    first, _ = ops.write_issue_description(workdir, "Original criteria.")
+    second, _ = ops.write_issue_description(workdir, "Updated criteria.")
+    assert first != second
+    assert Path(first).read_text() == "Original criteria."
+    assert Path(second).read_text() == "Updated criteria."
+    Path(first).write_text("truncated")
+    with pytest.raises(GitOpsError, match="does not match"):
+        ops.write_issue_description(workdir, "Original criteria.")

@@ -165,6 +165,9 @@ class FakeGitOperations:
         self.worktrees[path] = branch
         return path
 
+    def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
+        raise NotImplementedError("use real GitWorktreeOps for issue input delivery tests")
+
     def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
         return "sha"
 
@@ -475,6 +478,9 @@ class RecordingGit(FakeGitOperations):
         self.cleanups.append(path)
         super().cleanup_worktree(path)
 
+    def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
+        raise NotImplementedError("use real GitWorktreeOps for issue input delivery tests")
+
     def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
         self.commits.append((workdir, message))
         return super().commit(workdir, message, name=name, email=email)
@@ -648,21 +654,42 @@ def test_review_round_cap_never_accepts_unreviewed_fixes(findings, gate_calls):
     assert "v3-work-needs-human" in fake.get_labels(1)
 
 
-def test_issue_body_is_included_in_coder_prompt():
-    """The coder prompt carries the issue description/acceptance criteria, not
-    just the slug (F16)."""
+@pytest.mark.parametrize("body", ["", "Add feature X. AC: it must be fast.", "x" * 8_000])
+def test_issue_body_is_included_in_coder_and_all_reviewer_prompts(body):
     fake = _ready_fake()
-    fake._issue_bodies[1] = "Add feature X. AC: it must be fast."
+    fake._issue_bodies[1] = body
     executor = ScriptedExecutor()
     loop, _ = _foreman(fake, executor, _gate())
-    loop.run_pass()[0]
-    dev_prompts = [
-        p
-        for call, p in zip(executor.calls, executor.prompts, strict=False)
-        if call[0] == "developer"
-    ]
-    assert dev_prompts
-    assert "Add feature X. AC: it must be fast." in dev_prompts[0]
+    assert loop.run_pass()[0].final_phase == "done"
+    assert len(executor.prompts) == 4  # coder and all three independent reviewers
+    for prompt in executor.prompts:
+        assert body in prompt
+    for prompt in executor.prompts[1:]:
+        assert "Return only a JSON array" in prompt
+
+
+@pytest.mark.parametrize("successful_reads", [0, 1])
+def test_issue_description_fetch_failure_prevents_contextless_execution(
+    monkeypatch, successful_reads
+):
+    fake = _ready_fake()
+    calls = 0
+
+    def get_body(number):
+        nonlocal calls
+        calls += 1
+        if calls > successful_reads:
+            raise RuntimeError("authoritative issue fetch failed")
+        return "Complete requirements."
+
+    monkeypatch.setattr(fake, "get_issue_body", get_body)
+    executor = ScriptedExecutor()
+    loop, _ = _foreman(fake, executor, _gate())
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "authoritative issue fetch failed" in outcome.reason
+    assert len(executor.calls) == successful_reads
+    assert fake.list_open_prs() == []
 
 
 def test_terminal_worktree_is_cleanup_but_pending_is_retained():

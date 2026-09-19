@@ -379,7 +379,7 @@ class ForemanPolicyLoop:
                     self._worker_lane(),
                     worktree,
                     state,
-                    self._coder_prompt(issue, fix_findings),
+                    self._coder_prompt(issue, fix_findings, worktree),
                 )
                 coder_invocations += 1
                 if result.exit_code != 0:
@@ -605,7 +605,9 @@ class ForemanPolicyLoop:
         triggers = reviewer_triggers
         for lane_name in reviewer_lanes:
             lane = self._lanes.get(lane_name)
-            result = self._run_lane(lane, worktree, state, self._reviewer_prompt(issue, round_id))
+            result = self._run_lane(
+                lane, worktree, state, self._reviewer_prompt(issue, round_id, worktree)
+            )
             triggers += 1
             if result.exit_code != 0:
                 raise _ForemanEscalation(
@@ -993,9 +995,11 @@ class ForemanPolicyLoop:
             return "policy violation: lane modified files under .github/workflows/"
         return None
 
-    def _coder_prompt(self, issue: GitHubIssueRef, findings: tuple[ReviewerFinding, ...]) -> str:
+    def _coder_prompt(
+        self, issue: GitHubIssueRef, findings: tuple[ReviewerFinding, ...], worktree: str
+    ) -> str:
         lines = [f"Implement issue {issue.slug()} in the current worktree."]
-        description = self._read_issue_description(issue)
+        description = self._read_issue_description(issue, worktree)
         if description:
             lines.append(f"Issue description:\n{description}")
         if findings:
@@ -1003,25 +1007,25 @@ class ForemanPolicyLoop:
             lines.extend(f"- [{f.severity}] {f.body}" for f in findings)
         return "\n".join(lines)
 
-    def _read_issue_description(self, issue: GitHubIssueRef) -> str:
-        """The issue body (description + any acceptance criteria) for the coder."""
+    def _read_issue_description(self, issue: GitHubIssueRef, worktree: str) -> str:
+        """Shared complete requirements, inline up to 8,000 characters, else file-linked."""
         client = getattr(self._queue, "_client", None)
         get_body = getattr(client, "get_issue_body", None)
         if get_body is None:
-            return ""
-        try:
-            return get_body(issue.number) or ""
-        except Exception:
-            return ""
+            raise ForemanQueueError("queue cannot fetch the authoritative issue description")
+        description = get_body(issue.number) or ""
+        if len(description) <= 8_000:
+            return description
+        path, digest = self._git.write_issue_description(worktree, description)
+        return (
+            f"Read the COMPLETE issue description and acceptance criteria from {path!r} "
+            f"({len(description.encode('utf-8'))} UTF-8 bytes; SHA-256 {digest}). "
+            "Read all pages, including the final criteria; do not rely on a preview. "
+            "If the file cannot be read completely or its digest differs, report that failure "
+            "instead of implementing or returning a clean review."
+        )
 
-    def _reviewer_prompt(self, issue: GitHubIssueRef, round_id: str) -> str:
-        # PR #73 review thread 15 / issue #84: the requirements reviewer
-        # cannot determine whether the implementation satisfies the
-        # requested behaviour unless its profile independently fetches
-        # GitHub state — and the lane contract does not include that.
-        # Embed the same authoritative issue description the coder sees so
-        # reviewer findings are grounded in the requirements they actually
-        # need to verify.
+    def _reviewer_prompt(self, issue: GitHubIssueRef, round_id: str, worktree: str) -> str:
         lines = [
             f"Review the changes for issue {issue.slug()} ({round_id}); report structured findings.",
             "Return only a JSON array of new findings, or [] when there are none; no Markdown. "
@@ -1030,7 +1034,7 @@ class ForemanPolicyLoop:
             "Use ReviewerFinding fields for optional location/evidence. Omit created_at, lane/run_id/round_id "
             "and durable policy/provenance fields; the controller supplies turn attribution.",
         ]
-        description = self._read_issue_description(issue)
+        description = self._read_issue_description(issue, worktree)
         if description:
             lines.append(f"Issue description:\n{description}")
         return "\n".join(lines)

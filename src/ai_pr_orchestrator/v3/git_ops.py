@@ -17,6 +17,7 @@ No vendor, model, or provider name appears in this module.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -74,6 +75,21 @@ class GitWorktreeOps:
             workdir = self._root / workdir
         self._run("worktree", "add", str(workdir), branch)
         return str(workdir)
+
+    def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
+        """Cache complete input in worktree-private metadata, never staged content."""
+        git_dir = self._run("-C", str(self._workdir(workdir)), "rev-parse", "--absolute-git-dir")
+        content = description.encode("utf-8")
+        digest = hashlib.sha256(content).hexdigest()
+        path = Path(git_dir.strip()) / f"aipro-issue-{digest}.md"
+        try:
+            with path.open("xb") as stream:
+                stream.write(content)
+        except FileExistsError:
+            pass  # Identical inputs reuse a cache; never overwrite an in-flight input.
+        if path.read_bytes() != content:
+            raise GitOpsError(f"issue description cache does not match fetched body: {path}")
+        return str(path), digest
 
     def commit(self, workdir: str, message: str, *, name: str, email: str) -> str:
         cwd = self._workdir(workdir)
