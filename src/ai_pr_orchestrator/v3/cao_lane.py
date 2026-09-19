@@ -103,6 +103,11 @@ class CaoLaneExecutor:
 
     def _session_env(self, lease: ModelLease | None) -> dict[str, str]:
         env = dict(self._env)
+        env.update(
+            GIT_CONFIG_COUNT="1",
+            GIT_CONFIG_KEY_0="remote.origin.pushurl",
+            GIT_CONFIG_VALUE_0="aipro-no-push://authoritative-branch",
+        )
         if lease is None:
             return env
         entry = self._catalog.get(lease.assignment.model_ref)
