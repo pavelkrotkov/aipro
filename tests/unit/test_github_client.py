@@ -40,7 +40,7 @@ def _pr_json(number: int = 42) -> dict[str, Any]:
         "title": "Test PR",
         "body": "PR body",
         "state": "open",
-        "head": {"sha": "abc123", "ref": "feature"},
+        "head": {"sha": "abc123", "ref": "feature", "repo": {"full_name": f"{OWNER}/{REPO}"}},
         "base": {"ref": "main"},
         "user": {"login": "author"},
         "draft": False,
@@ -1080,3 +1080,52 @@ def test_stable_check_run_id_is_deterministic_and_process_stable() -> None:
     assert stable_check_run_id("ci/jenkins") != stable_check_run_id("lint")
     # Known fixed digest so a future refactor that changes the scheme is caught.
     assert isinstance(stable_check_run_id("ci/jenkins"), int)
+
+
+@pytest.mark.parametrize("failure", ["timeout", "server_error"])
+def test_create_pr_uncertain_response_does_not_retry_post(monkeypatch, failure):
+    created: list[dict[str, Any]] = []
+    sleeps = []
+    monkeypatch.setattr("ai_pr_orchestrator.github.client.time.sleep", sleeps.append)
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            created.append(_pr_json(len(created) + 1))
+            if failure == "timeout":
+                raise httpx.ReadTimeout("lost response", request=request)
+            return httpx.Response(503)
+        if request.url.path.endswith("/files"):
+            return httpx.Response(200, json=[])
+        if request.url.path.endswith("/pulls"):
+            return httpx.Response(200, json=created)
+        return httpx.Response(200, json=created[0])
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as http:
+        client = GitHubClient(TOKEN, OWNER, REPO, http_client=http)
+        with pytest.raises(GitHubClientError):
+            client.create_pr("title", "body", head="feature", base="main")
+        assert len(created) == 1
+        assert sleeps == []
+        # A subsequent authoritative read discovers the successful side effect.
+        assert [(pr.number, pr.head_ref) for pr in client.list_open_prs()] == [(1, "feature")]
+
+
+@pytest.mark.parametrize(
+    ("head_name", "fork", "expected"),
+    [
+        (f"{OWNER.upper()}/{REPO.upper()}", True, False),
+        ("other-owner/repo", True, True),
+        ("other-owner/repo", False, True),
+        (None, False, True),
+    ],
+)
+@respx.mock
+def test_pr_source_repository_identity_is_independent_of_fork_ancestry(head_name, fork, expected):
+    data = _pr_json()
+    data["head"]["repo"] = {"full_name": head_name, "fork": fork}
+    data["base"]["repo"] = {"full_name": f"{OWNER}/{REPO}", "fork": True}
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls").respond(200, json=[data])
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/pulls/42").respond(200, json=data)
+    _mock_pr_files(42, [])
+    with _make_client() as client:
+        assert client.list_open_prs()[0].is_fork is expected
