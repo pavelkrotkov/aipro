@@ -42,6 +42,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from .broker import TaskDemand
+from .cao import SessionBusyError
 from .config import V3Config
 from .domain import (
     TERMINAL_PHASES,
@@ -225,6 +226,8 @@ class ForemanPolicyLoop:
         (``mark_needs_human``) so the authoritative issue is never left on an
         active phase with a stranded claim. The pass continues only after
         that authoritative write succeeds; persistence failures propagate.
+        Busy CAO sessions propagate for reconciliation without terminalizing
+        their active run or deleting its checkout.
         """
         issues = self._list_ready()
         if max_items is not None:
@@ -233,6 +236,9 @@ class ForemanPolicyLoop:
         for issue in issues:
             try:
                 outcomes.append(self._drive(issue, now=now))
+            except SessionBusyError:
+                # Earlier work is still running; retain its claim and checkout.
+                raise
             except Exception as exc:
                 reason = f"foreman error: {exc}"
                 self._persist_crash(issue, reason)
