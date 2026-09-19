@@ -383,18 +383,19 @@ class PolicyBroker:
         model. The caller must :meth:`release` the lease when its dispatch
         ends.
         """
+        if type(external_in_flight) is not int or external_in_flight < 0:
+            raise BrokerError("external_in_flight must be a non-negative integer")
         with self._cap_lock:
+            external = max(self._external.get(assignment.model_ref, 0), external_in_flight)
             entry = self._catalog.get(assignment.model_ref)
             cap = entry.max_concurrency if entry else None
             if cap is not None:
-                total = self._outstanding.get(assignment.model_ref, 0) + self._external.get(
-                    assignment.model_ref, 0
-                )
+                total = self._outstanding.get(assignment.model_ref, 0) + external
                 if total >= cap:
                     raise BrokerError(
                         f"model {assignment.model_ref!r} is at its concurrency cap "
                         f"({total} outstanding incl. "
-                        f"{self._external.get(assignment.model_ref, 0)} external, "
+                        f"{external} external, "
                         f"cap {cap}); cannot reserve another slot"
                     )
             lease_id = f"{assignment.lane}:{assignment.model_ref}:{self._next_lease_seq}"
@@ -402,12 +403,8 @@ class PolicyBroker:
             self._outstanding[assignment.model_ref] = (
                 self._outstanding.get(assignment.model_ref, 0) + 1
             )
-            # Persist the caller-declared external occupancy (never decreased
-            # here: only the operator's reconciliation knows when those
-            # dispatches actually ended).
-            self._external[assignment.model_ref] = max(
-                self._external.get(assignment.model_ref, 0), external_in_flight
-            )
+            # Retain successful observations until the final local release.
+            self._external[assignment.model_ref] = external
             self._leases[lease_id] = assignment.model_ref
         return ModelLease(lease_id=lease_id, assignment=assignment)
 

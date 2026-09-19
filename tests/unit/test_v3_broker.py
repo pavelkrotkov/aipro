@@ -944,6 +944,64 @@ def test_cap_counts_external_dispatches_not_just_local_leases():
     b.reserve(assignment)  # allowed again
 
 
+@pytest.mark.parametrize("external", [1, 2])
+def test_first_reservation_rejects_full_external_capacity(external):
+    b = broker(entry("capped", max_concurrency=1))
+    assignment = ModelAssignment(lane="developer", model_ref="capped")
+    with pytest.raises(BrokerError, match="concurrency cap"):
+        b.reserve(assignment, external_in_flight=external)
+    # Rejection creates neither a local lease nor a retained snapshot.
+    lease = b.reserve(assignment)
+    assert lease.lease_id.endswith(":0")
+    with pytest.raises(BrokerError):
+        b.reserve(assignment)
+    b.release(lease)
+    b.reserve(assignment)
+
+
+def test_current_external_increase_participates_in_admission():
+    b = broker(entry("capped", max_concurrency=3))
+    assignment = ModelAssignment(lane="developer", model_ref="capped")
+    first = b.reserve(assignment, external_in_flight=1)
+    with pytest.raises(BrokerError, match="2 external"):
+        b.reserve(assignment, external_in_flight=2)
+    # Failed admission leaves the previous lease/snapshot intact.
+    second = b.reserve(assignment, external_in_flight=0)
+    assert second.lease_id.endswith(":1")
+    with pytest.raises(BrokerError):
+        b.reserve(assignment)
+    b.release(first)
+    b.release(first)  # A duplicate release must not expire the snapshot.
+    third = b.reserve(assignment)
+    with pytest.raises(BrokerError):
+        b.reserve(assignment)
+    b.release(second)
+    b.release(third)
+    # Final local release expires the snapshot: all three slots are free.
+    leases = [b.reserve(assignment) for _ in range(3)]
+    with pytest.raises(BrokerError):
+        b.reserve(assignment)
+    for lease in leases:
+        b.release(lease)
+
+
+@pytest.mark.parametrize("external", [-1, True, False, 1.0, 0.5, "1", None])
+@pytest.mark.parametrize("cap", [None, 2])
+def test_reserve_rejects_malformed_external_count_without_changing_leases(external, cap):
+    b = broker(entry("capped", max_concurrency=cap))
+    assignment = ModelAssignment(lane="developer", model_ref="capped")
+    first = b.reserve(assignment)
+    with pytest.raises(BrokerError, match="non-negative integer"):
+        b.reserve(assignment, external_in_flight=external)
+    second = b.reserve(assignment)
+    assert second.lease_id.endswith(":1")
+    if cap is not None:
+        with pytest.raises(BrokerError):
+            b.reserve(assignment)
+    b.release(first)
+    b.release(second)
+
+
 def test_release_is_idempotent_per_lease():
     b = broker(entry("capped", max_concurrency=2))
     assignment = ModelAssignment(lane="developer", model_ref="capped")
