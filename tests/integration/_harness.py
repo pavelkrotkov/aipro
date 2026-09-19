@@ -87,6 +87,12 @@ class FakeGitOperations:
         self.worktrees[path] = branch
         return path
 
+    def head_sha(self, workdir: str) -> str:
+        return "sha"
+
+    def repo_instructions(self, workdir: str) -> str:
+        return ""
+
     def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
         raise NotImplementedError("use real GitWorktreeOps for issue input delivery tests")
 
@@ -124,6 +130,10 @@ def script_protocol(fake_cao, loop, *, proposal="rebut", decision="accept", repl
         )
     )
     coder = {
+        "summary": "addressed reviewer finding",
+        "tests": [{"command": "pytest -q", "result": "passed", "notes": ""}],
+        "concerns": [],
+        "no_changes": False,
         "dispositions": [
             {
                 "finding_id": "guard",
@@ -143,8 +153,16 @@ def script_protocol(fake_cao, loop, *, proposal="rebut", decision="accept", repl
             }
         ],
     }
+    initial = {
+        "summary": "implemented requested change",
+        "tests": [{"command": "pytest -q", "result": "passed", "notes": ""}],
+        "concerns": [],
+        "no_changes": False,
+        "dispositions": [],
+    }
     fake_cao.set_output_sequence(
-        session_name_for(loop.run_id, "developer"), ["implemented", json.dumps(coder)]
+        session_name_for(loop.run_id, "developer", "owner/repo#1"),
+        [json.dumps(initial), json.dumps(coder)],
     )
     fake_cao.set_output_sequence(
         session_name_for(loop.run_id, "requirements-reviewer"),
