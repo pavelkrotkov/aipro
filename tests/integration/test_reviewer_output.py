@@ -1,11 +1,14 @@
 """Untrusted reviewer output crosses the real CAO/controller boundary."""
 
 import json
+from dataclasses import replace
+from datetime import UTC, datetime
 
 import pytest
 
 from ai_pr_orchestrator.v3.cao import CaoReviewerOutputError, session_name_for
 from ai_pr_orchestrator.v3.domain import Evidence, ReviewerFinding
+from ai_pr_orchestrator.v3.findings import FindingRegistry
 from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
 
@@ -63,6 +66,13 @@ def test_duplicate_finding_ids_fail_closed(review_lane):
         review_lane(json.dumps([payload, payload]))
 
 
+@pytest.mark.parametrize("created_at", ["1900-01-01T00:00:00+00:00", None])
+def test_reviewer_cannot_supply_engine_timestamp(review_lane, created_at):
+    payload = {"id": "bug", "body": "Missing guard", "severity": "major", "created_at": created_at}
+    with pytest.raises(CaoReviewerOutputError, match="created_at"):
+        review_lane(json.dumps([payload]))
+
+
 def test_review_findings_reuse_domain_schema_and_current_turn(review_lane):
     finding = ReviewerFinding(
         id="bug-1",
@@ -76,9 +86,19 @@ def test_review_findings_reuse_domain_schema_and_current_turn(review_lane):
         evidence=[Evidence(kind="command", text="pytest tests/test_example.py")],
         falsification="Add the guard and rerun the failing test",
     )
-    result = review_lane(json.dumps([finding.to_dict()]))
-    assert result.findings == [finding]
+    payload = finding.to_dict()
+    del payload["created_at"]
+    before = datetime.now(UTC)
+    result = review_lane(json.dumps([payload]))
+    received = result.findings[0]
+    assert before <= received.created_at <= datetime.now(UTC)
+    assert received == replace(finding, created_at=received.created_at)
     assert result.exit_code == 0
+    prior = replace(finding, id="engine-earlier", created_at=datetime(2000, 1, 1, tzinfo=UTC))
+    registry = FindingRegistry()
+    registry.register(prior)
+    registry.register(received)
+    assert registry.deduplicate()[0].id == prior.id
 
 
 def test_review_minimal_finding_uses_confirmed_attribution(review_lane):

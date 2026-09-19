@@ -210,7 +210,9 @@ fields use the existing finding schema and its constructor validation. For examp
 The controller supplies omitted `lane`, `run_id` and `round_id` from the confirmed
 current session turn. Supplied attribution must match. Findings must be `open`:
 reviewers cannot supply settled dispositions, existing thread IDs, conflict groups
-or merged provenance. Those belong to durable policy processing. IDs must be
+or merged provenance. `created_at` must be omitted: the domain constructor assigns
+the engine timestamp used for canonical finding selection. Those fields belong
+to durable policy processing. IDs must be
 unique within a response. Primitive types are checked before domain construction;
 booleans are not line numbers, and non-JSON NaN/Infinity values are rejected.
 Legacy durable-state decoding remains unchanged and is not used for this ingress.

@@ -334,12 +334,12 @@ def _reviewer_finding(payload: Any, metadata: CaoSessionMetadata) -> ReviewerFin
             raise ValueError(f"finding {key} does not match the current reviewer turn")
     _require_new_finding(data)
     data["evidence"] = [_review_evidence(item) for item in data.get("evidence", [])]
-    if "created_at" in data:
-        data["created_at"] = datetime.fromisoformat(data["created_at"])
     return ReviewerFinding(**data)
 
 
 def _require_new_finding(data: dict[str, Any]) -> None:
+    if "created_at" in data:
+        raise ValueError("created_at is assigned by the engine, not the reviewer")
     if data.get("status", "open") != "open":
         raise ValueError("reviewer findings must be open; policy owns dispositions")
     defaults = {"sources": [], "thread_id": None, "conflict_group_id": None, "extras": {}}
@@ -377,7 +377,6 @@ def _review_field_types(data: dict[str, Any]) -> None:
         "status_reason",
         "thread_id",
         "conflict_group_id",
-        "created_at",
         "kind",
         "snippet",
         "text",

@@ -1054,7 +1054,7 @@ class ForemanPolicyLoop:
             "Return only a JSON array of new findings, or [] when there are none; no Markdown. "
             "Each finding needs id, body and severity (info, minor, major or blocker). "
             'Example: [{"id":"missing-guard","body":"Describe the defect","severity":"major"}]. '
-            "Use ReviewerFinding fields for optional location/evidence. Omit lane/run_id/round_id "
+            "Use ReviewerFinding fields for optional location/evidence. Omit created_at, lane/run_id/round_id "
             "and durable policy/provenance fields; the controller supplies turn attribution.",
         ]
         description = self._read_issue_description(issue)
