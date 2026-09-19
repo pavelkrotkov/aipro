@@ -113,9 +113,23 @@ def real_repo(tmp_path: Path) -> Path:
     return root
 
 
+
+def test_repo_instructions_reads_root_agent_files(real_repo: Path):
+    (real_repo / "AGENTS.md").write_text("agent rules\n")
+    (real_repo / "CLAUDE.md").write_text("claude rules\n")
+    instructions = GitWorktreeOps(real_repo).repo_instructions(str(real_repo))
+    assert instructions == "AGENTS.md:\nagent rules\n\n\nCLAUDE.md:\nclaude rules\n"
+
 def test_default_branch_and_branch_creation(real_repo: Path):
     ops = GitWorktreeOps(real_repo)
     assert ops.default_branch() == "main"
+    assert ops.head_sha(str(real_repo)) == subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=real_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
     ops.create_branch("feat/x", "main")
     heads = subprocess.run(
         ["git", "branch", "--list", "feat/x"],
