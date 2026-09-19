@@ -118,7 +118,8 @@ class LaneResult:
     Reviewer lanes return their observations as structured
     :class:`~ai_pr_orchestrator.v3.domain.ReviewerFinding` values so they can
     flow into the policy engine unchanged; dispositions record the policy
-    decisions applied to those findings.
+    decisions applied to those findings. ``changed_files`` must contain
+    authoritative repository observations, not agent-reported paths.
     """
 
     session: SessionHandle
@@ -308,7 +309,8 @@ class GitOperations(Protocol):
         ...
 
     def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
-        """Paths the worktree has touched relative to ``base_ref`` (or, when
+        """Paths changed since the merge base with ``base_ref``, plus pending
+        changes (or, when
         ``base_ref`` is ``None``, uncommitted + untracked paths in the
         working tree). Used by the foreman to enforce workflow-file policy
         and pre-commit budgets before committing (PR #73 review thread 8).

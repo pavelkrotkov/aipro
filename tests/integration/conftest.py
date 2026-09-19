@@ -93,7 +93,9 @@ def cao_lane_executor(cao_controller: CaoSessionController) -> CaoLaneExecutor:
             for lane in lanes
         )
     )
-    return CaoLaneExecutor(cao_controller, lanes, catalog=catalog, poll_interval_seconds=0.01)
+    return CaoLaneExecutor(
+        cao_controller, lanes, git=FakeGitOperations(), catalog=catalog, poll_interval_seconds=0.01
+    )
 
 
 @pytest.fixture

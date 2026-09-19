@@ -22,6 +22,7 @@ from ai_pr_orchestrator.v3.domain import ModelAssignment
 from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, ModelLease
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from tests.integration._fake_cao_server import FakeCAOServer
+from tests.unit.test_v3_git_ops import FakeGitOperations
 
 WRAPPER = Path(__file__).resolve().parents[2] / "scripts" / "aipro-hermes"
 
@@ -68,6 +69,7 @@ def test_leased_model_reaches_hermes_without_losing_session_env(tmp_path, lane_n
         executor = CaoLaneExecutor(
             controller,
             lanes,
+            git=FakeGitOperations(),
             catalog=ModelCatalog((entry,)),
             env=defaults,
             poll_interval_seconds=0,
@@ -120,7 +122,9 @@ def test_unresolvable_lease_fails_before_cao_launch(tmp_path, entries, reason):
         FakeCAOServer() as cao,
         CaoSessionController(CAOControlPlaneConfig(base_url=cao.url), lanes) as controller,
     ):
-        executor = CaoLaneExecutor(controller, lanes, catalog=ModelCatalog(entries))
+        executor = CaoLaneExecutor(
+            controller, lanes, git=FakeGitOperations(), catalog=ModelCatalog(entries)
+        )
         with pytest.raises(ValueError, match=reason):
             executor.execute(
                 lanes.get("developer"),
@@ -140,7 +144,11 @@ def test_adoption_cannot_reassign_running_model(tmp_path):
         CaoSessionController(CAOControlPlaneConfig(base_url=cao.url), lanes) as controller,
     ):
         executor = CaoLaneExecutor(
-            controller, lanes, catalog=ModelCatalog(entries), poll_interval_seconds=0
+            controller,
+            lanes,
+            git=FakeGitOperations(),
+            catalog=ModelCatalog(entries),
+            poll_interval_seconds=0,
         )
         lane = lanes.get("developer")
         context = LaneExecutionContext("run")
@@ -167,7 +175,9 @@ def test_unleased_session_preserves_base_env_and_wrapper_arguments(tmp_path):
         FakeCAOServer() as cao,
         CaoSessionController(CAOControlPlaneConfig(base_url=cao.url), lanes) as controller,
     ):
-        executor = CaoLaneExecutor(controller, lanes, env=env, poll_interval_seconds=0)
+        executor = CaoLaneExecutor(
+            controller, lanes, git=FakeGitOperations(), env=env, poll_interval_seconds=0
+        )
         result = executor.execute(
             lanes.get("developer"), "task", str(tmp_path), LaneExecutionContext("run")
         )
