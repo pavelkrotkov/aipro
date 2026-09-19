@@ -19,7 +19,6 @@ from __future__ import annotations
 import pytest
 
 from ai_pr_orchestrator.v3.cao import session_name_for
-from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE
 from tests.integration._fake_cao_server import (
     STATUS_IDLE,
     STATUS_PROCESSING,
