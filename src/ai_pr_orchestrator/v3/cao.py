@@ -332,7 +332,11 @@ def _parse_disposition_output(result: LaneResult, metadata: CaoSessionMetadata) 
     try:
         payload = json.loads(result.output_summary, parse_constant=_reject_json_constant)
         reviewer = metadata.lane.role == "reviewer"
-        keys = {"findings", "dispositions"} if reviewer else {"dispositions"}
+        keys = (
+            {"findings", "dispositions"}
+            if reviewer
+            else {"summary", "tests", "concerns", "no_changes", "dispositions"}
+        )
         if not isinstance(payload, dict) or set(payload) != keys:
             raise ValueError(f"expected exactly {sorted(keys)}")
         raw = payload["dispositions"]
