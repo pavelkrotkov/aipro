@@ -192,9 +192,7 @@ def _run_route_explain(args: argparse.Namespace) -> int:
         config = load_v3_config(path)
         catalog = resolve_catalog(config, base_dir=path.parent)
         telemetry, _ledger = build_telemetry(config.telemetry, catalog=catalog)
-        broker = build_model_broker(
-            config, telemetry_source=telemetry, at=now, base_dir=path.parent
-        )
+        broker = build_model_broker(config, telemetry_source=telemetry, at=now, catalog=catalog)
         decision = broker.select(TaskDemand("route-explain", args.role, args.difficulty), at=now)
     except SchemaError as exc:
         raise SystemExit(redact_secrets(str(exc))) from exc

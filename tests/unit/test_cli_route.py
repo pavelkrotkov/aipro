@@ -100,7 +100,7 @@ def test_route_matches_broker_without_side_effects(
             + "\n"
         )
     assert build.call_count == (2 if as_json else 1)
-    assert sampled == [("account", NOW)] * build.call_count
+    assert sampled == [("account", NOW), ("primary", NOW), ("fallback", NOW)] * build.call_count
     assert clock.now.call_count == build.call_count
     forbidden.assert_not_called()
     assert expected.assignment is not None
@@ -203,3 +203,60 @@ def test_route_rejects_non_finite_json_without_partial_output(
     with pytest.raises(SystemExit, match="non-finite score"):
         cli.main([*ARGS, "--config", str(path), "--json"])
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("include_catalog", [True, False])
+def test_route_uses_one_catalog_for_telemetry_and_selection(
+    config_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    include_catalog: bool,
+) -> None:
+    catalog_path = config_path.parent / "catalog.yml"
+    catalog_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": [
+                    {
+                        "ref": "ordinary",
+                        "descriptor": "d",
+                        "cost_class": "free",
+                        "quality_by_role": {"worker": 3},
+                    },
+                    {
+                        "ref": "expiring",
+                        "descriptor": "d",
+                        "promotional": True,
+                        "promo_ends_at": "2026-09-19T01:00:00Z",
+                        "quality_by_role": {"worker": 3},
+                    },
+                ]
+            }
+        )
+    )
+    config_path.write_text(
+        "model_router: {catalog_path: catalog.yml}\n"
+        f"telemetry: {{include_catalog_resources: {str(include_catalog).lower()}}}\n"
+    )
+    clock = Mock()
+    clock.now.return_value = NOW
+    monkeypatch.setattr(cli, "datetime", clock)
+    original_build = cli.build_telemetry
+
+    def build(*args, **kwargs):
+        registry = original_build(*args, **kwargs)
+        # A replacement after telemetry construction must not change the
+        # catalog version used for this selection.
+        catalog_path.write_text("models: []")
+        return registry
+
+    monkeypatch.setattr(cli, "build_telemetry", build)
+    assert cli.main([*ARGS, "--config", str(config_path), "--json"]) == 0
+    decision = json.loads(capsys.readouterr().out)["decision"]
+    scores = {candidate["ref"]: candidate["score"] for candidate in decision["ranked"]}
+    assert (
+        scores["expiring"]["perishability"] > 0
+        if include_catalog
+        else scores["expiring"]["perishability"] == 0
+    )
+    assert decision["assignment"]["model_ref"] == ("expiring" if include_catalog else "ordinary")
