@@ -807,7 +807,9 @@ class FindingDisposition:
     ``thread_id`` identifies the GitHub review thread carrying the finding,
     and ``reply_body`` is the reply posted on that thread (needed for
     reply-before-resolve style policies); both are ``None`` when the
-    disposition did not involve a GitHub thread or a reply.
+    disposition did not involve a GitHub thread or a reply. Optional turn fields
+    preserve readability of legacy records; absent provenance is not evidence
+    of independent adjudication, and old archives are not retroactively verified.
     """
 
     finding_id: str

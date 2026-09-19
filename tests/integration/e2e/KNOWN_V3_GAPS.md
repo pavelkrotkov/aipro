@@ -18,3 +18,7 @@ laboratories; #53 owns autonomous cold-start scheduling. These tests use a fake
 CAO HTTP service and fake external GitHub/Git/broker/gate boundaries; they do
 not establish live Hermes reasoning, OS isolation, production deployment, or
 #55 cutover/soak acceptance.
+
+Legacy disposition/archive records remain readable. Missing run/turn provenance
+is not retroactively treated as proof of independent adjudication; #87 does not
+revalidate historical archives or change #85's existing CI-only resume policy.

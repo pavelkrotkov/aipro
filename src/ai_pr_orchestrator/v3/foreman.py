@@ -38,6 +38,7 @@ import json
 import logging
 import threading
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol, cast
@@ -355,7 +356,6 @@ class ForemanPolicyLoop:
     ) -> WorkItemOutcome:
         safety = self._cfg.safety
         coder_invocations = 0
-        coder_failures = 0
         review_rounds = self._saved_review_round(state)
         stagnant_rounds = 0
         reviewer_triggers = review_rounds * len(self._reviewer_lanes())
@@ -378,56 +378,9 @@ class ForemanPolicyLoop:
                     raise _ForemanEscalation("coding requires a local worktree")
                 requests = tuple((f.id, None) for f in fix_findings if f.lane != "ci")
                 if not self._resume_proposals(state):
-                    # --- Coding ---------------------------------------------------
-                    # The cap is checked BEFORE launching: once it is reached with
-                    # open findings, no further coder invocation may start
-                    # (round-2 #6).
-                    if fix_findings and coder_invocations >= safety.max_coder_invocations_per_run:
-                        return self._escalate(
-                            issue,
-                            state,
-                            "coder invocation budget exhausted with open findings",
-                            now=now,
-                        )
-                    state = self._transition(
-                        issue, state, "coding", round_id=f"response-{review_rounds}", now=now
+                    state, result, coder_invocations = self._run_coder(
+                        issue, state, worktree, fix_findings, coder_invocations, now=now
                     )
-                    state = self._heartbeat(issue, state, now=now)
-                    result = self._run_lane(
-                        self._worker_lane(),
-                        worktree,
-                        state,
-                        self._coder_prompt(issue, fix_findings, worktree, state.dispositions),
-                        requests,
-                    )
-                    coder_invocations += 1
-                    if result.exit_code != 0:
-                        coder_failures += 1
-                        # A failed attempt consumes invocation budget too; it must not
-                        # bypass the cap by leaning only on the consecutive-failure
-                        # threshold (which counts differently).
-                        if coder_invocations >= safety.max_coder_invocations_per_run:
-                            return self._escalate(
-                                issue,
-                                state,
-                                "coder budget exhausted on failing attempts",
-                                now=now,
-                            )
-                        if coder_failures >= self._cfg.escalation.max_consecutive_coder_failures:
-                            return self._escalate(
-                                issue,
-                                state,
-                                f"coder failed {coder_failures}x consecutively",
-                                now=now,
-                            )
-                        # Below both thresholds the failure is retried: transient lane
-                        # crashes must not kill the item, and every retry stays within
-                        # the invocation budget.
-                        continue
-                    coder_failures = 0
-                    # A background lease heartbeat may have advanced the CAS
-                    # version while the lane ran: reload before further writes.
-                    state = self._load(issue, state)
                     violation = self._policy_violation(result)
                     if violation:
                         return self._fail(issue, state, violation, now=now)
@@ -576,6 +529,52 @@ class ForemanPolicyLoop:
             )
             # Loop back to coding with the CI-check findings.
 
+    def _run_coder(
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        worktree: str,
+        findings: tuple[ReviewerFinding, ...],
+        invocations: int,
+        *,
+        now: datetime | None,
+    ) -> tuple[WorkflowState, LaneResult, int]:
+        """Run the existing bounded coder attempts until success or escalation.
+
+        Invocation budget spans successful turns; consecutive failures reset only
+        after success. Failed attempts do not consume a reviewer round.
+        """
+        failures = 0
+        cap = self._cfg.safety.max_coder_invocations_per_run
+        requests = tuple((f.id, None) for f in findings if f.lane != "ci")
+        while True:
+            if findings and invocations >= cap:
+                raise _ForemanEscalation("coder invocation budget exhausted with open findings")
+            state = self._transition(
+                issue,
+                state,
+                "coding",
+                round_id=f"response-{self._saved_review_round(state)}",
+                now=now,
+            )
+            state = self._heartbeat(issue, state, now=now)
+            result = self._run_lane(
+                self._worker_lane(),
+                worktree,
+                state,
+                self._coder_prompt(issue, findings, worktree, state.dispositions),
+                requests,
+            )
+            invocations += 1
+            if result.exit_code == 0:
+                # The background heartbeat may have advanced the CAS version.
+                return self._load(issue, state), result, invocations
+            failures += 1
+            if invocations >= cap:
+                raise _ForemanEscalation("coder budget exhausted on failing attempts")
+            if failures >= self._cfg.escalation.max_consecutive_coder_failures:
+                raise _ForemanEscalation(f"coder failed {failures}x consecutively")
+
     # --- Review ---------------------------------------------------------------
 
     def _review(
@@ -617,7 +616,7 @@ class ForemanPolicyLoop:
         state = self._heartbeat(issue, state, now=now)
 
         registry = FindingRegistry(
-            findings=list(state.findings),
+            findings=deepcopy(state.findings),
             archived=list(state.archived),
             require_coder_reply_before_resolve=policy.require_coder_reply_before_resolve,
             quarantine_unknown_head_sha=False,

@@ -372,3 +372,73 @@ def test_acceptance_cas_then_object_loss_replays_without_resurrection(
     unchanged = fresh_queue.load_state(issue.slug())
     assert unchanged is not None and unchanged.updated_at == version
     assert not github.list_open_prs()  # Interrupted before the gate.
+
+
+def test_conflict_group_changes_do_not_mutate_review_cas_baseline(fake_cao, foreman_harness):
+    """Acceptance of one conflict member must not discard a later legitimate rejection."""
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+
+    def output(lane, responses):
+        fake_cao.set_output_sequence(
+            session_name_for(loop.run_id, lane), [json.dumps(response) for response in responses]
+        )
+
+    def finding(fid, body):
+        return {"id": fid, "body": body, "severity": "major", "path": "src/guard.py", "line": 10}
+
+    def decide(fid, action, turn="response-1"):
+        return {
+            "finding_id": fid,
+            "action": action,
+            "rationale": "Independent reproduction",
+            "response_to_round_id": turn,
+        }
+
+    output(
+        "requirements-reviewer",
+        [
+            [finding("guard", "guard is missing")],
+            {"findings": [], "dispositions": [decide("guard", "accept")]},
+            [],
+        ],
+    )
+    output(
+        "breaker-reviewer",
+        [
+            [finding("race", "guard is harmful")],
+            {"findings": [], "dispositions": [decide("race", "fix")]},
+            {"findings": [], "dispositions": [decide("race", "fix", "response-2")]},
+        ],
+    )
+    output(
+        "developer",
+        [
+            "implemented",
+            {
+                "dispositions": [
+                    {"finding_id": fid, "action": "rebut", "rationale": "Concrete evidence"}
+                    for fid in ["guard", "race"]
+                ]
+            },
+            {
+                "dispositions": [
+                    {"finding_id": "race", "action": "fix", "rationale": "New regression evidence"}
+                ]
+            },
+        ],
+    )
+    outcome = loop.run_pass()[0]
+    state = queue.load_state("owner/repo#1")
+    assert outcome.reason == "unresolved findings after 3 review rounds"
+    assert [(d.finding_id, d.action) for d in state.dispositions] == [
+        ("guard", "rebut"),
+        ("race", "rebut"),
+        ("guard", "accept"),
+        ("race", "fix"),
+        ("race", "fix"),
+        ("race", "fix"),
+    ]
+    assert [f.finding_id for f in state.archived] == ["guard"]
+    assert [(f.id, f.conflict_group_id) for f in state.findings] == [("race", None)]
+    assert not github.list_open_prs()
