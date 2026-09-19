@@ -41,6 +41,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
+import httpx
+
 from ai_pr_orchestrator.github.protocol import GitHubClient
 
 from .broker import TaskDemand
@@ -240,8 +242,15 @@ class ForemanPolicyLoop:
             issues = issues[:max_items]
         outcomes: list[WorkItemOutcome] = []
         for issue in issues:
+            existing = self._queue.load_state(issue.slug())
+            resume_at_gate = existing is not None and (
+                existing.phase in ("queued", "ci_gating")
+                and existing.extras.get("pr_number") is not None
+            )
             try:
-                outcomes.append(self._drive(issue, now=now))
+                outcomes.append(
+                    self._drive(issue, existing, now=now, resume_at_gate=resume_at_gate)
+                )
             except (SessionBusyError, PRReconciliationError):
                 # Uncertain effects require reconciliation, not terminal cleanup.
                 raise
@@ -256,7 +265,10 @@ class ForemanPolicyLoop:
                         escalated=True,
                     )
                 )
-            self._cleanup_terminal_worktree(issue)
+            # CI-only claims own no local checkout; a retained path can belong
+            # to unrelated work on this host. Keep its attribution for recovery.
+            if not resume_at_gate:
+                self._cleanup_terminal_worktree(issue)
         return outcomes
 
     def _persist_crash(self, issue: GitHubIssueRef, reason: str) -> None:
@@ -293,21 +305,21 @@ class ForemanPolicyLoop:
 
     # --- Lifecycle -----------------------------------------------------------
 
-    def _drive(self, issue: GitHubIssueRef, *, now: datetime | None) -> WorkItemOutcome:
+    def _drive(
+        self,
+        issue: GitHubIssueRef,
+        existing: WorkflowState | None,
+        *,
+        now: datetime | None,
+        resume_at_gate: bool,
+    ) -> WorkItemOutcome:
         branch = f"aipro-issue-{issue.number}"
 
         # Claim FIRST — resources are created only once the claim is won, so a
         # lost claim (contention) never leaks a branch/worktree behind it.
-        existing = self._load_optional(issue)
         extras = existing.extras if existing is not None else {}
         branch = extras.get("branch") or branch
-        # A requeued item that already has a PR (pending-CI path) must go
-        # straight back to the CI gate on re-claim — relaunching coding/review
-        # would redo settled work against the same head (round-2 #2).
         pr_number = extras.get("pr_number")
-        resume_at_gate = existing is not None and (
-            existing.phase in ("queued", "ci_gating") and pr_number is not None
-        )
         state = self._claim(
             issue,
             branch=branch,
@@ -318,7 +330,7 @@ class ForemanPolicyLoop:
 
         worktree: str | None = state.extras.get("worktree")
         try:
-            if not worktree:
+            if not worktree and not resume_at_gate:
                 base = self._git.default_branch()
                 self._git.create_branch(branch, base)
                 worktree = self._git.create_worktree(
@@ -335,7 +347,7 @@ class ForemanPolicyLoop:
         self,
         issue: GitHubIssueRef,
         state: WorkflowState,
-        worktree: str,
+        worktree: str | None,
         branch: str,
         *,
         now: datetime | None,
@@ -350,6 +362,7 @@ class ForemanPolicyLoop:
         self._prompt_tokens = 0
         fix_findings: tuple[ReviewerFinding, ...] = ()
         result: LaneResult | None = None
+        head_sha: str | None = None
 
         while True:
             if resume_at_gate:
@@ -362,6 +375,8 @@ class ForemanPolicyLoop:
                 result = None
                 resume_at_gate = False
             else:
+                if worktree is None:
+                    raise _ForemanEscalation("coding requires a local worktree")
                 # --- Coding ---------------------------------------------------
                 # The cap is checked BEFORE launching: once it is reached with
                 # open findings, no further coder invocation may start
@@ -441,27 +456,23 @@ class ForemanPolicyLoop:
             # --- CI gate ------------------------------------------------------
             state = self._transition(issue, state, "ci_gating", now=now)
             state = self._heartbeat(issue, state, now=now)
-            # PR #73 review thread 16 / issue #85: when resuming at the
-            # gate (no fresh coding work), the previous host's local
-            # worktree may not exist on this host. Skip the
-            # commit/push step and use the recorded PR head directly.
             if result is not None:
-                sha = self._commit_and_push(
+                assert worktree is not None  # Coding requires a checkout above.
+                head_sha = self._commit_and_push(
                     issue,
                     state,
                     worktree,
                     branch,
                     changes_pending=bool(result.changed_files),
                 )
-                self._head_sha = sha
-            else:
-                # Reuse the previously recorded head; if none is recorded,
-                # fall back to ``None`` and let the gate decide (a missing
-                # head will surface as a typed gate failure rather than a
-                # worktree-not-found crash).
-                self._head_sha = self._head_sha or state.extras.get("head_sha")
             try:
-                pr = self._ensure_pr(issue, state, branch, worktree)
+                pr = self._ensure_pr(issue, state, branch, head_sha)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404 and state.extras.get("pr_number") is not None:
+                    raise _ForemanEscalation(
+                        f"recorded PR #{state.extras['pr_number']} could not be found"
+                    ) from exc
+                raise PRReconciliationError(f"PR reconciliation required: {exc}") from exc
             except Exception as exc:
                 raise PRReconciliationError(f"PR reconciliation required: {exc}") from exc
             # _ensure_pr may persist the recorded PR number (advancing the CAS
@@ -516,6 +527,10 @@ class ForemanPolicyLoop:
                     review_rounds=review_rounds,
                     coder_invocations=coder_invocations,
                     gate=decision,
+                )
+            if result is None:
+                return self._escalate(
+                    issue, state, "CI-only resume cannot safely dispatch local remediation", now=now
                 )
             # Real CI failures become findings for the next coding round —
             # unless the review budget is spent and reviews keep reporting
@@ -884,15 +899,6 @@ class ForemanPolicyLoop:
             )
         return list(list_ready())
 
-    def _load_optional(self, issue: GitHubIssueRef) -> WorkflowState | None:
-        load = getattr(self._queue, "load_state", None)
-        if load is None:
-            return None
-        try:
-            return load(issue.slug())
-        except Exception:
-            return None
-
     def _claim(
         self,
         issue: GitHubIssueRef,
@@ -1083,7 +1089,7 @@ class ForemanPolicyLoop:
         issue: GitHubIssueRef,
         state: WorkflowState,
         branch: str,
-        worktree: str,
+        head_sha: str | None,
     ) -> GitHubPullRequestRef:
         """Refresh a known PR or reconcile by branch before creating one.
 
@@ -1119,7 +1125,7 @@ class ForemanPolicyLoop:
             owner=issue.owner,
             repo=issue.repo,
             number=number,
-            head_sha=self._head_sha or f"head-{number}",
+            head_sha=head_sha or f"head-{number}",
         )
 
     def _discover_open_pr(self, client, branch: str):
