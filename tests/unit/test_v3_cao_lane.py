@@ -41,6 +41,7 @@ from tests.integration._fake_cao_server import (
     FakeCAOServer,
     FaultSpec,
 )
+from tests.unit.test_v3_git_ops import FakeGitOperations
 
 #: Marker the agent is asked to echo. Asserted via the controller's
 #: ``final_output`` (which returns whatever the fake stored), so the
@@ -94,7 +95,9 @@ def test_execute_returns_lane_result_on_completed_session(fake_cao: FakeCAOServe
     fake_cao.set_output(name, MARKER)
 
     controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
-    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+    executor = CaoLaneExecutor(
+        controller, LaneRegistry.default(), git=FakeGitOperations(), poll_interval_seconds=0.01
+    )
 
     handle = executor.execute(
         _lane(),
@@ -122,11 +125,15 @@ def test_execute_adopts_existing_session_by_name(fake_cao: FakeCAOServer, tmp_pa
     name = session_name_for(run_id, DEVELOPER_LANE)
     registry = LaneRegistry.default()
     with CaoSessionController(_config(fake_cao.url), registry) as controller:
-        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        executor = CaoLaneExecutor(
+            controller, registry, git=FakeGitOperations(), poll_interval_seconds=0.01
+        )
         executor.execute(_lane(), "first task", str(tmp_path), _context(run_id))
         if restart:
             with CaoSessionController(_config(fake_cao.url), registry) as restarted:
-                executor = CaoLaneExecutor(restarted, registry, poll_interval_seconds=0.01)
+                executor = CaoLaneExecutor(
+                    restarted, registry, git=FakeGitOperations(), poll_interval_seconds=0.01
+                )
                 result = executor.execute(
                     _lane(), "follow-up task", str(tmp_path), _context(run_id)
                 )
@@ -155,7 +162,9 @@ def test_execute_preserves_busy_adopted_session(fake_cao: FakeCAOServer, tmp_pat
                 status_code=409,
             )
         )
-        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        executor = CaoLaneExecutor(
+            controller, registry, git=FakeGitOperations(), poll_interval_seconds=0.01
+        )
         with pytest.raises(SessionBusyError):
             executor.execute(_lane(), "follow-up task", str(tmp_path), _context(run_id))
 
@@ -170,7 +179,9 @@ def test_execute_surfaces_uncertain_followup_submission(fake_cao: FakeCAOServer,
     name = session_name_for(run_id, DEVELOPER_LANE)
     registry = LaneRegistry.default()
     with CaoSessionController(_config(fake_cao.url), registry) as controller:
-        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        executor = CaoLaneExecutor(
+            controller, registry, git=FakeGitOperations(), poll_interval_seconds=0.01
+        )
         executor.execute(_lane(), "first task", str(tmp_path), _context(run_id))
         state = fake_cao._sessions[name]
         fake_cao.add_fault(
@@ -204,7 +215,9 @@ def test_execute_clears_previous_idle_evidence_on_new_work(fake_cao: FakeCAOServ
     )
 
     controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
-    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+    executor = CaoLaneExecutor(
+        controller, LaneRegistry.default(), git=FakeGitOperations(), poll_interval_seconds=0.01
+    )
 
     first = executor.execute(_lane(), f"echo {MARKER}", str(tmp_path), _context(run_id))
     second = executor.execute(_lane(), f"echo {MARKER}", str(tmp_path), _context(run_id))
@@ -229,7 +242,9 @@ def test_execute_succeeds_after_transient_5xx(fake_cao: FakeCAOServer, tmp_path)
     fake_cao.add_fault(FaultSpec(method="POST", path_prefix="/sessions", status_code=503))
 
     controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
-    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+    executor = CaoLaneExecutor(
+        controller, LaneRegistry.default(), git=FakeGitOperations(), poll_interval_seconds=0.01
+    )
 
     with pytest.raises(CaoControlPlaneError):
         executor.execute(
@@ -259,7 +274,9 @@ def test_execute_returns_failure_on_terminal_error(fake_cao: FakeCAOServer, tmp_
     fake_cao.set_status_sequence(name, [STATUS_ERROR])
 
     controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
-    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+    executor = CaoLaneExecutor(
+        controller, LaneRegistry.default(), git=FakeGitOperations(), poll_interval_seconds=0.01
+    )
 
     result = executor.execute(
         _lane(),
@@ -300,9 +317,9 @@ def test_execute_allows_work_beyond_old_600_second_budget(fake_cao, tmp_path, ac
     fake_cao.set_output(name, MARKER)
     fake_cao.set_status_sequence(name, [STATUS_PROCESSING] * 5 + [STATUS_IDLE] * 3)
     with CaoSessionController(CAOControlPlaneConfig(base_url=fake_cao.url)) as controller:
-        result = CaoLaneExecutor(controller, LaneRegistry.default()).execute(
-            _lane(), "long task", str(tmp_path), _context("long-work")
-        )
+        result = CaoLaneExecutor(
+            controller, LaneRegistry.default(), git=FakeGitOperations()
+        ).execute(_lane(), "long task", str(tmp_path), _context("long-work"))
     assert 600 < accelerated_time[0] < 3600
     assert result.exit_code == 0
     assert result.output_summary == MARKER
@@ -315,7 +332,9 @@ def test_executor_rejects_invalid_override(fake_cao, budget):
         CaoSessionController(_config(fake_cao.url)) as controller,
         pytest.raises(ValueError, match="exceed session_timeout_seconds"),
     ):
-        CaoLaneExecutor(controller, LaneRegistry.default(), max_poll_seconds=budget)
+        CaoLaneExecutor(
+            controller, LaneRegistry.default(), git=FakeGitOperations(), max_poll_seconds=budget
+        )
     assert not fake_cao._sessions
 
 
@@ -323,9 +342,9 @@ def test_controller_timeout_remains_authoritative(fake_cao, tmp_path, accelerate
     name = session_name_for("expired-work", DEVELOPER_LANE)
     fake_cao.set_status_sequence(name, [STATUS_PROCESSING] * 20)
     with CaoSessionController(_config(fake_cao.url)) as controller:
-        result = CaoLaneExecutor(controller, LaneRegistry.default()).execute(
-            _lane(), "task", str(tmp_path), _context("expired-work")
-        )
+        result = CaoLaneExecutor(
+            controller, LaneRegistry.default(), git=FakeGitOperations()
+        ).execute(_lane(), "task", str(tmp_path), _context("expired-work"))
     assert result.exit_code != 0
     assert "session exceeded 60s" in result.output_summary
     assert fake_cao._sessions[name].deleted
@@ -339,7 +358,9 @@ def test_execute_raises_when_observer_never_finishes(
     with CaoSessionController(_config(fake_cao.url)) as controller:
         # Deliberately break only the observation boundary to exercise the guard.
         monkeypatch.setattr(controller, "poll_session", lambda _handle: None)
-        executor = CaoLaneExecutor(controller, LaneRegistry.default(), max_poll_seconds=override)
+        executor = CaoLaneExecutor(
+            controller, LaneRegistry.default(), git=FakeGitOperations(), max_poll_seconds=override
+        )
         with pytest.raises(TimeoutError):
             executor.execute(_lane(), "task", str(tmp_path), _context("stuck-observer"))
     assert accelerated_time[0] >= (90 if override is None else override)
@@ -358,7 +379,9 @@ def test_execute_uses_registry_lane_not_caller_identity(fake_cao: FakeCAOServer,
     run_id = f"it-{int(time.time() * 1000)}"
 
     controller = CaoSessionController(_config(fake_cao.url), LaneRegistry.default())
-    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+    executor = CaoLaneExecutor(
+        controller, LaneRegistry.default(), git=FakeGitOperations(), poll_interval_seconds=0.01
+    )
 
     # The real lane is the registry's. The caller passes a different
     # LaneIdentity with the same lane NAME but a different (wrong)
@@ -407,7 +430,9 @@ def test_execute_refreshes_round_context_durably(fake_cao: FakeCAOServer, tmp_pa
         LaneExecutionContext(run_id=run_id, round_id="review-2", work_item_id="fixed-head"),
     ]
     with CaoSessionController(_config(fake_cao.url), registry) as controller:
-        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        executor = CaoLaneExecutor(
+            controller, registry, git=FakeGitOperations(), poll_interval_seconds=0.01
+        )
         for context in contexts:
             result = executor.execute(lane, f"Review {context.round_id}", str(tmp_path), context)
             assert result.exit_code == 0
@@ -433,7 +458,9 @@ def test_execute_fails_closed_when_turn_context_update_fails(
     name = session_name_for(run_id, lane.lane)
     fake_cao.set_output(name, "[]")
     with CaoSessionController(_config(fake_cao.url), registry) as controller:
-        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        executor = CaoLaneExecutor(
+            controller, registry, git=FakeGitOperations(), poll_interval_seconds=0.01
+        )
         executor.execute(lane, "first review", str(tmp_path), _context(run_id))
         state = fake_cao._sessions[name]
         fake_cao.add_fault(
@@ -463,7 +490,9 @@ def test_busy_followup_preserves_previous_round(fake_cao: FakeCAOServer, tmp_pat
     name = session_name_for(run_id, lane.lane)
     fake_cao.set_output(name, "[]")
     with CaoSessionController(_config(fake_cao.url), registry) as controller:
-        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        executor = CaoLaneExecutor(
+            controller, registry, git=FakeGitOperations(), poll_interval_seconds=0.01
+        )
         context = LaneExecutionContext(run_id=run_id, round_id="review-1")
         executor.execute(lane, "first review", str(tmp_path), context)
         state = fake_cao._sessions[name]

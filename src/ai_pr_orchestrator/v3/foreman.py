@@ -424,7 +424,7 @@ class ForemanPolicyLoop:
                 # A background lease heartbeat may have advanced the CAS
                 # version while the lane ran: reload before further writes.
                 state = self._load(issue, state)
-                violation = self._policy_violation(result, worktree=worktree)
+                violation = self._policy_violation(result)
                 if violation:
                     return self._fail(issue, state, violation, now=now)
 
@@ -463,7 +463,6 @@ class ForemanPolicyLoop:
                     state,
                     worktree,
                     branch,
-                    changes_pending=bool(result.changed_files),
                 )
             try:
                 pr = self._ensure_pr(issue, state, branch, head_sha)
@@ -628,7 +627,7 @@ class ForemanPolicyLoop:
                 raise _ForemanEscalation(
                     f"reviewer lane {lane_name!r} failed (exit {result.exit_code})"
                 )
-            violation = self._policy_violation(result, worktree=worktree)
+            violation = self._policy_violation(result)
             if violation:
                 # Reviewer lanes are bound by the same workflow-file policy as
                 # the coder — a reviewer editing .github/workflows/ must never
@@ -981,22 +980,9 @@ class ForemanPolicyLoop:
                 return lane
         return self._lanes.get(DEVELOPER_LANE)
 
-    def _policy_violation(self, result: LaneResult, worktree: str | None = None) -> str | None:
-        # PR #73 review thread 8 / issue #78: the production CAO controller
-        # returns ``changed_files=[]`` for every completed session, so the
-        # workflow-file policy is bypassed in the only production executor
-        # path. Derive the changed paths from the worktree (when the lane
-        # execution surface supplies a worktree to inspect) before applying
-        # the policy, so a coder or reviewer editing ``.github/workflows/``
-        # is caught here rather than at commit time.
-        observed = list(result.changed_files)
-        if not observed and worktree is not None and hasattr(self._git, "changed_files"):
-            try:
-                observed = list(self._git.changed_files(worktree))
-            except Exception:
-                observed = []
+    def _policy_violation(self, result: LaneResult) -> str | None:
         if self._cfg.safety.disallow_workflow_file_changes and any(
-            f.startswith(".github/workflows/") for f in observed
+            f.startswith(".github/workflows/") for f in result.changed_files
         ):
             return "policy violation: lane modified files under .github/workflows/"
         return None
@@ -1051,8 +1037,6 @@ class ForemanPolicyLoop:
         state: WorkflowState,
         worktree: str,
         branch: str,
-        *,
-        changes_pending: bool,
     ) -> str:
         """Commit lane output and push it to the remote branch.
 
@@ -1068,13 +1052,13 @@ class ForemanPolicyLoop:
         cap (round-2 #7). A visit with nothing to commit consumes no budget.
         """
         cap = self._cfg.safety.max_commits_per_run
-        if changes_pending:
-            count = self._git.commit_count(worktree, self._git.default_branch())
-            if count >= cap:
-                raise _ForemanEscalation(
-                    f"commit budget exhausted: {count} commits on {branch} already "
-                    f">= max_commits_per_run ({cap})"
-                )
+        count = self._git.commit_count(worktree, self._git.default_branch())
+        pending = bool(self._git.changed_files(worktree))
+        if count > cap or (count == cap and pending):
+            raise _ForemanEscalation(
+                f"commit budget exhausted: {count} commits on {branch} already "
+                f">= max_commits_per_run ({cap})"
+            )
         sha = self._git.commit(
             worktree,
             f"[aipro] work for {issue.slug()} ({self._run_id})",

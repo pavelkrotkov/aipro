@@ -155,6 +155,7 @@ class FakeGitOperations:
         self.default = default
         self.branches = [default]
         self.worktrees: dict[str, str] = {}
+        self.touched: dict[str, list[str]] = {}
 
     def default_branch(self) -> str:
         return self.default
@@ -986,6 +987,7 @@ def test_commit_cap_exceeded_escalates_but_noop_passes():
     fake = _ready_fake()
     git = CountingGit()
     git.count = 1  # default cap is 1
+    git.touched = {"/wt/issue-1": ["src/change.py"]}
     loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "escalated"
@@ -1184,6 +1186,7 @@ def test_busy_cao_submission_preserves_active_run_despite_heartbeat_failure(monk
             executor = CaoLaneExecutor(
                 controller,
                 registry,
+                git=FakeGitOperations(),
                 catalog=ModelCatalog(
                     (ModelCatalogEntry("ref-developer", "test-model", provider="test"),)
                 ),

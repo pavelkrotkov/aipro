@@ -93,6 +93,7 @@ def test_harness_repeated_lane_invocation_starts_fresh_work(fake_cao, foreman_ha
     from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
     from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext
     from ai_pr_orchestrator.v3.lanes import LaneRegistry
+    from tests.unit.test_v3_git_ops import FakeGitOperations
 
     run_id = f"it-rep-{int(time.time() * 1000)}"
     name = session_name_for(run_id, DEVELOPER_LANE)
@@ -106,7 +107,9 @@ def test_harness_repeated_lane_invocation_starts_fresh_work(fake_cao, foreman_ha
         ),
         LaneRegistry.default(),
     )
-    executor = CaoLaneExecutor(controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+    executor = CaoLaneExecutor(
+        controller, LaneRegistry.default(), git=FakeGitOperations(), poll_interval_seconds=0.01
+    )
     lane = LaneRegistry.default().get(DEVELOPER_LANE)
     ctx = LaneExecutionContext(run_id=run_id)
 

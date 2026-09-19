@@ -35,6 +35,7 @@ from .cao import CaoSessionController, SessionBusyError
 from .catalog import ModelCatalog
 from .domain import LaneIdentity
 from .interfaces import (
+    GitOperations,
     LaneExecutionContext,
     LaneResult,
     ModelLease,
@@ -56,6 +57,9 @@ class CaoLaneExecutor:
         The :class:`LaneRegistry` that owns the ``lane -> profile``
         binding. The executor looks each lane up on every call so a
         reconfigured registry is picked up without re-instantiation.
+    git:
+        The existing repository Git operations; completed results are populated
+        from actual worktree and issue-branch changes, never agent summaries.
     catalog:
         The same resolved catalog used by the broker. Leased model refs must
         resolve to a model descriptor and an explicit Hermes provider.
@@ -80,6 +84,7 @@ class CaoLaneExecutor:
         controller: CaoSessionController,
         lane_registry: LaneRegistry,
         *,
+        git: GitOperations,
         catalog: ModelCatalog | None = None,
         env: Mapping[str, str] | None = None,
         poll_interval_seconds: float = 0.05,
@@ -87,6 +92,7 @@ class CaoLaneExecutor:
     ) -> None:
         self._controller = controller
         self._lanes = lane_registry
+        self._git = git
         self._catalog = catalog or ModelCatalog()
         self._env = dict(env or {})
         self._poll_interval = poll_interval_seconds
@@ -162,7 +168,7 @@ class CaoLaneExecutor:
                         session=handle,
                         exit_code=result.exit_code,
                         output_summary=result.output_summary,
-                        changed_files=list(result.changed_files),
+                        changed_files=self._git.changed_files(workdir, self._git.default_branch()),
                         findings=list(result.findings),
                         dispositions=list(result.dispositions),
                     )
