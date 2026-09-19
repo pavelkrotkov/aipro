@@ -1,0 +1,9 @@
+#!/bin/sh
+# CAO's hermesProfile invokes this with `chat ...`; HERMES_HOME stays lane-owned.
+if [ -n "${AIPRO_MODEL:-}" ]; then
+    set -- "$@" --model "$AIPRO_MODEL"
+fi
+if [ -n "${AIPRO_PROVIDER:-}" ]; then
+    set -- "$@" --provider "$AIPRO_PROVIDER"
+fi
+exec hermes "$@"

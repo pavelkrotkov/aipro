@@ -119,12 +119,18 @@ directory and corrupt it.
 
 CAO's Hermes provider launches whatever command the profile's `hermesProfile`
 field names. Use that indirection to give each lane its own state directory:
-create one small wrapper per lane on `PATH`, e.g. `aipro-hermes-developer`:
+install the shared model-environment bridge on `PATH` from this checkout:
+
+```sh
+install -m 755 scripts/aipro-hermes "$HOME/.local/bin/aipro-hermes"
+```
+
+Then create one small wrapper per lane on `PATH`, e.g. `aipro-hermes-developer`:
 
 ```sh
 #!/bin/sh
 export HERMES_HOME="$HOME/.aipro/hermes/developer"
-exec hermes "$@"
+exec aipro-hermes "$@"
 ```
 
 Repeat for `aipro-hermes-requirements-reviewer`,
@@ -159,6 +165,33 @@ and one file per reviewer lane, with `role: reviewer`, its own
 broker and passed per session; a model pinned in the profile would silently
 override that decision, and it would put a vendor name in the deployment's
 lane definition where aipro cannot audit it.
+
+### Per-session model binding
+
+Construct `CaoLaneExecutor` with the same resolved `ModelCatalog` used by the
+broker (`model_router.resolve_catalog(config, base_dir=...)`). The executor
+resolves a lease's policy `model_ref` to its catalog `descriptor` and `provider`;
+these become `AIPRO_MODEL` and `AIPRO_PROVIDER` in the CAO session environment.
+Optional constructor `env` defaults are copied and preserved, with the selected
+model/provider taking precedence. Coordinator process environment is never copied.
+
+The installed `aipro-hermes` bridge translates those variables to Hermes's
+supported `chat --model` and `--provider` arguments. Hermes does not natively
+consume `AIPRO_MODEL`, `LLM_MODEL`, or `OPENAI_MODEL`: merely setting a variable
+without installing this bridge does not select the model. The lane wrapper
+continues to own `HERMES_HOME`; do not pin `model:` in the CAO profile.
+
+Leased aliases absent from the supplied catalog, missing explicit providers, and
+custom `endpoint` entries fail before session launch. This bridge cannot bind a
+custom endpoint; configure a supported Hermes provider rather than silently
+billing a default endpoint. No lease leaves the supplied environment unchanged.
+Adoption retains the existing process's model; a different model assignment is
+rejected by the controller, not applied retroactively. Keep the catalog binding
+for a running assignment stable throughout its session.
+
+The launch arguments are verified against
+[CAO's Hermes provider](https://github.com/awslabs/cli-agent-orchestrator/blob/0ef89f358fa2b475b0025ccb86f8ad20bbadca38/src/cli_agent_orchestrator/providers/hermes.py)
+and [Hermes's chat parser](https://github.com/NousResearch/hermes-agent/blob/03fee43ca344ead7245a3b0ae20d38de0ae75642/hermes_cli/_parser.py).
 
 ### Step 3 — verify
 
