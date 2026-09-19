@@ -21,7 +21,8 @@ def _pr(number: int, *, state: str = "open") -> PullRequest:
 
 def test_get_issue_body_round_trip():
     fake = FakeGitHubClient()
-    fake.seed_issue(7, labels=["v3-work"], body="Do the thing")
+    fake.seed_issue(7, labels=["v3-work"], title="Fix the thing", body="Do the thing")
+    assert fake.get_issue_title(7) == "Fix the thing"
     assert fake.get_issue_body(7) == "Do the thing"
 
 
