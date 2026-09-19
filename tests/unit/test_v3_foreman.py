@@ -28,6 +28,7 @@ from ai_pr_orchestrator.v3.config import (
     EscalationPolicyConfig,
     HermesLanesConfig,
     LaneProfileConfig,
+    ReviewPolicyConfig,
     SafetyPolicyConfig,
     V3Config,
 )
@@ -237,7 +238,9 @@ def test_clean_lifecycle_claim_to_done():
     fake = _ready_fake()
     executor = ScriptedExecutor()
     gate = _gate()
-    loop, queue = _foreman(fake, executor, gate)
+    loop, queue = _foreman(
+        fake, executor, gate, V3Config(review_policy=ReviewPolicyConfig(max_review_rounds=1))
+    )
     outcomes = loop.run_pass()
 
     assert len(outcomes) == 1
@@ -588,17 +591,60 @@ def test_worker_lane_resolves_from_configured_lanes():
     assert executor.calls and executor.calls[0][0] == "coder"
 
 
-def test_reviewer_triggers_capped_per_run():
-    """max_reviewer_triggers_per_run bounds reviewer lane launches across the
-    whole run (F14)."""
+@pytest.mark.parametrize("budget,completed_rounds", [(0, 0), (1, 0), (2, 0), (4, 1), (5, 1)])
+def test_reviewer_triggers_capped_per_run(budget, completed_rounds):
+    """A budget must cover every required reviewer before any lane starts."""
     fake = _ready_fake()
-    executor = ScriptedExecutor()
-    cfg = V3Config(safety=SafetyPolicyConfig(max_reviewer_triggers_per_run=1))
-    loop, _ = _foreman(fake, executor, _gate(), cfg)
+    executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(1)]})
+    gate = _gate()
+    cfg = V3Config(
+        safety=SafetyPolicyConfig(
+            max_coder_invocations_per_run=3, max_reviewer_triggers_per_run=budget
+        )
+    )
+    loop, queue = _foreman(fake, executor, gate, cfg)
     outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
-    reviewer_calls = [c for c in executor.calls if c[0] != "developer"]
-    assert len(reviewer_calls) == 1
+    assert outcome.final_phase == "escalated"
+    assert "reviewer trigger budget" in outcome.reason
+    assert len([c for c in executor.calls if c[0] != "developer"]) == 3 * completed_rounds
+    assert gate.evaluated == []
+    assert fake.list_open_prs() == []
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None and state.phase == "escalated"
+
+
+@pytest.mark.parametrize("findings,gate_calls", [({1: [_finding(1)]}, 0), ({}, 1)])
+def test_review_round_cap_never_accepts_unreviewed_fixes(findings, gate_calls):
+    fake = _ready_fake()
+    executor = ScriptedExecutor(reviewer_findings_by_round=findings)
+    gate = RecordingGate(
+        [
+            GateDecision(passed=False, pending_checks=(), failed_checks=("build",)),
+            GateDecision(passed=True, pending_checks=(), failed_checks=()),
+        ]
+    )
+    git = RecordingGit()
+    cfg = V3Config(
+        review_policy=ReviewPolicyConfig(max_review_rounds=1),
+        safety=SafetyPolicyConfig(
+            max_coder_invocations_per_run=3,
+            max_commits_per_run=3,
+            max_reviewer_triggers_per_run=6,
+        ),
+    )
+    loop, queue = _foreman(fake, executor, gate, cfg, git)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "review-round cap exhausted while fix findings pending" in outcome.reason
+    assert executor.calls.count(("developer", "/wt/issue-1")) == 2
+    assert len(executor.calls) == 5  # two coder turns and three reviewers
+    assert len(gate.seen) == gate_calls
+    assert len(git.commits) == len(git.pushed) == len(gate.seen)
+    assert len(fake.list_open_prs()) == gate_calls
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None and state.phase == "escalated"
+    assert state.terminal_reason == outcome.reason
+    assert "v3-work-needs-human" in fake.get_labels(1)
 
 
 def test_issue_body_is_included_in_coder_prompt():
