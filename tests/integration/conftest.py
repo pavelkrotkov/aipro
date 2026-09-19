@@ -28,6 +28,7 @@ from ai_pr_orchestrator.v3.cao import (
     CaoSessionController,
 )
 from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
+from ai_pr_orchestrator.v3.catalog import ModelCatalog, ModelCatalogEntry
 from ai_pr_orchestrator.v3.config import V3Config
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop
 from ai_pr_orchestrator.v3.interfaces import GateDecision, GitOperations
@@ -85,7 +86,14 @@ def cao_lane_executor(cao_controller: CaoSessionController) -> CaoLaneExecutor:
     harness can override this with a larger value to drive wall-clock
     behaviour.
     """
-    return CaoLaneExecutor(cao_controller, LaneRegistry.default(), poll_interval_seconds=0.01)
+    lanes = LaneRegistry.default()
+    catalog = ModelCatalog(
+        tuple(
+            ModelCatalogEntry(ref=f"ref-{lane.lane}", descriptor="test-model", provider="test")
+            for lane in lanes
+        )
+    )
+    return CaoLaneExecutor(cao_controller, lanes, catalog=catalog, poll_interval_seconds=0.01)
 
 
 @pytest.fixture
