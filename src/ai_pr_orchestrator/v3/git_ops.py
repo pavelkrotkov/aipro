@@ -183,6 +183,7 @@ class GitWorktreeOps:
         Git's non-force removal rechecks dirtiness at the destructive boundary.
         """
         root = Path(worktree_root).resolve()
+        default = self.default_branch()
         observations = []
         for block in self._run("worktree", "list", "--porcelain").split("\n\n"):
             fields = dict(line.split(" ", 1) for line in block.splitlines() if " " in line)
@@ -193,12 +194,15 @@ class GitWorktreeOps:
             if self._run("-C", str(path), "status", "--porcelain"):
                 continue
             git_dir = Path(self._run("-C", str(path), "rev-parse", "--absolute-git-dir").strip())
-            activity = max(p.stat().st_mtime for p in (path, path / ".git", git_dir))
+            activity = max(
+                path.stat().st_mtime, (path / ".git").stat().st_mtime, git_dir.stat().st_mtime
+            )
             observations.append(
                 WorktreeObservation(
                     path=str(path),
                     branch=branch,
                     last_commit_at=datetime.fromtimestamp(activity, UTC),
+                    is_default_branch=branch == default,
                 )
             )
         return tuple(observations)

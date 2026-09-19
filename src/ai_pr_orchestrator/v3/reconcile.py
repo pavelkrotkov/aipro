@@ -671,8 +671,10 @@ class ReconcilePlanner:
             raise DomainError("ReconciliationInputs.now must be timezone-aware")
         # Cross-item live-branch set, computed once before any per-item
         # planning so orphan detection sees the whole picture.
-        live_branches = self._collect_live_branches(inputs_list)
-        live_session_ids = self._collect_live_session_ids(inputs_list)
+        live_branches, live_session_ids = self._protected_resources(
+            [i.observation for i in inputs_list],
+            tuple(s for i in inputs_list for s in i.sessions),
+        )
         actions: list[Action] = []
         for inputs in inputs_list:
             actions.extend(
@@ -1081,15 +1083,7 @@ class ReconcilePlanner:
         Expired claims require independent reconciliation, not deletion. Queued
         checkpoints also retain resources until their owner resumes or abandons them.
         """
-        protected = {
-            item.work_item_id: item.state
-            for item in observations
-            if item.state is not None and item.state.phase not in TERMINAL_PHASES
-        }
-        branches = {
-            state.extras["branch"] for state in protected.values() if state.extras.get("branch")
-        }
-        session_ids = {s.session_id for s in sessions if s.work_item_id in protected}
+        branches, session_ids = self._protected_resources(observations, sessions)
         actions = list(self._plan_orphan_sessions(sessions, now, live_session_ids=session_ids))
         actions.extend(self._plan_orphan_worktrees(worktrees, now, live_branches=branches))
         return self._finalize(actions)
@@ -1159,108 +1153,47 @@ class ReconcilePlanner:
                 auto_apply=True,
             )
 
-    def _collect_live_branches(self, inputs_list: list[ReconciliationInputs]) -> set[str]:
-        """Branches that *any* work item in ``inputs_list`` still actively claims.
-
-        Computed across the entire inputs list (not per-item) so a follow-up
-        item's plan does not spuriously flag a prior item's live branch as
-        orphan. A branch is "live" only when its claim has a non-stale
-        lease — a stale lease means another foreman may already own the
-        branch.
-        """
+    @staticmethod
+    def _protected_resources(
+        observations: list[WorkItemObservation], sessions: tuple[SessionObservation, ...]
+    ) -> tuple[set[str], set[str]]:
+        """Unfinished checkpoints retain their resources, even with expired leases."""
+        work_items: set[str] = set()
         branches: set[str] = set()
-        for inputs in inputs_list:
-            claim = inputs.observation.claim
-            if claim is None or claim.branch is None:
+        for item in observations:
+            if item.state is None or item.state.phase in TERMINAL_PHASES:
                 continue
-            if claim.is_stale(inputs.now):
-                continue
-            branches.add(claim.branch)
-        return branches
-
-    def _collect_live_session_ids(self, inputs_list: list[ReconciliationInputs]) -> set[str]:
-        """Session IDs that *any* work item in ``inputs_list`` still holds a
-        live lease for, used by orphan-session detection (mirror of
-        :meth:`_collect_live_branches`)."""
-        ids: set[str] = set()
-        for inputs in inputs_list:
-            claim = inputs.observation.claim
-            if claim is None:
-                continue
-            if claim.is_stale(inputs.now):
-                continue
-            for session in inputs.sessions:
-                if session.work_item_id != inputs.observation.work_item_id:
-                    continue
-                if session.run_id is not None and claim.run_id != session.run_id:
-                    continue
-                ids.add(session.session_id)
-        return ids
+            work_items.add(item.work_item_id)
+            branch = item.state.extras.get("branch")
+            if branch:
+                branches.add(branch)
+        session_ids = {s.session_id for s in sessions if s.work_item_id in work_items}
+        return branches, session_ids
 
     # -- Output post-processing --------------------------------------------
 
     def _finalize(self, actions: list[Action]) -> list[Action]:
-        """Apply the no-two-branches-per-run invariant.
-
-        The acceptance property test proves this; here we defensively enforce
-        it by collapsing RELAUNCH actions that share the same ``run_id``
-        across the inputs. (The planner is invoked per-work-item so
-        collisions across work items normally do not happen here, but a
-        future caller passing the same observation twice, or two distinct
-        observations with the same ``run_id`` but different branches,
-        should still produce a deterministic plan.)
-
-        Branch identity alone is not enough: the dedupe key is ``run_id``
-        because two RELAUNCH actions for the *same* run (even with
-        different branch names) cannot both be authoritative — only one
-        branch owns a given run.
-
-        Round-1 Codex review fix #14: orphan-cleanup actions are
-        also deduplicated by their primary identifier (``session_id``
-        for ``CLEAN_ORPHAN_SESSION``, ``branch`` for
-        ``CLEAN_ORPHAN_WORKTREE``). The per-work-item iteration
-        of ``_plan_orphan_*`` walks the same union tuple for
-        every candidate, so an orphan that genuinely has no
-        live lease across all items would be emitted N times.
-        The cross-item dedupe key is the action's primary
-        identifier — the same one the sweeper would have used
-        to dispatch the action — so callers can rely on the
-        output list being deduplicated end-to-end.
-
-        Round-2 Codex review fix: orphan deduplication keeps the
-        session and worktree namespaces SEPARATE. The round-1
-        implementation used one ``seen_orphans`` set keyed by a
-        bare string, so a session id that collided with a worktree
-        branch deduplicated against each other; and worktrees were
-        keyed on ``branch`` even though the sweeper dispatches by
-        worktree *path*, collapsing distinct stale worktrees that
-        happen to share a branch. Each type now has its own set and
-        its own dispatch key.
-        """
-        seen: set[str] = set()
-        seen_session_orphans: set[str] = set()
-        seen_worktree_orphans: set[str] = set()
-        out: list[Action] = []
+        """Deduplicate branch-creating runs and orphan resources in separate namespaces."""
+        seen: set[tuple[ActionKind, str | None]] = set()
+        out = []
         for action in actions:
-            if actions_target_branch(action):
-                key = action.run_id or ""
+            key = self._deduplication_key(action)
+            if key is not None:
                 if key in seen:
                     continue
                 seen.add(key)
-            elif action.kind is ActionKind.CLEAN_ORPHAN_SESSION:
-                key = action.session_id or ""
-                if key in seen_session_orphans:
-                    continue
-                seen_session_orphans.add(key)
-            elif action.kind is ActionKind.CLEAN_ORPHAN_WORKTREE:
-                # Dispatch key is the worktree PATH (cleanup removes by
-                # path), falling back to the branch when no path is set.
-                key = action.worktree or action.branch or ""
-                if key in seen_worktree_orphans:
-                    continue
-                seen_worktree_orphans.add(key)
             out.append(action)
         return out
+
+    @staticmethod
+    def _deduplication_key(action: Action) -> tuple[ActionKind, str | None] | None:
+        if actions_target_branch(action):
+            return action.kind, action.run_id
+        if action.kind is ActionKind.CLEAN_ORPHAN_SESSION:
+            return action.kind, action.session_id
+        if action.kind is ActionKind.CLEAN_ORPHAN_WORKTREE:
+            return action.kind, action.worktree or action.branch
+        return None
 
 
 # --- Orphan detection helpers (public) --------------------------------------

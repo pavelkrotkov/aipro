@@ -134,8 +134,8 @@ class TestCliApplyAndRepo:
                 "test-owner/test-repo",
             ]
         )
-        # Stale lease = ESCALATE -> exit code 2.
-        assert exit_code == 2
+        # No authenticated execution client: refuse apply, still show manual plan.
+        assert exit_code == 3
         out = capsys.readouterr().out
         assert "ESCALATE" in out or "escalate" in out
 

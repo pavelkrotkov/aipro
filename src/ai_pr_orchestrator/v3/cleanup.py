@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from .config import CleanupConfig, GitHubQueueConfig
-from .domain import TERMINAL_PHASES
+from .domain import TERMINAL_PHASES, GitHubIssueRef
 from .interfaces import SessionHandle
 from .queue import GitHubIssueQueue, claim_from_state
 from .reconcile import (
@@ -56,29 +56,43 @@ class SweepOutcome:
     orphans: int = 0
     worktrees_cleaned: int = 0
     sessions_terminated: int = 0
-    state_load_failures: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def has_manual_actions(self) -> bool:
         return bool(self.manual_actions)
 
-    @property
-    def has_state_load_failures(self) -> bool:
-        return bool(self.state_load_failures)
+
+def _observations(
+    queue: GitHubIssueQueue,
+    sessions: tuple[SessionObservation, ...],
+    worktrees: tuple[WorktreeObservation, ...],
+) -> list[WorkItemObservation]:
+    issue_numbers = tuple(
+        int(w.branch.removeprefix("aipro-issue-"))
+        for w in worktrees
+        if w.branch.removeprefix("aipro-issue-").isdigit()
+    )
+    slugs = tuple(s.work_item_id for s in sessions if s.work_item_id is not None)
+    issues = queue.list_tracked(work_item_ids=slugs, issue_numbers=issue_numbers)
+    return [_observe_item(queue, issue) for issue in issues]
 
 
-def _observations(queue: GitHubIssueQueue) -> list[WorkItemObservation]:
-    observations = []
-    for issue in queue.list_tracked():
-        try:
-            state = queue.load_state(issue.slug())
-            claim = None
-            if state is not None and state.phase not in (*TERMINAL_PHASES, "queued"):
-                claim = claim_from_state(state)
-            observations.append(WorkItemObservation(issue, state, claim))
-        except Exception as exc:
-            raise CleanupStateLoadError(f"Cannot verify {issue.slug()}: {exc}") from exc
-    return observations
+def _observe_item(queue: GitHubIssueQueue, issue: GitHubIssueRef) -> WorkItemObservation:
+    """Read state and claim atomically from the sweep's perspective.
+
+    A malformed active claim or missing state behind a lifecycle label is
+    unknown ownership, not proof that its resources can be deleted.
+    """
+    try:
+        state = queue.load_state(issue.slug())
+        if state is None:
+            if not queue.is_enabled(issue) and queue.load_work_item(issue).labels:
+                raise ValueError("lifecycle item has no authoritative state")
+            return WorkItemObservation(issue, None, None)
+        claim = None if state.phase in (*TERMINAL_PHASES, "queued") else claim_from_state(state)
+        return WorkItemObservation(issue, state, claim)
+    except Exception as exc:
+        raise CleanupStateLoadError(f"Cannot verify {issue.slug()}: {exc}") from exc
 
 
 def run_cleanup(
@@ -86,7 +100,6 @@ def run_cleanup(
     *,
     cao: CaoControllerLike | None = None,
     git: GitOpsLike | None = None,
-    planner: ReconcilePlanner | None = None,
     policy: CleanupPolicy | None = None,
     sessions: Iterable[SessionObservation] = (),
     worktree_obs: Iterable[WorktreeObservation] = (),
@@ -96,11 +109,35 @@ def run_cleanup(
     Missing/failed controllers leave a manual action, never a successful removal.
     """
     policy = policy or CleanupPolicy(CleanupConfig(), GitHubQueueConfig())
-    observations = _observations(queue)
     sessions, worktrees = tuple(sessions), tuple(worktree_obs)
-    planner = planner or ReconcilePlanner(
+    observations = _observations(queue, sessions, worktrees)
+    known_ids = {item.work_item_id for item in observations}
+    sessions = tuple(s for s in sessions if s.work_item_id in known_ids)
+    planner = ReconcilePlanner(
         cleanup_config=policy.cleanup_config, queue_config=policy.queue_config
     )
+    outcome = SweepOutcome(
+        manual_actions=_manual_recovery_actions(planner, observations, sessions, policy)
+    )
+    actions = planner.plan_orphans(observations, sessions, worktrees, now=policy.now)
+    for action in actions:
+        # Re-read all ownership immediately before deletion. A newly claimed item
+        # makes its earlier orphan action ineligible; failed reads abort the sweep.
+        current = planner.plan_orphans(
+            _observations(queue, sessions, worktrees), sessions, worktrees, now=policy.now
+        )
+        if action in current:
+            _apply_action(action, cao=cao, git=git, outcome=outcome)
+    return outcome
+
+
+def _manual_recovery_actions(
+    planner: ReconcilePlanner,
+    observations: list[WorkItemObservation],
+    sessions: tuple[SessionObservation, ...],
+    policy: CleanupPolicy,
+) -> list[Action]:
+    """Recovery remains a planner decision; this sweep executes only orphan removal."""
     inputs = [
         ReconciliationInputs(
             observation=item,
@@ -113,16 +150,7 @@ def run_cleanup(
         )
         for item in observations
     ]
-    outcome = SweepOutcome()
-    outcome.manual_actions = [a for a in planner.plan_many(inputs) if not a.auto_apply]
-    actions = planner.plan_orphans(observations, sessions, worktrees, now=policy.now)
-    for action in actions:
-        # Re-read all ownership immediately before deletion. A newly claimed item
-        # makes its earlier orphan action ineligible; failed reads abort the sweep.
-        current = planner.plan_orphans(_observations(queue), sessions, worktrees, now=policy.now)
-        if action in current:
-            _apply_action(action, cao=cao, git=git, outcome=outcome)
-    return outcome
+    return [action for action in planner.plan_many(inputs) if not action.auto_apply]
 
 
 def _apply_action(
@@ -133,18 +161,7 @@ def _apply_action(
     outcome: SweepOutcome,
 ) -> None:
     try:
-        if action.kind is ActionKind.CLEAN_ORPHAN_SESSION:
-            if cao is None or action.session_id is None:
-                raise RuntimeError("Session cleanup requires a CAO controller and session id")
-            cao.terminate_session(SessionHandle(session_id=action.session_id, lane="-"))
-            outcome.sessions_terminated += 1
-        elif action.kind is ActionKind.CLEAN_ORPHAN_WORKTREE:
-            if git is None or action.worktree is None:
-                raise RuntimeError("Worktree cleanup requires git operations and a path")
-            git.cleanup_worktree(action.worktree)
-            outcome.worktrees_cleaned += 1
-        else:
-            raise ValueError(f"Unsupported cleanup action: {action.kind}")
+        _remove_orphan(action, cao=cao, git=git)
     except Exception as exc:
         outcome.manual_actions.append(
             Action(
@@ -158,3 +175,21 @@ def _apply_action(
         return
     outcome.auto_applied.append(action)
     outcome.orphans += 1
+    outcome.sessions_terminated += action.kind is ActionKind.CLEAN_ORPHAN_SESSION
+    outcome.worktrees_cleaned += action.kind is ActionKind.CLEAN_ORPHAN_WORKTREE
+
+
+def _remove_orphan(
+    action: Action, *, cao: CaoControllerLike | None, git: GitOpsLike | None
+) -> None:
+    """The destructive boundary returns only after its controller confirms success."""
+    if action.kind is ActionKind.CLEAN_ORPHAN_SESSION:
+        if cao is None or action.session_id is None:
+            raise RuntimeError("Session cleanup requires a CAO controller and session id")
+        cao.terminate_session(SessionHandle(session_id=action.session_id, lane="-"))
+    elif action.kind is ActionKind.CLEAN_ORPHAN_WORKTREE:
+        if git is None or action.worktree is None:
+            raise RuntimeError("Worktree cleanup requires git operations and a path")
+        git.cleanup_worktree(action.worktree)
+    else:
+        raise ValueError(f"Unsupported cleanup action: {action.kind}")

@@ -1,31 +1,8 @@
-"""E2E scenario 6 (issue #55): provider 429 / capacity failure -> Hermes
-fallback without losing the phase.
+"""CAO launch-rate-limit regression, a prerequisite to #55 scenario 6.
 
-The lane execution surface can fail with :class:`CaoRateLimitedError`
-when CAO returns HTTP 429 or an equivalent backpressure signal. The
-foreman must NOT lose the work item's authoritative state when that
-happens — every committed observation (claim, branch, worktree, PR)
-must remain reachable so a later pass (or operator intervention) can
-recover. The production contract is "transient lane failures escalate
-the item rather than silently rewriting durable state".
-
-This test exercises the path through the real
-:class:`~ai_pr_orchestrator.v3.cao_lane.CaoLaneExecutor` against a
-``FakeCAOServer`` whose launch endpoint is faulted to return 429 on the
-first call. The foreman's lane exception propagates up to ``run_pass``,
-which persists the crash via ``mark_needs_human`` so the operator can
-re-queue the item; the authoritative labels move to
-``v3-work-needs-human`` and the durable claim is retained (so an
-operator's `aipro reconcile --apply` can recover the lease).
-
-Acceptance (per #55 E2E scenarios, #6):
-- The 429 did not delete the claim: the work item still carries
-  ``v3-work-needs-human`` (a recoverable phase, not ``done``).
-- The branch, worktree, and PR attribution persist on the workflow
-  state. A recovered foreman should be able to ``reclaim_expired``
-  from there.
-- No duplicate PR was minted; ``list_open_prs()`` returns zero (the
-  lane never reached the ``_ensure_pr`` step).
+A control-plane 429 must preserve attribution and escalate. This is not a
+Hermes provider-fallback test: that scenario still needs a Hermes-side stub
+or real-provider smoke through CAO, without adding retries inside aipro.
 """
 
 from __future__ import annotations
@@ -228,13 +205,10 @@ def test_scenario_6_lane_429_does_not_lose_the_phase(faulted_cao: Any):
     assert "v3-work" not in labels
 
 
-def test_scenario_6_transient_429_then_success_does_not_mint_duplicate(
+def test_launch_429_terminal_claim_cannot_be_silently_reclaimed(
     faulted_cao: Any,
 ):
-    """After the first call returns 429, a re-run on the same issue
-    succeeds (no PR was created on the first attempt). No duplicate
-    branches or PRs are minted on the second pass because the claim was
-    already escalated, not re-claimable."""
+    """A launch failure remains terminal until explicitly reconciled by an operator."""
     fake = FakeGitHubClient()
     fake.seed_issue(1, labels=["v3-work"])
     loop, queue = _foreman(fake, faulted_cao)

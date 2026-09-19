@@ -582,9 +582,11 @@ def test_reviewer_triggers_capped_per_run():
     cfg = V3Config(safety=SafetyPolicyConfig(max_reviewer_triggers_per_run=1))
     loop, _ = _foreman(fake, executor, _gate(), cfg)
     outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "done"
+    assert outcome.final_phase == "escalated"
+    assert "reviewer trigger budget" in outcome.reason
+    assert fake.list_open_prs() == []
     reviewer_calls = [c for c in executor.calls if c[0] != "developer"]
-    assert len(reviewer_calls) == 1
+    assert reviewer_calls == []
 
 
 def test_issue_body_is_included_in_coder_prompt():

@@ -434,9 +434,15 @@ class GitHubIssueQueue:
         numbers = self._client.list_issues_by_label(self._cfg.enabled_label)
         return [GitHubIssueRef(owner=self._owner, repo=self._repo, number=n) for n in numbers]
 
-    def list_tracked(self) -> list[GitHubIssueRef]:
+    def list_tracked(
+        self, *, work_item_ids: tuple[str, ...] = (), issue_numbers: tuple[int, ...] = ()
+    ) -> list[GitHubIssueRef]:
         """Discover durable work across all lifecycle labels, including terminal items."""
-        numbers = set()
+        numbers = set(issue_numbers)
+        prefix = f"{self._owner}/{self._repo}#"
+        numbers.update(
+            int(slug.removeprefix(prefix)) for slug in work_item_ids if slug.startswith(prefix)
+        )
         for label in self._lifecycle_labels:
             numbers.update(self._client.list_issues_by_label(label))
         return [GitHubIssueRef(self._owner, self._repo, n) for n in sorted(numbers)]

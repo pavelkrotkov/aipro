@@ -25,8 +25,9 @@ side-effect invariants:
   ``CleanupConfig.session_lease_ttl_seconds``.
 - No orphan worktrees beyond
   ``CleanupConfig.worktree_inactivity_ttl_seconds``.
-- No state divergence between in-memory :class:`FakeGitHubClient`
-  and the ``FakeCAOServer``'s view of the world.
+- No state divergence between authoritative GitHub records and the
+  persistent Git/CAO resource fakes. This is policy evidence, not a
+  real Hermes/CAO execution acceptance gate.
 
 A ``--dry-run`` mode prints the planned number of rounds, the
 expected issues per round, and the cleanup behaviour without
@@ -364,7 +365,7 @@ def _seed_orphans(
     worktree_age = timedelta(seconds=cleanup_cfg.worktree_inactivity_ttl_seconds * 2)
     # We use a unique issue slug per round so a seeded orphan
     # does not collide with a real work item in the same round.
-    orphan_issue_slug = f"owner/repo#orphan-round-{round_index}"
+    orphan_issue_slug = f"owner/repo#{900000 + round_index}"
     sessions = [
         SessionObservation(
             session_id=f"orphan-session-{round_index}",
@@ -463,7 +464,6 @@ def _run_round(
         fakes.queue,
         cao=fakes,
         git=fakes.git,
-        planner=None,
         policy=cleanup_policy,
         sessions=seeded_sessions,
         worktree_obs=seeded_worktrees,

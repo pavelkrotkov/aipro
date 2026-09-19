@@ -213,7 +213,7 @@ def test_foreman_feeds_real_observations_into_cleanup():
     def _orphan_session(now):
         return SessionObservation(
             session_id="orphan-cao-sess",
-            work_item_id="owner/repo#orphan-3",
+            work_item_id="owner/repo#999",
             run_id=None,
             lane="developer",
             state="terminal",
@@ -480,7 +480,7 @@ def test_cleanup_plans_orphans_without_active_items():
     fake = FakeGitHubClient()  # no labels -> empty candidate set
     queue = _queue(fake)
     now = datetime.now(UTC)
-    session = _orphan_session("orphan-7", now=now, slug="owner/repo#orphan-7")
+    session = _orphan_session("orphan-7", now=now, slug="owner/repo#999")
     worktree = _orphan_worktree("/wt/orphan-7", now=now, branch="orphan-branch-7")
 
     terminated: list[str] = []

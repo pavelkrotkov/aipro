@@ -491,7 +491,7 @@ def test_cleanup_executes_orphan_session_through_cao():
     # live. So we need a different work item to anchor the
     # orphan session. The candidate set includes issue 1 (via
     # the v3-work label); the orphan session is associated
-    # with ``owner/repo#orphan`` and has no live claim, so
+    # with ``owner/repo#999`` and has no live claim, so
     # the planner classifies it as orphan.
     from ai_pr_orchestrator.v3.reconcile import SessionObservation
 
@@ -507,7 +507,7 @@ def test_cleanup_executes_orphan_session_through_cao():
     now = datetime.now(UTC)
     session = SessionObservation(
         session_id="orphan-sess-1",
-        work_item_id="owner/repo#orphan",
+        work_item_id="owner/repo#999",
         run_id=None,
         lane="developer",
         state="terminal",
@@ -690,7 +690,7 @@ def test_cleanup_deduplicates_orphan_observations():
     now = datetime.now(UTC)
     session = SessionObservation(
         session_id="orphan-shared",
-        work_item_id="owner/repo#orphan",
+        work_item_id="owner/repo#999",
         run_id=None,
         lane="developer",
         state="terminal",

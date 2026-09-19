@@ -1,33 +1,9 @@
-"""E2E scenario 9 (issue #55): foreman / CAO / aipro restart mid-run ->
-reconciliation resumes safely.
+"""Recovery prerequisites for #55 scenario 9, not cold-restart acceptance.
 
-The simulation:
-
-1. A foreman claim wins, branch + worktree are created, the coder
-   lane is launched against the real ``CaoLaneExecutor``.
-2. The coder session completes but the durable record of the result is
-   not yet written to the workflow state (this is the post-launch,
-   pre-persist window where a crash can lose the result).
-3. The "restart" replaces the foreman instance, and a new pass is
-   issued. The new pass MUST consult
-   :class:`~ai_pr_orchestrator.v3.reconcile.ReconcilePlanner` to derive
-   the correct next action (the reconciliation's
-   :attr:`ActionKind.COLLECT_RESULT` row matches this exact case: the
-   coder finished, no findings were persisted, the durable state must
-   catch up without duplicating side effects).
-4. The foreman then acts on the planner's recommendation: it runs the
-   reviewer round (which the planner's plan says is the next safe
-   step), and the item reaches ``done``.
-
-Acceptance (per #55 E2E scenarios, #9):
-- Exactly one PR is opened (no duplicate branch / PR across the restart).
-- The coder lane is NOT re-launched (no double side effect on the
-  worktree); the deterministic CAO session name is reused for the
-  reviewer round that follows.
-- The reconciliation plan from :class:`ReconcilePlanner` is the
-  authoritative source for the next action; the foreman's behavior
-  follows the plan.
-- The post-restart pass reaches ``done`` with CI green.
+The planner test checks a recovery decision. A separate failure regression
+explicitly requeues a checkpoint, then proves a failing coder cannot mint a PR
+or duplicate its branch. Neither test applies COLLECT_RESULT through a fresh
+CAO controller to reach done; that production acceptance remains outstanding.
 """
 
 from __future__ import annotations
@@ -39,8 +15,6 @@ from typing import Any
 from ai_pr_orchestrator.github.fake import FakeGitHubClient
 from ai_pr_orchestrator.v3.broker import BrokerDecision
 from ai_pr_orchestrator.v3.cao import (
-    CAOControlPlaneConfig,
-    CaoSessionController,
     session_name_for,
 )
 from ai_pr_orchestrator.v3.config import V3Config
@@ -262,34 +236,23 @@ def test_scenario_9_reconcile_plan_directs_resume_after_midrun_crash():
     )
 
 
-def test_scenario_9_post_restart_pass_does_not_duplicate_side_effects():
-    """A second foreman pass after the planner-derived recovery runs the
-    reviewer round (not a new coder invocation) and reaches done.
-    Exactly one PR is opened."""
+def test_explicitly_requeued_checkpoint_fails_without_duplicate_side_effects():
+    """Failure regression only; successful cold restart remains a #55 acceptance gap."""
     fake = FakeGitHubClient()
     queue, git = _seed_partial_state(fake, issue_number=1, run_id="run-s9-pre", phase="coding")
+    # Explicit operator recovery, not an assertion of automatic cold restart.
+    prior = queue.load_state("owner/repo#1")
+    assert prior is not None
+    queue.abandon(GitHubIssueRef("owner", "repo", 1), prior)
+    fake.add_label(1, "v3-work")
 
     cfg = V3Config()
-    cfg = V3Config()
-    controller = CaoSessionController(
-        CAOControlPlaneConfig(base_url="http://localhost:0", session_timeout_seconds=60),
-        LaneRegistry.default(),
-    )
-    controller.close()
 
-    # The reviewer lane uses a session name derived from the same run
-    # id; this is the same session the planner's COLLECT_RESULT picked
-    # up. We use a ScriptedExecutor below so the lane is deterministic
-    # and does not depend on the closed controller.
     from dataclasses import dataclass
 
     @dataclass
     class ReviewerOnlyExecutor:
-        """A lane executor that runs the coder lane ONCE (no-op) and
-        the reviewer lane ONCE (returns no findings). The coder
-        invocation corresponds to the one the original foreman already
-        performed; we mark it as already-completed by skipping it and
-        only running the reviewer when asked."""
+        """A failing coder; reviewers must never run after its failure."""
 
         coder_called: int = 0
         reviewer_called: int = 0
@@ -333,18 +296,17 @@ def test_scenario_9_post_restart_pass_does_not_duplicate_side_effects():
         committer_email="aipro-bot@example.invalid",
     )
 
-    # The new foreman sees the existing claim and transitions through
-    # the lifecycle. The coder's failure short-circuits to escalation
-    # here (a real production path would have a more nuanced handler
-    # for "already-completed" lane results); what the test asserts is
-    # the absence of *duplicate side effects*: exactly one PR is opened
-    # or zero, never two.
+    # Explicitly resumed coding fails closed without duplicating resources.
     outcomes = new_loop.run_pass()
     assert len(outcomes) == 1
+    assert outcomes[0].final_phase == "escalated"
+    assert executor.coder_called > 0
+    assert executor.reviewer_called == 0
+    assert git.branches.count("aipro-issue-1") == 1
     # Outcome is terminal (escalated because the coder "failed" in our
     # simulation); what's important is no duplicate PRs.
     open_prs = fake.list_open_prs()
-    assert len(open_prs) <= 1, f"second pass minted duplicate PRs after restart: {open_prs}"
+    assert open_prs == [], f"failed coder must not produce a PR: {open_prs}"
 
 
 def test_scenario_9_cleanup_runner_does_not_clean_a_live_lease():

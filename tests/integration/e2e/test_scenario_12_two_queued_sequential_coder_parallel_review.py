@@ -1,21 +1,8 @@
-"""E2E scenario 12 (issue #55): two queued issues -> sequential developer
-execution with parallel review fan-out.
+"""Multi-issue policy coverage for #55 scenario 12.
 
-The foreman claims multiple issues in a single pass, but the coder
-lanes run sequentially (the coder is single-threaded per
-:class:`~ai_pr_orchestrator.v3.lanes.LaneRegistry`). Reviewer lanes
-across rounds run in parallel within their own round (each round
-spawns one lane per reviewer profile).
-
-The test:
-
-1. Seeds two issues on the enabled label.
-2. Drives the foreman through one ``run_pass``.
-3. Asserts: both issues reach ``done``, exactly one PR per issue,
-   exactly one coder invocation per issue (no interleaving that would
-   spawn duplicate branches or PRs), and the reviewer lane ran
-   multiple times (the fan-out across the three default reviewer
-   profiles).
+Two issues complete sequentially with three reviewer calls each. This test does
+not establish temporal concurrency or fresh CAO sessions; those remain explicit
+production acceptance requirements in docs/V3_SOAK.md.
 """
 
 from __future__ import annotations
