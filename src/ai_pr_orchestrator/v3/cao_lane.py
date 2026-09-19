@@ -95,7 +95,7 @@ class CaoLaneExecutor:
            context and the optional :class:`ModelLease`.
         3. ``start_session`` adopts an existing session if one is alive
            under the same deterministic name; otherwise it creates one.
-        4. Submit this turn's prompt via ``submit_work``, then poll
+        4. Submit this turn's prompt, persist its context, then poll
            ``poll_session`` until the controller reports terminal
            state or the wall-clock budget is exhausted.
         5. Preserve a busy session when CAO rejects input. On other
@@ -118,6 +118,7 @@ class CaoLaneExecutor:
         deadline = time.monotonic() + self._max_poll
         try:
             self._controller.submit_work(handle, task_prompt)
+            self._controller.update_turn_context(handle, context)
             while True:
                 result = self._controller.poll_session(handle)
                 if result is not None:

@@ -392,7 +392,22 @@ class _FakeHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         if self._apply_fault_or(self.command, self.path) is not None:
             return
-        self._read_body()  # metadata is best-effort persistence in CAO
+        body = self._read_body() or {}
+        match self._strip_query().split("/"):
+            case ["", "terminals", terminal_id, "metadata"]:
+                pass
+            case _:
+                self._write_text(404, f"unknown metadata path {self.path}")
+                return
+        if not isinstance(body.get("metadata"), dict):
+            self._write_text(422, "metadata object required")
+            return
+        with self._fake._lock:
+            state = _find_by_terminal(self._fake._sessions, terminal_id)
+            if state is None or state.deleted:
+                self._write_text(404, f"no terminal {terminal_id}")
+                return
+            state.metadata = body["metadata"]
         self._write_text(204, "")
 
     def do_DELETE(self) -> None:
