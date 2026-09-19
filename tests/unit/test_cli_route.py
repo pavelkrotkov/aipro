@@ -189,3 +189,17 @@ def test_route_redacts_config_error(tmp_path: Path) -> None:
         cli.main([*ARGS, "--config", str(path)])
     assert "sk-proj-secret12345" not in str(exc.value)
     assert "cost_class" in str(exc.value)
+
+
+def test_route_rejects_non_finite_json_without_partial_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "v3.yml"
+    path.write_text(
+        "broker: {weight_quality: 1.0e+308, weight_cash_cost: 1.0e+308}\n"
+        "model_router:\n  catalog:\n"
+        "    - {ref: free, descriptor: d, cost_class: free, quality_by_role: {worker: 5}}\n"
+    )
+    with pytest.raises(SystemExit, match="non-finite score"):
+        cli.main([*ARGS, "--config", str(path), "--json"])
+    assert capsys.readouterr().out == ""

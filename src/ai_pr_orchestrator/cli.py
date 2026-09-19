@@ -201,7 +201,15 @@ def _run_route_explain(args: argparse.Namespace) -> int:
 
     if args.json:
         payload = {"schema_version": 1, "hypothetical": True, "decision": decision.to_dict()}
-        print(json.dumps(_redact_route_output(payload), indent=2, sort_keys=True))
+        try:
+            output = json.dumps(
+                _redact_route_output(payload), indent=2, sort_keys=True, allow_nan=False
+            )
+        except ValueError as exc:
+            raise SystemExit(
+                "Routing explanation contains a non-finite score; check broker weights"
+            ) from exc
+        print(output)
     else:
         print("Hypothetical current selection; no incumbent, peers, or active lane counts.")
         print(redact_secrets(decision.render()))
