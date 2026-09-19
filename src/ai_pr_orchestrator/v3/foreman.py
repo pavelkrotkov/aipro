@@ -39,7 +39,6 @@ import threading
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Protocol, cast
 
 import httpx
@@ -519,9 +518,9 @@ class ForemanPolicyLoop:
                     coder_invocations=coder_invocations,
                     gate=decision,
                 )
-            if result is None and (worktree is None or not Path(worktree).is_dir()):
+            if result is None:
                 return self._escalate(
-                    issue, state, "CI remediation requires a local worktree", now=now
+                    issue, state, "CI-only resume cannot safely dispatch local remediation", now=now
                 )
             # Real CI failures become findings for the next coding round —
             # unless the review budget is spent and reviews keep reporting

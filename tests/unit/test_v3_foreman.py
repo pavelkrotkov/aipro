@@ -1367,7 +1367,7 @@ def test_pr_discovery_excludes_other_repository_or_base(mismatch):
     assert state is not None and state.extras["pr_number"] == matching.number
 
 
-@pytest.mark.parametrize("retained_path", [True, False])
+@pytest.mark.parametrize("retained_path", ["absent", "missing", "unrelated"])
 @pytest.mark.parametrize("settled", ["green", "pending", "failed"])
 def test_cold_ci_resume_needs_only_recorded_pr(monkeypatch, tmp_path, retained_path, settled):
     fake = _ready_fake()
@@ -1379,8 +1379,10 @@ def test_cold_ci_resume_needs_only_recorded_pr(monkeypatch, tmp_path, retained_p
     assert first.run_pass()[0].final_phase == "ci_gating"
     state = queue.load_state(ISSUE.slug())
     extras = {k: v for k, v in state.extras.items() if k != "worktree"}
-    if retained_path:
+    if retained_path != "absent":
         extras["worktree"] = str(tmp_path / "other-host-checkout")
+    if retained_path == "unrelated":
+        (tmp_path / "other-host-checkout").mkdir()
     queue.save_state(replace(state, extras=extras), expected_updated_at=state.updated_at)
     original = fake.get_pr(extras["pr_number"])
     fake._prs[original.number] = replace(original, head_sha="live-pr-head")
