@@ -38,7 +38,7 @@ import threading
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from .broker import TaskDemand
 from .config import V3Config
@@ -143,6 +143,22 @@ class _ForemanEscalation(RuntimeError):
         self.reason = reason
 
 
+class _SafetyMetadataError(RuntimeError):
+    """Transient failure to fetch origin metadata in :meth:`_safety_check`.
+
+    Distinguished from a *confirmed* policy rejection (fork / untrusted
+    author): when the metadata is UNVERIFIABLE right now (rate limit, 5xx,
+    parse error) the item is escalated via ``mark_needs_human`` so an
+    operator sees the failure and the item stays eligible once GitHub
+    recovers — it is never silently rejected-and-removed the way a
+    confirmed rejection is (round-2 Codex review fix #5).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class _RoundReport:
     """Result of one review round."""
@@ -200,6 +216,13 @@ class ForemanPolicyLoop:
         self._worktree_root = worktree_root
         self._name = committer_name
         self._email = committer_email
+        # Round-2 Codex review fix #3: the foreman owns the live CAO
+        # controller, but the constructor never recorded it, so the
+        # post-pass cleanup unconditionally saw ``cao=None`` and could
+        # never terminate real orphan sessions. Declared (default None so
+        # partial test fakes still construct) and wired by the production
+        # runner once a controller exists.
+        self._cao: Any = None
 
     @property
     def run_id(self) -> str:
@@ -223,6 +246,17 @@ class ForemanPolicyLoop:
         One item crashing escalates *that item* only — and persists the crash
         (``mark_needs_human``) so the authoritative issue is never left on an
         active phase with a stranded claim. The pass continues.
+
+        Round-1 Codex review fix #2: the production foreman now
+        invokes :func:`~ai_pr_orchestrator.v3.cleanup.run_cleanup`
+        after the foreman pass completes so orphan sessions /
+        worktrees / stale leases are surfaced and EXECUTED in the
+        same pass. The CAO controller and git operations are wired
+        through the foreman so the sweep can call
+        ``terminate_session`` / ``cleanup_worktree`` /
+        ``reclaim_expired`` directly. A failed sweep (state-load
+        error) is logged but does not crash the foreman — partial
+        progress on the work items is the primary deliverable.
         """
         issues = self._list_ready()
         if max_items is not None:
@@ -242,7 +276,78 @@ class ForemanPolicyLoop:
                         escalated=True,
                     )
                 )
+        self._run_post_pass_cleanup()
         return outcomes
+
+    def _run_post_pass_cleanup(self) -> None:
+        """Invoke the production ``v3.cleanup`` sweeper after the foreman pass.
+
+        Round-1 Codex review fix #2: wiring point. The foreman
+        owns the live CAO controller and git operations, so the
+        sweep is fed real controllers (not the default no-op
+        stubs) and can actually terminate orphan sessions and
+        clean orphan worktrees. A failure (e.g. state load
+        errors) is logged but never propagates — the foreman's
+        contract is to surface work-item outcomes, not to gate
+        the pass on the sweep.
+        """
+        from .cleanup import CleanupPolicy, run_cleanup
+        from .queue import GitHubIssueQueue
+
+        queue = self._queue
+        # ``run_cleanup`` requires a ``GitHubIssueQueue`` (it pokes
+        # at ``_client`` / ``_owner`` / ``_repo`` to discover
+        # candidates and load state). The foreman accepts any
+        # structural queue; the real production wiring passes a
+        # real ``GitHubIssueQueue``, so this is a type narrowing
+        # not a real cast.
+        if not isinstance(queue, GitHubIssueQueue):
+            return
+        cao = getattr(self, "_cao", None)
+        git = self._git
+        policy = CleanupPolicy(
+            cleanup_config=self._cfg.cleanup,
+            queue_config=self._cfg.github_queue,
+        )
+        # Round-2 Codex review fix #3: feed the sweep REAL resource
+        # observations from the live CAO controller and git ops, not empty
+        # iterables. Orphan actions are derived exclusively from these
+        # observation iterables, so an empty collection meant the post-pass
+        # sweep could never discover a real orphan session or worktree.
+        # Controllers expose optional discovery methods; absence (tests /
+        # partial fakes) degrades to no observations rather than raising.
+        sessions: tuple = ()
+        list_sessions = getattr(cao, "list_session_observations", None)
+        if list_sessions is not None:
+            try:
+                sessions = tuple(list_sessions())
+            except Exception as exc:  # pragma: no cover - defensive
+                log = __import__("logging").getLogger(__name__)
+                log.warning("foreman: could not list CAO sessions: %s", exc)
+        worktrees: tuple = ()
+        list_worktrees = getattr(git, "list_worktree_observations", None)
+        if list_worktrees is not None:
+            try:
+                worktrees = tuple(list_worktrees())
+            except Exception as exc:  # pragma: no cover - defensive
+                log = __import__("logging").getLogger(__name__)
+                log.warning("foreman: could not list git worktrees: %s", exc)
+        try:
+            run_cleanup(
+                queue,
+                cao=cao,
+                git=git,
+                policy=policy,
+                sessions=sessions,
+                worktree_obs=worktrees,
+                # Round-2 Codex review fix #4: stale-lease recovery re-claims
+                # under THIS foreman's real run identity, never a fabricated
+                # ``<old>-recover`` owner nobody resumes.
+                recovery_run_id=self._run_id,
+            )
+        except Exception as exc:
+            log = __import__("logging").getLogger(__name__)
+            log.warning("foreman: post-pass cleanup failed: %s", exc)
 
     def _persist_crash(self, issue: GitHubIssueRef, reason: str) -> None:
         """Persist an in-pass crash against the authoritative issue.
@@ -273,6 +378,48 @@ class ForemanPolicyLoop:
     # --- Lifecycle -----------------------------------------------------------
 
     def _drive(self, issue: GitHubIssueRef, *, now: datetime | None) -> WorkItemOutcome:
+        # Safety gate: the originating issue's metadata (``is_fork`` /
+        # ``author_association``) is checked BEFORE claim so a forbidden
+        # issue never opens a branch, worktree, or PR. The originating
+        # issue is the source of truth — the PR is bot-authored, so its
+        # association would vacuously pass every gate.
+        #
+        # Round-1 Codex review fix #11: a rejected issue is removed
+        # from the ``enabled_label`` set before returning so the next
+        # ``run_pass`` does not re-discover it. Without this, a fork
+        # or untrusted-author issue would surface on every pass and
+        # be re-rejected indefinitely (and the foreman would mint
+        # label churn). The label-removal uses the queue's own
+        # ``remove_label`` verb so production / fake clients agree.
+        #
+        # Round-2 Codex review fix #8: the opt-in label is revalidated
+        # BEFORE continuing. ``run_pass`` snapshots ``list_ready()`` at the
+        # start; if the operator removed the enabled label between passes
+        # (or mid-snapshot), the foreground would otherwise skip straight to
+        # fork/author checks and claim + continue real work (branch, PR, CI
+        # side effects) on an item the operator explicitly opted out of. The
+        # revalidation terminates any live session and abandons (parks) the
+        # item instead of running it.
+        if not self._revalidate_opt_in(issue):
+            existing = self._load_optional(issue)
+            return self._dropdown_opted_out(issue, existing, now=now)
+        try:
+            rejection = self._safety_check(issue)
+        except _SafetyMetadataError as exc:
+            # Round-2 Codex review fix #5: unverifiable metadata is NOT a
+            # confirmed rejection. The item must not silently lose its
+            # opt-in label / be dropped from later passes; instead persist
+            # ``mark_needs_human`` so an operator can find and adjudicate
+            # it once GitHub recovers.
+            return self._escalate_unverified(issue, str(exc))
+        if rejection is not None:
+            self._remove_enabled_label(issue)
+            return WorkItemOutcome(
+                issue=issue,
+                final_phase="failed",
+                reason=rejection,
+            )
+
         branch = f"aipro-issue-{issue.number}"
 
         # Claim FIRST — resources are created only once the claim is won, so a
@@ -923,6 +1070,248 @@ class ForemanPolicyLoop:
             pr_number=pr_number,
             now=now,
         )
+
+    def _safety_check(self, issue: GitHubIssueRef) -> str | None:
+        """Pre-claim safety gate on the originating issue's metadata.
+
+        Returns a failure ``reason`` if the issue must NOT be claimed,
+        ``None`` if it is safe to proceed. The gate is checked BEFORE
+        :meth:`_claim` opens a branch / worktree, so a rejected item
+        leaves no trace (no PR, no lease, no label churn).
+
+        Two controls live here (V1 parity):
+
+        - ``disallow_forks`` rejects issues whose originating repository
+          is a fork.
+        - ``allowed_pr_author_associations`` rejects issues whose
+          author association is not whitelisted (the originating issue's
+          association is the source of truth, NOT the PR's — the PR is
+          bot-authored, so its association would vacuously pass).
+
+        Round-1 Codex review fix #4: production must fail CLOSED on
+        metadata errors (rate limit, 5xx, parse error). A transient
+        GitHub outage must NOT silently approve every item that was
+        about to be rejected for a fork / untrusted-author reason.
+        The previous implementation degraded OPEN: a missing client
+        surfaced as "safe to proceed" so a flaky GitHub fetch did
+        not block eligible items. That fallback is too permissive —
+        it would let an attacker bypass the gate by triggering a
+        rate limit. Now: any exception inside the metadata fetch
+        short-circuits to a ``needs-human``-grade rejection so the
+        item is escalated, not silently approved.
+
+        The flip side (for tests) is in the queue's
+        :meth:`GitHubIssueQueue.repair_labels` / the foreman's
+        ``_drive`` flow: a rejected item is removed from the
+        ``enabled_label`` set so ``list_ready()`` does not return it
+        again (round-1 Codex review fix #11).
+        """
+        safety = self._cfg.safety
+        get_issue = getattr(self._queue, "_client", None)
+        client = getattr(get_issue, "get_issue", None) if get_issue is not None else None
+        if client is None:
+            # No client means a fake / partial queue. Tests inject the
+            # rejection reasons via the seeded issue metadata, so a
+            # missing client is "no metadata to check" rather than a
+            # transient error. The fake path therefore behaves as
+            # before: no gate trips.
+            return None
+        try:
+            issue_view = client(issue.number)
+        except Exception as exc:
+            # Fail closed: a transient GitHub error must NOT silently
+            # approve a fork or an untrusted-author issue. Round-2 Codex
+            # review fix #5: this is an UNVERIFIABLE-metadata condition,
+            # distinct from a CONFIRMED rejection. Raise
+            # ``_SafetyMetadataError`` so ``_drive`` persists
+            # ``mark_needs_human`` (durable, operator-visible) instead of
+            # routing the item through the permanent-rejection branch and
+            # silently removing its opt-in label. Escalation, not
+            # rejection: a human inspects the metadata once GitHub recovers.
+            raise _SafetyMetadataError(
+                f"safety check could not verify issue metadata: {exc}"
+            ) from exc
+        # ``disallow_forks`` — reject if the originating repository is a fork.
+        if safety.disallow_forks and getattr(issue_view, "is_fork", False):
+            return "origin repository is a fork; disallow_forks rejects forks"
+        # ``allowed_pr_author_associations`` — reject if the originating
+        # issue author's association is not whitelisted.
+        association = getattr(issue_view, "author_association", "") or ""
+        allowed = list(safety.allowed_pr_author_associations)
+        if allowed and association not in allowed:
+            return (
+                f"author association {association!r} not in "
+                f"allowed_pr_author_associations {allowed!r}"
+            )
+        return None
+
+    def _revalidate_opt_in(self, issue: GitHubIssueRef) -> bool:
+        """Return whether the operator still wants ``issue`` processed.
+
+        Round-2 Codex review fix #8: ``run_pass`` snapshots
+        ``list_ready()`` once at the start; the opt-in label can be removed
+        between passes (or while a lane runs) without this check. Before
+        claiming / continuing an item we positively confirm the enabled
+        label is still on the issue: if it has been removed, ``_drive``
+        parks the item instead of running branch/PR/CI side effects.
+
+        A *positive* absence stops work; an unreadable label set (transient
+        failure) degrades to *proceed* so a healthy claim is never
+        abandoned on a flapping read — we only drop out on a confirmed
+        opt-out.
+        """
+        client = getattr(self._queue, "_client", None)
+        if client is None:
+            return True
+        label = self._cfg.github_queue.enabled_label
+        try:
+            labels = set(client.get_labels(issue.number))
+        except Exception:
+            return True
+        return label in labels
+
+    def _dropdown_opted_out(
+        self,
+        issue: GitHubIssueRef,
+        existing: WorkflowState | None,
+        *,
+        now: datetime | None,
+    ) -> WorkItemOutcome:
+        """Park an item whose opt-in label vanished (round-2 fix #8).
+
+        Terminates any live session and abandons (requeues + clears the
+        claim) an existing non-terminal item so it is not left half-claimed
+        under a dead lease; a never-claimed item is simply skipped. The
+        item stays requeueable for when the operator restores the label.
+        """
+        reason = "opt-in enabled label removed by operator; not continuing"
+        if existing is not None and existing.phase not in TERMINAL_PHASES:
+            self._terminate_live_sessions(issue)
+            abandon = getattr(self._queue, "abandon", None)
+            if abandon is not None:
+                with contextlib.suppress(Exception):
+                    abandon(issue, existing, reason=reason)
+        return WorkItemOutcome(issue=issue, final_phase="queued", reason=reason)
+
+    def _terminate_live_sessions(self, issue: GitHubIssueRef) -> None:
+        """Best-effort terminate of CAO sessions owned by ``issue``.
+
+        Round-2 fix #8 follow-on: dropping out must terminate the live
+        session before ``abandon()`` so a lane is not left running against
+        item the operator opted out of. Uses the controller's observation
+        surface to find sessions attributed to this work item; absence of a
+        controller / surface is handled gracefully.
+        """
+        cao = getattr(self, "_cao", None)
+        if cao is None:
+            return
+        list_sessions = getattr(cao, "list_session_observations", None)
+        terminate = getattr(cao, "terminate_session", None)
+        if list_sessions is None or terminate is None:
+            return
+        try:
+            from .interfaces import SessionHandle
+
+            target = issue.slug()
+            for obs in list_sessions():
+                if getattr(obs, "work_item_id", None) != target:
+                    continue
+                terminate(SessionHandle(session_id=obs.session_id, lane=getattr(obs, "lane", "-")))
+        except Exception:
+            # Best-effort; the durable abandon is the authoritative signal.
+            return
+
+    def _escalate_unverified(self, issue: GitHubIssueRef, reason: str) -> WorkItemOutcome:
+        """Persist a needs-human escalation for an unverifiable-metadata item.
+
+        Round-2 Codex review fix #5: a transient metadata-fetch failure is
+        NOT a confirmed rejection. Rather than silently dropping the item
+        (removing its opt-in label with no durable record), we persist a
+        needs-human escalation — creating a minimal escalated durable state
+        when the item has none yet — so an operator can find and adjudicate
+        it. The needs-human label migration runs exactly as for any
+        escalation; the durable block carries the reason.
+        """
+        self._persist_needs_human(issue, reason)
+        return WorkItemOutcome(
+            issue=issue,
+            final_phase="escalated",
+            reason=reason,
+            escalated=True,
+        )
+
+    def _persist_needs_human(self, issue: GitHubIssueRef, reason: str) -> WorkflowState | None:
+        """Persist an escalated / needs-human durable state for ``issue``.
+
+        Reuses the queue's ``mark_needs_human`` when durable state already
+        exists; otherwise bootstraps a minimal escalated state (the item was
+        never claimed, so there is no comment to transition). Best-effort: a
+        persistence failure still returns ``None`` but is logged.
+        """
+        queue = self._queue
+        load = getattr(queue, "load_state", None)
+        save = getattr(queue, "save_state", None)
+        mark = getattr(queue, "mark_needs_human", None)
+        apply_labels = getattr(queue, "_apply_phase_labels", None)
+        if load is None or save is None:
+            return None
+        existing = load(issue.slug())
+        if existing is not None:
+            if existing.phase in TERMINAL_PHASES:
+                return existing
+            if mark is not None:
+                try:
+                    mark(issue, existing, reason=reason)
+                except Exception as exc:
+                    log = __import__("logging").getLogger(__name__)
+                    log.warning("foreman: mark_needs_human failed for %s: %s", issue.slug(), exc)
+                    return None
+                return load(issue.slug())
+            return existing
+        state = WorkflowState(
+            work_item_id=issue.slug(),
+            run_id=self._run_id,
+            phase="escalated",
+            terminal_reason=reason,
+            updated_at=datetime.now(UTC),
+            findings=list(),
+            dispositions=list(),
+            archived=list(),
+            extras={"escalation_reason": reason, "host_id": self._run_id},
+        )
+        try:
+            save(state, expected_updated_at=None)
+            if apply_labels is not None:
+                apply_labels(issue, "escalated")
+        except Exception as exc:
+            log = __import__("logging").getLogger(__name__)
+            log.warning("foreman: could not persist needs-human for %s: %s", issue.slug(), exc)
+            return None
+        return state
+
+    def _remove_enabled_label(self, issue: GitHubIssueRef) -> None:
+        """Remove the enabled label from ``issue`` so it does not return from
+        ``list_ready()`` after a safety rejection (fix #11).
+
+        Best-effort: a transient GitHub failure on this label removal
+        must not crash the foreman pass (the rejection has already
+        been recorded on the ``WorkItemOutcome``). The next pass will
+        surface the rejection again, but the item is no longer
+        claimable from ``list_ready()`` either, so the worst case is
+        a stuck enabled label that ``aipro reconcile --apply`` can
+        clean up.
+        """
+        client = getattr(self._queue, "_client", None)
+        if client is None:
+            return
+        label = self._cfg.github_queue.enabled_label
+        try:
+            labels = list(client.get_labels(issue.number))
+        except Exception:
+            return
+        if label in labels:
+            with contextlib.suppress(Exception):
+                client.remove_label(issue.number, label)
 
     def _heartbeat(
         self, issue: GitHubIssueRef, state: WorkflowState, *, now: datetime | None = None

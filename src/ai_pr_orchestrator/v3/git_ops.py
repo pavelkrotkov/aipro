@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 
 class GitOpsError(RuntimeError):
@@ -172,6 +174,58 @@ class GitWorktreeOps:
 
     def cleanup_worktree(self, path: str) -> None:
         self._run("worktree", "remove", str(Path(path)), "--force")
+
+    def list_worktree_observations(self) -> tuple[Any, ...]:
+        """Return a live view of every managed worktree as reconciliation observations.
+
+        Round-2 Codex review fix #3: the foreman's post-pass cleanup uses
+        this to feed real git state into ``v3.cleanup`` (which dispatches
+        ``CLEAN_ORPHAN_WORKTREE`` actions). Without it the sweeper saw an
+        empty ``worktree_obs`` collection and could never discover a leaked
+        worktree as an orphan. Returned as the ``v3.reconcile.WorktreeObservation``
+        view; imported lazily so this module stays decoupled from the planner.
+        Parsing ``git worktree list --porcelain`` (each block starts with
+        ``worktree <path>`` and may carry a ``branch refs/heads/<name>``).
+        """
+        from .reconcile import WorktreeObservation
+
+        porcelain = self._run("worktree", "list", "--porcelain")
+
+        default = self.default_branch()
+        observations: list[Any] = []
+        for block in porcelain.split("\n\n"):
+            block = block.strip()
+            if not block:
+                continue
+            path = ""
+            branch = ""
+            for line in block.splitlines():
+                if line.startswith("worktree "):
+                    path = line[len("worktree ") :].strip()
+                elif line.startswith("branch "):
+                    branch = line[len("branch ") :].strip()
+                    # ``refs/heads/<name>`` -> ``<name>``
+                    if branch.startswith("refs/heads/"):
+                        branch = branch[len("refs/heads/") :]
+            if not path or not branch:
+                continue
+            last_commit_at = datetime.now(UTC)
+            # Derive the branch's last commit date (best-effort).
+            try:
+                out = self._run("log", "-1", "--format=%cI", branch).strip()
+                if out:
+                    last_commit_at = datetime.fromisoformat(out)
+            except GitOpsError:  # no commits yet on the branch -> use now
+                pass
+            observations.append(
+                WorktreeObservation(
+                    path=path,
+                    branch=branch,
+                    last_commit_at=last_commit_at,
+                    is_default_branch=branch == default,
+                )
+            )
+        return tuple(observations)
 
     # --- helpers -------------------------------------------------------------
 

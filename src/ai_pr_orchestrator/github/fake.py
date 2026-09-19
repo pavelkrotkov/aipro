@@ -78,6 +78,13 @@ class FakeGitHubClient:
         self._page_size = page_size
         self._prs: dict[int, models.PullRequest] = {}
         self._issue_bodies: dict[int, str] = {}
+        self._is_fork: dict[int, bool] = {}
+        # Default to ``OWNER`` so the foreman's
+        # ``allowed_pr_author_associations`` gate does not reject
+        # every issue in tests that did not seed association
+        # explicitly. Tests that want to exercise the rejection path
+        # seed ``author_association=...`` via ``seed_issue``.
+        self._author_association: dict[int, str] = {}
         self._next_pr_number = 1
         self._comments: dict[int, _MutableComment] = {}
         self._labels: dict[int, list[str]] = {}
@@ -103,11 +110,22 @@ class FakeGitHubClient:
         self._labels[pr.number] = list(pr.labels)
 
     def seed_issue(
-        self, number: int, labels: list[str] | None = None, *, body: str | None = None
+        self,
+        number: int,
+        labels: list[str] | None = None,
+        *,
+        body: str | None = None,
+        is_fork: bool = False,
+        author_association: str = "",
     ) -> None:
         self._labels[number] = list(labels) if labels else []
         if body is not None:
             self._issue_bodies[number] = body
+        # Safety-relevant metadata for ``disallow_forks`` /
+        # ``allowed_pr_author_associations``: stored per issue so the
+        # foreman's safety gates see what the tests seeded.
+        self._is_fork[number] = is_fork
+        self._author_association[number] = author_association
         # Issues and pull requests share one repo-wide number sequence. A seeded
         # issue must advance ``_next_pr_number`` past it, otherwise a later
         # create_pr() would mint a PR that aliases this issue's number (and any
@@ -234,6 +252,21 @@ class FakeGitHubClient:
 
     def get_issue_body(self, number: int) -> str | None:
         return self._issue_bodies.get(number)
+
+    def get_issue(self, number: int) -> models.Issue:
+        seeded = self._author_association.get(number)
+        # Default the unseen association to ``OWNER`` so existing
+        # tests that do not seed one do not suddenly start failing
+        # the safety gate. Tests that want to exercise the
+        # rejection path seed ``author_association=...``.
+        association = seeded if seeded else "OWNER"
+        return models.Issue(
+            number=number,
+            is_fork=self._is_fork.get(number, False),
+            author_association=association,
+            title="",
+            body=self._issue_bodies.get(number, ""),
+        )
 
     def create_pr(self, title: str, body: str, head: str, base: str) -> models.PullRequest:
         number = self._next_pr_number
