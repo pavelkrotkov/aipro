@@ -164,6 +164,40 @@ def _canonical_among(group: list[ReviewerFinding]) -> ReviewerFinding:
     return sorted(group, key=lambda f: (-_severity_of(f), _aware_created_at(f), f.id))[0]
 
 
+def _merge_duplicate_findings(
+    group: list[ReviewerFinding], canonical: ReviewerFinding
+) -> ReviewerFinding:
+    evidence: list[Evidence] = []
+    seen_evidence: set[str] = set()
+    sources: list[FindingProvenance] = []
+    seen_sources: set[tuple[object, ...]] = set()
+    for f in sorted(group, key=lambda f: f.id):
+        for item in f.evidence:
+            # Canonical serialization: evidence dicts merge an
+            # ``extras`` bucket, so plain repr() is insertion-order
+            # dependent and identical evidence with differently
+            # ordered keys would both survive (finding round-2 fix #8).
+            marker = json.dumps(item.to_dict(), sort_keys=True, default=repr)
+            if marker not in seen_evidence:
+                seen_evidence.add(marker)
+                evidence.append(item)
+        for src in f.sources:
+            marker = (src.lane, src.finding_id, src.run_id, src.round_id, src.thread_id)
+            if marker not in seen_sources:
+                seen_sources.add(marker)
+                sources.append(src)
+    return replace(
+        canonical,
+        severity=max(group, key=_severity_of).severity,
+        evidence=evidence,
+        sources=sources,
+        confidence=_max_confidence(group),
+        falsification=_first_present(group, "falsification"),
+        reproduction_command=_first_present(group, "reproduction_command"),
+        suggested_fix=_first_present(group, "suggested_fix"),
+    )
+
+
 def _first_present(group: list[ReviewerFinding], attr: str) -> Any:
     for f in sorted(group, key=lambda f: f.id):
         value = getattr(f, attr)
@@ -285,6 +319,26 @@ class FindingRegistry:
         self.findings.append(stored)
         return stored
 
+    def reconcile(self, finding: ReviewerFinding) -> ReviewerFinding | None:
+        """Merge a repeated report without replacing an established finding identity."""
+        key = finding_dedup_key(finding)
+        for existing in self.findings:
+            if existing.id == finding.id and finding_dedup_key(existing) != key:
+                raise DomainError(f"finding id {finding.id!r} reused for a different claim")
+        stored = self._admit(finding)
+        if stored is None:
+            return None
+        for index, existing in enumerate(self.findings):
+            if finding_dedup_key(existing) != key:
+                continue
+            if existing.status != stored.status:
+                raise DomainError("repeated finding contradicts its disposition")
+            merged = _merge_duplicate_findings([existing, stored], existing)
+            self.findings[index] = merged
+            return merged
+        self.findings.append(stored)
+        return stored
+
     def deduplicate(self) -> list[ReviewerFinding]:
         """Merge exact duplicates (same dedup key) in place and return the
         surviving findings.
@@ -322,35 +376,7 @@ class FindingRegistry:
                     f"cannot deduplicate findings across lifecycle states {sorted(statuses)}"
                 )
             canonical = _canonical_among(group)
-            evidence: list[Evidence] = []
-            seen_evidence: set[str] = set()
-            sources: list[FindingProvenance] = []
-            seen_sources: set[str] = set()
-            for f in sorted(group, key=lambda f: f.id):
-                for item in f.evidence:
-                    # Canonical serialization: evidence dicts merge an
-                    # ``extras`` bucket, so plain repr() is insertion-order
-                    # dependent and identical evidence with differently
-                    # ordered keys would both survive (finding round-2 fix #8).
-                    marker = json.dumps(item.to_dict(), sort_keys=True, default=repr)
-                    if marker not in seen_evidence:
-                        seen_evidence.add(marker)
-                        evidence.append(item)
-                for src in f.sources:
-                    if src.finding_id not in seen_sources:
-                        seen_sources.add(src.finding_id)
-                        sources.append(src)
-            merged.append(
-                replace(
-                    canonical,
-                    evidence=evidence,
-                    sources=sources,
-                    confidence=_max_confidence(group),
-                    falsification=_first_present(group, "falsification"),
-                    reproduction_command=_first_present(group, "reproduction_command"),
-                    suggested_fix=_first_present(group, "suggested_fix"),
-                )
-            )
+            merged.append(_merge_duplicate_findings(group, canonical))
         self.findings = merged
         return merged
 

@@ -364,6 +364,7 @@ def test_coder_exit_code_retries_then_escalates():
     assert len(dev_calls) == 3  # threshold reached within the budget
     state = queue.load_state("owner/repo#1")
     assert state is not None and state.phase == "escalated"
+    assert state.extras["coder_usage"] == {"run_id": loop.run_id, "invocations": 3}
 
 
 def test_failed_coder_attempts_consume_invocation_budget():
@@ -1543,3 +1544,26 @@ def test_initial_state_read_failure_cannot_authorize_cleanup(monkeypatch):
     assert git.cleanups == []
     assert git.worktrees == {}
     assert loop._executor.calls == []
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {},
+        {"run_id": "run-1", "invocations": True},
+        {"run_id": "run-1", "invocations": -1},
+        {"run_id": "other", "invocations": 1},
+    ],
+)
+def test_reconstructed_coder_budget_never_guesses_missing_or_invalid_usage(usage):
+    loop, _ = _foreman(_ready_fake(), ScriptedExecutor(), _gate())
+    state = WorkflowState(
+        "owner/repo#1",
+        loop.run_id,
+        "coding",
+        extras={} if usage is None else {"coder_usage": usage},
+    )
+    restored = WorkflowState.from_dict(state.to_dict())
+    with pytest.raises(_ForemanEscalation, match=r"coder (budget|usage)|malformed"):
+        loop._coder_usage(restored)

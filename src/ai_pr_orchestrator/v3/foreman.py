@@ -355,7 +355,7 @@ class ForemanPolicyLoop:
         resume_at_gate: bool = False,
     ) -> WorkItemOutcome:
         safety = self._cfg.safety
-        coder_invocations = 0
+        coder_invocations = 0 if resume_at_gate else self._coder_usage(state)
         review_rounds = self._saved_review_round(state)
         stagnant_rounds = 0
         reviewer_triggers = review_rounds * len(self._reviewer_lanes())
@@ -379,7 +379,7 @@ class ForemanPolicyLoop:
                 requests = tuple((f.id, None) for f in fix_findings if f.lane != "ci")
                 if not self._resume_proposals(state):
                     state, result, coder_invocations = self._run_coder(
-                        issue, state, worktree, fix_findings, coder_invocations, now=now
+                        issue, state, worktree, fix_findings, now=now
                     )
                     violation = self._policy_violation(result)
                     if violation:
@@ -529,13 +529,29 @@ class ForemanPolicyLoop:
             )
             # Loop back to coding with the CI-check findings.
 
+    def _coder_usage(self, state: WorkflowState) -> int:
+        usage = state.extras.get("coder_usage")
+        if usage is None:
+            if state.phase != "claiming" or any(
+                (state.round_id, state.findings, state.dispositions, state.archived)
+            ):
+                raise _ForemanEscalation("coder budget usage is unknown; reconciliation required")
+            return 0
+        if not isinstance(usage, dict) or set(usage) != {"run_id", "invocations"}:
+            raise _ForemanEscalation("malformed durable coder usage")
+        count = usage["invocations"]
+        if type(count) is not int or count < 0:
+            raise _ForemanEscalation("malformed durable coder usage")
+        if usage["run_id"] != self._run_id:
+            raise _ForemanEscalation("coder usage belongs to another run; reconciliation required")
+        return count
+
     def _run_coder(
         self,
         issue: GitHubIssueRef,
         state: WorkflowState,
         worktree: str,
         findings: tuple[ReviewerFinding, ...],
-        invocations: int,
         *,
         now: datetime | None,
     ) -> tuple[WorkflowState, LaneResult, int]:
@@ -545,10 +561,11 @@ class ForemanPolicyLoop:
         after success. Failed attempts do not consume a reviewer round.
         """
         failures = 0
+        invocations = self._coder_usage(state)
         cap = self._cfg.safety.max_coder_invocations_per_run
         requests = tuple((f.id, None) for f in findings if f.lane != "ci")
         while True:
-            if findings and invocations >= cap:
+            if invocations >= cap:
                 raise _ForemanEscalation("coder invocation budget exhausted with open findings")
             state = self._transition(
                 issue,
@@ -558,6 +575,18 @@ class ForemanPolicyLoop:
                 now=now,
             )
             state = self._heartbeat(issue, state, now=now)
+            # Reserve the attempt durably before dispatch; uncertain outcomes retain the charge.
+            invocations += 1
+            charged = replace(
+                state,
+                updated_at=datetime.now(UTC),
+                extras={
+                    **state.extras,
+                    "coder_usage": {"run_id": self._run_id, "invocations": invocations},
+                },
+            )
+            self._queue.save_state(charged, expected_updated_at=state.updated_at)
+            state = charged
             result = self._run_lane(
                 self._worker_lane(),
                 worktree,
@@ -565,7 +594,6 @@ class ForemanPolicyLoop:
                 self._coder_prompt(issue, findings, worktree, state.dispositions),
                 requests,
             )
-            invocations += 1
             if result.exit_code == 0:
                 # The background heartbeat may have advanced the CAS version.
                 return self._load(issue, state), result, invocations
@@ -637,9 +665,6 @@ class ForemanPolicyLoop:
             self._apply_review_result(registry, result, proposals)
             dispositions.extend(result.dispositions)
             triggers += 1
-        # Preserve pending identities: deduplication may not rename an adjudicated finding.
-        if not state.findings:
-            registry.deduplicate()
         conflicts = registry.detect_conflicts()
         open_findings = [f for f in registry.findings if f.status == "open"]
 
@@ -709,7 +734,7 @@ class ForemanPolicyLoop:
         for finding in result.findings:
             if finding.id in archived_ids:
                 raise _ForemanEscalation("reviewer reused an archived finding id")
-            registry.register(finding)
+            registry.reconcile(finding)
 
     def _reviewer_lanes(self) -> list[str]:
         return self._cfg.review_policy.reviewer_lanes or [

@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from ai_pr_orchestrator.v3.cao import session_name_for
-from ai_pr_orchestrator.v3.domain import WorkflowState
+from ai_pr_orchestrator.v3.domain import GitHubIssueRef, WorkflowState
 from ai_pr_orchestrator.v3.findings import FindingRegistry
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop, _ForemanEscalation
 from tests.integration._harness import script_protocol
@@ -227,7 +227,7 @@ def test_saved_proposal_survives_foreman_and_controller_loss(
             now=None,
         )
     assert outcome.final_phase == "done", outcome.reason
-    assert outcome.coder_invocations == 0  # Durable proposal is reviewed directly.
+    assert outcome.coder_invocations == 2  # Total durable usage; no additional coder call.
     restored = queue.load_state("owner/repo#1")
     assert [d.action for d in restored.dispositions] == ["rebut", "accept"]
     assert not restored.findings
@@ -441,4 +441,256 @@ def test_conflict_group_changes_do_not_mutate_review_cas_baseline(fake_cao, fore
     ]
     assert [f.finding_id for f in state.archived] == ["guard"]
     assert [(f.id, f.conflict_group_id) for f in state.findings] == [("race", None)]
+    assert not github.list_open_prs()
+
+
+@pytest.mark.parametrize(
+    "repeat_id,severity",
+    [("guard", "major"), ("guard-repeat", "major"), ("guard-repeat", "blocker")],
+)
+def test_repeated_open_finding_keeps_identity_and_evidence(
+    fake_cao, foreman_harness, repeat_id, severity
+):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+    first = [
+        {"id": fid, "body": body, "severity": "major"}
+        for fid, body in [("guard", "Missing guard"), ("race", "Race condition")]
+    ]
+    proposal = {
+        "dispositions": [
+            {"finding_id": fid, "action": "rebut", "rationale": "Concrete evidence"}
+            for fid in ["guard", "race"]
+        ]
+    }
+    repeated = {
+        "id": repeat_id,
+        "body": "Missing guard",
+        "severity": severity,
+        "reproduction_command": "pytest regression_guard.py",
+    }
+    decisions = [
+        {
+            "finding_id": fid,
+            "action": action,
+            "rationale": "Independent evidence",
+            "response_to_round_id": "response-1",
+        }
+        for fid, action in [("guard", "fix"), ("race", "accept")]
+    ]
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "developer"), ["initial", json.dumps(proposal)]
+    )
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "requirements-reviewer"),
+        [json.dumps(first), json.dumps({"findings": [repeated], "dispositions": decisions})],
+    )
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    state = queue.load_state("owner/repo#1")
+    assert [(f.id, f.status) for f in state.findings] == [("guard", "open")]
+    assert state.findings[0].severity == severity
+    assert state.findings[0].reproduction_command == "pytest regression_guard.py"
+    assert {(source.finding_id, source.round_id) for source in state.findings[0].sources} == {
+        ("guard", "review-1"),
+        (repeat_id, "review-2"),
+    }
+    assert [a.finding_id for a in state.archived] == ["race"]
+    assert len(state.dispositions) == 4
+    assert not github.list_open_prs()
+
+
+def test_saved_rejection_does_not_reset_coder_budget(fake_cao, foreman_harness, monkeypatch):
+    loop, queue, gh = foreman_harness()
+    script_protocol(fake_cao, loop, decision="fix")
+    loop._cfg = replace(
+        loop._cfg, safety=replace(loop._cfg.safety, max_coder_invocations_per_run=2)
+    )
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "developer"),
+        [
+            "initial",
+            json.dumps(
+                {
+                    "dispositions": [
+                        {"finding_id": "guard", "action": "rebut", "rationale": "first evidence"}
+                    ]
+                }
+            ),
+            json.dumps(
+                {
+                    "dispositions": [
+                        {"finding_id": "guard", "action": "fix", "rationale": "second evidence"}
+                    ]
+                }
+            ),
+        ],
+    )
+
+    def reply(action, turn):
+        return json.dumps(
+            {
+                "findings": [],
+                "dispositions": [
+                    {
+                        "finding_id": "guard",
+                        "action": action,
+                        "rationale": "independent result",
+                        "response_to_round_id": turn,
+                    }
+                ],
+            }
+        )
+
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "requirements-reviewer"),
+        [
+            '[{"id":"guard","body":"missing guard","severity":"major"}]',
+            reply("fix", "response-1"),
+            reply("accept", "response-2"),
+        ],
+    )
+    save = queue.save_state
+
+    def crash_after_rejection(state, **kwargs):
+        save(state, **kwargs)
+        if state.dispositions and state.dispositions[-1].response_to_round_id:
+            raise KeyboardInterrupt("lost process after rejection CAS")
+
+    monkeypatch.setattr(queue, "save_state", crash_after_rejection)
+    with pytest.raises(KeyboardInterrupt):
+        loop.run_pass()
+    monkeypatch.setattr(queue, "save_state", save)
+    state = queue.load_state("owner/repo#1")
+    fresh = ForemanPolicyLoop(
+        queue,
+        loop._broker,
+        loop._lanes,
+        loop._executor,
+        loop._gate,
+        loop._git,
+        loop._cfg,
+        run_id=loop.run_id,
+        worktree_root="/wt",
+        committer_name="test",
+        committer_email="test@invalid",
+    )
+    with pytest.raises(_ForemanEscalation, match="budget"):
+        fresh._run_loop(
+            GitHubIssueRef("owner", "repo", 1),
+            state,
+            state.extras["worktree"],
+            state.extras["branch"],
+            now=None,
+        )
+    prompts = fake_cao._sessions[session_name_for(loop.run_id, "developer")].submitted_messages
+    assert len(prompts) == 2, f"actual coder calls={len(prompts)}"
+    assert not gh.list_open_prs()
+
+
+@pytest.mark.parametrize("after_dispatch", [False, True])
+def test_unknown_initial_coder_attempt_remains_charged(
+    fake_cao, foreman_harness, monkeypatch, after_dispatch
+):
+    from ai_pr_orchestrator.v3.foreman import _ForemanEscalation
+
+    loop, queue, gh = foreman_harness()
+    for lane in loop._lanes:
+        fake_cao.set_output(session_name_for(loop.run_id, lane.lane), "[]")
+    execute = loop._executor.execute
+
+    def crash(*args, **kwargs):
+        if after_dispatch:
+            execute(*args, **kwargs)
+        raise KeyboardInterrupt("lost process at unknown initial invocation outcome")
+
+    monkeypatch.setattr(loop._executor, "execute", crash)
+    with pytest.raises(KeyboardInterrupt):
+        loop.run_pass()
+    state = queue.load_state("owner/repo#1")
+    assert state.findings == []
+    fresh = ForemanPolicyLoop(
+        queue,
+        loop._broker,
+        loop._lanes,
+        loop._executor,
+        loop._gate,
+        loop._git,
+        loop._cfg,
+        run_id=loop.run_id,
+        worktree_root="/wt",
+        committer_name="test",
+        committer_email="test@invalid",
+    )
+    monkeypatch.setattr(
+        loop._executor,
+        "execute",
+        lambda *a, **kw: pytest.fail("restarted initial attempt exceeded cap1"),
+    )
+    with pytest.raises(_ForemanEscalation, match="budget"):
+        fresh._run_loop(
+            GitHubIssueRef("owner", "repo", 1),
+            state,
+            state.extras["worktree"],
+            state.extras["branch"],
+            now=None,
+        )
+    assert not gh.list_open_prs()
+
+
+@pytest.mark.parametrize(
+    "repeat_id,body,decision",
+    [
+        ("guard", "A different claim", "fix"),
+        ("guard", "Alleged missing guard", "accept"),
+        ("new-id", "Alleged missing guard", "accept"),
+    ],
+)
+def test_conflicting_id_or_acceptance_repetition_fails_closed(
+    fake_cao, foreman_harness, repeat_id, body, decision
+):
+    loop, queue, github = foreman_harness()
+    script_protocol(fake_cao, loop)
+    fake_cao.set_output_sequence(
+        session_name_for(loop.run_id, "requirements-reviewer"),
+        [
+            '[{"id":"guard","body":"Alleged missing guard","severity":"major"}]',
+            json.dumps(
+                {
+                    "findings": [{"id": repeat_id, "body": body, "severity": "major"}],
+                    "dispositions": [
+                        {
+                            "finding_id": "guard",
+                            "action": decision,
+                            "rationale": "independent evidence",
+                            "response_to_round_id": "response-1",
+                        }
+                    ],
+                }
+            ),
+        ],
+    )
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    state = queue.load_state("owner/repo#1")
+    assert [(f.id, f.status) for f in state.findings] == [("guard", "open")]
+    assert not state.archived
+    assert [d.action for d in state.dispositions] == ["rebut"]
+    assert not github.list_open_prs()
+
+
+def test_coder_charge_save_failure_prevents_dispatch(fake_cao, foreman_harness, monkeypatch):
+    loop, queue, github = foreman_harness()
+    save = queue.save_state
+
+    def reject_charge(state, **kwargs):
+        if "coder_usage" in state.extras:
+            raise RuntimeError("cannot reserve coder budget")
+        return save(state, **kwargs)
+
+    monkeypatch.setattr(queue, "save_state", reject_charge)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "cannot reserve coder budget" in outcome.reason
+    assert not fake_cao._sessions
     assert not github.list_open_prs()
