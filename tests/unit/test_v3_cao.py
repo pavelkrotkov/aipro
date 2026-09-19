@@ -1,6 +1,7 @@
 """Tests for the V3 CAO control-plane adapter, against a faked HTTP transport."""
 
 import dataclasses
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1048,3 +1049,27 @@ def test_controller_closes_its_client_on_exit():
         pass
 
     assert client.is_closed
+
+
+def test_unsupported_cao_2_4_1_metadata_contract_fails_visibly(respx_mock):
+    """Replay the real pinned release's missing-route response, not our fake server."""
+    contract = json.loads(
+        (Path(__file__).parents[1] / "fixtures/cao-2.4.1-metadata-contract.json").read_text()
+    )
+    assert "metadata" not in contract["create_session_fields"]
+    assert not contract["metadata_patch_route_present"]
+    assert tuple(map(int, cao_module.MINIMUM_CAO_VERSION.split("."))) > tuple(
+        map(int, contract["release"].split("."))
+    )
+    with make_controller() as controller:
+        handle = launch(controller, respx_mock)
+        response = contract["patch_response"]
+        respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+            return_value=httpx.Response(response["status_code"], json=response["json"])
+        )
+        with pytest.raises(CaoSessionNotFoundError, match="update turn context"):
+            controller.update_turn_context(
+                handle, LaneExecutionContext(run_id=RUN_ID, round_id="round-3")
+            )
+        status_route(respx_mock, "idle")
+        assert controller.observe(handle).metadata.context.round_id == "round-2"
