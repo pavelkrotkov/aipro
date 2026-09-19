@@ -69,10 +69,11 @@ def build_model_broker(
     telemetry_source: ProviderTelemetrySource | None = None,
     at: datetime | None = None,
     base_dir: Path | None = None,
+    catalog: ModelCatalog | None = None,
 ) -> PolicyBroker:
     """Build a :class:`PolicyBroker` for ``config``.
 
-    When ``telemetry_source`` is supplied, one snapshot per configured
+    When ``telemetry_source`` is supplied, one snapshot per configured or advertised
     telemetry resource is taken at the same instant ``at`` (defaulting to
     now), so the broker evaluates every resource against one consistent
     view. The resource→provider join comes from the telemetry config rows.
@@ -80,10 +81,13 @@ def build_model_broker(
     ``base_dir`` anchors a relative ``catalog_path`` (the config file's
     directory); when omitted the catalog path is resolved against the current
     working directory, so callers loading a config file should pass its parent.
+    Pass an already resolved ``catalog`` when it also supplied the telemetry
+    source, so both consumers observe the same catalog version.
     """
 
     config.validate()
-    catalog = resolve_catalog(config, base_dir=base_dir)
+    if catalog is None:
+        catalog = resolve_catalog(config, base_dir=base_dir)
     snapshots: list[ProviderResourceSnapshot] = []
     resource_by_provider: dict[str, str] = {}
     if telemetry_source is not None:
@@ -91,9 +95,9 @@ def build_model_broker(
         # sample its own "now" would give the broker snapshots from
         # slightly different instants (round-2 #12).
         at = at or datetime.now(UTC)
-        for row in config.telemetry.resources:
-            snapshots.append(telemetry_source.snapshot(row.name, at=at))
-            resource_by_provider[row.provider] = row.name
+        resource_by_provider = {row.provider: row.name for row in config.telemetry.resources}
+        resources = dict.fromkeys((*resource_by_provider.values(), *telemetry_source.resources()))
+        snapshots = [telemetry_source.snapshot(resource, at=at) for resource in resources]
     return PolicyBroker(
         catalog,
         config.broker,

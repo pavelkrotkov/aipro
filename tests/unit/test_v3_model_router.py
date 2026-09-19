@@ -183,3 +183,39 @@ def test_snapshots_share_one_timestamp_when_at_is_omitted():
     assert telemetry.ats[0] is not None and telemetry.ats[1] is not None
     assert telemetry.ats[0] == telemetry.ats[1]
     assert telemetry.ats[0].tzinfo == UTC
+
+
+def test_catalog_snapshot_cannot_override_explicit_provider_account():
+    from datetime import timedelta
+    from unittest.mock import Mock
+
+    telemetry = Mock(spec=_StaticTelemetry)
+    telemetry.resources = Mock(return_value=("acct-main", "alpha"))
+    telemetry.snapshot = Mock(
+        side_effect=[
+            ProviderResourceSnapshot(
+                resource="acct-main",
+                observed_at=NOW,
+                availability="exhausted",
+                cash_balance=0,
+            ),
+            ProviderResourceSnapshot(
+                resource="alpha",
+                observed_at=NOW,
+                availability="available",
+                expires_at=NOW + timedelta(hours=1),
+            ),
+        ]
+    )
+    config = V3Config(
+        model_router=ModelRouterConfig(catalog=[entry("alpha")]),
+        telemetry=TelemetryConfig(
+            resources=[TelemetryResourceConfig(name="acct-main", provider="alpha")]
+        ),
+    )
+    decision = build_model_broker(config, telemetry_source=telemetry, at=NOW).select(
+        TaskDemand("developer", "worker"), at=NOW
+    )
+    assert decision.assignment is None
+    assert "exhausted" in decision.rejected[0].reason
+    assert [call.args[0] for call in telemetry.snapshot.call_args_list] == ["acct-main", "alpha"]

@@ -13,6 +13,7 @@ from typing import Any
 
 from ai_pr_orchestrator import runner
 from ai_pr_orchestrator.v3._schema import SchemaError
+from ai_pr_orchestrator.v3.broker import TaskDemand
 from ai_pr_orchestrator.v3.catalog import (
     MAX_TASK_DIFFICULTY,
     MIN_TASK_DIFFICULTY,
@@ -26,6 +27,7 @@ from ai_pr_orchestrator.v3.config import (
     resolve_model_catalog,
 )
 from ai_pr_orchestrator.v3.domain import VALID_LANE_ROLES, GitHubIssueRef
+from ai_pr_orchestrator.v3.model_router import build_model_broker, resolve_catalog
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 from ai_pr_orchestrator.v3.reconcile import (
     Action as ReconcileAction,
@@ -38,6 +40,7 @@ from ai_pr_orchestrator.v3.reconcile import (
     ReconciliationInputs,
     WorkItemObservation,
 )
+from ai_pr_orchestrator.v3.telemetry import redact_secrets
 from ai_pr_orchestrator.v3.telemetry_hermes import build_telemetry
 
 
@@ -51,6 +54,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "telemetry":
         return _run_telemetry(args)
+
+    if args.command == "route":
+        return _run_route_explain(args)
 
     if args.command == "reconcile":
         return _run_reconcile(args)
@@ -122,6 +128,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit JSON instead of a table"
     )
 
+    route_parser = subparsers.add_parser("route", help="Explain hypothetical model routing")
+    explain_parser = route_parser.add_subparsers(required=True).add_parser("explain")
+    explain_parser.add_argument("--config", required=True, help="Path to a V3 config")
+    explain_parser.add_argument("--role", required=True, choices=sorted(VALID_LANE_ROLES))
+    explain_parser.add_argument("--difficulty", required=True, type=_difficulty)
+    explain_parser.add_argument("--json", action="store_true", help="Emit versioned JSON")
+
     reconcile_parser = subparsers.add_parser(
         "reconcile",
         help="Inspect durable state and emit a deterministic recovery plan (issue #44)",
@@ -169,6 +182,47 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def _run_route_explain(args: argparse.Namespace) -> int:
+    """Observe current telemetry and explain selection without reserving a lane."""
+    now = datetime.now(UTC)
+    try:
+        path = Path(args.config)
+        config = load_v3_config(path)
+        catalog = resolve_catalog(config, base_dir=path.parent)
+        telemetry, _ledger = build_telemetry(config.telemetry, catalog=catalog)
+        broker = build_model_broker(config, telemetry_source=telemetry, at=now, catalog=catalog)
+        decision = broker.select(TaskDemand("route-explain", args.role, args.difficulty), at=now)
+    except SchemaError as exc:
+        raise SystemExit(redact_secrets(str(exc))) from exc
+
+    if args.json:
+        payload = {"schema_version": 1, "hypothetical": True, "decision": decision.to_dict()}
+        try:
+            output = json.dumps(
+                _redact_route_output(payload), indent=2, sort_keys=True, allow_nan=False
+            )
+        except ValueError as exc:
+            raise SystemExit(
+                "Routing explanation contains a non-finite score; check broker weights"
+            ) from exc
+        print(output)
+    else:
+        print("Hypothetical current selection; no incumbent, peers, or active lane counts.")
+        print(redact_secrets(decision.render()))
+    return 0
+
+
+def _redact_route_output(value: Any) -> Any:
+    """Redact strings in the fixed broker schema before JSON quoting/escaping."""
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        return [_redact_route_output(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_route_output(item) for key, item in value.items()}
+    return value
 
 
 def _run_telemetry(args: argparse.Namespace) -> int:
