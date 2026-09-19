@@ -10,12 +10,11 @@ Policy, stated once:
   ``pending``, is *pending* — and a gate cannot pass with outstanding work
   (:class:`~ai_pr_orchestrator.v3.interfaces.GateDecision` enforces the
   inverse, so a bug here fails loudly rather than passing silently).
-- Anything that concluded ``failure``/``timed_out``/``cancelled``/
-  ``action_required`` (or a commit status in state ``error``/``failure``) is
-  a failed check.
+- Completed check-runs pass only with ``success``, ``neutral``, or
+  ``skipped`` (GitHub required-check semantics); completed commit statuses
+  pass only with ``success``. Any other completed outcome fails closed.
 - Every name in ``CIPolicyConfig.required_checks`` must be present; a
-  required check that never reported is recorded as failed by name, because
-  "did not run" must be visible, not silently equivalent to green.
+  required check that has not reported is pending, not silently green.
 - With ``require_green_ci_before_merge`` and *no* checks at all, the gate
   fails with an explicit detail: absence of evidence is not green.
 
@@ -29,10 +28,8 @@ from .config import CIPolicyConfig
 from .domain import GitHubIssueRef, GitHubPullRequestRef
 from .interfaces import GateDecision
 
-#: Check-run conclusions that count as failed.
-_FAILED_CONCLUSIONS = frozenset(("failure", "timed_out", "cancelled", "action_required", "stale"))
-#: Commit-status states that count as failed.
-_FAILED_STATES = frozenset(("error", "failure"))
+#: GitHub accepts these completed check-run outcomes for required checks.
+_PASSED_CONCLUSIONS = ("success", "neutral", "skipped")
 #: Check-run conclusion that marks completion.
 _COMPLETED = "completed"
 
@@ -60,17 +57,17 @@ class CIPRGateImpl:
         for run in runs:
             if run.status != _COMPLETED:
                 pending.append(run.name)
-            elif run.conclusion in _FAILED_CONCLUSIONS or run.conclusion is None:
+            elif run.conclusion not in _PASSED_CONCLUSIONS:
                 failed.append(run.name)
             else:
                 by_name[run.name] = run.conclusion
         for status in statuses:
             if status.status != _COMPLETED:
                 pending.append(status.name)
-            elif status.conclusion in _FAILED_STATES:
+            elif status.conclusion != "success":
                 failed.append(status.name)
             else:
-                by_name[status.name] = status.conclusion or "success"
+                by_name[status.name] = status.conclusion
 
         missing_required = [name for name in self._cfg.required_checks if name not in by_name]
         if self._cfg.required_checks:
