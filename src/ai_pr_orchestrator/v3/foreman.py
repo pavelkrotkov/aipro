@@ -34,6 +34,7 @@ fakes. No vendor, model, or provider name appears in this module.
 from __future__ import annotations
 
 import contextlib
+import logging
 import threading
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -222,7 +223,8 @@ class ForemanPolicyLoop:
         is skipped rather than fatal: contention is normal queue behaviour.
         One item crashing escalates *that item* only — and persists the crash
         (``mark_needs_human``) so the authoritative issue is never left on an
-        active phase with a stranded claim. The pass continues.
+        active phase with a stranded claim. The pass continues only after
+        that authoritative write succeeds; persistence failures propagate.
         """
         issues = self._list_ready()
         if max_items is not None:
@@ -242,33 +244,40 @@ class ForemanPolicyLoop:
                         escalated=True,
                     )
                 )
+            self._cleanup_terminal_worktree(issue)
         return outcomes
 
     def _persist_crash(self, issue: GitHubIssueRef, reason: str) -> None:
         """Persist an in-pass crash against the authoritative issue.
 
-        Best-effort: if the issue was claimed *by this run* (state exists, is
-        non-terminal, and carries our run id) the crash is recorded as
-        ``needs-human`` so the item is recovered. A competing foreman's claim
-        (contention, or a stale pre-run state) is left alone — it is not ours
-        to escalate.
+        Only this run's non-terminal claim may be escalated. Authoritative
+        read/write failures propagate so the caller cannot report a terminal
+        outcome while the durable claim remains active.
         """
-        load = getattr(self._queue, "load_state", None)
-        mark = getattr(self._queue, "mark_needs_human", None)
-        if load is None or mark is None:
-            return
-        try:
-            state = load(issue.slug())
-        except Exception:
-            return
+        state = self._queue.load_state(issue.slug())
         if state is None or state.phase in TERMINAL_PHASES:
             return
         if state.run_id != self._run_id:
-            # Another foreman owns this claim (or it is a stale pre-run state);
-            # escalating it would mis-mark someone else's live work.
             return
-        with suppress(Exception):
-            mark(issue, self._load(issue, state), reason=reason)
+        self._queue.mark_needs_human(issue, state, reason=reason)
+
+    def _cleanup_terminal_worktree(self, issue: GitHubIssueRef) -> None:
+        """Release this run's checkout only after confirming durable termination."""
+        try:
+            state = self._queue.load_state(issue.slug())
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Retaining worktree for %s: cleanup state verification failed",
+                issue.slug(),
+                exc_info=True,
+            )
+            return
+        if state is None or state.run_id != self._run_id or state.phase not in TERMINAL_PHASES:
+            return
+        worktree = state.extras.get("worktree")
+        if worktree:
+            with suppress(Exception):
+                self._git.cleanup_worktree(worktree)
 
     # --- Lifecycle -----------------------------------------------------------
 
@@ -278,25 +287,24 @@ class ForemanPolicyLoop:
         # Claim FIRST — resources are created only once the claim is won, so a
         # lost claim (contention) never leaks a branch/worktree behind it.
         existing = self._load_optional(issue)
-        if existing is not None:
-            branch = existing.extras.get("branch") or branch
+        extras = existing.extras if existing is not None else {}
+        branch = extras.get("branch") or branch
         # A requeued item that already has a PR (pending-CI path) must go
         # straight back to the CI gate on re-claim — relaunching coding/review
         # would redo settled work against the same head (round-2 #2).
-        pr_number = existing.extras.get("pr_number") if existing else None
+        pr_number = extras.get("pr_number")
         resume_at_gate = existing is not None and (
             existing.phase in ("queued", "ci_gating") and pr_number is not None
         )
         state = self._claim(
             issue,
             branch=branch,
-            worktree=existing.extras.get("worktree") if existing else None,
+            worktree=extras.get("worktree"),
             pr_number=pr_number,
             now=now,
         )
 
         worktree: str | None = state.extras.get("worktree")
-        outcome: WorkItemOutcome | None = None
         try:
             if not worktree:
                 base = self._git.default_branch()
@@ -305,23 +313,11 @@ class ForemanPolicyLoop:
                     f"{self._worktree_root}/issue-{issue.number}", branch
                 )
                 state = self._persist_resources(issue, state, branch=branch, worktree=worktree)
-            outcome = self._run_loop(
+            return self._run_loop(
                 issue, state, worktree, branch, now=now, resume_at_gate=resume_at_gate
             )
         except _ForemanEscalation as exc:
-            outcome = self._escalate(issue, state, exc.reason, now=now)
-        finally:
-            # Terminal outcomes release the worktree; the pending-CI/requeue
-            # path deliberately retains it so a later pass reuses the checkout.
-            # An unexpected crash (outcome still None in this frame) is terminal
-            # too — run_pass persists the escalation — so the checkout is
-            # cleaned up exactly on the paths that end the item (round-2 #8).
-            terminal = outcome is None or outcome.final_phase in TERMINAL_PHASES
-            if worktree and terminal:
-                with suppress(Exception):
-                    self._git.cleanup_worktree(worktree)
-        assert outcome is not None
-        return outcome
+            return self._escalate(issue, state, exc.reason, now=now)
 
     def _run_loop(
         self,

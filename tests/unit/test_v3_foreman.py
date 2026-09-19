@@ -11,6 +11,8 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, cast
 
+import pytest
+
 from ai_pr_orchestrator.github.fake import FakeGitHubClient
 from ai_pr_orchestrator.v3.broker import BrokerDecision
 from ai_pr_orchestrator.v3.config import (
@@ -911,9 +913,8 @@ def test_commit_cap_exceeded_escalates_but_noop_passes():
     assert outcome.final_phase == "done"
 
 
-def test_crash_path_cleans_up_worktree():
-    """An unexpected crash is terminal: the worktree is released even though
-    the outcome is None in the crashing frame (#8)."""
+def test_crash_path_cleans_up_worktree(monkeypatch):
+    """A crash releases its worktree only after the terminal write succeeds."""
 
     class CrashingExecutor(ScriptedExecutor):
         def execute(self, lane, task_prompt, workdir, context, lease=None):
@@ -921,7 +922,15 @@ def test_crash_path_cleans_up_worktree():
 
     fake = _ready_fake()
     git = RecordingGit()
-    loop, _ = _foreman(fake, CrashingExecutor(), _gate(), git=git)
+    loop, queue = _foreman(fake, CrashingExecutor(), _gate(), git=git)
+    cleanup = git.cleanup_worktree
+
+    def require_terminal_before_cleanup(path):
+        state = queue.load_state(ISSUE.slug())
+        assert state is not None and state.phase == "escalated"
+        cleanup(path)
+
+    monkeypatch.setattr(git, "cleanup_worktree", require_terminal_before_cleanup)
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "escalated"
     assert "/wt/issue-1" in git.cleanups  # leaked no worktree on the crash path
@@ -977,3 +986,77 @@ def test_failed_thread_reply_is_an_escalation():
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "escalated"
     assert "reply" in outcome.reason
+
+
+@pytest.mark.parametrize(
+    "developer_exit,developer_files", [(1, []), (0, [".github/workflows/evil.yml"])]
+)
+@pytest.mark.parametrize("error_type", [RuntimeError, StateConflictError])
+def test_terminal_write_failure_retains_active_worktree(
+    monkeypatch, developer_exit, developer_files, error_type
+):
+    fake = _ready_fake()
+    git = RecordingGit()
+    executor = ScriptedExecutor(developer_exit=developer_exit, developer_files=developer_files)
+    loop, queue = _foreman(fake, executor, _gate(), git=git)
+    save = queue.save_state
+
+    def reject_terminal(state, expected_updated_at):
+        if state.phase in ("failed", "escalated"):
+            raise error_type("terminal persistence unavailable")
+        save(state, expected_updated_at)
+
+    monkeypatch.setattr(queue, "save_state", reject_terminal)
+    with pytest.raises(error_type, match="terminal persistence unavailable"):
+        loop.run_pass()
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None and state.phase == "coding"
+    assert git.cleanups == []
+    assert state.extras["worktree"] in git.worktrees
+
+
+def test_crash_state_read_failure_propagates_and_retains_worktree(monkeypatch):
+    fake = _ready_fake()
+    git = RecordingGit()
+    loop, queue = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
+    load = queue.load_state
+
+    def fail_read(work_item_id):
+        raise RuntimeError("authoritative state unavailable")
+
+    def crash(*args, **kwargs):
+        monkeypatch.setattr(queue, "load_state", fail_read)
+        raise RuntimeError("lane exploded")
+
+    monkeypatch.setattr(loop._executor, "execute", crash)
+    with pytest.raises(RuntimeError, match="authoritative state unavailable"):
+        loop.run_pass()
+    state = load(ISSUE.slug())
+    assert state is not None and state.phase == "coding"
+    assert git.cleanups == []
+    assert state.extras["worktree"] in git.worktrees
+
+
+def test_cleanup_read_failure_retains_worktree_and_continues_pass(monkeypatch, caplog):
+    fake = _ready_fake()
+    fake.seed_issue(2, labels=["v3-work"])
+    git = RecordingGit()
+    loop, queue = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
+    load = queue.load_state
+
+    def reject_first_terminal_read(work_item_id):
+        state = load(work_item_id)
+        if work_item_id == ISSUE.slug() and state is not None and state.phase == "done":
+            raise RuntimeError("cleanup verification unavailable")
+        return state
+
+    monkeypatch.setattr(queue, "load_state", reject_first_terminal_read)
+    outcomes = loop.run_pass()
+    assert [(outcome.issue.number, outcome.final_phase) for outcome in outcomes] == [
+        (1, "done"),
+        (2, "done"),
+    ]
+    assert "/wt/issue-1" in git.worktrees
+    assert git.cleanups == ["/wt/issue-2"]
+    assert "owner/repo#1" in caplog.text
+    assert "cleanup verification unavailable" in caplog.text

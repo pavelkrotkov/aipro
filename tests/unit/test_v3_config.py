@@ -511,6 +511,19 @@ class TestTelemetrySection:
                 }
             )
 
+    def test_duplicate_providers_rejected(self) -> None:
+        with pytest.raises(V3ConfigError, match=r"Duplicate telemetry providers:.*anthropic"):
+            V3Config.from_dict(
+                {
+                    "telemetry": {
+                        "resources": [
+                            {"name": "account-one", "provider": "anthropic"},
+                            {"name": "account-two", "provider": "anthropic"},
+                        ]
+                    }
+                }
+            )
+
     def test_resource_requires_a_provider(self) -> None:
         with pytest.raises(V3ConfigError, match="provider must be non-empty"):
             V3Config.from_dict(
