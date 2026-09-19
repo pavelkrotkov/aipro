@@ -371,6 +371,7 @@ def test_execute_refreshes_round_context_durably(fake_cao: FakeCAOServer, tmp_pa
     registry = LaneRegistry.default()
     run_id = "multi-round"
     name = session_name_for(run_id, lane.lane)
+    fake_cao.set_output(name, "[]" if lane.role == "reviewer" else MARKER)
     contexts = [
         LaneExecutionContext(run_id=run_id, round_id="review-1", work_item_id="first-head"),
         LaneExecutionContext(run_id=run_id, round_id="review-2", work_item_id="fixed-head"),
@@ -400,6 +401,7 @@ def test_execute_fails_closed_when_turn_context_update_fails(
     lane = registry.get("requirements-reviewer")
     run_id = "context-failure"
     name = session_name_for(run_id, lane.lane)
+    fake_cao.set_output(name, "[]")
     with CaoSessionController(_config(fake_cao.url), registry) as controller:
         executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
         executor.execute(lane, "first review", str(tmp_path), _context(run_id))
@@ -429,6 +431,7 @@ def test_busy_followup_preserves_previous_round(fake_cao: FakeCAOServer, tmp_pat
     lane = registry.get("requirements-reviewer")
     run_id = "busy-review"
     name = session_name_for(run_id, lane.lane)
+    fake_cao.set_output(name, "[]")
     with CaoSessionController(_config(fake_cao.url), registry) as controller:
         executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
         context = LaneExecutionContext(run_id=run_id, round_id="review-1")

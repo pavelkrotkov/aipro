@@ -188,3 +188,33 @@ AIPO_CAO_INTEGRATION=1 uv run pytest tests/integration/test_v3_cao_local.py
 It additionally skips when the `cao` binary is absent or no control plane
 answers, and it needs the `aipro-developer` profile from step 2. Override the
 endpoint with `AIPO_CAO_BASE_URL`.
+
+## Reviewer result contract
+
+On a successful lane with `role == "reviewer"`, `poll_session` parses the
+normalized `LaneResult.output_summary` (CAO's extracted last response). It never
+parses terminal scrollback. The response must be a JSON array of new
+`ReviewerFinding` objects; `[]` explicitly reports no findings. Plain text,
+empty output, Markdown fences, malformed JSON and invalid fields raise
+`CaoReviewerOutputError`, so the foreman escalates instead of opening a PR.
+Worker-lane text and unsuccessful lane results are not parsed as reviews.
+
+Each object requires `id`, `body` and `severity` (`info`, `minor`, `major` or
+`blocker`). Location, confidence, claim, evidence, falsification and reproduction
+fields use the existing finding schema and its constructor validation. For example:
+
+```json
+[{"id":"missing-guard","body":"Missing permission check","severity":"major","path":"src/service.py","line":12}]
+```
+
+The controller supplies omitted `lane`, `run_id` and `round_id` from the confirmed
+current session turn. Supplied attribution must match. Findings must be `open`:
+reviewers cannot supply settled dispositions, existing thread IDs, conflict groups
+or merged provenance. Those belong to durable policy processing. IDs must be
+unique within a response. Primitive types are checked before domain construction;
+booleans are not line numbers, and non-JSON NaN/Infinity values are rejected.
+Legacy durable-state decoding remains unchanged and is not used for this ingress.
+
+`head_sha`, when supplied, is retained as finding evidence; this parser cannot
+verify it because session execution context currently has no authoritative reviewed
+head. Head validation remains a separate policy/execution-context requirement.
