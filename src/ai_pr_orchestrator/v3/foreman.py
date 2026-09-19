@@ -34,9 +34,11 @@ fakes. No vendor, model, or provider name appears in this module.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import threading
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol, cast
@@ -51,7 +53,6 @@ from .config import V3Config
 from .domain import (
     TERMINAL_PHASES,
     ArchivedFinding,
-    DispositionAction,
     FindingDisposition,
     GitHubIssueRef,
     GitHubPullRequestRef,
@@ -354,13 +355,12 @@ class ForemanPolicyLoop:
         resume_at_gate: bool = False,
     ) -> WorkItemOutcome:
         safety = self._cfg.safety
-        coder_invocations = 0
-        coder_failures = 0
-        review_rounds = 0
+        coder_invocations = 0 if resume_at_gate else self._coder_usage(state)
+        review_rounds = self._saved_review_round(state)
         stagnant_rounds = 0
-        reviewer_triggers = 0
+        reviewer_triggers = review_rounds * len(self._reviewer_lanes())
         self._prompt_tokens = 0
-        fix_findings: tuple[ReviewerFinding, ...] = ()
+        fix_findings = tuple(f for f in state.findings if f.status == "open")
         result: LaneResult | None = None
         head_sha: str | None = None
 
@@ -373,61 +373,20 @@ class ForemanPolicyLoop:
                 # against the recorded PR number — the worktree is not
                 # the source of truth for a CI-only resume.
                 result = None
-                resume_at_gate = False
             else:
                 if worktree is None:
                     raise _ForemanEscalation("coding requires a local worktree")
-                # --- Coding ---------------------------------------------------
-                # The cap is checked BEFORE launching: once it is reached with
-                # open findings, no further coder invocation may start
-                # (round-2 #6).
-                if fix_findings and coder_invocations >= safety.max_coder_invocations_per_run:
-                    return self._escalate(
-                        issue,
-                        state,
-                        "coder invocation budget exhausted with open findings",
-                        now=now,
+                requests = tuple((f.id, None) for f in fix_findings if f.lane != "ci")
+                if not self._resume_proposals(state):
+                    state, result, coder_invocations = self._run_coder(
+                        issue, state, worktree, fix_findings, now=now
                     )
-                state = self._transition(issue, state, "coding", now=now)
-                state = self._heartbeat(issue, state, now=now)
-                result = self._run_lane(
-                    self._worker_lane(),
-                    worktree,
-                    state,
-                    self._coder_prompt(issue, fix_findings, worktree),
-                )
-                coder_invocations += 1
-                if result.exit_code != 0:
-                    coder_failures += 1
-                    # A failed attempt consumes invocation budget too; it must not
-                    # bypass the cap by leaning only on the consecutive-failure
-                    # threshold (which counts differently).
-                    if coder_invocations >= safety.max_coder_invocations_per_run:
-                        return self._escalate(
-                            issue,
-                            state,
-                            "coder budget exhausted on failing attempts",
-                            now=now,
-                        )
-                    if coder_failures >= self._cfg.escalation.max_consecutive_coder_failures:
-                        return self._escalate(
-                            issue,
-                            state,
-                            f"coder failed {coder_failures}x consecutively",
-                            now=now,
-                        )
-                    # Below both thresholds the failure is retried: transient lane
-                    # crashes must not kill the item, and every retry stays within
-                    # the invocation budget.
-                    continue
-                coder_failures = 0
-                # A background lease heartbeat may have advanced the CAS
-                # version while the lane ran: reload before further writes.
-                state = self._load(issue, state)
-                violation = self._policy_violation(result)
-                if violation:
-                    return self._fail(issue, state, violation, now=now)
+                    violation = self._policy_violation(result)
+                    if violation:
+                        return self._fail(issue, state, violation, now=now)
 
+                    if requests:
+                        state = self._record_proposals(state, result)
                 # --- Review rounds --------------------------------------------
                 report = self._review(
                     issue,
@@ -456,7 +415,7 @@ class ForemanPolicyLoop:
             # --- CI gate ------------------------------------------------------
             state = self._transition(issue, state, "ci_gating", now=now)
             state = self._heartbeat(issue, state, now=now)
-            if result is not None:
+            if not resume_at_gate:
                 assert worktree is not None  # Coding requires a checkout above.
                 head_sha = self._commit_and_push(
                     issue,
@@ -527,7 +486,7 @@ class ForemanPolicyLoop:
                     coder_invocations=coder_invocations,
                     gate=decision,
                 )
-            if result is None:
+            if resume_at_gate:
                 return self._escalate(
                     issue, state, "CI-only resume cannot safely dispatch local remediation", now=now
                 )
@@ -570,6 +529,80 @@ class ForemanPolicyLoop:
             )
             # Loop back to coding with the CI-check findings.
 
+    def _coder_usage(self, state: WorkflowState) -> int:
+        usage = state.extras.get("coder_usage")
+        if usage is None:
+            if state.phase != "claiming" or any(
+                (state.round_id, state.findings, state.dispositions, state.archived)
+            ):
+                raise _ForemanEscalation("coder budget usage is unknown; reconciliation required")
+            return 0
+        if not isinstance(usage, dict) or set(usage) != {"run_id", "invocations"}:
+            raise _ForemanEscalation("malformed durable coder usage")
+        count = usage["invocations"]
+        if type(count) is not int or count < 0:
+            raise _ForemanEscalation("malformed durable coder usage")
+        if usage["run_id"] != self._run_id:
+            raise _ForemanEscalation("coder usage belongs to another run; reconciliation required")
+        return count
+
+    def _run_coder(
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        worktree: str,
+        findings: tuple[ReviewerFinding, ...],
+        *,
+        now: datetime | None,
+    ) -> tuple[WorkflowState, LaneResult, int]:
+        """Run the existing bounded coder attempts until success or escalation.
+
+        Invocation budget spans successful turns; consecutive failures reset only
+        after success. Failed attempts do not consume a reviewer round.
+        """
+        failures = 0
+        invocations = self._coder_usage(state)
+        cap = self._cfg.safety.max_coder_invocations_per_run
+        requests = tuple((f.id, None) for f in findings if f.lane != "ci")
+        while True:
+            if invocations >= cap:
+                raise _ForemanEscalation("coder invocation budget exhausted with open findings")
+            state = self._transition(
+                issue,
+                state,
+                "coding",
+                round_id=f"response-{self._saved_review_round(state)}",
+                now=now,
+            )
+            state = self._heartbeat(issue, state, now=now)
+            # Reserve the attempt durably before dispatch; uncertain outcomes retain the charge.
+            invocations += 1
+            charged = replace(
+                state,
+                updated_at=datetime.now(UTC),
+                extras={
+                    **state.extras,
+                    "coder_usage": {"run_id": self._run_id, "invocations": invocations},
+                },
+            )
+            self._queue.save_state(charged, expected_updated_at=state.updated_at)
+            state = charged
+            result = self._run_lane(
+                self._worker_lane(),
+                worktree,
+                state,
+                self._coder_prompt(issue, findings, worktree, state.dispositions),
+                requests,
+            )
+            if result.exit_code == 0:
+                # The background heartbeat may have advanced the CAS version.
+                return self._load(issue, state), result, invocations
+            failures += 1
+            if invocations >= cap:
+                raise _ForemanEscalation("coder budget exhausted on failing attempts")
+            if failures >= self._cfg.escalation.max_consecutive_coder_failures:
+                raise _ForemanEscalation(f"coder failed {failures}x consecutively")
+
     # --- Review ---------------------------------------------------------------
 
     def _review(
@@ -596,9 +629,7 @@ class ForemanPolicyLoop:
                 "review-round cap exhausted while fix findings pending "
                 f"(limit {policy.max_review_rounds}); refusing unverified changes"
             )
-        reviewer_lanes = policy.reviewer_lanes or [
-            lane.lane for lane in self._lanes if lane.role == "reviewer"
-        ]
+        reviewer_lanes = self._reviewer_lanes()
         budget_left = max(0, self._cfg.safety.max_reviewer_triggers_per_run - reviewer_triggers)
         rounds = review_rounds + 1
         round_id = f"review-{rounds}"
@@ -613,82 +644,184 @@ class ForemanPolicyLoop:
         state = self._heartbeat(issue, state, now=now)
 
         registry = FindingRegistry(
+            findings=deepcopy(state.findings),
+            archived=list(state.archived),
             require_coder_reply_before_resolve=policy.require_coder_reply_before_resolve,
             quarantine_unknown_head_sha=False,
         )
+        proposals = self._pending_proposals(state)
+        dispositions: list[FindingDisposition] = []
         triggers = reviewer_triggers
         for lane_name in reviewer_lanes:
-            lane = self._lanes.get(lane_name)
-            result = self._run_lane(
-                lane, worktree, state, self._reviewer_prompt(issue, round_id, worktree)
+            requests = tuple(
+                (f.id, proposals[f.id].round_id)
+                for f in registry.findings
+                if f.id in proposals and self._adjudicator(f) == lane_name
             )
+            prompt = self._reviewer_prompt(issue, round_id, worktree)
+            if requests:
+                prompt += self._adjudication_prompt(registry, proposals, requests)
+            result = self._review_lane(lane_name, worktree, state, prompt, requests)
+            self._apply_review_result(registry, result, proposals)
+            dispositions.extend(result.dispositions)
             triggers += 1
-            if result.exit_code != 0:
-                raise _ForemanEscalation(
-                    f"reviewer lane {lane_name!r} failed (exit {result.exit_code})"
-                )
-            violation = self._policy_violation(result)
-            if violation:
-                # Reviewer lanes are bound by the same workflow-file policy as
-                # the coder — a reviewer editing .github/workflows/ must never
-                # reach a push (round-2 #9).
-                raise _ForemanEscalation(violation)
-            for finding in result.findings:
-                registry.register(finding)
-        registry.deduplicate()
         conflicts = registry.detect_conflicts()
         open_findings = [f for f in registry.findings if f.status == "open"]
 
-        if not open_findings:
-            stagnant = stagnant_rounds + 1
-            if rounds > 1 and stagnant >= self._cfg.escalation.stagnation_rounds_threshold:
-                # Persist the empty round so restart reconciliation sees it,
-                # then escalate *through* the loop (never as a plain empty
-                # report, which _drive would resume from as if unscathed).
-                self._persist_round(issue, state, round_id, registry, [])
-                raise _ForemanEscalation("review rounds produced no converging signal")
-            return _RoundReport((), rounds, stagnant, triggers)
-        stagnant_rounds = 0
-
-        # Adjudicate: blockers/majors (and whole conflict groups) are fixed;
-        # minors are deferred with an explicit reply.
         conflict_members = {fid for ids in conflicts.values() for fid in ids}
-        fix_ids: set[str] = set()
-        dispositions: list[FindingDisposition] = []
-        for finding in sorted(open_findings, key=lambda f: (-SEVERITY_RANK[f.severity], f.id)):
-            if finding.id in conflict_members:
-                action: DispositionAction = "fix"
-                rationale = "conflict group adjudicated: fix"
-            elif SEVERITY_RANK[finding.severity] >= SEVERITY_RANK["major"]:
-                action = "fix"
-                rationale = "major/blocker finding: fix"
-            else:
-                action = "reply_deferred"
-                rationale = "minor finding: deferred with reply"
-            if action == "fix":
-                fix_ids.add(finding.id)
+        for finding in open_findings:
+            if (
+                finding.id in conflict_members
+                or SEVERITY_RANK[finding.severity] >= SEVERITY_RANK["major"]
+            ):
+                continue
+            # Defer nonblocking findings explicitly, without pretending the coder replied.
+            if finding.thread_id:
+                continue
             _, disposition = registry.apply_disposition(
                 finding.id,
-                action,
-                rationale=rationale,
+                "reply_deferred",
+                rationale="minor finding deferred by policy",
                 decided_by="foreman",
-                reply_body="coder will address this finding",
             )
-            dispositions.append(disposition)
-            if finding.thread_id:
-                # The recorded reply must actually reach the GitHub review
-                # thread the finding came from — a disposition that claims a
-                # reply while the thread gets nothing is a lie (round-2 #10).
-                self._post_thread_reply(finding.thread_id, disposition.reply_body or "")
-        # "What the coder must address next": everything dispositioned as
-        # ``fix`` (including whole conflict groups), regardless of the
-        # settled status — the disposition records the *decision*, the
-        # follow-up coding round records the work. Computed *before*
-        # compaction, which archives settled findings out of the registry.
-        remaining = tuple(f for f in registry.findings if f.id in fix_ids)
+            dispositions.append(replace(disposition, run_id=self._run_id, round_id=round_id))
+        remaining = tuple(f for f in registry.findings if f.status == "open")
         registry.compact()
         self._persist_round(issue, state, round_id, registry, dispositions)
-        return _RoundReport(remaining, rounds, stagnant_rounds, triggers)
+        stagnant = stagnant_rounds + 1 if not open_findings and not dispositions else 0
+        if rounds > 1 and stagnant >= self._cfg.escalation.stagnation_rounds_threshold:
+            raise _ForemanEscalation("review rounds produced no converging signal")
+        return _RoundReport(remaining, rounds, stagnant, triggers)
+
+    def _review_lane(
+        self,
+        lane_name: str,
+        worktree: str,
+        state: WorkflowState,
+        prompt: str,
+        requests: tuple[tuple[str, str | None], ...],
+    ) -> LaneResult:
+        lane = self._lanes.get(lane_name)
+        result = self._run_lane(lane, worktree, state, prompt, requests)
+        if result.exit_code != 0:
+            raise _ForemanEscalation(
+                f"reviewer lane {lane_name!r} failed (exit {result.exit_code})"
+            )
+        violation = self._policy_violation(result)
+        if violation:
+            raise _ForemanEscalation(violation)
+        LaneExecutionContext(
+            self._run_id, state.round_id, disposition_requests=requests
+        ).validate_dispositions(result.dispositions, lane)
+        return result
+
+    @staticmethod
+    def _apply_review_result(
+        registry: FindingRegistry,
+        result: LaneResult,
+        proposals: dict[str, FindingDisposition],
+    ) -> None:
+        for decision in result.dispositions:
+            if decision.action == "accept":
+                registry.apply_disposition(
+                    decision.finding_id,
+                    "accept",
+                    rationale=decision.rationale,
+                    decided_by=decision.decided_by,
+                    reply_body=proposals[decision.finding_id].rationale,
+                )
+        archived_ids = {a.finding_id for a in registry.archived}
+        for finding in result.findings:
+            if finding.id in archived_ids:
+                raise _ForemanEscalation("reviewer reused an archived finding id")
+            registry.reconcile(finding)
+
+    def _reviewer_lanes(self) -> list[str]:
+        return self._cfg.review_policy.reviewer_lanes or [
+            lane.lane for lane in self._lanes if lane.role == "reviewer"
+        ]
+
+    def _adjudicator(self, finding: ReviewerFinding) -> str:
+        lanes = self._reviewer_lanes()
+        if not lanes or any(self._lanes.get(name).role != "reviewer" for name in lanes):
+            raise _ForemanEscalation("independent reviewer required for adjudication")
+        return finding.lane if finding.lane in lanes else lanes[0]
+
+    @staticmethod
+    def _saved_review_round(state: WorkflowState) -> int:
+        turns = [state.round_id, *(d.round_id for d in state.dispositions)]
+        return max(
+            (int(t.split("-")[-1]) for t in turns if t and t.startswith(("review-", "response-"))),
+            default=0,
+        )
+
+    def _resume_proposals(self, state: WorkflowState) -> bool:
+        pending = self._pending_proposals(state)
+        if pending and any(f.thread_id for f in state.findings if f.id in pending):
+            raise _ForemanEscalation("pending thread reply requires reconciliation before resume")
+        return bool(pending)
+
+    def _pending_proposals(self, state: WorkflowState) -> dict[str, FindingDisposition]:
+        latest = {d.finding_id: d for d in state.dispositions}
+        pending = {}
+        for finding in state.findings:
+            decision = latest.get(finding.id)
+            if decision is None:
+                continue
+            if finding.status != "open" or decision.response_to_round_id is not None:
+                continue
+            if (decision.run_id, decision.decided_by, decision.action) not in {
+                (self._run_id, self._worker_lane().lane, "fix"),
+                (self._run_id, self._worker_lane().lane, "rebut"),
+            }:
+                raise _ForemanEscalation("pending proposal lacks current run/turn provenance")
+            if not decision.round_id:
+                raise _ForemanEscalation("pending proposal lacks current run/turn provenance")
+            pending[finding.id] = decision
+        return pending
+
+    def _record_proposals(self, state: WorkflowState, result: LaneResult) -> WorkflowState:
+        requests = tuple((f.id, None) for f in state.findings if f.status == "open")
+        LaneExecutionContext(
+            self._run_id, state.round_id, disposition_requests=requests
+        ).validate_dispositions(result.dispositions, self._worker_lane())
+        by_id = {f.id: f for f in state.findings}
+        proposals = [
+            replace(d, thread_id=by_id[d.finding_id].thread_id, reply_body=d.rationale)
+            for d in result.dispositions
+        ]
+        history = self._merge_dispositions(state.dispositions, proposals)
+        # Save real coder evidence before any reviewer or thread side effect.
+        saved = replace(state, dispositions=history, updated_at=datetime.now(UTC))
+        self._queue.save_state(saved, expected_updated_at=state.updated_at)
+        for proposal in proposals:
+            if proposal in state.dispositions:
+                continue  # Exact replay cannot repeat a thread mutation.
+            finding = by_id[proposal.finding_id]
+            if finding.thread_id:
+                self._post_thread_reply(finding.thread_id, proposal.rationale)
+        return saved
+
+    @staticmethod
+    def _adjudication_prompt(
+        registry: FindingRegistry,
+        proposals: dict[str, FindingDisposition],
+        requests: tuple[tuple[str, str | None], ...],
+    ) -> str:
+        findings = {f.id: f for f in registry.findings}
+        packet = [
+            {"finding": findings[fid].to_dict(), "proposal": proposals[fid].to_dict()}
+            for fid, _ in requests
+        ]
+        return (
+            "\nFor this adjudication return an object instead of the array: "
+            '{"findings":[],"dispositions":[{"finding_id":"...","action":"accept",'
+            '"rationale":"independent evidence","response_to_round_id":"response-N"}]}. '
+            "Supply exactly one decision per requested finding. Accept confirms the coder response; "
+            "fix rejects it and requests further remediation. Echo each proposal round_id as "
+            "response_to_round_id; never accept your own or a different turn's response.\n"
+            + json.dumps(packet)
+        )
 
     def _persist_round(
         self,
@@ -702,7 +835,7 @@ class ForemanPolicyLoop:
 
         Rounds accumulate rather than replace: a restart must reconcile every
         review round, so prior findings/dispositions/archive are preserved and
-        this round's are appended (newest disposition wins per finding).
+        this round's immutable decisions are appended without losing earlier rationale.
 
         Persistence is restart-safety-critical: any failure to save raises
         ``_ForemanEscalation`` so the pass aborts and escalates instead of
@@ -713,18 +846,28 @@ class ForemanPolicyLoop:
             raise _ForemanEscalation(
                 f"cannot persist review round {round_id}: no authoritative state for {issue.slug()}"
             )
-        merged_findings = self._merge_round_findings(fresh.findings, registry.findings)
+        archived_ids = {a.finding_id for a in registry.archived}
+        merged_findings = [f for f in registry.findings if f.id not in archived_ids]
         merged_dispositions = self._merge_dispositions(fresh.dispositions, dispositions)
         merged_archived = self._merge_archived(fresh.archived, registry.archived)
+        current = (fresh.findings, fresh.dispositions, fresh.archived)
+        desired = (merged_findings, merged_dispositions, merged_archived)
+        if current == desired and fresh.round_id == round_id:
+            return  # Reconcile an already committed decision without another write.
+        if current != (state.findings, state.dispositions, state.archived):
+            raise _ForemanEscalation(
+                "finding history changed during review; reconciliation required"
+            )
         try:
-            self._save_fresh(
-                issue,
+            updated = replace(
                 fresh,
+                updated_at=datetime.now(UTC),
                 round_id=round_id,
                 findings=merged_findings,
                 dispositions=merged_dispositions,
                 archived=merged_archived,
             )
+            self._queue.save_state(updated, expected_updated_at=fresh.updated_at)
         except Exception as exc:
             raise _ForemanEscalation(
                 f"persist review round {round_id} for {issue.slug()} failed: {exc}"
@@ -770,30 +913,21 @@ class ForemanPolicyLoop:
             ) from exc
 
     @staticmethod
-    def _merge_round_findings(
-        existing: list[ReviewerFinding], current: list[ReviewerFinding]
-    ) -> list[ReviewerFinding]:
-        seen = {f.id for f in existing}
-        merged = list(existing)
-        for finding in current:
-            if finding.id not in seen:
-                merged.append(finding)
-                seen.add(finding.id)
-        return merged
-
-    @staticmethod
     def _merge_dispositions(
         existing: list[FindingDisposition],
         current: list[FindingDisposition],
     ) -> list[FindingDisposition]:
-        # Newest disposition per finding wins, on top of the accumulated
-        # prior rounds. A round's disposition always settles a finding that is
-        # in this round's registry, so the merge is keyed on finding_id.
-        dealt: set[str] = set()
-        for d in current:
-            dealt.add(d.finding_id)
-        merged = [d for d in existing if d.finding_id not in dealt]
-        merged.extend(current)
+        merged = list(existing)
+        for decision in current:
+            key = (decision.run_id, decision.round_id, decision.decided_by, decision.finding_id)
+            prior = next(
+                (d for d in merged if (d.run_id, d.round_id, d.decided_by, d.finding_id) == key),
+                None,
+            )
+            if prior is None:
+                merged.append(decision)
+            elif prior != decision:
+                raise _ForemanEscalation("conflicting replay of immutable finding disposition")
         return merged
 
     @staticmethod
@@ -811,11 +945,19 @@ class ForemanPolicyLoop:
     # --- Lane execution ---------------------------------------------------------
 
     def _run_lane(
-        self, lane: LaneIdentity, worktree: str, state: WorkflowState, prompt: str
+        self,
+        lane: LaneIdentity,
+        worktree: str,
+        state: WorkflowState,
+        prompt: str,
+        disposition_requests: tuple[tuple[str, str | None], ...] = (),
     ) -> LaneResult:
         lease = self._reserve(lane)
         context = LaneExecutionContext(
-            run_id=self._run_id, round_id=state.round_id, work_item_id=state.work_item_id
+            run_id=self._run_id,
+            round_id=state.round_id,
+            work_item_id=state.work_item_id,
+            disposition_requests=disposition_requests,
         )
         # Prompt-token budget: charge before executing so a lane is never
         # launched past the configured cap — escalate rather than exceed.
@@ -988,7 +1130,11 @@ class ForemanPolicyLoop:
         return None
 
     def _coder_prompt(
-        self, issue: GitHubIssueRef, findings: tuple[ReviewerFinding, ...], worktree: str
+        self,
+        issue: GitHubIssueRef,
+        findings: tuple[ReviewerFinding, ...],
+        worktree: str,
+        dispositions: list[FindingDisposition] | None = None,
     ) -> str:
         lines = [f"Implement issue {issue.slug()} in the current worktree."]
         description = self._read_issue_description(issue, worktree)
@@ -996,7 +1142,19 @@ class ForemanPolicyLoop:
             lines.append(f"Issue description:\n{description}")
         if findings:
             lines.append("Address these review findings:")
-            lines.extend(f"- [{f.severity}] {f.body}" for f in findings)
+            lines.extend(f"- {f.id} [{f.severity}] {f.body}" for f in findings)
+            latest = {d.finding_id: d for d in dispositions or []}
+            lines.extend(
+                f"Prior decision for {f.id}: {latest[f.id].rationale}"
+                for f in findings
+                if f.id in latest
+            )
+            if any(f.lane != "ci" for f in findings):
+                lines.append(
+                    'Return only {"dispositions":[{"finding_id":"...","action":"fix",'
+                    '"rationale":"change/test or falsifiable rebuttal evidence"}]}. '
+                    "Exactly one fix or rebut per requested review finding; you cannot accept your own response."
+                )
         return "\n".join(lines)
 
     def _read_issue_description(self, issue: GitHubIssueRef, worktree: str) -> str:

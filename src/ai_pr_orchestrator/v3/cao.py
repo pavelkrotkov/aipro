@@ -37,7 +37,15 @@ from typing import Any, Literal
 import httpx
 
 from .config import CAOControlPlaneConfig
-from .domain import Evidence, LaneIdentity, LaneName, ModelAssignment, ReviewerFinding, RunId
+from .domain import (
+    Evidence,
+    FindingDisposition,
+    LaneIdentity,
+    LaneName,
+    ModelAssignment,
+    ReviewerFinding,
+    RunId,
+)
 from .interfaces import LaneExecutionContext, LaneResult, SessionHandle, SessionSpec
 from .lanes import LaneRegistry
 
@@ -209,6 +217,7 @@ class CaoSessionMetadata:
             "run_id": self.context.run_id,
             "round_id": self.context.round_id,
             "work_item_id": self.context.work_item_id,
+            "disposition_requests": list(self.context.disposition_requests),
             "model_assignment": (
                 self.model_assignment.to_dict() if self.model_assignment is not None else None
             ),
@@ -252,6 +261,9 @@ class CaoSessionMetadata:
                 run_id=data["run_id"],
                 round_id=data.get("round_id"),
                 work_item_id=data.get("work_item_id"),
+                disposition_requests=tuple(
+                    tuple(request) for request in data.get("disposition_requests", [])
+                ),
             ),
             model_assignment=(
                 ModelAssignment.from_dict(assignment) if assignment is not None else None
@@ -317,6 +329,42 @@ def _parse_reviewer_output(
         return findings
     except (ValueError, TypeError, KeyError) as exc:
         raise CaoReviewerOutputError(f"Invalid reviewer output: {exc}") from exc
+
+
+def _parse_disposition_output(result: LaneResult, metadata: CaoSessionMetadata) -> LaneResult:
+    """Requested decisions are explicit; an empty review cannot accept a proposal."""
+    try:
+        payload = json.loads(result.output_summary, parse_constant=_reject_json_constant)
+        reviewer = metadata.lane.role == "reviewer"
+        keys = {"findings", "dispositions"} if reviewer else {"dispositions"}
+        if not isinstance(payload, dict) or set(payload) != keys:
+            raise ValueError(f"expected exactly {sorted(keys)}")
+        raw = payload["dispositions"]
+        if not isinstance(raw, list):
+            raise ValueError("dispositions must be an array")
+        dispositions = [_parse_disposition(item, metadata) for item in raw]
+        metadata.context.validate_dispositions(dispositions, metadata.lane)
+        findings = _parse_reviewer_output(json.dumps(payload.get("findings", [])), metadata)
+        return dataclasses.replace(result, findings=findings, dispositions=dispositions)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise CaoReviewerOutputError(f"Invalid disposition output: {exc}") from exc
+
+
+def _parse_disposition(payload: Any, metadata: CaoSessionMetadata) -> FindingDisposition:
+    reviewer = metadata.lane.role == "reviewer"
+    keys = {"finding_id", "action", "rationale"}
+    if reviewer:
+        keys.add("response_to_round_id")
+    if not isinstance(payload, dict) or set(payload) != keys:
+        raise ValueError(f"disposition requires exactly {sorted(keys)}")
+    if any(not isinstance(value, str) or not value.strip() for value in payload.values()):
+        raise ValueError("disposition fields must be nonempty strings")
+    return FindingDisposition(
+        **payload,
+        decided_by=metadata.lane.lane,
+        run_id=metadata.context.run_id,
+        round_id=metadata.context.round_id,
+    )
 
 
 def _reviewer_finding(payload: Any, metadata: CaoSessionMetadata) -> ReviewerFinding:
@@ -617,10 +665,14 @@ class CaoSessionController:
             output_summary=output,
             changed_files=[],
         )
-        if observation.state == "completed" and observation.metadata.lane.role == "reviewer":
-            return dataclasses.replace(
-                result, findings=_parse_reviewer_output(result.output_summary, observation.metadata)
-            )
+        if observation.state == "completed":
+            metadata = observation.metadata
+            if metadata.context.disposition_requests:
+                return _parse_disposition_output(result, metadata)
+            if metadata.lane.role == "reviewer":
+                return dataclasses.replace(
+                    result, findings=_parse_reviewer_output(result.output_summary, metadata)
+                )
         return result
 
     def final_output(self, handle: SessionHandle) -> str:

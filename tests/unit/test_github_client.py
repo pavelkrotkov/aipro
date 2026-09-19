@@ -1129,3 +1129,23 @@ def test_pr_source_repository_identity_is_independent_of_fork_ancestry(head_name
     _mock_pr_files(42, [])
     with _make_client() as client:
         assert client.list_open_prs()[0].is_fork is expected
+
+
+@pytest.mark.parametrize("failure", ["timeout", "server_error"])
+def test_thread_reply_uncertain_response_is_not_retried(monkeypatch, failure):
+    replies = []
+    sleeps = []
+    monkeypatch.setattr("ai_pr_orchestrator.github.client.time.sleep", sleeps.append)
+
+    def transport(request):
+        replies.append(json.loads(request.content)["variables"])
+        if failure == "timeout":
+            raise httpx.ReadTimeout("reply accepted but response lost", request=request)
+        return httpx.Response(503)
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as http:
+        client = GitHubClient(TOKEN, OWNER, REPO, http_client=http)
+        with pytest.raises(GitHubClientError):
+            client.reply_to_review_thread("thread-1", "actual coder evidence")
+    assert replies == [{"threadId": "thread-1", "body": "actual coder evidence"}]
+    assert sleeps == []

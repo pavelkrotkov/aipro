@@ -156,6 +156,7 @@ class FakeCAOServer:
         # Stored both pre-launch (so set_output() before start_session
         # still wins) and on the live session state.
         self._outputs: dict[str, str] = {}
+        self._output_sequences: dict[str, list[str]] = {}
         # Per-request fault specs.
         self._faults: list[FaultSpec] = []
         # FIFO queue of consumable faults (finding #9 in PR #72).
@@ -190,6 +191,11 @@ class FakeCAOServer:
             state = self._sessions.get(session_name)
             if state is not None:
                 state.output = output
+
+    def set_output_sequence(self, session_name: str, outputs: Sequence[str]) -> None:
+        """Consume one normalized response per completed turn over real HTTP."""
+        with self._lock:
+            self._output_sequences[session_name] = list(outputs)
 
     def _output_for(self, session_name: str) -> str:
         return self._outputs.get(session_name, "")
@@ -544,7 +550,9 @@ class _FakeHandler(BaseHTTPRequestHandler):
             if state is None or state.deleted:
                 self._write_text(404, f"no terminal {terminal_id}")
                 return
-            self._write_json(200, {"output": state.output})
+            sequence = self._fake._output_sequences.get(state.session_name)
+            output = sequence.pop(0) if sequence else state.output
+            self._write_json(200, {"output": output})
 
 
 @contextmanager

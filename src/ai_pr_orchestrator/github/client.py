@@ -399,6 +399,7 @@ class GitHubClient:
         return self._graphql(
             graphql.REPLY_TO_REVIEW_THREAD_MUTATION,
             {"threadId": thread_id, "body": body},
+            max_attempts=1,  # Unknown mutation outcomes require reconciliation, not reposting.
         )
 
     def resolve_review_thread(self, thread_id: str) -> dict[str, Any] | None:
@@ -457,12 +458,19 @@ class GitHubClient:
 
         return all_items
 
-    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    def _graphql(
+        self,
+        query: str,
+        variables: dict[str, Any],
+        *,
+        max_attempts: int = _MAX_RETRIES,
+    ) -> dict[str, Any]:
         response = self._request(
             "POST",
             self._graphql_url,
             json={"query": query, "variables": variables},
             absolute_url=True,
+            max_attempts=max_attempts,
         )
         body: dict[str, Any] = response.json()
         if "errors" in body:
