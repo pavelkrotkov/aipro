@@ -118,6 +118,12 @@ def test_session_name_is_deterministic_for_a_run_and_lane():
     assert session_name_for(RUN_ID, DEVELOPER_LANE) == session_name_for(RUN_ID, DEVELOPER_LANE)
 
 
+def test_worker_session_name_isolated_by_work_item():
+    first = session_name_for(RUN_ID, DEVELOPER_LANE, "owner/repo#1")
+    assert first == session_name_for(RUN_ID, DEVELOPER_LANE, "owner/repo#1")
+    assert first != session_name_for(RUN_ID, DEVELOPER_LANE, "owner/repo#2")
+
+
 def test_session_name_is_sanitized_and_length_bounded():
     name = session_name_for("owner/repo#42:very-long-" + "x" * 80, "architecture-reviewer")
 
