@@ -20,6 +20,7 @@ import pytest
 
 from ai_pr_orchestrator.v3.cao import (
     CAOControlPlaneConfig,
+    CaoControlPlaneError,
     CaoSessionController,
     CaoTransportError,
     SessionBusyError,
@@ -28,7 +29,7 @@ from ai_pr_orchestrator.v3.cao import (
 from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
 from ai_pr_orchestrator.v3.domain import LaneIdentity
 from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, SessionSpec
-from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
+from ai_pr_orchestrator.v3.lanes import DEFAULT_LANES, DEVELOPER_LANE, LaneRegistry
 from tests.integration._fake_cao_server import (
     DEFAULT_STATUS_SEQUENCE,
     STATUS_COMPLETED,
@@ -362,3 +363,90 @@ def test_fake_cao_status_constants_match_real_cao_vocabulary():
     assert len(DEFAULT_STATUS_SEQUENCE) >= 3, (
         "default sequence must walk started -> processing -> idle at minimum"
     )
+
+
+@pytest.mark.parametrize("lane", DEFAULT_LANES, ids=lambda lane: lane.lane)
+def test_execute_refreshes_round_context_durably(fake_cao: FakeCAOServer, tmp_path, lane):
+    """Every lane retains its session identity while advancing turn attribution."""
+    registry = LaneRegistry.default()
+    run_id = "multi-round"
+    name = session_name_for(run_id, lane.lane)
+    contexts = [
+        LaneExecutionContext(run_id=run_id, round_id="review-1", work_item_id="first-head"),
+        LaneExecutionContext(run_id=run_id, round_id="review-2", work_item_id="fixed-head"),
+    ]
+    with CaoSessionController(_config(fake_cao.url), registry) as controller:
+        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        for context in contexts:
+            result = executor.execute(lane, f"Review {context.round_id}", str(tmp_path), context)
+            assert result.exit_code == 0
+            metadata = fake_cao._sessions[name].metadata
+            assert (metadata["round_id"], metadata["work_item_id"]) == (
+                context.round_id,
+                context.work_item_id,
+            )
+    assert len(fake_cao._sessions) == 1
+    assert fake_cao._sessions[name].submitted_messages == ["Review review-1", "Review review-2"]
+    with CaoSessionController(_config(fake_cao.url), registry) as restarted:
+        observation = restarted.adopt_session(name)
+        assert observation.metadata.context == contexts[-1]
+
+
+@pytest.mark.parametrize("transport_reset", [False, True])
+def test_execute_fails_closed_when_turn_context_update_fails(
+    fake_cao: FakeCAOServer, tmp_path, transport_reset
+):
+    registry = LaneRegistry.default()
+    lane = registry.get("requirements-reviewer")
+    run_id = "context-failure"
+    name = session_name_for(run_id, lane.lane)
+    with CaoSessionController(_config(fake_cao.url), registry) as controller:
+        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        executor.execute(lane, "first review", str(tmp_path), _context(run_id))
+        state = fake_cao._sessions[name]
+        fake_cao.add_fault(
+            FaultSpec(
+                method="PATCH",
+                path_prefix=f"/terminals/{state.terminal_id}/metadata",
+                status_code=503,
+                transport_reset=transport_reset,
+            )
+        )
+        error = CaoTransportError if transport_reset else CaoControlPlaneError
+        with pytest.raises(error):
+            executor.execute(
+                lane,
+                "second review",
+                str(tmp_path),
+                LaneExecutionContext(run_id=run_id, round_id="review-2"),
+            )
+    assert state.submitted_messages == ["first review", "second review"]
+    assert state.deleted
+
+
+def test_busy_followup_preserves_previous_round(fake_cao: FakeCAOServer, tmp_path):
+    registry = LaneRegistry.default()
+    lane = registry.get("requirements-reviewer")
+    run_id = "busy-review"
+    name = session_name_for(run_id, lane.lane)
+    with CaoSessionController(_config(fake_cao.url), registry) as controller:
+        executor = CaoLaneExecutor(controller, registry, poll_interval_seconds=0.01)
+        context = LaneExecutionContext(run_id=run_id, round_id="review-1")
+        executor.execute(lane, "first review", str(tmp_path), context)
+        state = fake_cao._sessions[name]
+        previous_metadata = dict(state.metadata)
+        fake_cao.add_fault(
+            FaultSpec(
+                method="POST", path_prefix=f"/terminals/{state.terminal_id}/input", status_code=409
+            )
+        )
+        with pytest.raises(SessionBusyError):
+            executor.execute(
+                lane,
+                "second review",
+                str(tmp_path),
+                LaneExecutionContext(run_id=run_id, round_id="review-2"),
+            )
+    assert state.metadata == previous_metadata
+    assert state.submitted_messages == ["first review"]
+    assert not state.deleted
