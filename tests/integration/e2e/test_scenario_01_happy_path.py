@@ -18,6 +18,7 @@ import pytest
 
 from ai_pr_orchestrator.v3.cao import session_name_for
 from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
+from tests.integration._harness import developer_output, developer_session_name
 from tests.integration._fake_cao_server import (
     STATUS_IDLE,
     STATUS_PROCESSING,
@@ -29,12 +30,12 @@ from tests.integration._fake_cao_server import (
 _TERMINAL = (STATUS_STARTED, STATUS_PROCESSING, STATUS_IDLE, STATUS_IDLE, STATUS_IDLE)
 
 
-def _script_worker(fake_cao, run_id: str) -> str:
+def _script_worker(fake_cao, run_id: str, issue_number: int = 1) -> str:
     """Set up the fake's per-session state for the worker lane and
     return the deterministic session name."""
-    name = session_name_for(run_id, DEVELOPER_LANE)
+    name = developer_session_name(run_id, issue_number)
     fake_cao.set_status_sequence(name, _TERMINAL)
-    fake_cao.set_output(name, "scenario-1 worker output")
+    fake_cao.set_output(name, developer_output(summary="scenario-1 worker output"))
     for lane in LaneRegistry.default():
         if lane.role == "reviewer":
             fake_cao.set_output(session_name_for(run_id, lane.lane), "[]")
@@ -63,7 +64,7 @@ def test_scenario_1_happy_path_opens_exactly_one_pr(fake_cao, foreman_harness):
     )
 
     # The worker spoke to CAO under the deterministic session name.
-    name = session_name_for(loop.run_id, DEVELOPER_LANE)
+    name = developer_session_name(loop.run_id)
     assert name in fake_cao._sessions
 
 
@@ -90,7 +91,7 @@ def test_scenario_1_repeated_runs_do_not_duplicate(fake_cao, foreman_harness, se
     duplicate branches or PRs. The foreman's claim should find nothing
     ready on the second pass because the issue is already ``done``."""
     loop, _queue, fake = foreman_harness(seed_issue_numbers=[seed])
-    _script_worker(fake_cao, loop.run_id)
+    _script_worker(fake_cao, loop.run_id, seed)
 
     first = loop.run_pass()
     second = loop.run_pass()
