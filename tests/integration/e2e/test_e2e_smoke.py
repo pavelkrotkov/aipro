@@ -40,7 +40,9 @@ _DEFAULT_TERMINAL_SEQUENCE = (
 
 
 @pytest.mark.usefixtures("cao_lane_executor", "lane_registry")
-def test_foreman_drives_one_fake_cao_session_to_completion(fake_cao, foreman_harness):
+def test_foreman_drives_one_fake_cao_session_to_completion(
+    fake_cao, foreman_harness, lane_registry
+):
     """One seeded issue walks the full lifecycle to ``done`` with the
     real :class:`CaoLaneExecutor` and the in-process ``FakeCAOServer``.
 
@@ -59,6 +61,9 @@ def test_foreman_drives_one_fake_cao_session_to_completion(fake_cao, foreman_har
     session_name = session_name_for(run_id, DEVELOPER_LANE)
     fake_cao.set_status_sequence(session_name, _DEFAULT_TERMINAL_SEQUENCE)
     fake_cao.set_output(session_name, "ok")
+    for lane in lane_registry:
+        if lane.role == "reviewer":
+            fake_cao.set_output(session_name_for(run_id, lane.lane), "[]")
 
     outcomes = loop.run_pass()
 

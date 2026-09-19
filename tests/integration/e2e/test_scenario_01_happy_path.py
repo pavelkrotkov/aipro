@@ -4,7 +4,7 @@
 The foreman loop drives a single seeded issue through the full
 lifecycle to ``done``. The worker lane runs through the real
 ``CaoLaneExecutor`` against ``FakeCAOServer``; the reviewer lanes
-return no findings (the hybrid executor's default for round 1).
+explicitly return the structured clean result ``[]``.
 
 Acceptance (per #55 E2E scenarios, #1):
 - One PR is opened, no duplicates.
@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from ai_pr_orchestrator.v3.cao import session_name_for
-from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE
+from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
 from tests.integration._fake_cao_server import (
     STATUS_IDLE,
     STATUS_PROCESSING,
@@ -35,6 +35,9 @@ def _script_worker(fake_cao, run_id: str) -> str:
     name = session_name_for(run_id, DEVELOPER_LANE)
     fake_cao.set_status_sequence(name, _TERMINAL)
     fake_cao.set_output(name, "scenario-1 worker output")
+    for lane in LaneRegistry.default():
+        if lane.role == "reviewer":
+            fake_cao.set_output(session_name_for(run_id, lane.lane), "[]")
     return name
 
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -36,7 +37,7 @@ from typing import Any, Literal
 import httpx
 
 from .config import CAOControlPlaneConfig
-from .domain import LaneIdentity, LaneName, ModelAssignment, RunId
+from .domain import Evidence, LaneIdentity, LaneName, ModelAssignment, ReviewerFinding, RunId
 from .interfaces import LaneExecutionContext, LaneResult, SessionHandle, SessionSpec
 from .lanes import LaneRegistry
 
@@ -84,6 +85,10 @@ _UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9_-]")
 
 class CaoControlPlaneError(RuntimeError):
     """Base class for CAO control-plane failures."""
+
+
+class CaoReviewerOutputError(CaoControlPlaneError):
+    """A completed reviewer did not return valid new structured findings."""
 
 
 class CaoUnavailableError(CaoControlPlaneError):
@@ -293,6 +298,108 @@ def session_name_for(run_id: RunId, lane: LaneName) -> str:
     return f"{sanitized[: _MAX_SESSION_NAME_LEN - 9]}-{digest}"
 
 
+def _parse_reviewer_output(
+    output_summary: str, metadata: CaoSessionMetadata
+) -> list[ReviewerFinding]:
+    """Parse CAO's normalized last response, never terminal scrollback.
+
+    Only a JSON array is a review; ``[]`` is the explicit clean result.
+    Legacy durable-state deserializers intentionally skip validation and must
+    not be used for this untrusted ingress.
+    """
+    try:
+        payload = json.loads(output_summary, parse_constant=_reject_json_constant)
+        if not isinstance(payload, list):
+            raise ValueError("expected a JSON array")
+        findings = [_reviewer_finding(item, metadata) for item in payload]
+        if len({finding.id for finding in findings}) != len(findings):
+            raise ValueError("duplicate finding ids")
+        return findings
+    except (ValueError, TypeError, KeyError) as exc:
+        raise CaoReviewerOutputError(f"Invalid reviewer output: {exc}") from exc
+
+
+def _reviewer_finding(payload: Any, metadata: CaoSessionMetadata) -> ReviewerFinding:
+    if not isinstance(payload, dict):
+        raise ValueError("each finding must be an object")
+    data = dict(payload)
+    _review_field_types(data)
+    attribution = {
+        "lane": metadata.lane.lane,
+        "run_id": metadata.context.run_id,
+        "round_id": metadata.context.round_id,
+    }
+    for key, expected in attribution.items():
+        if data.setdefault(key, expected) != expected:
+            raise ValueError(f"finding {key} does not match the current reviewer turn")
+    _require_new_finding(data)
+    data["evidence"] = [_review_evidence(item) for item in data.get("evidence", [])]
+    return ReviewerFinding(**data)
+
+
+def _require_new_finding(data: dict[str, Any]) -> None:
+    if "created_at" in data:
+        raise ValueError("created_at is assigned by the engine, not the reviewer")
+    if data.get("status", "open") != "open":
+        raise ValueError("reviewer findings must be open; policy owns dispositions")
+    defaults = {"sources": [], "thread_id": None, "conflict_group_id": None, "extras": {}}
+    if any(data.get(key, default) != default for key, default in defaults.items()):
+        raise ValueError("new reviewer findings cannot supply durable policy/provenance state")
+    if not isinstance(data.get("evidence", []), list):
+        raise ValueError("finding evidence must be an array")
+
+
+def _review_evidence(payload: Any) -> Evidence:
+    if not isinstance(payload, dict):
+        raise ValueError("each evidence item must be an object")
+    if payload.get("extras", {}) != {}:
+        raise ValueError("review evidence cannot supply legacy extension fields")
+    _review_field_types(payload)
+    return Evidence(**payload)
+
+
+def _review_field_types(data: dict[str, Any]) -> None:
+    """Dataclass constructors enforce values, but Python does not enforce their types."""
+    text_fields = (
+        "id",
+        "body",
+        "severity",
+        "lane",
+        "run_id",
+        "round_id",
+        "path",
+        "claim",
+        "falsification",
+        "reproduction_command",
+        "suggested_fix",
+        "head_sha",
+        "status",
+        "status_reason",
+        "thread_id",
+        "conflict_group_id",
+        "kind",
+        "snippet",
+        "text",
+    )
+    for key in text_fields:
+        value = data.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"{key} must be a nonblank string")
+    _review_number_types(data)
+
+
+def _review_number_types(data: dict[str, Any]) -> None:
+    for key in ("line", "line_end", "line_start"):
+        if data.get(key) is not None and type(data[key]) is not int:
+            raise ValueError(f"{key} must be an integer")
+    if data.get("confidence") is not None and type(data["confidence"]) not in (int, float):
+        raise ValueError("confidence must be a number")
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"{value} is not a JSON number")
+
+
 class CaoSessionController:
     """Drives CAO sessions for V3 lanes over CAO's HTTP control plane.
 
@@ -499,12 +606,17 @@ class CaoSessionController:
             output = observation.detail
         else:
             output = self.final_output(handle) or observation.detail
-        return LaneResult(
+        result = LaneResult(
             session=handle,
             exit_code=0 if observation.state == "completed" else 1,
             output_summary=output,
             changed_files=[],
         )
+        if observation.state == "completed" and observation.metadata.lane.role == "reviewer":
+            return dataclasses.replace(
+                result, findings=_parse_reviewer_output(result.output_summary, observation.metadata)
+            )
+        return result
 
     def final_output(self, handle: SessionHandle) -> str:
         """Return the agent's last response as CAO extracted it.
