@@ -41,9 +41,9 @@ from .domain import Evidence, LaneIdentity, LaneName, ModelAssignment, ReviewerF
 from .interfaces import LaneExecutionContext, LaneResult, SessionHandle, SessionSpec
 from .lanes import LaneRegistry
 
-#: Minimum CAO release this adapter is written against. 2.4.x is the first
-#: line whose control plane exposes everything used here.
-MINIMUM_CAO_VERSION = "2.4"
+#: Earliest verified release with creation metadata and metadata PATCH.
+#: Exact tested upstream commit and runtime evidence: docs/V3_CAO.md.
+MINIMUM_CAO_VERSION = "2.5.0"
 
 #: Normalized session lifecycle. ``started`` means the session exists but its
 #: agent is not yet observable; ``disappeared`` means CAO no longer knows the

@@ -4,14 +4,57 @@
 control-plane contract `ai_pr_orchestrator.v3.cao` depends on, and how to
 provision the Hermes lane profiles.*
 
-## 1. Minimum CAO version: 2.4.x
+## 1. Minimum CAO version: 2.5.0
 
-**aipro V3 requires CAO >= 2.4.0 (developed against 2.4.1).** 2.4 is the first
-line whose HTTP control plane exposes every route the adapter needs, in
-particular per-terminal `metadata` (the durable attribution record that makes
-restart reconcile possible) and the typed terminal `status` field.
+**aipro V3 requires CAO >= 2.5.0.** The earliest verified release is
+[official v2.5.0](https://github.com/awslabs/cli-agent-orchestrator/tree/a5ccbe2624aabadfbdf64642c5f1e364db299ec3),
+commit `a5ccbe2624aabadfbdf64642c5f1e364db299ec3`. For a reproducible installation:
 
-The adapter records the floor as `ai_pr_orchestrator.v3.cao.MINIMUM_CAO_VERSION`.
+```sh
+uv tool install 'git+https://github.com/awslabs/cli-agent-orchestrator.git@a5ccbe2624aabadfbdf64642c5f1e364db299ec3'
+```
+
+The previous 2.4.x floor was incorrect: official 2.4.0 and 2.4.1 lack both
+creation attribution fields (`group`/`metadata`) and the metadata PATCH route.
+Their successful session launch is not evidence that restart recovery works.
+The adapter records the corrected floor as
+`ai_pr_orchestrator.v3.cao.MINIMUM_CAO_VERSION`; it does not infer a server
+version from `/health`. Missing metadata PATCH raises the existing
+`CaoSessionNotFoundError`; sessions without attribution cannot be adopted.
+Upgrade the control plane rather than retrying a missing capability.
+
+### Verified runtime contract (issue #94)
+
+On 2026-09-19, an isolated installation of the exact 2.5.0 commit above passed
+real HTTP/tmux checks using aipro controller revision
+`3712d3d5df8d8e726c33e4ff00e236452330bf8c`:
+
+- Creation attribution survived GET; `update_turn_context` persisted round 2.
+- PATCH used `{"metadata": {...}}` and replaced the complete metadata record.
+- A fresh controller and a restarted CAO server adopted the same session and
+  terminal with the updated attribution intact.
+- A CAO-launched process received the explicit session environment and read
+  all 220,030 bytes of a Unicode issue artifact from linked-worktree-private
+  Git metadata, with a matching SHA-256.
+
+The profile command was a harmless local process launched by CAO's Hermes
+provider, **not live Hermes reasoning**. This verifies transport, metadata,
+restart adoption, environment delivery and filesystem access. It does not
+verify model consumption, reviewer reasoning, task completion or #55 cutover.
+Owned sessions and the private server were stopped after the check.
+
+The negative regression fixture `tests/fixtures/cao-2.4.1-metadata-contract.json`
+was captured from official 2.4.1 commit
+`752be53f19c15b328a67a4e64c3d3c87c38b2d23`: its actual FastAPI OpenAPI schema
+omits creation metadata and the PATCH route, and an in-process ASGI request
+returns the recorded 404. It is not a response invented by FakeCAOServer.
+To recapture, install that commit in an isolated environment, import
+`cli_agent_orchestrator.api.main.app`, inspect
+`app.openapi()["components"]["schemas"]["CreateSessionBody"]["properties"]`
+and `app.openapi()["paths"]`, then use `httpx.ASGITransport(app=app)` to PATCH
+`/terminals/aipro94-probe/metadata` with `{"metadata":{"round_id":"round2"}}`.
+Set `CAO_HOME_DIR` to a scratch directory before importing. No live worker or
+provider credentials are needed for this missing-route check.
 
 ## 2. What aipro asks of CAO, and what it never does
 

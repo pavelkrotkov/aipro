@@ -1,0 +1,16 @@
+{
+  "release": "2.4.1",
+  "commit": "752be53f19c15b328a67a4e64c3d3c87c38b2d23",
+  "create_session_fields": [
+    "env_vars",
+    "initial_message",
+    "initial_message_orchestration_type"
+  ],
+  "metadata_patch_route_present": false,
+  "patch_response": {
+    "status_code": 404,
+    "json": {
+      "detail": "Not Found"
+    }
+  }
+}
