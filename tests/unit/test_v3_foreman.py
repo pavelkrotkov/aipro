@@ -7,6 +7,7 @@ the lane executor, broker, gate, and git ops are faked.
 
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -143,22 +144,33 @@ class ScriptedExecutor:
             import time
 
             time.sleep(self.developer_sleep)
+        dispositions = [
+            FindingDisposition(
+                finding_id=fid,
+                action="fix",
+                rationale="fixed guard; regression test passes",
+                decided_by=lane.lane,
+                run_id=context.run_id,
+                round_id=context.round_id,
+            )
+            for fid, _ in context.disposition_requests
+        ]
+        output = {
+            "summary": "implemented requested change",
+            "tests": [{"command": "pytest -q", "result": "passed", "notes": ""}],
+            "concerns": [],
+            "no_changes": not self.developer_files,
+            "dispositions": [
+                {"finding_id": d.finding_id, "action": d.action, "rationale": d.rationale}
+                for d in dispositions
+            ],
+        }
         return LaneResult(
             session=HANDLE,
             exit_code=self.developer_exit,
-            output_summary="",
+            output_summary=json.dumps(output),
             changed_files=list(self.developer_files),
-            dispositions=[
-                FindingDisposition(
-                    finding_id=fid,
-                    action="fix",
-                    rationale="fixed guard; regression test passes",
-                    decided_by=lane.lane,
-                    run_id=context.run_id,
-                    round_id=context.round_id,
-                )
-                for fid, _ in context.disposition_requests
-            ],
+            dispositions=dispositions,
         )
 
 
@@ -190,6 +202,12 @@ class FakeGitOperations:
     def create_worktree(self, path: str, branch: str) -> str:
         self.worktrees[path] = branch
         return path
+
+    def head_sha(self, workdir: str) -> str:
+        return "sha"
+
+    def repo_instructions(self, workdir: str) -> str:
+        return ""
 
     def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
         raise NotImplementedError("use real GitWorktreeOps for issue input delivery tests")
