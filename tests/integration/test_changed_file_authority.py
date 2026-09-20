@@ -159,6 +159,8 @@ def test_foreman_rejects_actual_cao_workflow_edits_before_push(
 
     def simulate_worker_edit(handle, prompt):
         submit(handle, prompt)  # Real HTTP input delivery still runs.
+        if handle.lane == "developer" and editing_lane != "developer":
+            (Path(loop._worktree_root) / "issue-1/safe.py").write_text("safe")
         if handle.lane == editing_lane:
             path = Path(loop._worktree_root) / "issue-1/.github/workflows/ci.yml"
             path.parent.mkdir(parents=True)
