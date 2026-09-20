@@ -423,7 +423,9 @@ def test_execute_refreshes_round_context_durably(fake_cao: FakeCAOServer, tmp_pa
     """Every lane retains its session identity while advancing turn attribution."""
     registry = LaneRegistry.default()
     run_id = "multi-round"
-    work_items = ["same-item", "same-item"] if lane.role == "worker" else ["first-head", "fixed-head"]
+    work_items = (
+        ["same-item", "same-item"] if lane.role == "worker" else ["first-head", "fixed-head"]
+    )
     name = session_name_for(run_id, lane.lane, work_items[0] if lane.role == "worker" else None)
     fake_cao.set_output(name, "[]" if lane.role == "reviewer" else MARKER)
     contexts = [
