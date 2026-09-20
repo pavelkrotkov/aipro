@@ -233,9 +233,7 @@ def test_saved_proposal_survives_foreman_and_controller_loss(
     assert [d.action for d in restored.dispositions] == ["rebut", "accept"]
     assert not restored.findings
     assert len(github.list_open_prs()) == 1
-    assert (
-        len(fake_cao._sessions[developer_session_name(loop.run_id)].submitted_messages) == 2
-    )
+    assert len(fake_cao._sessions[developer_session_name(loop.run_id)].submitted_messages) == 2
 
 
 def test_acceptance_save_failure_never_gates(fake_cao, foreman_harness, monkeypatch):
