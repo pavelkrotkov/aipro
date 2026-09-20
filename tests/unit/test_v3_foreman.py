@@ -354,6 +354,25 @@ def test_developer_no_change_is_explicit_and_can_complete():
     assert report["no_changes"] is True
 
 
+def test_developer_no_change_report_cannot_contradict_edits():
+    result = LaneResult(
+        session=HANDLE,
+        exit_code=0,
+        output_summary=json.dumps(
+            {
+                "summary": "no changes needed",
+                "tests": [],
+                "concerns": [],
+                "no_changes": True,
+                "dispositions": [],
+            }
+        ),
+        changed_files=["src/x.py"],
+    )
+    violation = ForemanPolicyLoop._developer_report_violation(result)
+    assert violation == "developer reported no_changes=true despite authoritative worktree edits"
+
+
 def test_developer_reported_test_failure_stops_before_push():
     fake = _ready_fake()
     executor = ScriptedExecutor(developer_test_result="failed")
