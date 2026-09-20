@@ -123,13 +123,16 @@ def test_repo_instructions_reads_root_agent_files(real_repo: Path):
 def test_default_branch_and_branch_creation(real_repo: Path):
     ops = GitWorktreeOps(real_repo)
     assert ops.default_branch() == "main"
-    assert ops.head_sha(str(real_repo)) == subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=real_repo,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+    assert (
+        ops.head_sha(str(real_repo))
+        == subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=real_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
     ops.create_branch("feat/x", "main")
     heads = subprocess.run(
         ["git", "branch", "--list", "feat/x"],
