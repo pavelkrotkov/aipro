@@ -1069,9 +1069,7 @@ class ForemanPolicyLoop:
             raise ForemanQueueError(f"broker cannot resolve a model for lane {lane.lane!r}")
         decision = select(TaskDemand(lane=lane.lane, role=lane.role))
         if decision.assignment is None:
-            raise ForemanQueueError(
-                f"no model available for lane {lane.lane!r}: {decision.reason}"
-            )
+            raise ForemanQueueError(f"no model available for lane {lane.lane!r}: {decision.reason}")
         return self._broker.reserve(decision.assignment), tuple(decision.fallbacks)
 
     @staticmethod
