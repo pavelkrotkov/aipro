@@ -406,6 +406,24 @@ def test_developer_head_movement_is_rejected_before_controller_commit():
     assert git.pushed == []
 
 
+def test_checkout_adoption_rejects_persisted_head_movement():
+    git = RecordingGit()
+    loop, _ = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), git=git)
+    state = WorkflowState(
+        ISSUE.slug(),
+        loop.run_id,
+        "coding",
+        extras={
+            "branch": "aipro-issue-1",
+            "worktree": "/wt/issue-1",
+            "head_sha": "trusted",
+        },
+    )
+
+    with pytest.raises(_ForemanEscalation, match="expected trusted, found sha"):
+        loop._verify_checkout(ISSUE, state, "aipro-issue-1", "/wt/issue-1")
+
+
 def test_developer_resources_and_task_packet_are_durable():
     class InstructionGit(RecordingGit):
         def repo_instructions(self, workdir: str) -> str:
