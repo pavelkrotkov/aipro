@@ -159,9 +159,7 @@ class ScriptedExecutor:
         ]
         output = {
             "summary": "implemented requested change",
-            "tests": [
-                {"command": "pytest -q", "result": self.developer_test_result, "notes": ""}
-            ],
+            "tests": [{"command": "pytest -q", "result": self.developer_test_result, "notes": ""}],
             "concerns": [],
             "no_changes": not self.developer_files,
             "dispositions": [
