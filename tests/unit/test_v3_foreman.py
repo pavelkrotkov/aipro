@@ -376,7 +376,7 @@ def test_developer_head_movement_is_rejected_before_controller_commit():
 
         def head_sha(self, workdir: str) -> str:
             self.reads += 1
-            return "sha" if self.reads <= 2 else "agent-commit"
+            return "sha" if self.reads <= 3 else "agent-commit"
 
     fake = _ready_fake()
     git = MovedHeadGit()
