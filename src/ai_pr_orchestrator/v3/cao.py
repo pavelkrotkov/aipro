@@ -293,9 +293,7 @@ class SessionObservation:
 
 def _worker_scope(lane: LaneIdentity, context: LaneExecutionContext) -> str | None:
     work_item_id = context.work_item_id
-    if lane.role != "worker" or not work_item_id:
-        return None
-    return work_item_id if "/" in work_item_id and "#" in work_item_id else None
+    return work_item_id if lane.role == "worker" and work_item_id else None
 
 
 def session_name_for(run_id: RunId, lane: LaneName, work_item_id: str | None = None) -> str:
