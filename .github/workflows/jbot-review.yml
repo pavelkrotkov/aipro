@@ -1,0 +1,145 @@
+name: J-Bot PR Review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  command:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/jbot')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      model: ${{ steps.parse.outputs.model }}
+      head: ${{ steps.pr.outputs.head }}
+    steps:
+      - name: Require write access
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if ! permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" --jq .permission)"; then
+            echo "::error::Failed to retrieve repository permission for $ACTOR."
+            exit 1
+          fi
+          case "$permission" in
+            admin|maintain|write) ;;
+            *)
+              echo "::error::/jbot requires write, maintain, or admin permission; got '$permission'."
+              exit 1
+              ;;
+          esac
+
+      - name: Parse /jbot command
+        id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          first_line="$(printf '%s\n' "$COMMENT_BODY" | head -n1 | tr -d '\r')"
+          read -r -a tokens <<< "$first_line"
+          if [ "${#tokens[@]}" -ne 2 ] || [ "${tokens[0]}" != "/jbot" ]; then
+            echo "::error::Expected exactly: /jbot --model=<provider/model>"
+            exit 1
+          fi
+          case "${tokens[1]}" in
+            --model=*) model="${tokens[1]#--model=}" ;;
+            *)
+              echo "::error::Expected exactly: /jbot --model=<provider/model>"
+              exit 1
+              ;;
+          esac
+          if [ -z "$model" ]; then
+            echo "::error::Model must not be empty."
+            exit 1
+          fi
+          case "$model" in
+            *[!A-Za-z0-9._:/-]*)
+              echo "::error::Model contains unsupported characters."
+              exit 1
+              ;;
+          esac
+          case "$model" in
+            */*) ;;
+            *)
+              echo "::error::Model must be qualified as provider/model."
+              exit 1
+              ;;
+          esac
+          echo "model=$model" >> "$GITHUB_OUTPUT"
+
+      - name: Freeze PR head and reject forks
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          if ! head_repo="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.repo.full_name)"; then
+            echo "::error::Failed to retrieve PR repository metadata."
+            exit 1
+          fi
+          if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::/jbot is disabled for fork-head PRs."
+            exit 1
+          fi
+          if ! head="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)"; then
+            echo "::error::Failed to retrieve PR head SHA."
+            exit 1
+          fi
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Acknowledge accepted command
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes --silent
+
+  review:
+    needs: command
+    if: needs.command.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      checks: read
+    concurrency:
+      group: jbot-review-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.command.outputs.head }}
+
+      - name: Review with J-Bot
+        uses: pgup-ai/jbot-review-action@9474de3728ec4de4283f028a530fe9a5e1df9d79
+        with:
+          model: ${{ needs.command.outputs.model }}
+          pr-number: ${{ github.event.issue.number }}
+          auto-approve: 'false'
+          include-prior-comments: 'true'
+          review-passes: '1'
+          verify-findings: 'true'
+          review-shards: '1'
+          enable-context7: 'auto'
+          fail-on-error: 'true'
+          opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          nvidia-api-key: ${{ secrets.NVIDIA_API_KEY }}
+          deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+          zai-api-key: ${{ secrets.ZAI_API_KEY }}
+          kimi-api-key: ${{ secrets.KIMI_API_KEY }}
+          commandcode-access-key: ${{ secrets.COMMANDCODE_ACCESS_KEY }}
+          openai-compatible-api-key: ${{ secrets.JBOT_OPENAI_COMPATIBLE_API_KEY }}
+          openai-compatible-base-url: ${{ vars.JBOT_OPENAI_COMPATIBLE_BASE_URL }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
