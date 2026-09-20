@@ -1178,11 +1178,15 @@ class ForemanPolicyLoop:
         self, issue: GitHubIssueRef, state: WorkflowState, branch: str, worktree: str
     ) -> WorkflowState:
         actual = self._git.head_sha(worktree)
-        if (
-            state.extras.get("branch") == branch
-            and state.extras.get("worktree") == worktree
-            and state.extras.get("head_sha") == actual
-        ):
+        same_checkout = (
+            state.extras.get("branch") == branch and state.extras.get("worktree") == worktree
+        )
+        expected = state.extras.get("head_sha")
+        if same_checkout and expected is not None and expected != actual:
+            raise _ForemanEscalation(
+                f"unexpected developer HEAD movement: expected {expected}, found {actual}"
+            )
+        if same_checkout and expected == actual:
             return state
         return self._persist_resources(issue, state, branch=branch, worktree=worktree)
 
