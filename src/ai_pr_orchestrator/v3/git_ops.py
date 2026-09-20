@@ -84,6 +84,8 @@ class GitWorktreeOps:
         parts = []
         for name in ("AGENTS.md", "CLAUDE.md"):
             path = root / name
+            if path.is_symlink():
+                raise GitOpsError(f"repository instruction file must not be a symlink: {path}")
             if path.is_file():
                 parts.append(f"{name}:\n{path.read_text(encoding='utf-8')}")
         return "\n\n".join(parts)
