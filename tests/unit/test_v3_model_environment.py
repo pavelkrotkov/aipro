@@ -203,7 +203,17 @@ def test_push_guard_rewrites_explicit_github_push_url(tmp_path):
 
     subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
-        ["git", "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "--allow-empty", "-m", "init"],
+        [
+            "git",
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
         cwd=tmp_path,
         check=True,
         capture_output=True,
