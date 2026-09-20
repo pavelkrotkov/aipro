@@ -104,9 +104,27 @@ class CaoLaneExecutor:
     def _session_env(self, lease: ModelLease | None) -> dict[str, str]:
         env = dict(self._env)
         env.update(
-            GIT_CONFIG_COUNT="1",
+            GIT_CONFIG_COUNT="6",
             GIT_CONFIG_KEY_0="remote.origin.pushurl",
             GIT_CONFIG_VALUE_0="aipro-no-push://authoritative-branch",
+            GIT_CONFIG_KEY_1="url.aipro-no-push://authoritative-branch.pushInsteadOf",
+            GIT_CONFIG_VALUE_1="https://github.com/",
+            GIT_CONFIG_KEY_2="url.aipro-no-push://authoritative-branch.pushInsteadOf",
+            GIT_CONFIG_VALUE_2="git@github.com:",
+            GIT_CONFIG_KEY_3="url.aipro-no-push://authoritative-branch.pushInsteadOf",
+            GIT_CONFIG_VALUE_3="ssh://git@github.com/",
+            GIT_CONFIG_KEY_4="credential.helper",
+            GIT_CONFIG_VALUE_4="",
+            GIT_CONFIG_KEY_5="credential.interactive",
+            GIT_CONFIG_VALUE_5="false",
+            GIT_TERMINAL_PROMPT="0",
+            GIT_ASKPASS="/bin/false",
+            SSH_ASKPASS="/bin/false",
+            SSH_AUTH_SOCK="",
+            GIT_SSH_COMMAND="ssh -oBatchMode=yes -oIdentitiesOnly=yes -oIdentityFile=/dev/null",
+            GH_TOKEN="",
+            GITHUB_TOKEN="",
+            GH_CONFIG_DIR="/nonexistent/aipro-no-github-auth",
         )
         if lease is None:
             return env
