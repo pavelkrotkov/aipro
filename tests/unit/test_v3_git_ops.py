@@ -120,6 +120,14 @@ def test_repo_instructions_reads_root_agent_files(real_repo: Path):
     assert instructions == "AGENTS.md:\nagent rules\n\n\nCLAUDE.md:\nclaude rules\n"
 
 
+def test_repo_instructions_reject_symlinks_outside_worktree(real_repo: Path):
+    secret = real_repo.parent / "host-secret"
+    secret.write_text("do not disclose\n")
+    (real_repo / "AGENTS.md").symlink_to(secret)
+    with pytest.raises(GitOpsError, match="must not be a symlink"):
+        GitWorktreeOps(real_repo).repo_instructions(str(real_repo))
+
+
 def test_default_branch_and_branch_creation(real_repo: Path):
     ops = GitWorktreeOps(real_repo)
     assert ops.default_branch() == "main"
