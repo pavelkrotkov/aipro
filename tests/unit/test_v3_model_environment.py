@@ -26,9 +26,27 @@ from tests.unit.test_v3_git_ops import FakeGitOperations
 
 WRAPPER = Path(__file__).resolve().parents[2] / "scripts" / "aipro-hermes"
 PUSH_GUARD = {
-    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_COUNT": "6",
     "GIT_CONFIG_KEY_0": "remote.origin.pushurl",
     "GIT_CONFIG_VALUE_0": "aipro-no-push://authoritative-branch",
+    "GIT_CONFIG_KEY_1": "url.aipro-no-push://authoritative-branch.pushInsteadOf",
+    "GIT_CONFIG_VALUE_1": "https://github.com/",
+    "GIT_CONFIG_KEY_2": "url.aipro-no-push://authoritative-branch.pushInsteadOf",
+    "GIT_CONFIG_VALUE_2": "git@github.com:",
+    "GIT_CONFIG_KEY_3": "url.aipro-no-push://authoritative-branch.pushInsteadOf",
+    "GIT_CONFIG_VALUE_3": "ssh://git@github.com/",
+    "GIT_CONFIG_KEY_4": "credential.helper",
+    "GIT_CONFIG_VALUE_4": "",
+    "GIT_CONFIG_KEY_5": "credential.interactive",
+    "GIT_CONFIG_VALUE_5": "false",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "/bin/false",
+    "SSH_ASKPASS": "/bin/false",
+    "SSH_AUTH_SOCK": "",
+    "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oIdentitiesOnly=yes -oIdentityFile=/dev/null",
+    "GH_TOKEN": "",
+    "GITHUB_TOKEN": "",
+    "GH_CONFIG_DIR": "/nonexistent/aipro-no-github-auth",
 }
 
 
@@ -172,6 +190,33 @@ def test_adoption_cannot_reassign_running_model(tmp_path):
         assert session.env_vars["AIPRO_MODEL"] == "first"
         assert session.submitted_messages == ["first task"]
         assert not session.deleted
+
+
+def test_push_guard_rewrites_explicit_github_push_url(tmp_path):
+    lanes = LaneRegistry.default()
+    with (
+        FakeCAOServer() as cao,
+        CaoSessionController(CAOControlPlaneConfig(base_url=cao.url), lanes) as controller,
+    ):
+        executor = CaoLaneExecutor(controller, lanes, git=FakeGitOperations())
+        env = {**os.environ, **executor._session_env(None)}
+
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "--allow-empty", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    push = subprocess.run(
+        ["git", "push", "https://github.com/owner/repo.git", "HEAD:main"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert push.returncode != 0
+    assert "aipro-no-push" in push.stderr
 
 
 def test_unleased_session_preserves_base_env_and_wrapper_arguments(tmp_path):
