@@ -113,12 +113,12 @@ def real_repo(tmp_path: Path) -> Path:
     return root
 
 
-
 def test_repo_instructions_reads_root_agent_files(real_repo: Path):
     (real_repo / "AGENTS.md").write_text("agent rules\n")
     (real_repo / "CLAUDE.md").write_text("claude rules\n")
     instructions = GitWorktreeOps(real_repo).repo_instructions(str(real_repo))
     assert instructions == "AGENTS.md:\nagent rules\n\n\nCLAUDE.md:\nclaude rules\n"
+
 
 def test_default_branch_and_branch_creation(real_repo: Path):
     ops = GitWorktreeOps(real_repo)
