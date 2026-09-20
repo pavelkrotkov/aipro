@@ -1347,6 +1347,8 @@ class ForemanPolicyLoop:
 
     @staticmethod
     def _no_change_violation(no_changes: object, result: LaneResult) -> str | None:
+        if result.changed_files and no_changes is True:
+            return "developer reported no_changes=true despite authoritative worktree edits"
         if not result.changed_files and no_changes is not True:
             return "developer made no changes but did not report no_changes=true"
         return None
