@@ -540,9 +540,8 @@ class CaoSessionController:
         lane = self._registered_lane(spec.lane)
         name = session_name_for(spec.run_id, lane.lane, _worker_scope(lane, spec.context))
 
-        adopted = self._lookup_session(name)
+        adopted = self._adoptable_session(name, spec)
         if adopted is not None:
-            self._validate_attribution(adopted, spec)
             self._register(adopted)
             return SessionHandle(session_id=adopted.session_name, lane=lane.lane)
 
@@ -740,6 +739,24 @@ class CaoSessionController:
         self._stop_session(metadata)
 
     # --- Internals ---------------------------------------------------------
+
+    def _adoptable_session(
+        self, session_name: str, spec: SessionSpec
+    ) -> CaoSessionMetadata | None:
+        metadata = self._lookup_session(session_name)
+        if metadata is None:
+            return None
+        requested = spec.model_lease.assignment if spec.model_lease is not None else None
+        if metadata.model_assignment != requested:
+            self._register(metadata)
+            observation = self.observe(
+                SessionHandle(session_id=metadata.session_name, lane=metadata.lane.lane)
+            )
+            if observation.state in {"failed", "timed_out", "disappeared"}:
+                self._stop_session(metadata)
+                return None
+        self._validate_attribution(metadata, spec)
+        return metadata
 
     def _registered_lane(self, lane: LaneIdentity) -> LaneIdentity:
         registered = self._lanes.get(lane.lane)
