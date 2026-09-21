@@ -349,12 +349,18 @@ def test_minor_findings_are_deferred_not_fixed():
 def test_developer_no_change_is_explicit_and_can_complete():
     fake = _ready_fake()
     executor = ScriptedExecutor(developer_files=[])
-    loop, queue = _foreman(fake, executor, _gate())
+    gate = _gate()
+    git = RecordingGit()
+    loop, queue = _foreman(fake, executor, gate, git=git)
     outcome = loop.run_pass()[0]
 
     assert outcome.final_phase == "done"
+    assert outcome.reason == "developer reported no changes"
     report = queue.load_state("owner/repo#1").extras["developer_report"]
     assert report["no_changes"] is True
+    assert fake.list_open_prs() == []
+    assert git.pushed == []
+    assert gate.evaluated == []
 
 
 def test_developer_no_change_report_cannot_contradict_edits():
@@ -374,6 +380,33 @@ def test_developer_no_change_report_cannot_contradict_edits():
     )
     violation = ForemanPolicyLoop._developer_report_violation(result)
     assert violation == "developer reported no_changes=true despite authoritative worktree edits"
+
+
+def test_failed_developer_attempt_advances_durable_fallback_route():
+    class FailOnceExecutor(ScriptedExecutor):
+        def __init__(self):
+            super().__init__()
+            self.worker_models = []
+            self.worker_attempts = 0
+
+        def execute(self, lane, task_prompt, workdir, context, lease=None):
+            if lane.role != "worker":
+                return super().execute(lane, task_prompt, workdir, context, lease)
+            self.worker_attempts += 1
+            self.worker_models.append(lease.assignment.model_ref)
+            self.developer_exit = 1 if self.worker_attempts == 1 else 0
+            return super().execute(lane, task_prompt, workdir, context, lease)
+
+    fake = _ready_fake()
+    executor = FailOnceExecutor()
+    loop, queue = _foreman(fake, executor, _gate())
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "done"
+    assert executor.worker_models == ["ref-developer", "fallback-developer"]
+    state = queue.load_state(ISSUE.slug())
+    assert state.extras["developer_model"]["model_ref"] == "fallback-developer"
+    assert state.extras["developer_fallbacks"] == []
 
 
 def test_developer_reported_test_failure_stops_before_push():
@@ -405,6 +438,49 @@ def test_developer_head_movement_is_rejected_before_controller_commit():
 
     assert outcome.final_phase == "escalated"
     assert "unexpected developer HEAD movement" in outcome.reason
+    assert git.commits == []
+    assert git.pushed == []
+
+
+def test_failed_developer_attempt_cannot_reset_trusted_head_for_retry():
+    class MovedHeadGit(RecordingGit):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        def head_sha(self, workdir: str) -> str:
+            self.reads += 1
+            return "sha" if self.reads <= 3 else "agent-commit"
+
+    fake = _ready_fake()
+    executor = ScriptedExecutor(developer_exit=1)
+    git = MovedHeadGit()
+    loop, _ = _foreman(fake, executor, _gate(), git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "unexpected developer HEAD movement" in outcome.reason
+    assert [lane for lane, _ in executor.calls if lane == "developer"] == ["developer"]
+    assert git.pushed == []
+
+
+def test_developer_branch_switch_is_rejected_before_controller_commit():
+    class SwitchedBranchGit(RecordingGit):
+        def __init__(self):
+            super().__init__()
+            self.branch_reads = 0
+
+        def current_branch(self, workdir: str) -> str:
+            self.branch_reads += 1
+            return "aipro-issue-1" if self.branch_reads == 1 else "other"
+
+    fake = _ready_fake()
+    git = SwitchedBranchGit()
+    loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "unexpected developer branch movement" in outcome.reason
     assert git.commits == []
     assert git.pushed == []
 
