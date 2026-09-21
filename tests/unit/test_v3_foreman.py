@@ -541,7 +541,7 @@ def test_developer_resources_and_task_packet_are_durable():
         "summary",
         "tests",
         "concerns",
-        "no_changes",
+        "no_changes=true only when the authoritative",
     ):
         assert expected in prompt
 

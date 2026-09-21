@@ -1266,8 +1266,9 @@ class ForemanPolicyLoop:
             "Run the relevant focused tests and repository checks before reporting success.",
             "Return only JSON with exactly: summary (nonempty string), tests (array of "
             "{command,result,notes}; result is passed|failed|not_run), concerns (string array), "
-            "no_changes (boolean), dispositions (array). Set no_changes=true only when this "
-            "turn requires no edits and explain why in summary.",
+            "no_changes (boolean), dispositions (array). Set no_changes=true only when the "
+            "authoritative worktree has no edits relative to the default branch; explain why "
+            "in summary.",
         ]
         if instructions:
             lines.append(f"Repository instructions:\n{instructions}")
