@@ -21,7 +21,7 @@ from ai_pr_orchestrator.v3.config import CAOControlPlaneConfig
 from ai_pr_orchestrator.v3.domain import ModelAssignment
 from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, ModelLease
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
-from tests.integration._fake_cao_server import FakeCAOServer
+from tests.integration._fake_cao_server import STATUS_ERROR, FakeCAOServer
 from tests.unit.test_v3_git_ops import FakeGitOperations
 
 WRAPPER = Path(__file__).resolve().parents[2] / "scripts" / "aipro-hermes"
@@ -227,6 +227,47 @@ def test_push_guard_rewrites_explicit_github_push_url(tmp_path):
     )
     assert push.returncode != 0
     assert "aipro-no-push" in push.stderr
+
+
+def test_failed_terminal_can_relaunch_same_issue_session_on_fallback(tmp_path):
+    lanes = LaneRegistry.default()
+    entries = tuple(ModelCatalogEntry(ref, ref, provider="test") for ref in ("first", "second"))
+    lane = lanes.get("developer")
+    context = LaneExecutionContext("run")
+    name = session_name_for("run", lane.lane)
+    with (
+        FakeCAOServer() as cao,
+        CaoSessionController(CAOControlPlaneConfig(base_url=cao.url), lanes) as controller,
+    ):
+        executor = CaoLaneExecutor(
+            controller,
+            lanes,
+            git=FakeGitOperations(),
+            catalog=ModelCatalog(entries),
+            poll_interval_seconds=0,
+        )
+        cao.set_status_sequence(name, [STATUS_ERROR])
+        first = executor.execute(
+            lane,
+            "first task",
+            str(tmp_path),
+            context,
+            ModelLease("first", ModelAssignment(lane.lane, "first")),
+        )
+        assert first.exit_code != 0
+        cao.set_output(name, "recovered")
+        second = executor.execute(
+            lane,
+            "retry task",
+            str(tmp_path),
+            context,
+            ModelLease("second", ModelAssignment(lane.lane, "second")),
+        )
+        session = cao._sessions[name]
+
+    assert second.exit_code == 0
+    assert session.metadata["model_assignment"]["model_ref"] == "second"
+    assert session.submitted_messages == ["retry task"]
 
 
 def test_unleased_session_preserves_base_env_and_wrapper_arguments(tmp_path):
