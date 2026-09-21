@@ -385,10 +385,6 @@ class ForemanPolicyLoop:
                     violation = self._policy_violation(result)
                     if violation:
                         return self._fail(issue, state, violation, now=now)
-                    head_violation = self._developer_head_violation(state, worktree)
-                    if head_violation:
-                        return self._escalate(issue, state, head_violation, now=now)
-
                     if requests:
                         state = self._record_proposals(state, result)
                 # --- Review rounds --------------------------------------------
@@ -415,6 +411,21 @@ class ForemanPolicyLoop:
                         )
                     fix_findings = report.remaining
                     continue  # fixes dispositioned; run the coder again
+                if self._clean_no_change(state, worktree):
+                    state = self._transition(
+                        issue,
+                        state,
+                        "done",
+                        terminal_reason="developer reported no changes",
+                        now=now,
+                    )
+                    return WorkItemOutcome(
+                        issue=issue,
+                        final_phase="done",
+                        reason="developer reported no changes",
+                        review_rounds=review_rounds,
+                        coder_invocations=coder_invocations,
+                    )
 
             # --- CI gate ------------------------------------------------------
             state = self._transition(issue, state, "ci_gating", now=now)
@@ -597,8 +608,9 @@ class ForemanPolicyLoop:
                 state,
                 extras={**state.extras, "head_sha": self._git.head_sha(worktree)},
             )
+            worker_lane = self._worker_lane()
             result = self._run_lane(
-                self._worker_lane(),
+                worker_lane,
                 worktree,
                 state,
                 self._coder_prompt(issue, findings, worktree, state.dispositions, state),
@@ -606,6 +618,9 @@ class ForemanPolicyLoop:
                 issue=issue,
             )
             state = self._load(issue, state)
+            checkout_violation = self._developer_head_violation(state, worktree)
+            if checkout_violation:
+                raise _ForemanEscalation(checkout_violation)
             if result.exit_code == 0:
                 violation = self._developer_report_violation(result)
                 if violation:
@@ -621,6 +636,7 @@ class ForemanPolicyLoop:
                 raise _ForemanEscalation("coder budget exhausted on failing attempts")
             if failures >= self._cfg.escalation.max_consecutive_coder_failures:
                 raise _ForemanEscalation(f"coder failed {failures}x consecutively")
+            state = self._advance_worker_route(issue, state, worker_lane)
 
     # --- Review ---------------------------------------------------------------
 
@@ -1087,6 +1103,24 @@ class ForemanPolicyLoop:
             raise ForemanQueueError("malformed durable developer fallback chain")
         return assignment, tuple(fallbacks)
 
+    def _advance_worker_route(
+        self, issue: GitHubIssueRef, state: WorkflowState, lane: LaneIdentity
+    ) -> WorkflowState:
+        saved = self._saved_worker_route(lane, state)
+        if saved is None or not saved[1]:
+            return state
+        _, fallbacks = saved
+        assignment = ModelAssignment(lane=lane.lane, model_ref=fallbacks[0])
+        return self._save_fresh(
+            issue,
+            state,
+            extras={
+                **state.extras,
+                "developer_model": assignment.to_dict(),
+                "developer_fallbacks": list(fallbacks[1:]),
+            },
+        )
+
     def _release(self, lease: ModelLease) -> None:
         self._broker.release(lease)
 
@@ -1177,6 +1211,11 @@ class ForemanPolicyLoop:
     def _verify_checkout(
         self, issue: GitHubIssueRef, state: WorkflowState, branch: str, worktree: str
     ) -> WorkflowState:
+        actual_branch = self._git.current_branch(worktree)
+        if actual_branch != branch:
+            raise _ForemanEscalation(
+                f"unexpected developer branch movement: expected {branch}, found {actual_branch}"
+            )
         actual = self._git.head_sha(worktree)
         same_checkout = (
             state.extras.get("branch") == branch and state.extras.get("worktree") == worktree
@@ -1287,11 +1326,26 @@ class ForemanPolicyLoop:
         )
 
     def _developer_head_violation(self, state: WorkflowState, worktree: str) -> str | None:
+        expected_branch = state.extras.get("branch")
+        actual_branch = self._git.current_branch(worktree)
+        if expected_branch is None or actual_branch != expected_branch:
+            return (
+                f"unexpected developer branch movement: expected {expected_branch}, "
+                f"found {actual_branch}"
+            )
         expected = state.extras.get("head_sha")
         actual = self._git.head_sha(worktree)
         if expected is None or actual != expected:
             return f"unexpected developer HEAD movement: expected {expected}, found {actual}"
         return None
+
+    def _clean_no_change(self, state: WorkflowState, worktree: str) -> bool:
+        report = state.extras.get("developer_report")
+        if not isinstance(report, dict) or report.get("no_changes") is not True:
+            return False
+        if self._git.changed_files(worktree):
+            return False
+        return self._git.commit_count(worktree, self._git.default_branch()) == 0
 
     @staticmethod
     def _developer_report_violation(result: LaneResult) -> str | None:
