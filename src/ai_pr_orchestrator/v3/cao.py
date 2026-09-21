@@ -740,9 +740,7 @@ class CaoSessionController:
 
     # --- Internals ---------------------------------------------------------
 
-    def _adoptable_session(
-        self, session_name: str, spec: SessionSpec
-    ) -> CaoSessionMetadata | None:
+    def _adoptable_session(self, session_name: str, spec: SessionSpec) -> CaoSessionMetadata | None:
         metadata = self._lookup_session(session_name)
         if metadata is None:
             return None
