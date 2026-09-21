@@ -400,7 +400,8 @@ def test_failed_developer_attempt_advances_durable_fallback_route():
 
     fake = _ready_fake()
     executor = FailOnceExecutor()
-    loop, queue = _foreman(fake, executor, _gate())
+    cfg = V3Config(safety=SafetyPolicyConfig(max_coder_invocations_per_run=2))
+    loop, queue = _foreman(fake, executor, _gate(), cfg)
     outcome = loop.run_pass()[0]
 
     assert outcome.final_phase == "done"
