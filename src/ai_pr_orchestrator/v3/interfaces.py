@@ -329,6 +329,11 @@ class GitOperations(Protocol):
 
         ...
 
+    def current_branch(self, workdir: str) -> str:
+        """Return the checkout's current symbolic branch name."""
+
+        ...
+
     def repo_instructions(self, workdir: str) -> str:
         """Return root agent instructions visible in the checkout."""
 
