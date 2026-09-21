@@ -21,7 +21,7 @@ from ai_pr_orchestrator.v3.config import CAOControlPlaneConfig
 from ai_pr_orchestrator.v3.domain import ModelAssignment
 from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, ModelLease
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
-from tests.integration._fake_cao_server import STATUS_ERROR, FakeCAOServer
+from tests.integration._fake_cao_server import DEFAULT_STATUS_SEQUENCE, STATUS_ERROR, FakeCAOServer
 from tests.unit.test_v3_git_ops import FakeGitOperations
 
 WRAPPER = Path(__file__).resolve().parents[2] / "scripts" / "aipro-hermes"
@@ -229,7 +229,7 @@ def test_push_guard_rewrites_explicit_github_push_url(tmp_path):
     assert "aipro-no-push" in push.stderr
 
 
-def test_failed_terminal_can_relaunch_same_issue_session_on_fallback(tmp_path):
+def test_failed_terminal_can_relaunch_same_issue_session_on_fallback(tmp_path, monkeypatch):
     lanes = LaneRegistry.default()
     entries = tuple(ModelCatalogEntry(ref, ref, provider="test") for ref in ("first", "second"))
     lane = lanes.get("developer")
@@ -255,6 +255,13 @@ def test_failed_terminal_can_relaunch_same_issue_session_on_fallback(tmp_path):
             ModelLease("first", ModelAssignment(lane.lane, "first")),
         )
         assert first.exit_code != 0
+        stop = controller._stop_session
+
+        def stop_and_reset(metadata):
+            stop(metadata)
+            cao.set_status_sequence(name, DEFAULT_STATUS_SEQUENCE)
+
+        monkeypatch.setattr(controller, "_stop_session", stop_and_reset)
         cao.set_output(name, "recovered")
         second = executor.execute(
             lane,
