@@ -393,6 +393,7 @@ def test_failed_developer_attempt_advances_durable_fallback_route():
             if lane.role != "worker":
                 return super().execute(lane, task_prompt, workdir, context, lease)
             self.worker_attempts += 1
+            assert lease is not None
             self.worker_models.append(lease.assignment.model_ref)
             self.developer_exit = 1 if self.worker_attempts == 1 else 0
             return super().execute(lane, task_prompt, workdir, context, lease)
