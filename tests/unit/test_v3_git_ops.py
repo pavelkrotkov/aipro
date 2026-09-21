@@ -135,6 +135,7 @@ def test_repo_instructions_reject_symlinks_outside_worktree(real_repo: Path):
 def test_default_branch_and_branch_creation(real_repo: Path):
     ops = GitWorktreeOps(real_repo)
     assert ops.default_branch() == "main"
+    assert ops.current_branch(str(real_repo)) == "main"
     assert (
         ops.head_sha(str(real_repo))
         == subprocess.run(
