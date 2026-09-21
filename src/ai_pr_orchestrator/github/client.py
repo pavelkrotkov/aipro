@@ -143,6 +143,10 @@ class GitHubClient:
         )
         return [item["filename"] for item in data if isinstance(item, dict) and "filename" in item]
 
+    def get_issue_title(self, number: int) -> str | None:
+        data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
+        return data.get("title")
+
     def get_issue_body(self, number: int) -> str | None:
         data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
         return data.get("body")

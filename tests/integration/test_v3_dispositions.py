@@ -9,7 +9,7 @@ from ai_pr_orchestrator.v3.cao import session_name_for
 from ai_pr_orchestrator.v3.domain import GitHubIssueRef, WorkflowState
 from ai_pr_orchestrator.v3.findings import FindingRegistry
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop, _ForemanEscalation
-from tests.integration._harness import script_protocol
+from tests.integration._harness import developer_output, developer_session_name, script_protocol
 
 
 @pytest.mark.parametrize("proposal", ["fix", "rebut"])
@@ -76,7 +76,7 @@ def test_rejected_rebuttal_returns_actual_reason_to_coder(fake_cao, foreman_harn
     state = queue.load_state("owner/repo#1")
     assert [d.action for d in state.dispositions] == ["rebut", "fix"]
     assert state.findings[0].status == "open"
-    coder = fake_cao._sessions[session_name_for(loop.run_id, "developer")]
+    coder = fake_cao._sessions[developer_session_name(loop.run_id)]
     assert "Independent reproduction confirms the coder evidence" in coder.submitted_messages[2]
     assert not github.list_open_prs()
 
@@ -137,7 +137,8 @@ def test_incomplete_or_forged_coder_response_fails_closed(fake_cao, foreman_harn
     loop, queue, github = foreman_harness()
     script_protocol(fake_cao, loop)
     fake_cao.set_output_sequence(
-        session_name_for(loop.run_id, "developer"), ["initial", json.dumps(payload)]
+        developer_session_name(loop.run_id),
+        [developer_output(), developer_output(dispositions=payload["dispositions"])],
     )
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == "escalated"
@@ -232,9 +233,7 @@ def test_saved_proposal_survives_foreman_and_controller_loss(
     assert [d.action for d in restored.dispositions] == ["rebut", "accept"]
     assert not restored.findings
     assert len(github.list_open_prs()) == 1
-    assert (
-        len(fake_cao._sessions[session_name_for(loop.run_id, "developer")].submitted_messages) == 2
-    )
+    assert len(fake_cao._sessions[developer_session_name(loop.run_id)].submitted_messages) == 2
 
 
 def test_acceptance_save_failure_never_gates(fake_cao, foreman_harness, monkeypatch):
@@ -278,8 +277,8 @@ def test_mixed_proposals_preserve_partial_adjudication(fake_cao, foreman_harness
         for fid, action in [("guard", "accept"), ("race", "fix")]
     ]
     fake_cao.set_output_sequence(
-        session_name_for(loop.run_id, "developer"),
-        ["initial", json.dumps({"dispositions": proposals})],
+        developer_session_name(loop.run_id),
+        [developer_output(), developer_output(dispositions=proposals)],
     )
     fake_cao.set_output_sequence(
         session_name_for(loop.run_id, "requirements-reviewer"),
@@ -380,9 +379,23 @@ def test_conflict_group_changes_do_not_mutate_review_cas_baseline(fake_cao, fore
     script_protocol(fake_cao, loop)
 
     def output(lane, responses):
-        fake_cao.set_output_sequence(
-            session_name_for(loop.run_id, lane), [json.dumps(response) for response in responses]
+        name = (
+            developer_session_name(loop.run_id)
+            if lane == "developer"
+            else session_name_for(loop.run_id, lane)
         )
+        payloads = (
+            [
+                developer_output(
+                    summary=response if isinstance(response, str) else "addressed reviewer finding",
+                    dispositions=[] if isinstance(response, str) else response["dispositions"],
+                )
+                for response in responses
+            ]
+            if lane == "developer"
+            else [json.dumps(response) for response in responses]
+        )
+        fake_cao.set_output_sequence(name, payloads)
 
     def finding(fid, body):
         return {"id": fid, "body": body, "severity": "major", "path": "src/guard.py", "line": 10}
@@ -479,7 +492,8 @@ def test_repeated_open_finding_keeps_identity_and_evidence(
         for fid, action in [("guard", "fix"), ("race", "accept")]
     ]
     fake_cao.set_output_sequence(
-        session_name_for(loop.run_id, "developer"), ["initial", json.dumps(proposal)]
+        developer_session_name(loop.run_id),
+        [developer_output(), developer_output(dispositions=proposal["dispositions"])],
     )
     fake_cao.set_output_sequence(
         session_name_for(loop.run_id, "requirements-reviewer"),
@@ -507,22 +521,18 @@ def test_saved_rejection_does_not_reset_coder_budget(fake_cao, foreman_harness, 
         loop._cfg, safety=replace(loop._cfg.safety, max_coder_invocations_per_run=2)
     )
     fake_cao.set_output_sequence(
-        session_name_for(loop.run_id, "developer"),
+        developer_session_name(loop.run_id),
         [
-            "initial",
-            json.dumps(
-                {
-                    "dispositions": [
-                        {"finding_id": "guard", "action": "rebut", "rationale": "first evidence"}
-                    ]
-                }
+            developer_output(),
+            developer_output(
+                dispositions=[
+                    {"finding_id": "guard", "action": "rebut", "rationale": "first evidence"}
+                ]
             ),
-            json.dumps(
-                {
-                    "dispositions": [
-                        {"finding_id": "guard", "action": "fix", "rationale": "second evidence"}
-                    ]
-                }
+            developer_output(
+                dispositions=[
+                    {"finding_id": "guard", "action": "fix", "rationale": "second evidence"}
+                ]
             ),
         ],
     )
@@ -583,7 +593,7 @@ def test_saved_rejection_does_not_reset_coder_budget(fake_cao, foreman_harness, 
             state.extras["branch"],
             now=None,
         )
-    prompts = fake_cao._sessions[session_name_for(loop.run_id, "developer")].submitted_messages
+    prompts = fake_cao._sessions[developer_session_name(loop.run_id)].submitted_messages
     assert len(prompts) == 2, f"actual coder calls={len(prompts)}"
     assert not gh.list_open_prs()
 

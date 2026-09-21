@@ -21,10 +21,33 @@ from ai_pr_orchestrator.v3.config import CAOControlPlaneConfig
 from ai_pr_orchestrator.v3.domain import ModelAssignment
 from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext, ModelLease
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
-from tests.integration._fake_cao_server import FakeCAOServer
+from tests.integration._fake_cao_server import DEFAULT_STATUS_SEQUENCE, STATUS_ERROR, FakeCAOServer
 from tests.unit.test_v3_git_ops import FakeGitOperations
 
 WRAPPER = Path(__file__).resolve().parents[2] / "scripts" / "aipro-hermes"
+PUSH_GUARD = {
+    "GIT_CONFIG_COUNT": "6",
+    "GIT_CONFIG_KEY_0": "remote.origin.pushurl",
+    "GIT_CONFIG_VALUE_0": "aipro-no-push://authoritative-branch",
+    "GIT_CONFIG_KEY_1": "url.aipro-no-push://authoritative-branch.pushInsteadOf",
+    "GIT_CONFIG_VALUE_1": "https://github.com/",
+    "GIT_CONFIG_KEY_2": "url.aipro-no-push://authoritative-branch.pushInsteadOf",
+    "GIT_CONFIG_VALUE_2": "git@github.com:",
+    "GIT_CONFIG_KEY_3": "url.aipro-no-push://authoritative-branch.pushInsteadOf",
+    "GIT_CONFIG_VALUE_3": "ssh://git@github.com/",
+    "GIT_CONFIG_KEY_4": "credential.helper",
+    "GIT_CONFIG_VALUE_4": "",
+    "GIT_CONFIG_KEY_5": "credential.interactive",
+    "GIT_CONFIG_VALUE_5": "false",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "/bin/false",
+    "SSH_ASKPASS": "/bin/false",
+    "SSH_AUTH_SOCK": "",
+    "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oIdentitiesOnly=yes -oIdentityFile=/dev/null",
+    "GH_TOKEN": "",
+    "GITHUB_TOKEN": "",
+    "GH_CONFIG_DIR": "/nonexistent/aipro-no-github-auth",
+}
 
 
 def _launch_wrapper(tmp_path: Path, env: dict[str, str]) -> dict:
@@ -79,6 +102,7 @@ def test_leased_model_reaches_hermes_without_losing_session_env(tmp_path, lane_n
         session = cao._sessions[result.session.session_id]
         assert session.env_vars == {
             **defaults,
+            **PUSH_GUARD,
             "AIPRO_MODEL": entry.descriptor,
             "AIPRO_PROVIDER": entry.provider,
         }
@@ -168,6 +192,91 @@ def test_adoption_cannot_reassign_running_model(tmp_path):
         assert not session.deleted
 
 
+def test_push_guard_rewrites_explicit_github_push_url(tmp_path):
+    lanes = LaneRegistry.default()
+    with (
+        FakeCAOServer() as cao,
+        CaoSessionController(CAOControlPlaneConfig(base_url=cao.url), lanes) as controller,
+    ):
+        executor = CaoLaneExecutor(controller, lanes, git=FakeGitOperations())
+        env = {**os.environ, **executor._session_env(None)}
+
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    push = subprocess.run(
+        ["git", "push", "https://github.com/owner/repo.git", "HEAD:main"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert push.returncode != 0
+    assert "aipro-no-push" in push.stderr
+
+
+def test_failed_terminal_can_relaunch_same_issue_session_on_fallback(tmp_path, monkeypatch):
+    lanes = LaneRegistry.default()
+    entries = tuple(ModelCatalogEntry(ref, ref, provider="test") for ref in ("first", "second"))
+    lane = lanes.get("developer")
+    context = LaneExecutionContext("run")
+    name = session_name_for("run", lane.lane)
+    with (
+        FakeCAOServer() as cao,
+        CaoSessionController(CAOControlPlaneConfig(base_url=cao.url), lanes) as controller,
+    ):
+        executor = CaoLaneExecutor(
+            controller,
+            lanes,
+            git=FakeGitOperations(),
+            catalog=ModelCatalog(entries),
+            poll_interval_seconds=0,
+        )
+        cao.set_status_sequence(name, [STATUS_ERROR])
+        first = executor.execute(
+            lane,
+            "first task",
+            str(tmp_path),
+            context,
+            ModelLease("first", ModelAssignment(lane.lane, "first")),
+        )
+        assert first.exit_code != 0
+        stop = controller._stop_session
+
+        def stop_and_reset(metadata):
+            stop(metadata)
+            cao.set_status_sequence(name, DEFAULT_STATUS_SEQUENCE)
+
+        monkeypatch.setattr(controller, "_stop_session", stop_and_reset)
+        cao.set_output(name, "recovered")
+        second = executor.execute(
+            lane,
+            "retry task",
+            str(tmp_path),
+            context,
+            ModelLease("second", ModelAssignment(lane.lane, "second")),
+        )
+        session = cao._sessions[name]
+
+    assert second.exit_code == 0
+    assert session.metadata["model_assignment"]["model_ref"] == "second"
+    assert session.submitted_messages == ["retry task"]
+
+
 def test_unleased_session_preserves_base_env_and_wrapper_arguments(tmp_path):
     lanes = LaneRegistry.default()
     env = {"HERMES_HOME": "/isolated/lane", "KEEP": "yes"}
@@ -181,7 +290,7 @@ def test_unleased_session_preserves_base_env_and_wrapper_arguments(tmp_path):
         result = executor.execute(
             lanes.get("developer"), "task", str(tmp_path), LaneExecutionContext("run")
         )
-        assert cao._sessions[result.session.session_id].env_vars == env
+        assert cao._sessions[result.session.session_id].env_vars == {**env, **PUSH_GUARD}
     assert _launch_wrapper(tmp_path, env) == {
         "argv": ["chat", "--yolo", "--source", "cao"],
         "home": env["HERMES_HOME"],

@@ -324,6 +324,21 @@ class GitOperations(Protocol):
 
         ...
 
+    def head_sha(self, workdir: str) -> str:
+        """Return the checkout's current HEAD commit."""
+
+        ...
+
+    def current_branch(self, workdir: str) -> str:
+        """Return the checkout's current symbolic branch name."""
+
+        ...
+
+    def repo_instructions(self, workdir: str) -> str:
+        """Return root agent instructions visible in the checkout."""
+
+        ...
+
     def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
         """Cache full issue input outside tracked files; return readable path and SHA-256.
 

@@ -7,6 +7,7 @@ the lane executor, broker, gate, and git ops are faked.
 
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -76,6 +77,7 @@ class FakeBroker:
             demand=demand,
             evaluated_at=NOW,
             assignment=ModelAssignment(lane=demand.lane, model_ref=f"ref-{demand.lane}"),
+            fallbacks=(f"fallback-{demand.lane}",),
         )
 
     def reserve(self, assignment: ModelAssignment) -> ModelLease:
@@ -99,6 +101,7 @@ class ScriptedExecutor:
     developer_files: list[str] = field(default_factory=lambda: ["src/x.py"])
     reviewer_files: list[str] = field(default_factory=list)
     developer_sleep: float = 0.0
+    developer_test_result: str = "passed"
     calls: list[tuple[str, str]] = field(default_factory=list)
     round_counter: dict[str, int] = field(default_factory=dict)
     prompts: list[str] = field(default_factory=list)
@@ -143,22 +146,33 @@ class ScriptedExecutor:
             import time
 
             time.sleep(self.developer_sleep)
+        dispositions = [
+            FindingDisposition(
+                finding_id=fid,
+                action="fix",
+                rationale="fixed guard; regression test passes",
+                decided_by=lane.lane,
+                run_id=context.run_id,
+                round_id=context.round_id,
+            )
+            for fid, _ in context.disposition_requests
+        ]
+        output = {
+            "summary": "implemented requested change",
+            "tests": [{"command": "pytest -q", "result": self.developer_test_result, "notes": ""}],
+            "concerns": [],
+            "no_changes": not self.developer_files,
+            "dispositions": [
+                {"finding_id": d.finding_id, "action": d.action, "rationale": d.rationale}
+                for d in dispositions
+            ],
+        }
         return LaneResult(
             session=HANDLE,
             exit_code=self.developer_exit,
-            output_summary="",
+            output_summary=json.dumps(output),
             changed_files=list(self.developer_files),
-            dispositions=[
-                FindingDisposition(
-                    finding_id=fid,
-                    action="fix",
-                    rationale="fixed guard; regression test passes",
-                    decided_by=lane.lane,
-                    run_id=context.run_id,
-                    round_id=context.round_id,
-                )
-                for fid, _ in context.disposition_requests
-            ],
+            dispositions=dispositions,
         )
 
 
@@ -190,6 +204,15 @@ class FakeGitOperations:
     def create_worktree(self, path: str, branch: str) -> str:
         self.worktrees[path] = branch
         return path
+
+    def head_sha(self, workdir: str) -> str:
+        return "sha"
+
+    def current_branch(self, workdir: str) -> str:
+        return self.worktrees.get(workdir, "aipro-issue-1")
+
+    def repo_instructions(self, workdir: str) -> str:
+        return ""
 
     def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
         raise NotImplementedError("use real GitWorktreeOps for issue input delivery tests")
@@ -321,6 +344,206 @@ def test_minor_findings_are_deferred_not_fixed():
     assert outcome.final_phase == "done"
     # a deferred minor finding did not trigger an extra coding round
     assert outcome.coder_invocations == 1
+
+
+def test_developer_no_change_is_explicit_and_can_complete():
+    fake = _ready_fake()
+    executor = ScriptedExecutor(developer_files=[])
+    gate = _gate()
+    git = RecordingGit()
+    loop, queue = _foreman(fake, executor, gate, git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "done"
+    assert outcome.reason == "developer reported no changes"
+    report = queue.load_state("owner/repo#1").extras["developer_report"]
+    assert report["no_changes"] is True
+    assert fake.list_open_prs() == []
+    assert git.pushed == []
+    assert gate.evaluated == []
+
+
+def test_developer_no_change_report_cannot_contradict_edits():
+    result = LaneResult(
+        session=HANDLE,
+        exit_code=0,
+        output_summary=json.dumps(
+            {
+                "summary": "no changes needed",
+                "tests": [],
+                "concerns": [],
+                "no_changes": True,
+                "dispositions": [],
+            }
+        ),
+        changed_files=["src/x.py"],
+    )
+    violation = ForemanPolicyLoop._developer_report_violation(result)
+    assert violation == "developer reported no_changes=true despite authoritative worktree edits"
+
+
+def test_failed_developer_attempt_advances_durable_fallback_route():
+    class FailOnceExecutor(ScriptedExecutor):
+        def __init__(self):
+            super().__init__()
+            self.worker_models = []
+            self.worker_attempts = 0
+
+        def execute(self, lane, task_prompt, workdir, context, lease=None):
+            if lane.role != "worker":
+                return super().execute(lane, task_prompt, workdir, context, lease)
+            self.worker_attempts += 1
+            assert lease is not None
+            self.worker_models.append(lease.assignment.model_ref)
+            self.developer_exit = 1 if self.worker_attempts == 1 else 0
+            return super().execute(lane, task_prompt, workdir, context, lease)
+
+    fake = _ready_fake()
+    executor = FailOnceExecutor()
+    cfg = V3Config(safety=SafetyPolicyConfig(max_coder_invocations_per_run=2))
+    loop, queue = _foreman(fake, executor, _gate(), cfg)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "done"
+    assert executor.worker_models == ["ref-developer", "fallback-developer"]
+    state = queue.load_state(ISSUE.slug())
+    assert state.extras["developer_model"]["model_ref"] == "fallback-developer"
+    assert state.extras["developer_fallbacks"] == []
+
+
+def test_developer_reported_test_failure_stops_before_push():
+    fake = _ready_fake()
+    executor = ScriptedExecutor(developer_test_result="failed")
+    git = RecordingGit()
+    loop, _ = _foreman(fake, executor, _gate(), git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "developer reported failing test" in outcome.reason
+    assert git.pushed == []
+
+
+def test_developer_head_movement_is_rejected_before_controller_commit():
+    class MovedHeadGit(RecordingGit):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        def head_sha(self, workdir: str) -> str:
+            self.reads += 1
+            return "sha" if self.reads <= 3 else "agent-commit"
+
+    fake = _ready_fake()
+    git = MovedHeadGit()
+    loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "unexpected developer HEAD movement" in outcome.reason
+    assert git.commits == []
+    assert git.pushed == []
+
+
+def test_failed_developer_attempt_cannot_reset_trusted_head_for_retry():
+    class MovedHeadGit(RecordingGit):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        def head_sha(self, workdir: str) -> str:
+            self.reads += 1
+            return "sha" if self.reads <= 3 else "agent-commit"
+
+    fake = _ready_fake()
+    executor = ScriptedExecutor(developer_exit=1)
+    git = MovedHeadGit()
+    loop, _ = _foreman(fake, executor, _gate(), git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "unexpected developer HEAD movement" in outcome.reason
+    assert [lane for lane, _ in executor.calls if lane == "developer"] == ["developer"]
+    assert git.pushed == []
+
+
+def test_developer_branch_switch_is_rejected_before_controller_commit():
+    class SwitchedBranchGit(RecordingGit):
+        def __init__(self):
+            super().__init__()
+            self.branch_reads = 0
+
+        def current_branch(self, workdir: str) -> str:
+            self.branch_reads += 1
+            return "aipro-issue-1" if self.branch_reads == 1 else "other"
+
+    fake = _ready_fake()
+    git = SwitchedBranchGit()
+    loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "unexpected developer branch movement" in outcome.reason
+    assert git.commits == []
+    assert git.pushed == []
+
+
+def test_checkout_adoption_rejects_persisted_head_movement():
+    git = RecordingGit()
+    loop, _ = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), git=git)
+    state = WorkflowState(
+        ISSUE.slug(),
+        loop.run_id,
+        "coding",
+        extras={
+            "branch": "aipro-issue-1",
+            "worktree": "/wt/issue-1",
+            "head_sha": "trusted",
+        },
+    )
+
+    with pytest.raises(_ForemanEscalation, match="expected trusted, found sha"):
+        loop._verify_checkout(ISSUE, state, "aipro-issue-1", "/wt/issue-1")
+
+
+def test_developer_resources_and_task_packet_are_durable():
+    class InstructionGit(RecordingGit):
+        def repo_instructions(self, workdir: str) -> str:
+            return "AGENTS.md:\nkeep it small"
+
+    fake = FakeGitHubClient()
+    fake.seed_issue(
+        1,
+        labels=["v3-work"],
+        title="Implement durable developer lane",
+        body="Acceptance: preserve issue context.",
+    )
+    executor = ScriptedExecutor()
+    loop, queue = _foreman(fake, executor, _gate(), git=InstructionGit())
+    assert loop.run_pass()[0].final_phase == "done"
+
+    state = queue.load_state("owner/repo#1")
+    assert state.extras["developer_model"] == {
+        "lane": "developer",
+        "model_ref": "ref-developer",
+    }
+    assert state.extras["developer_fallbacks"] == ["fallback-developer"]
+    assert state.extras["developer_session"] == HANDLE.session_id
+    assert state.extras["branch"] == "aipro-issue-1"
+    assert state.extras["head_sha"] == "sha"
+    prompt = executor.prompts[0]
+    for expected in (
+        "Implement owner/repo#1: Implement durable developer lane",
+        "Acceptance: preserve issue context.",
+        "AGENTS.md:\nkeep it small",
+        "Authoritative branch: aipro-issue-1",
+        "Expected HEAD: sha",
+        "Do not commit or push",
+        "summary",
+        "tests",
+        "concerns",
+        "no_changes=true only when the authoritative",
+    ):
+        assert expected in prompt
 
 
 def test_workflow_file_change_is_a_policy_violation():
@@ -1182,7 +1405,7 @@ def test_busy_cao_submission_preserves_active_run_despite_heartbeat_failure(monk
     registry = LaneRegistry.default()
     lane = registry.get("developer")
     git = RecordingGit()
-    name = session_name_for("run-1", lane.lane)
+    name = session_name_for("run-1", lane.lane, ISSUE.slug())
     with FakeCAOServer() as cao, httpx.Client(base_url=cao.url) as client:
         cao.set_status_sequence(name, [STATUS_PROCESSING])
         with CaoSessionController(
@@ -1194,7 +1417,7 @@ def test_busy_cao_submission_preserves_active_run_despite_heartbeat_failure(monk
                     run_id="run-1",
                     workdir="/wt/issue-1",
                     env={},
-                    context=LaneExecutionContext(run_id="run-1"),
+                    context=LaneExecutionContext(run_id="run-1", work_item_id=ISSUE.slug()),
                     model_lease=ModelLease(
                         lease_id="previous",
                         assignment=ModelAssignment(lane=lane.lane, model_ref="ref-developer"),

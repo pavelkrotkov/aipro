@@ -291,20 +291,21 @@ class SessionObservation:
         return self.state in TERMINAL_LIFECYCLE_STATES
 
 
-def session_name_for(run_id: RunId, lane: LaneName) -> str:
-    """Return the deterministic CAO session name for a run's lane.
+def _worker_scope(lane: LaneIdentity, context: LaneExecutionContext) -> str | None:
+    work_item_id = context.work_item_id
+    return work_item_id if lane.role == "worker" and work_item_id else None
 
-    Determinism is the whole reconcile story: the same run and lane always
-    resolve to the same session, so a restarted process can look the session
-    up instead of launching a second one.
 
-    The trailing digest is taken over both identifiers joined by a delimiter
-    that cannot appear in either, so the run/lane boundary is unambiguous:
-    two different (run, lane) pairs can never produce the same name, even
-    when the identifiers are built from the same safe character set
-    (``run-1`` + ``dev`` vs ``run`` + ``1-dev``).
+def session_name_for(run_id: RunId, lane: LaneName, work_item_id: str | None = None) -> str:
+    """Return the deterministic CAO session name for a run's lane and optional work item.
+
+    Worker sessions include the work item in their digest so one foreman run
+    cannot leak developer context between unrelated issues. Reviewer and
+    standalone sessions keep the historical run/lane identity when no work
+    item is supplied.
     """
-    digest = hashlib.sha256(f"{run_id}\x1f{lane}".encode()).hexdigest()[:8]
+    scope = run_id if work_item_id is None else f"{run_id}\x1e{work_item_id}"
+    digest = hashlib.sha256(f"{scope}\x1f{lane}".encode()).hexdigest()[:8]
     raw = f"{_CAO_SESSION_PREFIX}aipro-{run_id}-{lane}"
     sanitized = _UNSAFE_NAME_CHARS.sub("-", raw)
     return f"{sanitized[: _MAX_SESSION_NAME_LEN - 9]}-{digest}"
@@ -336,7 +337,11 @@ def _parse_disposition_output(result: LaneResult, metadata: CaoSessionMetadata) 
     try:
         payload = json.loads(result.output_summary, parse_constant=_reject_json_constant)
         reviewer = metadata.lane.role == "reviewer"
-        keys = {"findings", "dispositions"} if reviewer else {"dispositions"}
+        keys = (
+            {"findings", "dispositions"}
+            if reviewer
+            else {"summary", "tests", "concerns", "no_changes", "dispositions"}
+        )
         if not isinstance(payload, dict) or set(payload) != keys:
             raise ValueError(f"expected exactly {sorted(keys)}")
         raw = payload["dispositions"]
@@ -533,11 +538,10 @@ class CaoSessionController:
                 "Remove the image or extend the control plane first."
             )
         lane = self._registered_lane(spec.lane)
-        name = session_name_for(spec.run_id, lane.lane)
+        name = session_name_for(spec.run_id, lane.lane, _worker_scope(lane, spec.context))
 
-        adopted = self._lookup_session(name)
+        adopted = self._adoptable_session(name, spec)
         if adopted is not None:
-            self._validate_attribution(adopted, spec)
             self._register(adopted)
             return SessionHandle(session_id=adopted.session_name, lane=lane.lane)
 
@@ -736,6 +740,22 @@ class CaoSessionController:
 
     # --- Internals ---------------------------------------------------------
 
+    def _adoptable_session(self, session_name: str, spec: SessionSpec) -> CaoSessionMetadata | None:
+        metadata = self._lookup_session(session_name)
+        if metadata is None:
+            return None
+        requested = spec.model_lease.assignment if spec.model_lease is not None else None
+        if metadata.model_assignment != requested:
+            self._register(metadata)
+            observation = self.observe(
+                SessionHandle(session_id=metadata.session_name, lane=metadata.lane.lane)
+            )
+            if observation.state in {"failed", "timed_out", "disappeared"}:
+                self._stop_session(metadata)
+                return None
+        self._validate_attribution(metadata, spec)
+        return metadata
+
     def _registered_lane(self, lane: LaneIdentity) -> LaneIdentity:
         registered = self._lanes.get(lane.lane)
         if registered != lane:
@@ -881,15 +901,10 @@ class CaoSessionController:
         caller is asking about, adopting would misattribute findings across
         runs or across lanes.
 
-        **Per-turn context (round_id, work_item_id) is NOT part of session
-        identity** (round-2 finding, PR #71 #3). A session lives across
-        multiple rounds of the same run — coder round 1, reviewer round 1,
-        coder round 2 (fix), reviewer round 2, etc. Rejecting adoption on
-        round change would prevent the executor from driving the next round
-        on a still-live session, which is exactly the multi-round case
-        PR #73 scenarios 2-4 need to exercise. Per-turn context is updated
-        via ``update_turn_context`` after adoption so the rest of the
-        system sees the latest round.
+        ``round_id`` is per-turn context for every lane. ``work_item_id``
+        is also per-turn for reviewers, but is session identity for workers:
+        one developer must retain context through remediation of one issue
+        without carrying that context into another issue.
         """
         mismatches: list[str] = []
         if metadata.parent_run_id != spec.context.run_id:
@@ -900,6 +915,13 @@ class CaoSessionController:
             mismatches.append(f"lane {metadata.lane} != requested {spec.lane}")
         if metadata.workdir != spec.workdir:
             mismatches.append(f"workdir {metadata.workdir!r} != requested {spec.workdir!r}")
+        expected_work_item = _worker_scope(spec.lane, spec.context)
+        observed_work_item = _worker_scope(metadata.lane, metadata.context)
+        if expected_work_item is not None and observed_work_item != expected_work_item:
+            mismatches.append(
+                f"work_item_id {metadata.context.work_item_id!r} != requested "
+                f"{spec.context.work_item_id!r}"
+            )
         expected_model = spec.model_lease.assignment if spec.model_lease is not None else None
         # The full assignment (lane and model_ref together), not just the
         # model_ref: two lanes can share a model_ref, and a session whose
@@ -917,11 +939,11 @@ class CaoSessionController:
     def update_turn_context(self, handle: SessionHandle, context: LaneExecutionContext) -> None:
         """Refresh the per-turn attribution on an adopted session.
 
-        Round-2 finding, PR #71 #3: per-turn context (round_id,
-        work_item_id) is intentionally NOT part of session-level adoption
-        identity, but the controller must still observe the latest turn so
-        downstream attribution (findings, dispositions) reports against
-        the current round, not the session's first launch. The executor
+        Round-2 finding, PR #71 #3: round context is not session identity;
+        reviewer work-item context is also per-turn. Worker work-item identity
+        is validated at adoption so developer context cannot cross issues.
+        The controller must still observe the latest turn so downstream
+        attribution reports against the current round. The executor
         calls this on every adoption so ``metadata.context`` always
         reflects the turn currently being driven.
 

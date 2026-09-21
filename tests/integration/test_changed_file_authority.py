@@ -12,6 +12,7 @@ from ai_pr_orchestrator.v3.git_ops import GitOpsError, GitWorktreeOps
 from ai_pr_orchestrator.v3.interfaces import LaneExecutionContext
 from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from tests.integration._fake_cao_server import FakeCAOServer
+from tests.integration._harness import developer_output, developer_session_name
 from tests.unit.test_v3_foreman import _foreman, _gate, _ready_fake
 
 
@@ -134,7 +135,12 @@ def foreman_runtime(repo, tmp_path, monkeypatch):
         ) as controller,
     ):
         for lane in lanes:
-            cao.set_output(session_name_for("run-1", lane.lane), "[]")
+            name = (
+                developer_session_name("run-1")
+                if lane.role == "worker"
+                else session_name_for("run-1", lane.lane)
+            )
+            cao.set_output(name, developer_output() if lane.role == "worker" else "[]")
         executor = CaoLaneExecutor(
             controller, lanes, git=ops, catalog=catalog, poll_interval_seconds=0
         )
@@ -153,6 +159,8 @@ def test_foreman_rejects_actual_cao_workflow_edits_before_push(
 
     def simulate_worker_edit(handle, prompt):
         submit(handle, prompt)  # Real HTTP input delivery still runs.
+        if handle.lane == "developer" and editing_lane != "developer":
+            (Path(loop._worktree_root) / "issue-1/safe.py").write_text("safe")
         if handle.lane == editing_lane:
             path = Path(loop._worktree_root) / "issue-1/.github/workflows/ci.yml"
             path.parent.mkdir(parents=True)
@@ -203,18 +211,23 @@ def test_commit_budget_uses_current_worktree_after_review(
 ):
     loop, _, controller, gate, pushed = foreman_runtime
     submit = controller.submit_work
+    create_worktree = loop._git.create_worktree
+
+    def create_with_history(path, branch):
+        workdir = create_worktree(path, branch)
+        for number in range(commits):
+            (Path(workdir) / "tracked").write_text(str(number))
+            git(workdir, "add", ".")
+            git(workdir, "commit", "-m", "existing issue commit")
+        return workdir
 
     def simulate_worker_edit(handle, prompt):
         submit(handle, prompt)
-        worktree = Path(loop._worktree_root) / "issue-1"
-        if handle.lane == "developer":
-            for number in range(commits):
-                (worktree / "tracked").write_text(str(number))
-                git(worktree, "add", ".")
-                git(worktree, "commit", "-m", "agent commit")
         if handle.lane == editing_lane:
+            worktree = Path(loop._worktree_root) / "issue-1"
             (worktree / "pending").write_text("must consume a commit")
 
+    monkeypatch.setattr(loop._git, "create_worktree", create_with_history)
     monkeypatch.setattr(controller, "submit_work", simulate_worker_edit)
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == expected

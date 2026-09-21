@@ -43,6 +43,18 @@ class FakeGitOperations:
         self.worktrees[path] = branch
         return path
 
+    def head_sha(self, workdir: str) -> str:
+        self.calls.append(("head_sha", workdir))
+        return self.commits.get(workdir, ["sha"])[-1]
+
+    def current_branch(self, workdir: str) -> str:
+        self.calls.append(("current_branch", workdir))
+        return self.worktrees.get(workdir, self.default)
+
+    def repo_instructions(self, workdir: str) -> str:
+        self.calls.append(("repo_instructions", workdir))
+        return ""
+
     def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
         raise NotImplementedError("use real GitWorktreeOps for issue input delivery tests")
 
@@ -105,9 +117,35 @@ def real_repo(tmp_path: Path) -> Path:
     return root
 
 
+def test_repo_instructions_reads_root_agent_files(real_repo: Path):
+    (real_repo / "AGENTS.md").write_text("agent rules\n")
+    (real_repo / "CLAUDE.md").write_text("claude rules\n")
+    instructions = GitWorktreeOps(real_repo).repo_instructions(str(real_repo))
+    assert instructions == "AGENTS.md:\nagent rules\n\n\nCLAUDE.md:\nclaude rules\n"
+
+
+def test_repo_instructions_reject_symlinks_outside_worktree(real_repo: Path):
+    secret = real_repo.parent / "host-secret"
+    secret.write_text("do not disclose\n")
+    (real_repo / "AGENTS.md").symlink_to(secret)
+    with pytest.raises(GitOpsError, match="must not be a symlink"):
+        GitWorktreeOps(real_repo).repo_instructions(str(real_repo))
+
+
 def test_default_branch_and_branch_creation(real_repo: Path):
     ops = GitWorktreeOps(real_repo)
     assert ops.default_branch() == "main"
+    assert ops.current_branch(str(real_repo)) == "main"
+    assert (
+        ops.head_sha(str(real_repo))
+        == subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=real_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
     ops.create_branch("feat/x", "main")
     heads = subprocess.run(
         ["git", "branch", "--list", "feat/x"],

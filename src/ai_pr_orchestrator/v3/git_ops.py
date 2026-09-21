@@ -76,6 +76,25 @@ class GitWorktreeOps:
         self._run("worktree", "add", str(workdir), branch)
         return str(workdir)
 
+    def head_sha(self, workdir: str) -> str:
+        return self._run("-C", str(self._workdir(workdir)), "rev-parse", "HEAD").strip()
+
+    def current_branch(self, workdir: str) -> str:
+        return self._run(
+            "-C", str(self._workdir(workdir)), "rev-parse", "--abbrev-ref", "HEAD"
+        ).strip()
+
+    def repo_instructions(self, workdir: str) -> str:
+        root = self._workdir(workdir)
+        parts = []
+        for name in ("AGENTS.md", "CLAUDE.md"):
+            path = root / name
+            if path.is_symlink():
+                raise GitOpsError(f"repository instruction file must not be a symlink: {path}")
+            if path.is_file():
+                parts.append(f"{name}:\n{path.read_text(encoding='utf-8')}")
+        return "\n\n".join(parts)
+
     def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
         """Cache complete input in worktree-private metadata, never staged content."""
         git_dir = self._run("-C", str(self._workdir(workdir)), "rev-parse", "--absolute-git-dir")

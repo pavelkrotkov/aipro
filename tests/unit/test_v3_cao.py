@@ -35,8 +35,9 @@ from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE, LaneRegistry
 
 BASE = "http://cao.test:9889"
 RUN_ID = "run-1"
-# Digest over the unambiguously delimited run/lane pair (see session_name_for).
-SESSION = "cao-aipro-run-1-developer-b9d7cf8e"
+# Digests over the historical run/lane identity and the worker-scoped work item.
+UNSCOPED_SESSION = "cao-aipro-run-1-developer-b9d7cf8e"
+SESSION = "cao-aipro-run-1-developer-57926cab"
 TERMINAL = "a1b2c3d4"
 WORKDIR = "/worktrees/issue-1"
 
@@ -114,8 +115,21 @@ def status_route(respx_mock, *statuses):
 
 
 def test_session_name_is_deterministic_for_a_run_and_lane():
-    assert session_name_for(RUN_ID, DEVELOPER_LANE) == SESSION
+    assert session_name_for(RUN_ID, DEVELOPER_LANE) == UNSCOPED_SESSION
     assert session_name_for(RUN_ID, DEVELOPER_LANE) == session_name_for(RUN_ID, DEVELOPER_LANE)
+
+
+def test_worker_session_name_isolated_by_work_item():
+    first = session_name_for(RUN_ID, DEVELOPER_LANE, "owner/repo#1")
+    assert first == session_name_for(RUN_ID, DEVELOPER_LANE, "owner/repo#1")
+    assert first != session_name_for(RUN_ID, DEVELOPER_LANE, "owner/repo#2")
+
+
+def test_worker_scope_uses_any_nonempty_work_item_id():
+    lane = LaneRegistry.default().get(DEVELOPER_LANE)
+    first = cao_module._worker_scope(lane, LaneExecutionContext(RUN_ID, work_item_id="wi-1"))
+    second = cao_module._worker_scope(lane, LaneExecutionContext(RUN_ID, work_item_id="wi-2"))
+    assert (first, second) == ("wi-1", "wi-2")
 
 
 def test_session_name_is_sanitized_and_length_bounded():
@@ -955,7 +969,7 @@ def test_sanitized_names_carry_a_digest_so_lossy_names_stay_distinct():
     assert len(a) <= 64
     # Digests cover every name now, so the run/lane boundary is always
     # unambiguous — not only when sanitization was needed.
-    assert session_name_for(RUN_ID, DEVELOPER_LANE) == SESSION
+    assert session_name_for(RUN_ID, DEVELOPER_LANE) == UNSCOPED_SESSION
 
 
 # --- Teardown --------------------------------------------------------------

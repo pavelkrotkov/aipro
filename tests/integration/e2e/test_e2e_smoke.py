@@ -19,12 +19,12 @@ from __future__ import annotations
 import pytest
 
 from ai_pr_orchestrator.v3.cao import session_name_for
-from ai_pr_orchestrator.v3.lanes import DEVELOPER_LANE
 from tests.integration._fake_cao_server import (
     STATUS_IDLE,
     STATUS_PROCESSING,
     STATUS_STARTED,
 )
+from tests.integration._harness import developer_output, developer_session_name
 from tests.integration.conftest import E2E_WORK_TAG
 
 #: A scripted status sequence that walks the controller through
@@ -58,9 +58,9 @@ def test_foreman_drives_one_fake_cao_session_to_completion(
     # not a local one, so the controller's ``session_name_for`` lookup
     # hits the scripted session.
     run_id = loop.run_id
-    session_name = session_name_for(run_id, DEVELOPER_LANE)
+    session_name = developer_session_name(run_id)
     fake_cao.set_status_sequence(session_name, _DEFAULT_TERMINAL_SEQUENCE)
-    fake_cao.set_output(session_name, "ok")
+    fake_cao.set_output(session_name, developer_output())
     for lane in lane_registry:
         if lane.role == "reviewer":
             fake_cao.set_output(session_name_for(run_id, lane.lane), "[]")
@@ -90,9 +90,9 @@ def test_foreman_records_cao_session_in_fake(fake_cao, foreman_harness):
     loop, _queue, _fake = foreman_harness(seed_issue_numbers=[1])
 
     run_id = loop.run_id
-    session_name = session_name_for(run_id, DEVELOPER_LANE)
+    session_name = developer_session_name(run_id)
     fake_cao.set_status_sequence(session_name, _DEFAULT_TERMINAL_SEQUENCE)
-    fake_cao.set_output(session_name, "ok")
+    fake_cao.set_output(session_name, developer_output())
 
     loop.run_pass()
 

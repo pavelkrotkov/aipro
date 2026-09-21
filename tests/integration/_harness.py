@@ -87,6 +87,15 @@ class FakeGitOperations:
         self.worktrees[path] = branch
         return path
 
+    def head_sha(self, workdir: str) -> str:
+        return "sha"
+
+    def current_branch(self, workdir: str) -> str:
+        return self.worktrees.get(workdir, "aipro-issue-1")
+
+    def repo_instructions(self, workdir: str) -> str:
+        return ""
+
     def write_issue_description(self, workdir: str, description: str) -> tuple[str, str]:
         raise NotImplementedError("use real GitWorktreeOps for issue input delivery tests")
 
@@ -113,25 +122,51 @@ __all__ = [
     "FakeBroker",
     "FakeGitOperations",
     "StaticGate",
+    "developer_output",
+    "developer_session_name",
 ]
 
 
-def script_protocol(fake_cao, loop, *, proposal="rebut", decision="accept", reply=None):
+def developer_session_name(run_id: str, issue_number: int = 1) -> str:
+    return session_name_for(run_id, "developer", f"owner/repo#{issue_number}")
+
+
+def developer_output(
+    *,
+    summary: str = "implemented requested change",
+    dispositions: list[dict[str, str]] | None = None,
+    no_changes: bool = False,
+) -> str:
+    return json.dumps(
+        {
+            "summary": summary,
+            "tests": [{"command": "pytest -q", "result": "passed", "notes": ""}],
+            "concerns": [],
+            "no_changes": no_changes,
+            "dispositions": dispositions or [],
+        }
+    )
+
+
+def script_protocol(
+    fake_cao, loop, *, proposal="rebut", decision="accept", reply=None, issue_number: int = 1
+):
     loop._cfg = V3Config(
         safety=SafetyPolicyConfig(
             max_coder_invocations_per_run=3,
             max_reviewer_triggers_per_run=9,
         )
     )
-    coder = {
-        "dispositions": [
+    coder = developer_output(
+        summary="addressed reviewer finding",
+        dispositions=[
             {
                 "finding_id": "guard",
                 "action": proposal,
                 "rationale": "test_guard proves the premise cannot occur",
             }
-        ]
-    }
+        ],
+    )
     reviewer = {
         "findings": [],
         "dispositions": [
@@ -144,7 +179,8 @@ def script_protocol(fake_cao, loop, *, proposal="rebut", decision="accept", repl
         ],
     }
     fake_cao.set_output_sequence(
-        session_name_for(loop.run_id, "developer"), ["implemented", json.dumps(coder)]
+        developer_session_name(loop.run_id, issue_number),
+        [developer_output(), coder],
     )
     fake_cao.set_output_sequence(
         session_name_for(loop.run_id, "requirements-reviewer"),
