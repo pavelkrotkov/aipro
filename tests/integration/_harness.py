@@ -90,6 +90,9 @@ class FakeGitOperations:
     def head_sha(self, workdir: str) -> str:
         return "sha"
 
+    def current_branch(self, workdir: str) -> str:
+        return self.worktrees.get(workdir, "aipro-issue-1")
+
     def repo_instructions(self, workdir: str) -> str:
         return ""
 
