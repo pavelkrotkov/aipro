@@ -47,6 +47,10 @@ class FakeGitOperations:
         self.calls.append(("head_sha", workdir))
         return self.commits.get(workdir, ["sha"])[-1]
 
+    def current_branch(self, workdir: str) -> str:
+        self.calls.append(("current_branch", workdir))
+        return self.worktrees.get(workdir, self.default)
+
     def repo_instructions(self, workdir: str) -> str:
         self.calls.append(("repo_instructions", workdir))
         return ""
