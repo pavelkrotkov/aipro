@@ -79,6 +79,11 @@ class GitWorktreeOps:
     def head_sha(self, workdir: str) -> str:
         return self._run("-C", str(self._workdir(workdir)), "rev-parse", "HEAD").strip()
 
+    def current_branch(self, workdir: str) -> str:
+        return self._run(
+            "-C", str(self._workdir(workdir)), "rev-parse", "--abbrev-ref", "HEAD"
+        ).strip()
+
     def repo_instructions(self, workdir: str) -> str:
         root = self._workdir(workdir)
         parts = []
