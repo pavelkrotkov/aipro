@@ -61,8 +61,14 @@ class LaneExecutionContext:
     work_item_id: WorkItemId | None = None
     # Finding id and proposal turn to adjudicate; None requests a coder proposal.
     disposition_requests: tuple[tuple[str, str | None], ...] = ()
+    # Immutable repository snapshot this turn reviews, when applicable.
+    head_sha: str | None = None
 
     def __post_init__(self) -> None:
+        if self.head_sha is not None and (
+            not isinstance(self.head_sha, str) or not self.head_sha.strip()
+        ):
+            raise ValueError("head_sha must be a nonempty string when supplied")
         seen = set()
         for request in self.disposition_requests:
             if len(request) != 2:
@@ -290,6 +296,11 @@ class LaneExecutor(Protocol):
         lease: ModelLease | None = None,
     ) -> LaneResult: ...
 
+    def terminate_session(self, handle: SessionHandle) -> None:
+        """Confirm termination of a completed lane session."""
+
+        ...
+
 
 @runtime_checkable
 class CIPRGate(Protocol):
@@ -321,6 +332,11 @@ class GitOperations(Protocol):
 
     def create_worktree(self, path: str, branch: str) -> str:
         """Materialize ``branch`` at ``path``; return the resolved workdir."""
+
+        ...
+
+    def create_review_checkout(self, path: str, source_workdir: str, head_sha: str) -> str:
+        """Create an independent detached repository at ``head_sha``."""
 
         ...
 
@@ -369,4 +385,14 @@ class GitOperations(Protocol):
 
     def push(self, branch: str) -> None: ...
 
+    def push_sha(self, head_sha: str, branch: str) -> None:
+        """Publish exactly ``head_sha`` to ``branch``."""
+
+        ...
+
     def cleanup_worktree(self, path: str) -> None: ...
+
+    def cleanup_review_checkout(self, path: str, head_sha: str) -> None:
+        """Remove an owned disposable reviewer repository."""
+
+        ...

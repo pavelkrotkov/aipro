@@ -39,6 +39,7 @@ from .interfaces import (
     LaneExecutionContext,
     LaneResult,
     ModelLease,
+    SessionHandle,
     SessionSpec,
 )
 from .lanes import LaneRegistry
@@ -187,11 +188,16 @@ class CaoLaneExecutor:
                     # ``poll_session`` already builds a LaneResult; rewrite
                     # the ``session`` field with the live handle so the
                     # foreman can address the session that produced it.
+                    base_ref = (
+                        context.head_sha
+                        if lane.role == "reviewer" and context.head_sha
+                        else self._git.default_branch()
+                    )
                     return LaneResult(
                         session=handle,
                         exit_code=result.exit_code,
                         output_summary=result.output_summary,
-                        changed_files=self._git.changed_files(workdir, self._git.default_branch()),
+                        changed_files=self._git.changed_files(workdir, base_ref),
                         findings=list(result.findings),
                         dispositions=list(result.dispositions),
                     )
@@ -213,6 +219,10 @@ class CaoLaneExecutor:
             # session CAO has already forgotten is a no-op here.
             self._controller.terminate_session(handle)
             raise
+
+    def terminate_session(self, handle: SessionHandle) -> None:
+        """Confirm remote teardown before a disposable checkout is removed."""
+        self._controller.terminate_session(handle)
 
 
 __all__ = ["CaoLaneExecutor"]

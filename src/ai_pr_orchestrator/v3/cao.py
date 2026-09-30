@@ -218,6 +218,7 @@ class CaoSessionMetadata:
             "round_id": self.context.round_id,
             "work_item_id": self.context.work_item_id,
             "disposition_requests": list(self.context.disposition_requests),
+            "head_sha": self.context.head_sha,
             "model_assignment": (
                 self.model_assignment.to_dict() if self.model_assignment is not None else None
             ),
@@ -264,6 +265,7 @@ class CaoSessionMetadata:
                 disposition_requests=tuple(
                     tuple(request) for request in data.get("disposition_requests", [])
                 ),
+                head_sha=data.get("head_sha"),
             ),
             model_assignment=(
                 ModelAssignment.from_dict(assignment) if assignment is not None else None
@@ -385,6 +387,9 @@ def _reviewer_finding(payload: Any, metadata: CaoSessionMetadata) -> ReviewerFin
     for key, expected in attribution.items():
         if data.setdefault(key, expected) != expected:
             raise ValueError(f"finding {key} does not match the current reviewer turn")
+    reviewed_head = metadata.context.head_sha
+    if reviewed_head is not None and data.setdefault("head_sha", reviewed_head) != reviewed_head:
+        raise ValueError("finding head_sha does not match the reviewed snapshot")
     _require_new_finding(data)
     data["evidence"] = [_review_evidence(item) for item in data.get("evidence", [])]
     return ReviewerFinding(**data)
@@ -897,9 +902,9 @@ class CaoSessionController:
 
         A session name can be reconstructed by anything; the metadata CAO
         stored is what actually attributes the session's work. If it does
-        not agree with the run, lane, workdir, or model assignment the
-        caller is asking about, adopting would misattribute findings across
-        runs or across lanes.
+        not agree with the run, lane, workdir, reviewer snapshot, or model
+        assignment the caller is asking about, adopting would misattribute
+        findings across runs, lanes, or immutable review heads.
 
         ``round_id`` is per-turn context for every lane. ``work_item_id``
         is also per-turn for reviewers, but is session identity for workers:
@@ -921,6 +926,10 @@ class CaoSessionController:
             mismatches.append(
                 f"work_item_id {metadata.context.work_item_id!r} != requested "
                 f"{spec.context.work_item_id!r}"
+            )
+        if metadata.lane.role == "reviewer" and metadata.context.head_sha != spec.context.head_sha:
+            mismatches.append(
+                f"head_sha {metadata.context.head_sha!r} != requested {spec.context.head_sha!r}"
             )
         expected_model = spec.model_lease.assignment if spec.model_lease is not None else None
         # The full assignment (lane and model_ref together), not just the

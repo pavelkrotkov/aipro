@@ -158,6 +158,25 @@ directory and corrupt it.
 | `breaker-reviewer` | reviewer | `aipro-breaker-reviewer` |
 | `architecture-reviewer` | reviewer | `aipro-architecture-reviewer` |
 
+### Reviewer checkout isolation
+
+Each review wave first commits the developer output and records that immutable
+head SHA. The three reviewer sessions then run concurrently, when broker
+capacity permits, in separate independent clones detached at that same SHA.
+They do not use linked Git worktrees: independent clones avoid the shared Git
+metadata and writable refs that would let one reviewer's experimental commit
+or ref update contaminate the developer checkout or a sibling reviewer. The
+review clones have no source remote, and the lane environment also disables
+push credentials. Reviewer assignments and owned checkout paths are persisted
+before launch; findings/results are persisted before a successful session is
+terminated and its checkout is deleted.
+
+This is repository isolation, not a hostile-process sandbox. A reviewer process
+running as the same unrestricted OS user could still walk to another checkout
+by absolute path or inspect other same-user processes. Deployments that need
+protection against a malicious reviewer must add OS/container isolation around
+the CAO/Hermes lane.
+
 ### Step 1 — one isolated Hermes home per lane
 
 CAO's Hermes provider launches whatever command the profile's `hermesProfile`

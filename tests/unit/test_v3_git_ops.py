@@ -43,6 +43,11 @@ class FakeGitOperations:
         self.worktrees[path] = branch
         return path
 
+    def create_review_checkout(self, path: str, source_workdir: str, head_sha: str) -> str:
+        self.calls.append(("create_review_checkout", path, source_workdir, head_sha))
+        self.worktrees[path] = f"detached:{head_sha}"
+        return path
+
     def head_sha(self, workdir: str) -> str:
         self.calls.append(("head_sha", workdir))
         return self.commits.get(workdir, ["sha"])[-1]
@@ -77,8 +82,16 @@ class FakeGitOperations:
         self.calls.append(("push", branch))
         self.pushed.append(branch)
 
+    def push_sha(self, head_sha: str, branch: str) -> None:
+        self.calls.append(("push_sha", head_sha, branch))
+        self.pushed.append(branch)
+
     def cleanup_worktree(self, path: str) -> None:
         self.calls.append(("cleanup_worktree", path))
+        self.worktrees.pop(path, None)
+
+    def cleanup_review_checkout(self, path: str, head_sha: str) -> None:
+        self.calls.append(("cleanup_review_checkout", path, head_sha))
         self.worktrees.pop(path, None)
 
 
@@ -259,7 +272,14 @@ def test_bounded_prompts_deliver_complete_issue_context(real_repo: Path, tmp_pat
     loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=ops)
     prompts = [
         loop._coder_prompt(ISSUE, (), workdir),
-        loop._reviewer_prompt(ISSUE, "review-1", workdir),
+        loop._reviewer_prompt(
+            ISSUE,
+            "review-1",
+            workdir,
+            lane_name="requirements-reviewer",
+            head_sha=ops.head_sha(workdir),
+            issue_body=body,
+        ),
     ]
     path, digest = ops.write_issue_description(workdir, body)
     reference = f"{path!r} ({len(body.encode())} UTF-8 bytes; SHA-256 {hashlib.sha256(body.encode()).hexdigest()})"
@@ -307,3 +327,11 @@ def test_issue_input_versions_do_not_replace_inflight_context(real_repo: Path, t
     Path(first).write_text("truncated")
     with pytest.raises(GitOpsError, match="does not match"):
         ops.write_issue_description(workdir, "Original criteria.")
+
+
+def test_push_sha_uses_explicit_refspec(real_repo: Path):
+    ops = GitWorktreeOps(real_repo)
+    calls = []
+    ops._run = lambda *args, **kwargs: calls.append(args) or ""  # type: ignore[method-assign]
+    ops.push_sha("abc123", "reviewed")
+    assert calls == [("push", "origin", "abc123:refs/heads/reviewed")]

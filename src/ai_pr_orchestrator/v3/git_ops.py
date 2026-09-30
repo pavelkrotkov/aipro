@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -66,14 +67,25 @@ class GitWorktreeOps:
         self._run("branch", branch, from_ref)
 
     def create_worktree(self, path: str, branch: str) -> str:
-        workdir = Path(path)
-        if not workdir.is_absolute():
-            # git resolves a relative <path> against the invocation cwd (the
-            # repo root), but the caller uses the returned path from its own
-            # process cwd: hand back an absolute path rooted at the repo
-            # (round-2 #11).
-            workdir = self._root / workdir
+        workdir = self._checkout_path(path)
         self._run("worktree", "add", str(workdir), branch)
+        return str(workdir)
+
+    def create_review_checkout(self, path: str, source_workdir: str, head_sha: str) -> str:
+        """Clone an independent, remote-free repository for one reviewer."""
+        workdir = self._checkout_path(path)
+        source = self._workdir(source_workdir)
+        self._run("clone", "--no-local", "--no-checkout", str(source), str(workdir))
+        self._run("-C", str(workdir), "remote", "remove", "origin")
+        self._run("-C", str(workdir), "checkout", "--detach", head_sha)
+        actual = self.head_sha(str(workdir))
+        if actual != head_sha:
+            raise GitOpsError(
+                f"review checkout {workdir} expected HEAD {head_sha}, found {actual}"
+            )
+        (workdir / ".git" / "aipro-review-snapshot").write_text(
+            head_sha + "\n", encoding="utf-8"
+        )
         return str(workdir)
 
     def head_sha(self, workdir: str) -> str:
@@ -179,10 +191,26 @@ class GitWorktreeOps:
     def push(self, branch: str) -> None:
         self._run("push", "-u", "origin", branch)
 
+    def push_sha(self, head_sha: str, branch: str) -> None:
+        self._run("push", "origin", f"{head_sha}:refs/heads/{branch}")
+
     def cleanup_worktree(self, path: str) -> None:
         self._run("worktree", "remove", str(Path(path)), "--force")
 
+    def cleanup_review_checkout(self, path: str, head_sha: str) -> None:
+        workdir = self._checkout_path(path)
+        if workdir.is_symlink() or workdir.resolve() == self._root.resolve():
+            raise GitOpsError(f"refusing to remove unowned review checkout: {workdir}")
+        marker = workdir / ".git" / "aipro-review-snapshot"
+        if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != head_sha:
+            raise GitOpsError(f"refusing to remove unowned review checkout: {workdir}")
+        shutil.rmtree(workdir)
+
     # --- helpers -------------------------------------------------------------
+
+    def _checkout_path(self, path: str) -> Path:
+        workdir = Path(path)
+        return workdir if workdir.is_absolute() else self._root / workdir
 
     def _workdir(self, workdir: str) -> Path:
         path = Path(workdir)
