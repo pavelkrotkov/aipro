@@ -64,7 +64,7 @@ class TestCliApplyAndRepo:
         monkeypatch.setattr(cli, "_build_github_client", client)
         monkeypatch.setattr(cli, "_build_reconciliation_inputs", inventory)
 
-        assert cli.main(["reconcile", "--apply", "--token", "unused"]) == 3
+        assert cli.main(["reconcile", "--config", "unused", "--apply", "--token", "unused"]) == 3
         assert "--apply is unsupported" in capsys.readouterr().out
         client.assert_not_called()
         inventory.assert_not_called()
