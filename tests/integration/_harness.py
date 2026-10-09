@@ -123,9 +123,7 @@ class FakeGitOperations:
         self.worktrees.pop(path, None)
 
     def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
-        # Test stub: every commit registers a synthetic touched file so the
-        # foreman's workflow-file policy has something to act on.
-        return [f"src/{workdir.strip('/').replace('/', '_') or 'x'}.py"]
+        return [f"src/{workdir.strip('/').replace('/', '_') or 'x'}.py"] if base_ref else []
 
 
 __all__ = [
@@ -165,6 +163,7 @@ def script_protocol(
         safety=SafetyPolicyConfig(
             max_coder_invocations_per_run=3,
             max_reviewer_triggers_per_run=9,
+            max_commits_per_run=3,
         )
     )
     coder = developer_output(

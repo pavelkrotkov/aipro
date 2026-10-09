@@ -16,9 +16,7 @@ from ai_pr_orchestrator.v3.lanes import LaneRegistry
 @pytest.fixture
 def review_lane(cao_lane_executor, fake_cao, lane_registry, tmp_path):
     lane = lane_registry.get("requirements-reviewer")
-    context = LaneExecutionContext(
-        "review-output", round_id="review-1", head_sha="snapshot-123"
-    )
+    context = LaneExecutionContext("review-output", round_id="review-1", head_sha="snapshot-123")
 
     def execute(output, *, role_lane=lane):
         fake_cao.set_output(session_name_for(context.run_id, role_lane.lane), output)

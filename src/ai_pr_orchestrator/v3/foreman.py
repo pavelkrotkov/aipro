@@ -702,9 +702,7 @@ class ForemanPolicyLoop:
             for seat in seats:
                 self._release(seat.lease)
 
-        waves = deepcopy(
-            cast(dict[str, dict[str, object]], state.extras.get("review_waves", {}))
-        )
+        waves = deepcopy(cast(dict[str, dict[str, object]], state.extras.get("review_waves", {})))
         wave = waves[round_id]
         registry, dispositions, completed, failures = self._collect_review_outcomes(
             seats, outcomes, state, head_sha, registry, proposals, wave
@@ -714,11 +712,9 @@ class ForemanPolicyLoop:
         remaining, had_signal = self._settle_review_findings(registry, dispositions, round_id)
         registry.compact()
 
-        waves[round_id] = wave
-        state = self._save_fresh(
-            issue, state, extras={**state.extras, "review_waves": waves}
-        )
         self._persist_round(issue, state, round_id, registry, dispositions)
+        waves[round_id] = wave
+        self._save_fresh(issue, state, extras={**state.extras, "review_waves": waves})
         if heartbeat_error is None:
             failures.extend(self._cleanup_review_results(completed, head_sha))
         if failures:
@@ -886,14 +882,12 @@ class ForemanPolicyLoop:
                 lease, fallbacks = self._reserve(
                     lane, state, peers=tuple(peers), in_flight=in_flight
                 )
-                worktree = (
-                    f"{self._worktree_root}/issue-{issue.number}-{round_id}-{lane_name}"
-                )
+                worktree = f"{self._worktree_root}/issue-{issue.number}-{round_id}-{lane_name}"
                 seats.append(_ReviewSeat(lane, worktree, lease, fallbacks, requests))
                 ref = lease.assignment.model_ref
                 peers.append(ref)
                 in_flight[ref] = in_flight.get(ref, 0) + 1
-            wave = {
+            wave: dict[str, object] = {
                 "run_id": self._run_id,
                 "round_id": round_id,
                 "head_sha": head_sha,
@@ -912,9 +906,7 @@ class ForemanPolicyLoop:
                 cast(dict[str, dict[str, object]], state.extras.get("review_waves", {}))
             )
             waves[round_id] = wave
-            state = self._save_fresh(
-                issue, state, extras={**state.extras, "review_waves": waves}
-            )
+            state = self._save_fresh(issue, state, extras={**state.extras, "review_waves": waves})
         except Exception:
             for seat in seats:
                 self._release(seat.lease)
@@ -945,26 +937,34 @@ class ForemanPolicyLoop:
         seats: list[_ReviewSeat],
     ) -> dict[str, str]:
         prompts: dict[str, str] = {}
-        for seat in seats:
-            created = self._git.create_review_checkout(
-                seat.worktree, developer_worktree, head_sha
-            )
-            if created != seat.worktree:
-                raise _ForemanEscalation(
-                    f"review checkout path changed: planned {seat.worktree}, created {created}"
+        created_paths: list[str] = []
+        try:
+            for seat in seats:
+                created = self._git.create_review_checkout(
+                    seat.worktree, developer_worktree, head_sha
                 )
-            prompt = self._reviewer_prompt(
-                issue,
-                round_id,
-                seat.worktree,
-                lane_name=seat.lane.lane,
-                head_sha=head_sha,
-                issue_body=issue_body,
-            )
-            if seat.requests:
-                prompt += self._adjudication_prompt(registry, proposals, seat.requests)
-            self._charge_prompt(prompt)
-            prompts[seat.lane.lane] = prompt
+                if created != seat.worktree:
+                    raise _ForemanEscalation(
+                        f"review checkout path changed: planned {seat.worktree}, created {created}"
+                    )
+                created_paths.append(created)
+                prompt = self._reviewer_prompt(
+                    issue,
+                    round_id,
+                    seat.worktree,
+                    lane_name=seat.lane.lane,
+                    head_sha=head_sha,
+                    issue_body=issue_body,
+                )
+                if seat.requests:
+                    prompt += self._adjudication_prompt(registry, proposals, seat.requests)
+                self._charge_prompt(prompt)
+                prompts[seat.lane.lane] = prompt
+        except Exception:
+            for path in created_paths:
+                with suppress(Exception):
+                    self._git.cleanup_review_checkout(path, head_sha)
+            raise
         return prompts
 
     def _run_review_seats(
@@ -977,33 +977,35 @@ class ForemanPolicyLoop:
         outcomes: dict[str, LaneResult | Exception] = {}
         heartbeat_error: str | None = None
         try:
-            with self._lease_heartbeat(state):
-                with ThreadPoolExecutor(
+            with (
+                self._lease_heartbeat(state),
+                ThreadPoolExecutor(
                     max_workers=len(seats), thread_name_prefix="aipro-review"
-                ) as pool:
-                    futures = {
-                        pool.submit(
-                            self._executor.execute,
-                            seat.lane,
-                            prompts[seat.lane.lane],
-                            seat.worktree,
-                            LaneExecutionContext(
-                                run_id=self._run_id,
-                                round_id=state.round_id,
-                                work_item_id=state.work_item_id,
-                                disposition_requests=seat.requests,
-                                head_sha=head_sha,
-                            ),
-                            seat.lease,
-                        ): seat.lane.lane
-                        for seat in seats
-                    }
-                    for future in as_completed(futures):
-                        lane_name = futures[future]
-                        try:
-                            outcomes[lane_name] = future.result()
-                        except Exception as exc:
-                            outcomes[lane_name] = exc
+                ) as pool,
+            ):
+                futures = {
+                    pool.submit(
+                        self._executor.execute,
+                        seat.lane,
+                        prompts[seat.lane.lane],
+                        seat.worktree,
+                        LaneExecutionContext(
+                            run_id=self._run_id,
+                            round_id=state.round_id,
+                            work_item_id=state.work_item_id,
+                            disposition_requests=seat.requests,
+                            head_sha=head_sha,
+                        ),
+                        seat.lease,
+                    ): seat.lane.lane
+                    for seat in seats
+                }
+                for future in as_completed(futures):
+                    lane_name = futures[future]
+                    try:
+                        outcomes[lane_name] = future.result()
+                    except Exception as exc:
+                        outcomes[lane_name] = exc
         except _ForemanEscalation as exc:
             heartbeat_error = exc.reason
         return outcomes, heartbeat_error
@@ -1827,9 +1829,7 @@ class ForemanPolicyLoop:
             name=self._name,
             email=self._email,
         )
-        state = self._save_fresh(
-            issue, state, extras={**state.extras, "head_sha": sha}
-        )
+        state = self._save_fresh(issue, state, extras={**state.extras, "head_sha": sha})
         return state, sha
 
     def _publish_snapshot(self, worktree: str, branch: str, head_sha: str) -> None:

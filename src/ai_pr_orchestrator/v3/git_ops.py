@@ -80,12 +80,8 @@ class GitWorktreeOps:
         self._run("-C", str(workdir), "checkout", "--detach", head_sha)
         actual = self.head_sha(str(workdir))
         if actual != head_sha:
-            raise GitOpsError(
-                f"review checkout {workdir} expected HEAD {head_sha}, found {actual}"
-            )
-        (workdir / ".git" / "aipro-review-snapshot").write_text(
-            head_sha + "\n", encoding="utf-8"
-        )
+            raise GitOpsError(f"review checkout {workdir} expected HEAD {head_sha}, found {actual}")
+        (workdir / ".git" / "aipro-review-snapshot").write_text(head_sha + "\n", encoding="utf-8")
         return str(workdir)
 
     def head_sha(self, workdir: str) -> str:

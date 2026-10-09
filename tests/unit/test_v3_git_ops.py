@@ -329,9 +329,9 @@ def test_issue_input_versions_do_not_replace_inflight_context(real_repo: Path, t
         ops.write_issue_description(workdir, "Original criteria.")
 
 
-def test_push_sha_uses_explicit_refspec(real_repo: Path):
+def test_push_sha_uses_explicit_refspec(real_repo: Path, monkeypatch: pytest.MonkeyPatch):
     ops = GitWorktreeOps(real_repo)
     calls = []
-    ops._run = lambda *args, **kwargs: calls.append(args) or ""  # type: ignore[method-assign]
+    monkeypatch.setattr(ops, "_run", lambda *args, **kwargs: calls.append(args) or "")
     ops.push_sha("abc123", "reviewed")
     assert calls == [("push", "origin", "abc123:refs/heads/reviewed")]

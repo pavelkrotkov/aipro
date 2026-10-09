@@ -927,7 +927,8 @@ def test_review_round_cap_never_accepts_unreviewed_fixes(findings, gate_calls):
     assert executor.calls.count(("developer", "/wt/issue-1")) == 2
     assert len(executor.calls) == 5  # two coder turns and three reviewers
     assert len(gate.seen) == gate_calls
-    assert len(git.commits) == len(git.pushed) == len(gate.seen)
+    assert len(git.commits) == 1
+    assert len(git.pushed) == len(gate.seen)
     assert len(fake.list_open_prs()) == gate_calls
     state = queue.load_state(ISSUE.slug())
     assert state is not None and state.phase == "escalated"

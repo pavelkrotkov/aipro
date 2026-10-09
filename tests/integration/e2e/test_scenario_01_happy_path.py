@@ -53,7 +53,7 @@ def test_scenario_1_happy_path_opens_exactly_one_pr(fake_cao, foreman_harness):
     assert len(outcomes) == 1
     outcome = outcomes[0]
     assert outcome.final_phase == "done", (
-        f"expected 'done', got {outcome.final_phase!r}; terminal_reason={outcome.terminal_reason!r}"
+        f"expected 'done', got {outcome.final_phase!r}; terminal_reason={outcome.reason!r}"
     )
     assert outcome.gate is not None and outcome.gate.passed
 

@@ -44,12 +44,8 @@ def test_review_checkouts_are_independent_detached_repositories(tmp_path: Path):
     (developer / "tracked.txt").write_text("snapshot\n")
     head = ops.commit(str(developer), "snapshot", name="T", email="t@example.com")
 
-    review_a = Path(
-        ops.create_review_checkout(str(tmp_path / "review-a"), str(developer), head)
-    )
-    review_b = Path(
-        ops.create_review_checkout(str(tmp_path / "review-b"), str(developer), head)
-    )
+    review_a = Path(ops.create_review_checkout(str(tmp_path / "review-a"), str(developer), head))
+    review_b = Path(ops.create_review_checkout(str(tmp_path / "review-b"), str(developer), head))
     try:
         for review in (review_a, review_b):
             assert _git(review, "rev-parse", "HEAD") == head
@@ -86,7 +82,5 @@ def test_review_cleanup_refuses_unowned_path(tmp_path: Path):
     unknown = tmp_path / "unknown"
     (unknown / ".git").mkdir(parents=True)
     with pytest.raises(GitOpsError, match="unowned review checkout"):
-        GitWorktreeOps(root).cleanup_review_checkout(
-            str(unknown), _git(root, "rev-parse", "HEAD")
-        )
+        GitWorktreeOps(root).cleanup_review_checkout(str(unknown), _git(root, "rev-parse", "HEAD"))
     assert unknown.exists()

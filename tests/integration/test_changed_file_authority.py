@@ -121,7 +121,7 @@ def foreman_runtime(repo, tmp_path, monkeypatch):
     lanes = LaneRegistry.default()
     ops = GitWorktreeOps(repo)
     pushed = []
-    monkeypatch.setattr(ops, "push", pushed.append)
+    monkeypatch.setattr(ops, "push_sha", lambda _sha, branch: pushed.append(branch))
     catalog = ModelCatalog(
         tuple(
             ModelCatalogEntry(f"ref-{lane.lane}", "test-model", provider="test") for lane in lanes
@@ -162,17 +162,24 @@ def test_foreman_rejects_actual_cao_workflow_edits_before_push(
         if handle.lane == "developer" and editing_lane != "developer":
             (Path(loop._worktree_root) / "issue-1/safe.py").write_text("safe")
         if handle.lane == editing_lane:
-            path = Path(loop._worktree_root) / "issue-1/.github/workflows/ci.yml"
+            checkout = (
+                "issue-1" if editing_lane == "developer" else f"issue-1-review-1-{editing_lane}"
+            )
+            path = Path(loop._worktree_root) / checkout / ".github/workflows/ci.yml"
             path.parent.mkdir(parents=True)
             path.write_text("prohibited")
 
     monkeypatch.setattr(controller, "submit_work", simulate_worker_edit)
     outcome = loop.run_pass()[0]
-    assert outcome.final_phase in {"failed", "escalated"}
-    assert ".github/workflows/" in outcome.reason
-    assert pushed == []
-    assert gate.evaluated == []
-    assert queue.load_state("owner/repo#1").phase in {"failed", "escalated"}
+    if editing_lane == "developer":
+        assert outcome.final_phase == "failed"
+        assert ".github/workflows/" in outcome.reason
+        assert pushed == []
+        assert gate.evaluated == []
+    else:
+        assert outcome.final_phase == "done", outcome.reason
+        assert len(pushed) == len(gate.evaluated) == 1
+    assert queue.load_state("owner/repo#1").phase == outcome.final_phase
 
 
 def test_actual_executor_fails_closed_when_git_cannot_observe(repo):
@@ -232,7 +239,12 @@ def test_commit_budget_uses_current_worktree_after_review(
     outcome = loop.run_pass()[0]
     assert outcome.final_phase == expected
     if expected == "escalated":
-        assert "commit budget exhausted" in outcome.reason
+        expected_reason = (
+            "developer worktree changed"
+            if editing_lane == "requirements-reviewer"
+            else "commit budget exhausted"
+        )
+        assert expected_reason in outcome.reason
         assert pushed == []
         assert gate.evaluated == []
     else:

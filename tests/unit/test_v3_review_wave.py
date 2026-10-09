@@ -10,6 +10,7 @@ from tests.unit.test_v3_foreman import (
     FakeBroker,
     RecordingGit,
     ScriptedExecutor,
+    _finding,
     _foreman,
     _gate,
     _ready_fake,
@@ -183,3 +184,42 @@ def test_review_wave_uses_broker_fallbacks_when_primary_capacity_is_full():
         "fallback-breaker-reviewer",
         "fallback-architecture-reviewer",
     }
+
+
+def test_partial_checkout_failure_cleans_previously_materialized_reviews():
+    class FailingGit(RecordingGit):
+        def create_review_checkout(self, path, source_workdir, head_sha):
+            if "breaker-reviewer" in path:
+                raise RuntimeError("review checkout creation failed")
+            return super().create_review_checkout(path, source_workdir, head_sha)
+
+    git = FailingGit()
+    loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), git=git)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "review checkout creation failed" in outcome.reason
+    assert not any("-review-1-" in path for path in git.worktrees)
+    assert queue.load_state("owner/repo#1").extras["review_waves"]["review-1"]["lanes"]
+
+
+def test_failed_finding_persistence_does_not_claim_completed_reviews(monkeypatch):
+    git = RecordingGit()
+    executor = ScriptedExecutor(reviewer_findings_by_round={1: [_finding(1)]})
+    loop, queue = _foreman(_ready_fake(), executor, _gate(), git=git)
+    save = queue.save_state
+
+    def reject_findings(state, expected_updated_at):
+        if state.findings:
+            raise StateConflictError("finding persistence failed")
+        save(state, expected_updated_at)
+
+    monkeypatch.setattr(queue, "save_state", reject_findings)
+    outcome = loop.run_pass()[0]
+
+    assert outcome.final_phase == "escalated"
+    assert "finding persistence failed" in outcome.reason
+    wave = queue.load_state("owner/repo#1").extras["review_waves"]["review-1"]
+    assert {record["status"] for record in wave["lanes"].values()} == {"planned"}
+    assert executor.terminated == []
+    assert len([path for path in git.worktrees if "-review-1-" in path]) == 3
