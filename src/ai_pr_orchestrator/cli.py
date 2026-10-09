@@ -170,7 +170,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--apply",
         dest="dry_run",
         action="store_false",
-        help="Apply non-destructive actions (orphan cleanups, lease recovery)",
+        help="Unsupported: requires runtime controllers and complete inventory",
     )
     reconcile_parser.add_argument(
         "--issue",
@@ -465,23 +465,13 @@ def _pr_number_from_event(event_path: Path, *, fallback_pr: int | None = None) -
 
 
 def _run_reconcile(args: argparse.Namespace) -> int:
-    """Plan (or apply) recovery actions for the configured repo.
+    """Render a recovery plan; this CLI has no complete runtime apply boundary."""
+    if not args.dry_run:
+        print(
+            "aipro reconcile: --apply is unsupported; runtime controllers and inventory are required"
+        )
+        return 3
 
-    In ``--dry-run`` (the default) the planner runs against the GitHub
-    client the queue already speaks — the real :class:`GitHubClient` when a
-    token is available, the in-memory fake otherwise — and every action is
-    printed rather than applied. With ``--apply``, only non-destructive
-    actions (``RECOVER_STALE_LEASE``, ``CLEAN_ORPHAN_SESSION``,
-    ``CLEAN_ORPHAN_WORKTREE``) are applied through the queue / CAO
-    controller / git ops; the dangerous ones (``ESCALATE``,
-    ``HALT_BRANCH_MOVED``) are always surfaced and the command exits
-    non-zero, because a non-idempotent side effect on uncertain state is
-    exactly what reconciliation must not do.
-
-    The CLI is a thin orchestrator: it builds the observation bundle, hands
-    it to :class:`ReconcilePlanner`, and renders the result. Tests cover the
-    planner and the renderer; this function glues them to argparse.
-    """
     from ai_pr_orchestrator.v3.config import load_v3_config
     from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 
@@ -494,7 +484,7 @@ def _run_reconcile(args: argparse.Namespace) -> int:
     queue_cfg = config.github_queue
 
     owner, repo, github_token = _resolve_repo_credentials(args, queue_cfg)
-    client, dry_run_client = _build_github_client(
+    client, _ = _build_github_client(
         owner=owner, repo=repo, token=github_token, queue_dry_run=args.dry_run
     )
     queue = GitHubIssueQueue(
@@ -513,8 +503,7 @@ def _run_reconcile(args: argparse.Namespace) -> int:
 
     actions: list[ReconcileAction] = planner.plan_many(inputs_list)
 
-    # ESCALATE / HALT_BRANCH_MOVED must always surface and exit non-zero,
-    # regardless of --apply.
+    # Manual recovery decisions are visible as a non-zero planning result.
     manual_actions = [
         a
         for a in actions
@@ -556,15 +545,7 @@ def _run_reconcile(args: argparse.Namespace) -> int:
                     f"{action.reason}"
                 )
 
-    # --apply wires real I/O: non-destructive actions go through the
-    # queue (lease recovery), the CAO controller (session cleanup), and
-    # the git worktree ops (worktree cleanup). Manual actions never apply.
-    if not args.dry_run and actions:
-        _apply_actions(actions, queue=queue, client=client, dry_run_client=dry_run_client)
-
-    if manual_actions:
-        return 2
-    return 0
+    return 2 if manual_actions else 0
 
 
 def _resolve_repo_credentials(
@@ -613,9 +594,7 @@ def _build_github_client(
 
     Production callers always pass a real :class:`GitHubClient`; the
     dry-run path substitutes the in-memory fake so the CLI is testable
-    without a token. ``dry_run_client`` is reported back so ``--apply``
-    can refuse to run with a fake client (it would silently mutate
-    nothing).
+    without a token. The returned flag identifies this provenance.
     """
     if token:
         from ai_pr_orchestrator.github.client import GitHubClient
@@ -625,98 +604,6 @@ def _build_github_client(
 
     fake = FakeGitHubClient()
     return fake, True
-
-
-def _apply_actions(
-    actions: list[ReconcileAction],
-    *,
-    queue: GitHubIssueQueue,
-    client: Any,
-    dry_run_client: bool,
-) -> None:
-    """Apply the auto-apply subset of ``actions`` through their controllers.
-
-    Manual actions (ESCALATE / HALT_BRANCH_MOVED) are never applied — they
-    were already surfaced and ``_run_reconcile`` exits non-zero for them.
-    Recover / cleanup actions hit the relevant controller:
-
-    - ``RECOVER_STALE_LEASE``: ``queue.reclaim_expired`` (idempotent on the
-      already-stale lease).
-    - ``CLEAN_ORPHAN_SESSION``: ``queue`` cannot delete a CAO session
-      directly, so we record the intent on the queue's underlying client
-      and emit a structured log so an operator can run the appropriate
-      ``cao`` command. (The full CAO controller wiring lives in a
-      higher-level tool; this CLI is the reconciliation entry point.)
-    - ``CLEAN_ORPHAN_WORKTREE``: same approach — emit a structured log.
-
-    With a fake client we still print the actions but skip the queue
-    write: the fake has no notion of a stale lease.
-    if dry_run_client:
-        return
-    """
-    from ai_pr_orchestrator.v3.queue import claim_from_state
-
-    for action in actions:
-        if not action.auto_apply:
-            continue
-        if action.kind is ReconcileActionKind.RECOVER_STALE_LEASE:
-            issue_ref = _parse_work_item_to_issue(action.work_item_id)
-            if issue_ref is None:
-                continue
-            state = queue.load_state(issue_ref.slug())
-            if state is None:
-                continue
-            try:
-                claim = claim_from_state(state)
-            except Exception:
-                continue
-            new_run_id = f"{claim.run_id}-recover"
-            try:
-                queue.reclaim_expired(
-                    issue_ref,
-                    state,
-                    new_run_id,
-                    branch=claim.branch,
-                    worktree=claim.worktree,
-                    pr_number=claim.pr_number,
-                )
-            except Exception as exc:
-                print(f"recover_stale_lease failed for {issue_ref.slug()}: {exc}")
-            continue
-        if action.kind is ReconcileActionKind.CLEAN_ORPHAN_SESSION:
-            # The CLI's responsibility here is to surface the cleanup intent
-            # with a stable identifier (session_id). The actual session
-            # deletion goes through CaoSessionController in production;
-            # we record a structured log entry so an operator can dispatch.
-            print(
-                f"aipro reconcile: clean_orphan_session "
-                f"session_id={action.session_id} work_item={action.work_item_id}"
-            )
-            continue
-        if action.kind is ReconcileActionKind.CLEAN_ORPHAN_WORKTREE:
-            print(
-                f"aipro reconcile: clean_orphan_worktree "
-                f"branch={action.branch} worktree={action.worktree}"
-            )
-
-
-def _parse_work_item_to_issue(work_item_id: str | None) -> GitHubIssueRef | None:
-    """Convert ``"owner/repo#42"`` back to a :class:`GitHubIssueRef`."""
-    if not work_item_id:
-        return None
-    if "#" not in work_item_id:
-        return None
-    head, _, number_str = work_item_id.rpartition("#")
-    if "/" not in head:
-        return None
-    owner, _, repo = head.partition("/")
-    try:
-        number = int(number_str)
-    except ValueError:
-        return None
-    if not owner or not repo or number <= 0:
-        return None
-    return GitHubIssueRef(owner=owner, repo=repo, number=number)
 
 
 def _build_reconciliation_inputs(
