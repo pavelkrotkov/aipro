@@ -1426,9 +1426,7 @@ class ForemanPolicyLoop:
                 return self._broker.reserve(assignment), refs[index + 1 :]
             except BrokerError as exc:
                 errors.append(str(exc))
-        raise ForemanQueueError(
-            f"no reservable model for lane {lane.lane!r}: " + "; ".join(errors)
-        )
+        raise ForemanQueueError(f"no reservable model for lane {lane.lane!r}: " + "; ".join(errors))
 
     @staticmethod
     def _saved_worker_route(

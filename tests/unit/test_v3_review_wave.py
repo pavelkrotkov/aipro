@@ -64,8 +64,7 @@ def test_default_reviewers_are_blind_isolated_concurrent_and_diverse():
     assert "/wt/issue-1" not in workdirs
     assert {row[1].head_sha for row in seen.values()} == {"sha"}
     assert all(
-        "Acceptance: preserve the exact task specification." in row[2]
-        for row in seen.values()
+        "Acceptance: preserve the exact task specification." in row[2] for row in seen.values()
     )
     assert all("implemented requested change" not in row[2] for row in seen.values())
     assert "Requirements prosecutor:" in seen["requirements-reviewer"][2]
