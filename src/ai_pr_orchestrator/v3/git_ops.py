@@ -5,12 +5,13 @@ Subprocess-backed implementation of
 repository's default branch, materialize an isolated worktree, commit with an
 explicit identity, and push.
 
-Every git invocation carries an explicit identity (``-c user.name``/
-``user.email``) or takes one as a parameter: the implementation never reads
-ambient global git config, so a machine's default identity cannot silently
-author V3 commits. All failures surface as :class:`GitOpsError` with the
-command and its stderr attached — policy callers must not need to parse
-subprocess results.
+Git author identity is explicit, and authoritative invocations ignore ambient
+Git configuration and reject executable repository settings. Hooks are disabled.
+Worker isolation of credentials and shared Git metadata remains a deployment
+requirement; subprocess hardening is not an OS security boundary.
+
+All failures surface as :class:`GitOpsError` with the command and stderr
+attached — policy callers must not need to parse subprocess results.
 
 No vendor, model, or provider name appears in this module.
 """
@@ -47,10 +48,24 @@ class GitWorktreeOps:
         self._timeout = git_timeout if git_timeout is not None else timeout
         #: Non-interactive child environment: never prompt for credentials and
         #: make SSH/host-key interaction fail fast instead of hanging a lane.
-        env = dict(os.environ)
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND", "ssh") + " -o BatchMode=yes"
+        env = {
+            key: os.environ[key]
+            for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSH_AUTH_SOCK")
+            if key in os.environ
+        }
+        env.update(
+            GIT_TERMINAL_PROMPT="0",
+            GIT_SSH_COMMAND="ssh -o BatchMode=yes",
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1",
+        )
         self._env = env
+        try:
+            self._origin_url = self._run(
+                "config", "--local", "--no-includes", "--get", "remote.origin.url"
+            ).strip()
+        except GitOpsError:
+            self._origin_url = ""
 
     # --- primitives ---------------------------------------------------------
 
@@ -227,8 +242,61 @@ class GitWorktreeOps:
             raise GitOpsError(f"workdir {workdir} does not exist")
         return path
 
+    def _check_authority(self, args: tuple[str, ...]) -> None:
+        command = args[2:] if args[0] == "-C" else args
+        if command[0] == "config":
+            return
+        cwd = args[1] if args[0] == "-C" else str(self._root)
+        self._check_executable_config(cwd)
+        if command[0] == "push":
+            origin = self._run(
+                "config", "--local", "--no-includes", "--get", "remote.origin.url"
+            ).strip()
+            if not self._origin_url or origin != self._origin_url:
+                raise GitOpsError("origin URL changed since GitWorktreeOps initialization")
+
+    def _check_executable_config(self, cwd: str) -> None:
+        config = self._run("-C", cwd, "config", "--list", "--no-includes", "-z")
+        executable = (
+            "filter.",
+            "url.",
+            "include.",
+            "includeif.",
+            "credential.",
+            "gpg.",
+            "diff.",
+            "merge.",
+            "alias.",
+            "http.",
+            "https.",
+            "protocol.",
+            "push.",
+            "commit.gpgsign",
+            "core.sshcommand",
+            "core.worktree",
+            "core.alternaterefscommand",
+            "core.gitproxy",
+            "remote.origin.push",
+            "remote.origin.receivepack",
+            "remote.origin.uploadpack",
+            "remote.origin.vcs",
+            "remote.origin.mirror",
+            "remote.origin.proxy",
+        )
+        unsafe = next(
+            (
+                entry.partition("\n")[0]
+                for entry in config.split("\0")
+                if entry.startswith(executable)
+            ),
+            None,
+        )
+        if unsafe:
+            raise GitOpsError(f"unsafe Git configuration in {cwd}: {unsafe}")
+
     def _run(self, *args: str) -> str:
-        cmd = ("git", *args)
+        self._check_authority(args)
+        cmd = ("git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args)
         # Non-interactive + bounded: a git call must never hang waiting on a
         # credential/terminal prompt or a stalled SSH agent. We close stdin and
         # force batch behaviour so the only way a call ends is success, a clean
