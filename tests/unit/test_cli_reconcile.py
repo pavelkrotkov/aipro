@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from ai_pr_orchestrator import cli
+from ai_pr_orchestrator.v3.reconcile import Action, ActionKind
 
 CONFIG_BODY = """
 github_queue:
@@ -42,13 +43,30 @@ def test_reconcile_dry_run_with_no_issue(
     assert "noop" in out.lower() or "Nothing to reconcile" in out
 
 
-def test_reconcile_json_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+@pytest.mark.parametrize(
+    "kind", [ActionKind.NOOP, ActionKind.ESCALATE, ActionKind.HALT_BRANCH_MOVED]
+)
+def test_reconcile_json_output(tmp_path, capsys, monkeypatch, kind) -> None:
     config_path = write_config(tmp_path)
+    action = Action(kind, work_item_id="test-owner/test-repo#1", reason="recovery evidence")
+    monkeypatch.setattr(cli.ReconcilePlanner, "plan_many", lambda *_: [action])
     exit_code = cli.main(["reconcile", "--config", str(config_path), "--json"])
-    assert exit_code == 0
-    out = capsys.readouterr().out
-    parsed = json.loads(out)
-    assert "actions" in parsed
+    assert exit_code == (0 if kind == ActionKind.NOOP else 2)
+    assert json.loads(capsys.readouterr().out) == {
+        "actions": [
+            {
+                "kind": kind.value,
+                "work_item_id": action.work_item_id,
+                "run_id": None,
+                "session_id": None,
+                "branch": None,
+                "worktree": None,
+                "pr_number": None,
+                "reason": action.reason,
+                "auto_apply": kind == ActionKind.NOOP,
+            }
+        ]
+    }
 
 
 def test_reconcile_invalid_issue_arg(tmp_path: Path) -> None:

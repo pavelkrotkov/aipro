@@ -1,30 +1,13 @@
-"""Regression tests for Codex review round 1 on reconciliation: findings 1 and 2 (issue #44).
-
-1. ``--apply`` actually applies; non-manual actions go through controllers.
-2. The CLI uses a real :class:`GitHubClient` when a token is supplied
-   (not a hard-coded ``FakeGitHubClient`` with literal ``"owner"``/``"repo"``).
-"""
+"""Regression tests for reconciliation CLI safety and repository selection."""
 
 from __future__ import annotations
 
-from datetime import timedelta
 from unittest.mock import MagicMock
 
 import pytest
-from _reconcile_builders import (
-    frozen_now,
-    make_claim,
-    make_state,
-)
 
 from ai_pr_orchestrator import cli
-from ai_pr_orchestrator.github.fake import FakeGitHubClient
-from ai_pr_orchestrator.v3.domain import GitHubIssueRef, WorkflowState
-from ai_pr_orchestrator.v3.queue import GitHubIssueQueue, GitHubQueueConfig
-from ai_pr_orchestrator.v3.reconcile import (
-    ReconciliationInputs,
-    WorkItemObservation,
-)
+from ai_pr_orchestrator.v3.domain import WorkflowState
 
 
 class TestCliApplyAndRepo:
@@ -74,70 +57,17 @@ class TestCliApplyAndRepo:
             cli.main(["reconcile", "--config", str(config_path)])
         assert "Could not determine GitHub repo" in str(exc.value)
 
-    def test_reconcile_apply_invokes_queue_reclaim(self, tmp_path, monkeypatch, capsys) -> None:
-        """``--apply`` with a stale-lease scenario goes through
-        ``queue.reclaim_expired`` rather than printing and forgetting.
+    def test_reconcile_apply_refuses_before_any_io(self, monkeypatch, capsys) -> None:
+        """Without complete CAO/Git inventory, even authenticated apply is unsafe."""
+        client = MagicMock(side_effect=AssertionError("must not construct a GitHub client"))
+        inventory = MagicMock(side_effect=AssertionError("must not read partial inventory"))
+        monkeypatch.setattr(cli, "_build_github_client", client)
+        monkeypatch.setattr(cli, "_build_reconciliation_inputs", inventory)
 
-        The fake client + fake queue let us observe the write without a
-        live network.
-        """
-
-        # Build a config that names a real (fake-client-friendly) repo.
-        config_path = tmp_path / "v3.yml"
-        config_path.write_text(
-            "github_queue:\n  enabled_label: v3-work\n  lease_seconds: 900\n"
-            "  owner: test-owner\n  repo: test-repo\n"
-            "cao:\n  base_url: http://localhost:9889\n",
-            encoding="utf-8",
-        )
-
-        # Wire a fake client + queue and seed a stale-lease state.
-        fake = FakeGitHubClient()
-        GitHubIssueQueue(fake, "test-owner", "test-repo", GitHubQueueConfig(), host_id="test")
-        now = frozen_now()
-        state = make_state(
-            phase="coding",
-            lease_expires_at=now - timedelta(seconds=120),
-            claimed_at=now - timedelta(seconds=2000),
-        )
-        issue = GitHubIssueRef(owner="test-owner", repo="test-repo", number=42)
-
-        def fake_inputs(*args, **kwargs):
-
-            return [
-                ReconciliationInputs(
-                    observation=WorkItemObservation(
-                        work_item=issue,
-                        state=state,
-                        claim=make_claim(state),
-                    ),
-                    sessions=(),
-                    worktrees=(),
-                    pull_requests=(),
-                    config=kwargs["cleanup_cfg"],
-                    queue_config=kwargs["queue_cfg"],
-                    now=now,
-                )
-            ]
-
-        monkeypatch.setattr(cli, "_build_reconciliation_inputs", fake_inputs)
-        monkeypatch.setattr(cli, "_build_github_client", lambda **_: (fake, True))
-
-        # --apply should not raise and should report the stale lease.
-        exit_code = cli.main(
-            [
-                "reconcile",
-                "--config",
-                str(config_path),
-                "--apply",
-                "--repo",
-                "test-owner/test-repo",
-            ]
-        )
-        # Stale lease = ESCALATE -> exit code 2.
-        assert exit_code == 2
-        out = capsys.readouterr().out
-        assert "ESCALATE" in out or "escalate" in out
+        assert cli.main(["reconcile", "--config", "unused", "--apply", "--token", "unused"]) == 3
+        assert "--apply is unsupported" in capsys.readouterr().out
+        client.assert_not_called()
+        inventory.assert_not_called()
 
     def test_cli_uses_real_client_with_token(self, tmp_path, monkeypatch, capsys) -> None:
         """When ``GITHUB_TOKEN`` is set, the CLI builds the real
