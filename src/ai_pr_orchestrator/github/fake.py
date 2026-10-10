@@ -59,6 +59,7 @@ class _MutableCheckRun:
     status: str
     conclusion: str | None
     html_url: str = ""
+    summary: str = ""
 
     def to_model(self) -> models.CheckRun:
         return models.CheckRun(
@@ -67,6 +68,7 @@ class _MutableCheckRun:
             status=self.status,
             conclusion=self.conclusion,
             html_url=self.html_url,
+            summary=self.summary,
         )
 
 
@@ -176,6 +178,7 @@ class FakeGitHubClient:
         *,
         check_run_id: int | None = None,
         html_url: str = "",
+        summary: str = "",
     ) -> models.CheckRun:
         crid = check_run_id if check_run_id is not None else self._next_check_run_id
         if crid >= self._next_check_run_id:
@@ -187,6 +190,7 @@ class FakeGitHubClient:
             status=status,
             conclusion=conclusion,
             html_url=html_url,
+            summary=summary,
         )
         self._check_runs.setdefault(ref, []).append(mcr)
         return mcr.to_model()
@@ -197,6 +201,8 @@ class FakeGitHubClient:
         context: str,
         status: str,
         conclusion: str | None = None,
+        *,
+        summary: str = "",
     ) -> models.CheckRun:
         """Seed a Statuses-API context already adapted to CheckRun shape, as
         ``get_commit_statuses`` returns it to the runner."""
@@ -205,6 +211,7 @@ class FakeGitHubClient:
             name=context,
             status=status,
             conclusion=conclusion,
+            summary=summary,
         )
         self._commit_statuses.setdefault(ref, []).append(cr)
         return cr
@@ -266,6 +273,11 @@ class FakeGitHubClient:
         self._prs[number] = pr
         self._labels.setdefault(number, [])
         return pr
+
+    def update_pr_body(self, number: int, body: str) -> models.PullRequest:
+        updated = replace(self.get_pr(number), body=body)
+        self._prs[number] = updated
+        return updated
 
     def list_open_prs(self) -> list[models.PullRequest]:
         return [pr for pr in self._prs.values() if pr.state == "open"]

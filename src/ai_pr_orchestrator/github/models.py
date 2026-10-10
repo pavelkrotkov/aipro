@@ -53,6 +53,7 @@ class CheckRun:
     status: str
     conclusion: str | None
     html_url: str = ""
+    summary: str = ""
 
 
 @dataclass(frozen=True)

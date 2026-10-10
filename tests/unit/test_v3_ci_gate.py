@@ -209,3 +209,37 @@ def test_malformed_completed_adapted_status_cannot_pass(conclusion):
     assert not decision.passed
     assert decision.failed_checks == ("build",)
     assert decision.pending_checks == ()
+
+
+def test_failed_check_preserves_bounded_stable_failure_excerpt():
+    fake = FakeGitHubClient()
+    fake.seed_check_run(
+        SHA, "build", "completed", "failure", summary="Assert failed:\n  expected 42"
+    )
+    result = CIPRGateImpl(fake).evaluate(_issue(), _pr())
+    assert result.failed_checks == ("build",)
+    assert "build: Assert failed: expected 42" in result.detail
+    assert "\n" not in result.detail
+
+
+@respx.mock
+def test_real_github_clients_supply_check_summary_and_commit_status_description():
+    base = f"https://api.github.com/repos/owner/repo/commits/{SHA}"
+    runs = [
+        {
+            "id": 1,
+            "name": "build",
+            "status": "completed",
+            "conclusion": "failure",
+            "output": {"summary": "Compilation failed in job 1"},
+        },
+    ]
+    respx.get(f"{base}/check-runs").respond(200, json={"check_runs": runs})
+    respx.get(f"{base}/statuses").respond(
+        200, json=[{"context": "lint", "state": "failure", "description": "No license header"}]
+    )
+    with GitHubClient(token="test", owner="owner", repo="repo") as client:
+        result = CIPRGateImpl(client).evaluate(_issue(), _pr())
+    assert result.failed_checks == ("build", "lint")
+    assert "build: Compilation failed in job 1" in result.detail
+    assert "lint: No license header" in result.detail
