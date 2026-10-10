@@ -123,9 +123,7 @@ def test_bounded_spend_selection_requires_a_permanent_no_charge_model():
     assert decision.assignment.model_ref == "free"
     assert {item.ref for item in decision.rejected} == {"paid", "promo"}
     assert pool.reserve(decision.assignment).max_charge_usd == 0.0
-    assert (
-        pool.reserve(ModelAssignment(lane="developer", model_ref="paid")).max_charge_usd is None
-    )
+    assert pool.reserve(ModelAssignment(lane="developer", model_ref="paid")).max_charge_usd is None
 
 
 class TestUnscoredCandidates:

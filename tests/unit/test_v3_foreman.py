@@ -907,29 +907,31 @@ def test_spend_authorizations_are_cas_persisted_and_replay_safe():
     loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), cfg)
     state = queue.claim(ISSUE, "run-1")
     first = ModelLease(
-        "lease-1", ModelAssignment(lane="developer", model_ref="bounded"),
+        "lease-1",
+        ModelAssignment(lane="developer", model_ref="bounded"),
         max_charge_usd=0.3,
     )
     extras = loop._authorize_spend(state, first, "coder:1")
     state = loop._save_fresh(ISSUE, state, extras=extras)
-    assert queue.load_state(ISSUE.slug()).extras["spend_authorizations"] == extras[
-        "spend_authorizations"
-    ]
+    stored = queue.load_state(ISSUE.slug())
+    assert stored is not None
+    assert stored.extras["spend_authorizations"] == extras["spend_authorizations"]
     assert loop._authorize_spend(state, first, "coder:1") == extras
     with pytest.raises(_ForemanEscalation, match="conflicting dispatch authorization"):
-        loop._authorize_spend(
-            state, replace(first, max_charge_usd=0.1), "coder:1"
-        )
+        loop._authorize_spend(state, replace(first, max_charge_usd=0.1), "coder:1")
     with pytest.raises(_ForemanEscalation, match="maximum run cash charge exhausted"):
         loop._authorize_spend(
             state, replace(first, max_charge_usd=0.25), "review-1:breaker-reviewer"
         )
     altered = replace(
         state,
-        extras={**state.extras, "spend_authorizations": {
-            "run_id": "run-1",
-            "charges": {"past": {"max_charge_usd": -1}},
-        }},
+        extras={
+            **state.extras,
+            "spend_authorizations": {
+                "run_id": "run-1",
+                "charges": {"past": {"max_charge_usd": -1}},
+            },
+        },
     )
     with pytest.raises(_ForemanEscalation, match="invalid persisted"):
         loop._authorize_spend(altered, first, "coder:1")

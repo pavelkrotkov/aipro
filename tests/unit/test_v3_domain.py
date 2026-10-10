@@ -89,8 +89,10 @@ class TestWorkflowState:
         with pytest.raises(DomainError, match="terminal_reason"):
             WorkflowState(work_item_id="wi-1", run_id="run-1", phase="cancelled")
         state = WorkflowState(
-            work_item_id="wi-1", run_id="run-1",
-            phase="cancelled", terminal_reason="operator stopped the run",
+            work_item_id="wi-1",
+            run_id="run-1",
+            phase="cancelled",
+            terminal_reason="operator stopped the run",
         )
         assert WorkflowState.from_dict(state.to_dict()) == state
 

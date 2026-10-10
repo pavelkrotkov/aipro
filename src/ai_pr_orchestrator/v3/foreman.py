@@ -279,11 +279,10 @@ class ForemanPolicyLoop:
                 reason = f"foreman error: {exc}"
                 self._persist_crash(issue, reason)
                 cancelled = self._cancelled_outcome(issue)
-                outcomes.append(
-                    cancelled or WorkItemOutcome(
-                        issue=issue, final_phase="escalated", reason=reason, escalated=True
-                    )
+                outcome = cancelled or WorkItemOutcome(
+                    issue=issue, final_phase="escalated", reason=reason, escalated=True
                 )
+                outcomes.append(outcome)
             # CI-only claims own no local checkout; a retained path can belong
             # to unrelated work on this host. Keep its attribution for recovery.
             if not resume_at_gate:
@@ -1487,7 +1486,9 @@ class ForemanPolicyLoop:
     def _cash_total(charges: dict[str, object]) -> float:
         total = 0.0
         for row in charges.values():
-            amount = row.get("max_charge_usd") if isinstance(row, dict) else None
+            if not isinstance(row, dict):
+                raise _ForemanEscalation("spend guard: invalid persisted cash-charge ceiling")
+            amount = cast(dict[str, object], row).get("max_charge_usd")
             if (
                 not isinstance(amount, (int, float))
                 or isinstance(amount, bool)

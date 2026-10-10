@@ -700,7 +700,10 @@ class ReconcilePlanner:
         # evaluated crash rows first, which fired spurious RELAUNCH /
         # RESUME_SESSION actions on completed work and could re-launch a
         # terminal item.
-        if inputs.observation.state is not None and inputs.observation.state.phase in TERMINAL_PHASES:
+        if (
+            inputs.observation.state is not None
+            and inputs.observation.state.phase in TERMINAL_PHASES
+        ):
             return [
                 Action(
                     kind=ActionKind.NOOP,
