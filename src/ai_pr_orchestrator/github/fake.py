@@ -79,6 +79,7 @@ class FakeGitHubClient:
         self._now = now or datetime.now(UTC)
         self._page_size = page_size
         self._prs: dict[int, models.PullRequest] = {}
+        self._branch_heads: dict[str, str] = {}
         self._issue_titles: dict[int, str] = {}
         self._issue_bodies: dict[int, str] = {}
         self._next_pr_number = 1
@@ -253,6 +254,12 @@ class FakeGitHubClient:
     def get_issue_body(self, number: int) -> str | None:
         return self._issue_bodies.get(number)
 
+    def record_branch_head(self, branch: str, head_sha: str) -> None:
+        self._branch_heads[branch] = head_sha
+        for number, pr in self._prs.items():
+            if pr.head_ref == branch and not pr.is_fork:
+                self._prs[number] = replace(pr, head_sha=head_sha)
+
     def create_pr(self, title: str, body: str, head: str, base: str) -> models.PullRequest:
         number = self._next_pr_number
         self._next_pr_number += 1
@@ -261,11 +268,7 @@ class FakeGitHubClient:
             title=title,
             body=body,
             state="open",
-            # A real PR carries an actual commit SHA in ``head_sha``; the fake
-            # synthesizes a deterministic one so callers that rely on the SHA
-            # (e.g. the foreman's PR ref for gating) never see the branch name
-            # or an empty string masquerading as a head.
-            head_sha=f"fake-{number}-sha",
+            head_sha=self._branch_heads.get(head, f"fake-{number}-sha"),
             head_ref=head,
             base_ref=base,
             author="fake-bot",

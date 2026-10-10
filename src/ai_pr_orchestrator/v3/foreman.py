@@ -397,7 +397,7 @@ class ForemanPolicyLoop:
         state = self._enforce_deadline(issue, state, now=now)
         fix_findings = tuple(f for f in state.findings if f.status == "open")
         result: LaneResult | None = None
-        head_sha: str | None = None
+        head_sha: str | None = state.extras.get("head_sha")
 
         while True:
             cancelled = self._cancelled_outcome(issue)
@@ -2115,6 +2115,8 @@ class ForemanPolicyLoop:
     ) -> GitHubPullRequestRef:
         client = getattr(self._queue, "_client", None)
         pr = self._reconcile_pr(issue, state, branch)
+        if head_sha is None or pr.head_sha != head_sha:
+            raise PRReconciliationError("PR head differs from the reviewed snapshot")
         body = self._with_pr_summary(pr.body, self._pr_body(issue, state))
         if body != pr.body:
             expected_head = pr.head_sha
