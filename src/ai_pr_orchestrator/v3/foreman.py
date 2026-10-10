@@ -491,6 +491,7 @@ class ForemanPolicyLoop:
             # authoritative state.
             state = self._load(issue, state)
             decision = self._gate.evaluate(issue, pr)
+            self._validate_ci_head(pr)
             if decision.passed:
                 state = self._transition(issue, state, "updating_pr", now=now)
                 state = self._transition(issue, state, "done", terminal_reason="ci green", now=now)
@@ -571,6 +572,7 @@ class ForemanPolicyLoop:
                 )
             failure = self._signal_hash(
                 sorted(normalize_claim(name) for name in decision.failed_checks)
+                + [normalize_claim(decision.detail)]
             )
             seen = state.extras.get("ci_failure_hashes", [])
             if not isinstance(seen, list):
@@ -591,7 +593,7 @@ class ForemanPolicyLoop:
                 ReviewerFinding(
                     id=f"ci-failed-{name}",
                     lane="ci",
-                    body=f"CI check {name} failed",
+                    body=f"CI check {name} failed. {decision.detail[:1000]}",
                     severity="major",
                     run_id=self._run_id,
                     round_id=state.round_id or "ci",
@@ -2109,13 +2111,19 @@ class ForemanPolicyLoop:
             if pr is None and hasattr(client, "create_pr"):
                 pr = client.create_pr(
                     f"[aipro] issue #{issue.number}: automated change",
-                    f"Automated work for {issue.slug()}.",
+                    self._pr_body(issue, state),
                     head=branch,
                     base=self._git.default_branch(),
                 )
             if pr is not None:
                 self._record_pr(issue, state, pr.number)
         if pr is not None:
+            body = self._with_pr_summary(pr.body, self._pr_body(issue, state))
+            if body != pr.body:
+                expected_head = pr.head_sha
+                pr = cast(GitHubClient, client).update_pr_body(pr.number, body)
+                if pr.head_sha != expected_head:
+                    raise PRReconciliationError("PR head changed during summary update")
             return GitHubPullRequestRef(
                 owner=issue.owner,
                 repo=issue.repo,
@@ -2131,6 +2139,59 @@ class ForemanPolicyLoop:
             number=number,
             head_sha=head_sha or f"head-{number}",
         )
+
+
+    @staticmethod
+    def _pr_body(issue: GitHubIssueRef, state: WorkflowState) -> str:
+        report = state.extras.get("developer_report", {})
+        waves = state.extras.get("review_waves", {})
+        reviewers = [
+            f"{turn}/{lane}: {record['assignment']['model_ref']}"
+            for turn, wave in sorted(waves.items())
+            for lane, record in sorted(wave["lanes"].items())
+        ]
+        developer = state.extras.get("developer_model", {})
+        models = ", ".join([f"developer: {developer.get('model_ref', 'unknown')}", *reviewers])
+        dispositions = ", ".join(sorted(d.action for d in state.dispositions)) or "none"
+        tests = ", ".join(
+            f"{test['command']} ({test['result']})" for test in report.get("tests", [])
+        ) or "not reported"
+        detail = "\n".join(
+            (
+                f"Refs #{issue.number}",
+                f"Run: `{state.run_id}` | Head: `{state.extras.get('head_sha', '')}`",
+                f"Implementation: {report.get('summary', 'not reported')}",
+                f"Tests: {tests}",
+                f"Review: {len(state.findings)} active, {len(state.archived)} archived; "
+                f"dispositions: {dispositions}",
+                f"Models: {models}",
+            )
+        )
+        return "<!-- aipro-summary:start -->\n" + detail + "\n<!-- aipro-summary:end -->"
+
+    @staticmethod
+    def _with_pr_summary(body: str, summary: str) -> str:
+        start, end = "<!-- aipro-summary:start -->", "<!-- aipro-summary:end -->"
+        if start not in body:
+            return (body.rstrip() + "\n\n" + summary).lstrip()
+        prefix, _, remainder = body.partition(start)
+        _, marker, suffix = remainder.partition(end)
+        if not marker:
+            raise PRReconciliationError("malformed aipro PR summary markers")
+        return prefix + summary + suffix
+
+    def _validate_ci_head(self, pr: GitHubPullRequestRef) -> None:
+        client = getattr(self._queue, "_client", None)
+        if client is None:
+            return
+        try:
+            actual = client.get_pr(pr.number).head_sha
+        except Exception as exc:
+            raise PRReconciliationError(f"PR head recheck failed: {exc}") from exc
+        if actual != pr.head_sha:
+            raise PRReconciliationError(
+                f"PR head changed during CI gate: expected {pr.head_sha}, got {actual}"
+            )
 
     def _discover_open_pr(self, client, branch: str):
         """Reconcile the authoritative branch, excluding same-named fork PRs."""

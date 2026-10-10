@@ -162,6 +162,10 @@ class GitHubClient:
             raise GitHubClientError("create_pr returned no payload (dry-run client?)")
         return self.get_pr(data["number"])
 
+    def update_pr_body(self, number: int, body: str) -> models.PullRequest:
+        self._patch(f"/repos/{self._owner}/{self._repo}/pulls/{number}", json={"body": body})
+        return self.get_pr(number)
+
     def list_open_prs(self) -> list[models.PullRequest]:
         data = self._get_paginated(
             f"/repos/{self._owner}/{self._repo}/pulls",
@@ -257,6 +261,7 @@ class GitHubClient:
                 status=cr["status"],
                 conclusion=cr.get("conclusion"),
                 html_url=cr.get("html_url", ""),
+                summary=(cr.get("output") or {}).get("summary") or "",
             )
             for cr in data
         ]
@@ -304,6 +309,7 @@ class GitHubClient:
                     status=check_status,
                     conclusion=conclusion,
                     html_url=status.get("target_url") or "",
+                    summary=status.get("description") or "",
                 )
             )
         return runs

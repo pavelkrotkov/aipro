@@ -54,11 +54,14 @@ class CIPRGateImpl:
         by_name: dict[str, str] = {}
         failed: list[str] = []
         pending: list[str] = []
+        excerpts: dict[str, str] = {}
         for run in runs:
             if run.status != _COMPLETED:
                 pending.append(run.name)
             elif run.conclusion not in _PASSED_CONCLUSIONS:
                 failed.append(run.name)
+                if run.summary:
+                    excerpts[run.name] = " ".join(run.summary.split())[:240]
             else:
                 by_name[run.name] = run.conclusion
         for status in statuses:
@@ -66,6 +69,8 @@ class CIPRGateImpl:
                 pending.append(status.name)
             elif status.conclusion != "success":
                 failed.append(status.name)
+                if status.summary:
+                    excerpts[status.name] = " ".join(status.summary.split())[:240]
             else:
                 by_name[status.name] = status.conclusion
 
@@ -111,6 +116,10 @@ class CIPRGateImpl:
         pending_t = tuple(sorted(set(pending)))
         passed = not failed and not pending_t
         detail = f"required={sorted(self._cfg.required_checks)} observed={sorted(by_name)}"
+        if excerpts:
+            detail += " excerpts=" + "; ".join(
+                f"{name}: {excerpts[name]}" for name in sorted(excerpts)
+            )
         return GateDecision(
             passed=passed,
             pending_checks=pending_t,

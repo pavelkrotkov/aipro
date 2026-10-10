@@ -2064,3 +2064,62 @@ def test_reconstructed_coder_budget_never_guesses_missing_or_invalid_usage(usage
     restored = WorkflowState.from_dict(state.to_dict())
     with pytest.raises(_ForemanEscalation, match=r"coder (budget|usage)|malformed"):
         loop._coder_usage(restored)
+
+
+def test_pr_body_records_issue_run_tests_and_review_model_audit():
+    fake = _ready_fake()
+    loop, _ = _foreman(fake, ScriptedExecutor(), _gate())
+    assert loop.run_pass()[0].final_phase == "done"
+    body = fake.list_open_prs()[0].body
+    assert "Refs #1" in body
+    assert "Run: `run-1`" in body
+    assert "Implementation: implemented requested change" in body
+    assert "Tests: pytest -q (passed)" in body
+    assert "Review:" in body and "dispositions" in body
+    assert "developer: ref-developer" in body
+    assert "ref-requirements-reviewer" in body
+
+
+def test_head_moves_during_ci_evaluation_requires_reconciliation():
+    from ai_pr_orchestrator.v3.foreman import PRReconciliationError
+
+    fake = _ready_fake()
+
+    class MovingGate:
+        def evaluate(self, issue, pr):
+            old = fake.get_pr(pr.number)
+            fake._prs[pr.number] = replace(old, head_sha="newer-head")
+            return GateDecision(passed=True, pending_checks=(), failed_checks=())
+
+    loop, queue = _foreman(fake, ScriptedExecutor(), MovingGate())
+    with pytest.raises(PRReconciliationError, match="PR head changed during CI gate"):
+        loop.run_pass()
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None and state.phase == "ci_gating"
+    assert fake.list_open_prs()[0].head_sha == "newer-head"
+
+
+def test_existing_pr_audit_updates_without_erasing_human_text_or_reviews():
+    fake = _ready_fake()
+    human = fake.create_pr("human title", "Human context", head="aipro-issue-1", base="main")
+    fake.seed_review(human.number, author="human", body="Keep this review")
+    loop, queue = _foreman(fake, ScriptedExecutor(), _gate())
+    assert loop.run_pass()[0].final_phase == "done"
+    first = fake.get_pr(human.number)
+    assert len(fake.list_open_prs()) == 1
+    assert first.body.startswith("Human context\n\n<!-- aipro-summary:start -->")
+    assert first.body.count("<!-- aipro-summary:start -->") == 1
+    assert fake.get_pull_request_reviews(human.number)[0].body == "Keep this review"
+
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None
+    updated_report = {**state.extras["developer_report"], "summary": "second fix verified"}
+    changed = replace(state, extras={**state.extras, "developer_report": updated_report})
+    loop._ensure_pr(ISSUE, changed, "aipro-issue-1", first.head_sha)
+    current = fake.get_pr(human.number)
+    assert current.body.startswith("Human context\n\n<!-- aipro-summary:start -->")
+    assert "Implementation: second fix verified" in current.body
+    assert "Implementation: implemented requested change" not in current.body
+    assert current.body.count("<!-- aipro-summary:start -->") == 1
+    assert len(fake.list_open_prs()) == 1
+    assert fake.get_pull_request_reviews(human.number)[0].body == "Keep this review"

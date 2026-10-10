@@ -1149,3 +1149,17 @@ def test_thread_reply_uncertain_response_is_not_retried(monkeypatch, failure):
             client.reply_to_review_thread("thread-1", "actual coder evidence")
     assert replies == [{"threadId": "thread-1", "body": "actual coder evidence"}]
     assert sleeps == []
+
+
+@respx.mock
+def test_update_pr_body_uses_patch_and_reads_current_pr():
+    url = f"{BASE}/repos/{OWNER}/{REPO}/pulls/42"
+    data = {**_pr_json(), "body": "updated run summary"}
+    patch = respx.patch(url).respond(200, json=data)
+    respx.get(url).respond(200, json=data)
+    _mock_pr_files(42, [])
+    with _make_client() as client:
+        pr = client.update_pr_body(42, "updated run summary")
+    assert patch.called
+    assert json.loads(patch.calls[0].request.content) == {"body": "updated run summary"}
+    assert pr.body == "updated run summary"
