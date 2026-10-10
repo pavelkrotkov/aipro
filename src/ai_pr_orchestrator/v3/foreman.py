@@ -571,8 +571,10 @@ class ForemanPolicyLoop:
                     issue, state, f"CI gate cannot progress: {decision.detail}", now=now
                 )
             failure = self._signal_hash(
-                sorted(normalize_claim(name) for name in decision.failed_checks)
-                + [normalize_claim(decision.detail)]
+                [
+                    *sorted(normalize_claim(name) for name in decision.failed_checks),
+                    normalize_claim(decision.detail),
+                ]
             )
             seen = state.extras.get("ci_failure_hashes", [])
             if not isinstance(seen, list):
@@ -2140,7 +2142,6 @@ class ForemanPolicyLoop:
             head_sha=head_sha or f"head-{number}",
         )
 
-
     @staticmethod
     def _pr_body(issue: GitHubIssueRef, state: WorkflowState) -> str:
         report = state.extras.get("developer_report", {})
@@ -2151,7 +2152,9 @@ class ForemanPolicyLoop:
             for lane, record in sorted(wave["lanes"].items())
         ]
         developer = state.extras.get("developer_model", {})
-        models = ", ".join([f"developer: {developer.get('model_ref', 'unknown')}", *reviewers])
+        models = ", ".join(
+            [f"developer: {developer.get('model_ref', 'unknown')}", *reviewers]
+        )
         dispositions = ", ".join(sorted(d.action for d in state.dispositions)) or "none"
         tests = ", ".join(
             f"{test['command']} ({test['result']})" for test in report.get("tests", [])

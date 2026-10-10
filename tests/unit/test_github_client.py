@@ -1163,3 +1163,21 @@ def test_update_pr_body_uses_patch_and_reads_current_pr():
     assert patch.called
     assert json.loads(patch.calls[0].request.content) == {"body": "updated run summary"}
     assert pr.body == "updated run summary"
+
+
+@pytest.mark.parametrize("failure", ["timeout", "server_error"])
+def test_uncertain_pr_body_update_never_retries_patch(failure):
+    attempts = []
+
+    def transport(request):
+        assert request.method == "PATCH"
+        attempts.append(request)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("response lost after update", request=request)
+        return httpx.Response(503)
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as http:
+        client = GitHubClient(TOKEN, OWNER, REPO, http_client=http)
+        with pytest.raises(GitHubClientError):
+            client.update_pr_body(42, "keep human text")
+    assert len(attempts) == 1

@@ -163,7 +163,11 @@ class GitHubClient:
         return self.get_pr(data["number"])
 
     def update_pr_body(self, number: int, body: str) -> models.PullRequest:
-        self._patch(f"/repos/{self._owner}/{self._repo}/pulls/{number}", json={"body": body})
+        self._patch(
+            f"/repos/{self._owner}/{self._repo}/pulls/{number}",
+            json={"body": body},
+            max_attempts=1,
+        )
         return self.get_pr(number)
 
     def list_open_prs(self) -> list[models.PullRequest]:
@@ -434,11 +438,11 @@ class GitHubClient:
             return None
         return self._request("POST", path, json=json, max_attempts=max_attempts).json()
 
-    def _patch(self, path: str, *, json: Any) -> Any:
+    def _patch(self, path: str, *, json: Any, max_attempts: int = _MAX_RETRIES) -> Any:
         if self._dry_run:
             logger.info("DRY-RUN: would PATCH %s", path)
             return None
-        return self._request("PATCH", path, json=json).json()
+        return self._request("PATCH", path, json=json, max_attempts=max_attempts).json()
 
     def _delete(self, path: str) -> None:
         if self._dry_run:
