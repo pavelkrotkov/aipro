@@ -269,6 +269,7 @@ class FakeGitHubClient:
             head_ref=head,
             base_ref=base,
             author="fake-bot",
+            author_association="COLLABORATOR",
         )
         self._prs[number] = pr
         self._labels.setdefault(number, [])

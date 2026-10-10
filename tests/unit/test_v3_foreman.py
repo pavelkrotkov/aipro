@@ -2123,3 +2123,72 @@ def test_existing_pr_audit_updates_without_erasing_human_text_or_reviews():
     assert current.body.count("<!-- aipro-summary:start -->") == 1
     assert len(fake.list_open_prs()) == 1
     assert fake.get_pull_request_reviews(human.number)[0].body == "Keep this review"
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {"is_fork": True},
+        {"base_ref": "release"},
+        {"head_ref": "other"},
+        {"state": "closed"},
+        {"author_association": "NONE"},
+    ],
+)
+def test_recorded_pr_identity_is_rechecked_before_ci(mismatch):
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    gate = RecordingGate([GateDecision(passed=False, pending_checks=("build",), failed_checks=())])
+    loop, queue = _foreman(fake, executor, gate)
+    assert loop.run_pass()[0].final_phase == "ci_gating"
+    pr = fake.list_open_prs()[0]
+    fake._prs[pr.number] = replace(pr, body="Human context\n" + pr.body, **mismatch)
+    calls = list(executor.calls)
+    seen = list(gate.seen)
+    outcome = loop.run_pass()[0]
+    assert outcome.escalated, outcome.reason
+    assert executor.calls == calls
+    assert gate.seen == seen
+    assert fake.get_pr(pr.number).body == "Human context\n" + pr.body
+    assert queue.load_state(ISSUE.slug()).phase == "escalated"
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {"is_fork": True},
+        {"base_ref": "release"},
+        {"head_ref": "other"},
+        {"state": "closed"},
+        {"author_association": "NONE"},
+    ],
+)
+def test_pr_retarget_during_green_ci_cannot_complete(monkeypatch, mismatch):
+    fake = _ready_fake()
+    gate = RecordingGate([GateDecision(passed=True, pending_checks=(), failed_checks=())])
+    evaluate = gate.evaluate
+
+    def retarget(issue, pr):
+        decision = evaluate(issue, pr)
+        fake._prs[pr.number] = replace(fake.get_pr(pr.number), **mismatch)
+        return decision
+
+    monkeypatch.setattr(gate, "evaluate", retarget)
+    loop, queue = _foreman(fake, ScriptedExecutor(), gate)
+    outcome = loop.run_pass()[0]
+    assert outcome.escalated, outcome.reason
+    assert queue.load_state(ISSUE.slug()).phase == "escalated"
+
+
+def test_retained_default_branch_is_rejected_before_worker():
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    git = RecordingGit()
+    loop, queue = _foreman(fake, executor, _gate(), git=git)
+    state = queue.claim(ISSUE, "run-1", branch="main", worktree="retained")
+    queue.transition(ISSUE, state, "queued")
+    git.worktrees["retained"] = "main"
+    outcome = loop.run_pass()[0]
+    assert outcome.escalated, outcome.reason
+    assert executor.calls == []
+    assert git.pushed == []

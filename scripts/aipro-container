@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+: "${AIPRO_HERMES_IMAGE:?Set a trusted Hermes image pinned by digest}"
+: "${HERMES_HOME:?Set a dedicated lane home containing only model credentials}"
+case "$AIPRO_HERMES_IMAGE" in
+    *@sha256:*) ;;
+    *) echo 'AIPRO_HERMES_IMAGE must be pinned by digest' >&2; exit 2 ;;
+esac
+if [ "$(id -u)" -eq 0 ]; then
+    echo 'Run the coordinator as a non-root user' >&2
+    exit 2
+fi
+workdir=$(pwd -P)
+home=$(realpath "$HERMES_HOME")
+case "$home" in
+    "$HOME"|"$HOME/.hermes") echo 'Refusing to mount the coordinator home' >&2; exit 2 ;;
+esac
+if [ -L "$workdir/.git" ]; then
+    echo 'Refusing a symlinked Git entry' >&2
+    exit 2
+fi
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+if [ "$common" != "$workdir/.git" ]; then
+    set -- --mount "type=bind,source=$common,target=$common,readonly" "$AIPRO_HERMES_IMAGE" "$@"
+else
+    set -- "$AIPRO_HERMES_IMAGE" "$@"
+fi
+if [ -t 0 ]; then
+    set -- --tty "$@"
+fi
+exec docker run --rm --init -i --read-only --network bridge \
+    --label "aipro.checkout=$workdir" \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --user "$(id -u):$(id -g)" \
+    --tmpfs /tmp:rw,nosuid,nodev \
+    --mount "type=bind,source=$workdir,target=$workdir" \
+    --mount "type=bind,source=$workdir/.git,target=$workdir/.git,readonly" \
+    --mount "type=bind,source=$home,target=/opt/data" \
+    --workdir "$workdir" --entrypoint /usr/bin/env \
+    --env HOME=/opt/data --env HERMES_HOME=/opt/data \
+    --env USER=worker --env LOGNAME=worker \
+    --env AIPRO_MODEL --env AIPRO_PROVIDER \
+    "$@"
