@@ -570,12 +570,9 @@ class ForemanPolicyLoop:
                 return self._escalate(
                     issue, state, f"CI gate cannot progress: {decision.detail}", now=now
                 )
-            failure = self._signal_hash(
-                [
-                    *sorted(normalize_claim(name) for name in decision.failed_checks),
-                    normalize_claim(decision.detail),
-                ]
-            )
+            signals = sorted(normalize_claim(name) for name in decision.failed_checks)
+            signals.append(normalize_claim(decision.detail))
+            failure = self._signal_hash(signals)
             seen = state.extras.get("ci_failure_hashes", [])
             if not isinstance(seen, list):
                 raise _ForemanEscalation("malformed durable CI failure history")
@@ -2157,18 +2154,17 @@ class ForemanPolicyLoop:
         tests = ", ".join(
             f"{test['command']} ({test['result']})" for test in report.get("tests", [])
         ) or "not reported"
-        detail = "\n".join(
-            (
-                f"Refs #{issue.number}",
-                f"Run: `{state.run_id}` | Head: `{state.extras.get('head_sha', '')}`",
-                f"Implementation: {report.get('summary', 'not reported')}",
-                f"Tests: {tests}",
-                f"Review: {len(state.findings)} active, {len(state.archived)} archived; "
-                f"dispositions: {dispositions}",
-                f"Models: {models}",
-            )
+        return (
+            "<!-- aipro-summary:start -->\n"
+            f"Refs #{issue.number}\n"
+            f"Run: `{state.run_id}` | Head: `{state.extras.get('head_sha', '')}`\n"
+            f"Implementation: {report.get('summary', 'not reported')}\n"
+            f"Tests: {tests}\n"
+            f"Review: {len(state.findings)} active, {len(state.archived)} archived; "
+            f"dispositions: {dispositions}\n"
+            f"Models: {models}\n"
+            "<!-- aipro-summary:end -->"
         )
-        return "<!-- aipro-summary:start -->\n" + detail + "\n<!-- aipro-summary:end -->"
 
     @staticmethod
     def _with_pr_summary(body: str, summary: str) -> str:
