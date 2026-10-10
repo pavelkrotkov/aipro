@@ -249,10 +249,12 @@ class GitWorktreeOps:
         cwd = args[1] if args[0] == "-C" else str(self._root)
         self._check_executable_config(cwd)
         if command[0] == "push":
+            if not self._origin_url:
+                raise GitOpsError("push refused: no trusted origin URL at initialization")
             origin = self._run(
                 "config", "--local", "--no-includes", "--get", "remote.origin.url"
             ).strip()
-            if not self._origin_url or origin != self._origin_url:
+            if origin != self._origin_url:
                 raise GitOpsError("origin URL changed since GitWorktreeOps initialization")
 
     def _check_executable_config(self, cwd: str) -> None:
@@ -276,6 +278,12 @@ class GitWorktreeOps:
             "core.worktree",
             "core.alternaterefscommand",
             "core.gitproxy",
+            "core.pager",
+            "core.editor",
+            "core.askpass",
+            "sendemail.",
+            "sequence.editor",
+            "transfer.",
             "remote.origin.push",
             "remote.origin.receivepack",
             "remote.origin.uploadpack",
