@@ -100,6 +100,8 @@ class TaskDemand:
     #: one lineage are not two independent opinions, so a seat prefers a
     #: candidate unlike the ones already seated.
     peers: tuple[ModelRef, ...] = ()
+    #: Model refs whose family must not serve an independent adjudication.
+    independent_of: tuple[ModelRef, ...] = ()
     #: The model this phase is already running on. Kept while it remains
     #: dispatchable, so a phase does not change models mid-thought. Pass
     #: ``None`` at a phase boundary or after an operational failure, which is
@@ -110,6 +112,7 @@ class TaskDemand:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "peers", tuple(self.peers))
+        object.__setattr__(self, "independent_of", tuple(self.independent_of))
         object.__setattr__(self, "in_flight", MappingProxyType(dict(self.in_flight)))
         if not self.lane:
             raise BrokerError("TaskDemand.lane must be non-empty")
@@ -135,6 +138,7 @@ class TaskDemand:
             "role": self.role,
             "difficulty": self.difficulty,
             "peers": list(self.peers),
+            "independent_of": list(self.independent_of),
             "incumbent": self.incumbent,
             "in_flight": dict(self.in_flight),
         }
@@ -679,6 +683,10 @@ class PolicyBroker:
         """Why ``entry`` cannot serve ``demand``, or ``""`` if it can."""
         if not entry.enabled:
             return f"catalog entry {entry.ref!r} is disabled"
+        for ref in demand.independent_of:
+            peer = self._catalog.get(ref)
+            if peer is None or not peer.family or not entry.family or peer.family == entry.family:
+                return "independent adjudication requires a known, different model family"
         if entry.roles and demand.role not in entry.roles:
             return f"does not serve role {demand.role!r} (declares roles {sorted(entry.roles)})"
         if demand.difficulty < entry.min_task_difficulty:

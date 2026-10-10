@@ -110,6 +110,9 @@ class FakeGitOperations:
     def commit_count(self, workdir: str, base_ref: str) -> int:
         return sum(1 for w, _ in self.commits if w == workdir)
 
+    def patch_digest(self, workdir: str, base_ref: str) -> str:
+        return "|".join(sorted(self.changed_files(workdir, base_ref)))
+
     def push(self, branch: str) -> None:
         return None
 

@@ -383,6 +383,11 @@ class GitOperations(Protocol):
 
         ...
 
+    def patch_digest(self, workdir: str, base_ref: str) -> str:
+        """Stable digest of the committed content diff, excluding commit metadata."""
+
+        ...
+
     def push(self, branch: str) -> None: ...
 
     def push_sha(self, head_sha: str, branch: str) -> None:

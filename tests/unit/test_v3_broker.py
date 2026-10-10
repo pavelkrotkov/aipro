@@ -85,6 +85,25 @@ class TestPlacement:
         assert "4" in rejected["weak"]
 
 
+def test_independent_adjudicator_filters_same_or_unknown_family():
+    decision = broker(
+        entry("origin", family="same", quality_by_role={"reviewer": 5}),
+        entry("clone", family="same", quality_by_role={"reviewer": 5}),
+        entry("unknown", family="", quality_by_role={"reviewer": 5}),
+        entry("independent", family="other", quality_by_role={"reviewer": 5}),
+    ).select(
+        TaskDemand(
+            lane="architecture-reviewer",
+            role="reviewer",
+            difficulty=5,
+            independent_of=("origin",),
+        ),
+        at=NOW,
+    )
+    assert decision.assignment is not None and decision.assignment.model_ref == "independent"
+    assert {c.ref for c in decision.rejected} == {"origin", "clone", "unknown"}
+
+
 class TestUnscoredCandidates:
     def test_an_entry_unscored_for_the_role_is_not_silently_treated_as_adequate(self):
         # Scoring the role is how an operator states a model is fit for it.

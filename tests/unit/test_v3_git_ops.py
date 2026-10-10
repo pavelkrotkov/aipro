@@ -78,6 +78,10 @@ class FakeGitOperations:
         self.calls.append(("changed_files", workdir, base_ref))
         return list(self.touched.get(workdir, []))
 
+    def patch_digest(self, workdir: str, base_ref: str) -> str:
+        self.calls.append(("patch_digest", workdir, base_ref))
+        return "|".join(sorted(self.touched.get(workdir, [])))
+
     def push(self, branch: str) -> None:
         self.calls.append(("push", branch))
         self.pushed.append(branch)
@@ -195,6 +199,41 @@ def test_worktree_commit_push_round_trip(real_repo: Path, tmp_path: Path):
 
     ops.cleanup_worktree(str(wt))
     assert not wt.exists()
+
+
+def test_patch_digest_tracks_content_not_commit_metadata(real_repo: Path):
+    ops = GitWorktreeOps(real_repo)
+    ops.create_branch("feature", "main")
+    subprocess.run(
+        ["git", "checkout", "feature"],
+        cwd=real_repo,
+        check=True,
+        capture_output=True,
+    )
+    (real_repo / "file.txt").write_text("changed\n")
+    first_sha = ops.commit(str(real_repo), "first message", name="T", email="t@example.com")
+    first = ops.patch_digest(str(real_repo), "main")
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "--amend",
+            "-m",
+            "metadata only",
+        ],
+        cwd=real_repo,
+        check=True,
+        capture_output=True,
+    )
+    assert ops.head_sha(str(real_repo)) != first_sha
+    assert ops.patch_digest(str(real_repo), "main") == first
+    (real_repo / "file.txt").write_text("different content\n")
+    ops.commit(str(real_repo), "different", name="T", email="t@example.com")
+    assert ops.patch_digest(str(real_repo), "main") != first
 
 
 def test_push_failure_raises_gitops_error(real_repo: Path):

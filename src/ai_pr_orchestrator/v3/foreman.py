@@ -51,6 +51,7 @@ from ai_pr_orchestrator.github.protocol import GitHubClient
 
 from .broker import BrokerError, TaskDemand
 from .cao import SessionBusyError
+from .catalog import MAX_TASK_DIFFICULTY
 from .config import V3Config
 from .domain import (
     TERMINAL_PHASES,
@@ -63,7 +64,7 @@ from .domain import (
     ReviewerFinding,
     WorkflowState,
 )
-from .findings import SEVERITY_RANK, FindingRegistry
+from .findings import SEVERITY_RANK, FindingRegistry, normalize_claim
 from .interfaces import (
     CIPRGate,
     GateDecision,
@@ -379,11 +380,13 @@ class ForemanPolicyLoop:
         stagnant_rounds = 0
         reviewer_triggers = review_rounds * len(self._reviewer_lanes())
         self._prompt_tokens = 0
+        state = self._enforce_deadline(issue, state, now=now)
         fix_findings = tuple(f for f in state.findings if f.status == "open")
         result: LaneResult | None = None
         head_sha: str | None = None
 
         while True:
+            state = self._enforce_deadline(issue, state, now=now)
             if resume_at_gate:
                 # PR #73 review thread 16 / issue #85: requeued pending-CI
                 # items are claimable by a different foreman host whose
@@ -406,6 +409,7 @@ class ForemanPolicyLoop:
                     if requests:
                         state = self._record_proposals(state, result)
                 # --- Review rounds --------------------------------------------
+                state = self._enforce_deadline(issue, state, now=now)
                 report = self._review(
                     issue,
                     state,
@@ -420,7 +424,7 @@ class ForemanPolicyLoop:
                 review_rounds = report.rounds
                 head_sha = report.head_sha
                 stagnant_rounds = report.stagnant_rounds
-                state = self._load(issue, state)
+                state = self._enforce_deadline(issue, self._load(issue, state), now=now)
                 if report.remaining:
                     if review_rounds >= safety.max_total_iterations:
                         return self._escalate(
@@ -549,6 +553,20 @@ class ForemanPolicyLoop:
                 return self._escalate(
                     issue, state, f"CI gate cannot progress: {decision.detail}", now=now
                 )
+            failure = self._signal_hash(sorted(normalize_claim(name) for name in decision.failed_checks))
+            seen = state.extras.get("ci_failure_hashes", [])
+            if not isinstance(seen, list):
+                raise _ForemanEscalation("malformed durable CI failure history")
+            if failure in seen:
+                return self._escalate(
+                    issue, state, "no converging signal: repeated CI failure after remediation",
+                    now=now,
+                )
+            state = self._save_fresh(
+                issue,
+                state,
+                extras={**state.extras, "ci_failure_hashes": [*seen, failure]},
+            )
             fix_findings = tuple(
                 ReviewerFinding(
                     id=f"ci-failed-{name}",
@@ -561,6 +579,47 @@ class ForemanPolicyLoop:
                 for name in decision.failed_checks
             )
             # Loop back to coding with the CI-check findings.
+
+    def _enforce_deadline(
+        self, issue: GitHubIssueRef, state: WorkflowState, *, now: datetime | None
+    ) -> WorkflowState:
+        current = now or datetime.now(UTC)
+        started = state.extras.get("run_started_at")
+        if started is None:
+            return self._save_fresh(
+                issue, state, extras={**state.extras, "run_started_at": current.isoformat()}
+            )
+        try:
+            elapsed = (current - _parse_timestamp(started)).total_seconds()
+        except (TypeError, ValueError) as exc:
+            raise _ForemanEscalation("malformed durable run start time") from exc
+        if elapsed >= self._cfg.escalation.max_run_seconds:
+            raise _ForemanEscalation("run wall-clock deadline exhausted")
+        return state
+
+    @staticmethod
+    def _signal_hash(value: object) -> str:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _review_signature(
+        self,
+        worktree: str,
+        findings: tuple[ReviewerFinding, ...],
+        decisions: list[FindingDisposition],
+    ) -> str:
+        return self._signal_hash(
+            {
+                "patch": self._git.patch_digest(worktree, self._git.default_branch()),
+                "findings": sorted(
+                    (normalize_claim(f.claim or f.body), f.path or "", f.line or 0, f.severity)
+                    for f in findings
+                ),
+                "decisions": sorted(
+                    (d.finding_id, d.action, normalize_claim(d.rationale)) for d in decisions
+                ),
+            }
+        )
 
     def _coder_usage(self, state: WorkflowState) -> int:
         usage = state.extras.get("coder_usage")
@@ -713,15 +772,27 @@ class ForemanPolicyLoop:
         registry.compact()
 
         self._persist_round(issue, state, round_id, registry, dispositions)
+        signature = self._review_signature(developer_worktree, remaining, dispositions)
+        seen = state.extras.get("review_signatures", [])
+        if not isinstance(seen, list):
+            raise _ForemanEscalation("malformed durable review progress history")
         waves[round_id] = wave
-        self._save_fresh(issue, state, extras={**state.extras, "review_waves": waves})
+        self._save_fresh(
+            issue,
+            state,
+            extras={
+                **state.extras,
+                "review_waves": waves,
+                "review_signatures": [*seen, signature],
+            },
+        )
         if heartbeat_error is None:
             failures.extend(self._cleanup_review_results(completed, head_sha))
         if failures:
             raise _ForemanEscalation("review wave incomplete: " + "; ".join(failures))
 
         rounds = review_rounds + 1
-        stagnant = 0 if had_signal else stagnant_rounds + 1
+        stagnant = stagnant_rounds + 1 if signature in seen or not had_signal else 0
         if rounds > 1 and stagnant >= self._cfg.escalation.stagnation_rounds_threshold:
             raise _ForemanEscalation("review rounds produced no converging signal")
         return _RoundReport(
@@ -875,12 +946,15 @@ class ForemanPolicyLoop:
         seats: list[_ReviewSeat] = []
         peers: list[str] = []
         in_flight: dict[str, int] = {}
+        registry.detect_conflicts()
         try:
             for lane_name in reviewer_lanes:
                 lane = self._lanes.get(lane_name)
-                requests = self._review_requests(lane_name, registry, proposals)
+                requests = self._review_requests(lane_name, registry, proposals, state)
+                independent_of = self._adjudication_peers(state, registry, requests)
                 lease, fallbacks = self._reserve(
-                    lane, state, peers=tuple(peers), in_flight=in_flight
+                    lane, state, peers=tuple(peers), in_flight=in_flight,
+                    independent_of=independent_of,
                 )
                 worktree = f"{self._worktree_root}/issue-{issue.number}-{round_id}-{lane_name}"
                 seats.append(_ReviewSeat(lane, worktree, lease, fallbacks, requests))
@@ -913,16 +987,51 @@ class ForemanPolicyLoop:
             raise
         return state, seats
 
+    @staticmethod
+    def _needs_independent_review(finding: ReviewerFinding, state: WorkflowState) -> bool:
+        return bool(finding.conflict_group_id) or any(
+            d.finding_id == finding.id and d.action == "fix" and d.response_to_round_id
+            for d in state.dispositions
+        )
+
+    def _adjudication_peers(
+        self,
+        state: WorkflowState,
+        registry: FindingRegistry,
+        requests: tuple[tuple[str, str | None], ...],
+    ) -> tuple[str, ...]:
+        requested = {fid for fid, _ in requests}
+        findings = [
+            f for f in registry.findings
+            if f.id in requested and self._needs_independent_review(f, state)
+        ]
+        groups = {f.conflict_group_id for f in findings if f.conflict_group_id}
+        sources = [
+            f for f in registry.findings
+            if f in findings or (f.conflict_group_id and f.conflict_group_id in groups)
+        ]
+        waves = state.extras.get("review_waves", {})
+        refs: set[str] = set()
+        for finding in sources:
+            wave = waves.get(finding.round_id, {})
+            lane = wave.get("lanes", {}).get(finding.lane, {})
+            ref = lane.get("assignment", {}).get("model_ref")
+            if not isinstance(ref, str) or not ref:
+                raise _ForemanEscalation("independent adjudication lacks origin model provenance")
+            refs.add(ref)
+        return tuple(sorted(refs))
+
     def _review_requests(
         self,
         lane_name: str,
         registry: FindingRegistry,
         proposals: dict[str, FindingDisposition],
+        state: WorkflowState,
     ) -> tuple[tuple[str, str | None], ...]:
         return tuple(
             (finding.id, proposals[finding.id].round_id)
             for finding in registry.findings
-            if finding.id in proposals and self._adjudicator(finding) == lane_name
+            if finding.id in proposals and self._adjudicator(finding, registry, state) == lane_name
         )
 
     def _materialize_review_seats(
@@ -1083,11 +1192,23 @@ class ForemanPolicyLoop:
             lane.lane for lane in self._lanes if lane.role == "reviewer"
         ]
 
-    def _adjudicator(self, finding: ReviewerFinding) -> str:
+    def _adjudicator(
+        self, finding: ReviewerFinding, registry: FindingRegistry, state: WorkflowState
+    ) -> str:
         lanes = self._reviewer_lanes()
         if not lanes or any(self._lanes.get(name).role != "reviewer" for name in lanes):
             raise _ForemanEscalation("independent reviewer required for adjudication")
-        return finding.lane if finding.lane in lanes else lanes[0]
+        if not self._needs_independent_review(finding, state):
+            return finding.lane if finding.lane in lanes else lanes[0]
+        origins = {finding.lane}
+        origins.update(
+            f.lane for f in registry.findings
+            if finding.conflict_group_id and f.conflict_group_id == finding.conflict_group_id
+        )
+        candidate = next((name for name in lanes if name not in origins), None)
+        if candidate is None:
+            raise _ForemanEscalation("strong independent adjudicator unavailable for dispute")
+        return candidate
 
     @staticmethod
     def _saved_review_round(state: WorkflowState) -> int:
@@ -1132,6 +1253,7 @@ class ForemanPolicyLoop:
             replace(d, thread_id=by_id[d.finding_id].thread_id, reply_body=d.rationale)
             for d in result.dispositions
         ]
+        self._reject_repeated_rebuttals(state, proposals)
         history = self._merge_dispositions(state.dispositions, proposals)
         # Save real coder evidence before any reviewer or thread side effect.
         saved = replace(state, dispositions=history, updated_at=datetime.now(UTC))
@@ -1143,6 +1265,28 @@ class ForemanPolicyLoop:
             if finding.thread_id:
                 self._post_thread_reply(finding.thread_id, proposal.rationale)
         return saved
+
+    @classmethod
+    def _reject_repeated_rebuttals(
+        cls, state: WorkflowState, proposals: list[FindingDisposition]
+    ) -> None:
+        rejected = {
+            (d.finding_id, d.response_to_round_id)
+            for d in state.dispositions
+            if d.action == "fix" and d.response_to_round_id is not None
+        }
+        for proposal in proposals:
+            if proposal.action != "rebut":
+                continue
+            digest = cls._signal_hash(normalize_claim(proposal.rationale))
+            if any(
+                old.action == "rebut"
+                and old.finding_id == proposal.finding_id
+                and (old.finding_id, old.round_id) in rejected
+                and cls._signal_hash(normalize_claim(old.rationale)) == digest
+                for old in state.dispositions
+            ):
+                raise _ForemanEscalation("repeated rejected rebuttal without new evidence")
 
     @staticmethod
     def _adjudication_prompt(
@@ -1388,13 +1532,14 @@ class ForemanPolicyLoop:
         *,
         peers: tuple[str, ...] = (),
         in_flight: dict[str, int] | None = None,
+        independent_of: tuple[str, ...] = (),
     ) -> tuple[ModelLease, tuple[str, ...]]:
         saved = self._saved_worker_route(lane, state)
         if saved is not None:
             assignment, fallbacks = saved
             return self._broker.reserve(assignment), fallbacks
         ref = self._cfg.model_router.lane_assignments.get(lane.lane)
-        if ref:
+        if ref and not independent_of:
             assignment = ModelAssignment(lane=lane.lane, model_ref=ref)
             return self._broker.reserve(assignment), ()
         select = getattr(self._broker, "select", None)
@@ -1404,7 +1549,9 @@ class ForemanPolicyLoop:
             TaskDemand(
                 lane=lane.lane,
                 role=lane.role,
+                difficulty=MAX_TASK_DIFFICULTY if independent_of else 1,
                 peers=peers,
+                independent_of=independent_of,
                 in_flight=in_flight or {},
             )
         )
