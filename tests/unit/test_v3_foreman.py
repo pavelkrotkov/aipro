@@ -745,7 +745,9 @@ def test_repeated_rejected_rebuttal_requires_new_evidence(
         round_id="review-2",
         response_to_round_id="response-1",
     )
-    proposal = replace(prior, action=proposal_action, rationale=evidence, round_id="response-2")
+    proposal = replace(
+        prior, action=proposal_action, rationale=evidence, round_id="response-2"
+    )
     state = WorkflowState(
         work_item_id=ISSUE.slug(),
         run_id="run-1",
@@ -776,10 +778,18 @@ def test_stagnation_fingerprint_ignores_volatile_provenance():
         "/wt/issue-1",
         (
             replace(
-                finding, id="new-review-id", run_id="run-2", round_id="review-7", head_sha="new"
+                finding,
+                id="new-review-id",
+                run_id="run-2",
+                round_id="review-7",
+                head_sha="new",
             ),
         ),
-        [replace(decision, run_id="run-2", round_id="review-7", rationale="tests passed")],
+        [
+            replace(
+                decision, run_id="run-2", round_id="review-7", rationale="tests passed"
+            )
+        ],
     )
     assert baseline == repeated
     assert baseline != loop._review_signature(
@@ -828,7 +838,11 @@ def test_run_deadline_survives_authoritative_reload():
 def test_conflicted_findings_are_routed_outside_origin_lanes():
     loop, _ = _foreman(_ready_fake(), ScriptedExecutor(), _gate())
     a = replace(
-        _finding(1), lane="requirements-reviewer", path="src/a.py", line=7, claim="eager"
+        _finding(1),
+        lane="requirements-reviewer",
+        path="src/a.py",
+        line=7,
+        claim="eager",
     )
     b = replace(a, id="f-2", lane="breaker-reviewer", claim="lazy")
     registry = FindingRegistry(findings=[a, b])

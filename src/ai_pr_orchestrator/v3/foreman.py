@@ -553,13 +553,17 @@ class ForemanPolicyLoop:
                 return self._escalate(
                     issue, state, f"CI gate cannot progress: {decision.detail}", now=now
                 )
-            failure = self._signal_hash(sorted(normalize_claim(name) for name in decision.failed_checks))
+            failure = self._signal_hash(
+                sorted(normalize_claim(name) for name in decision.failed_checks)
+            )
             seen = state.extras.get("ci_failure_hashes", [])
             if not isinstance(seen, list):
                 raise _ForemanEscalation("malformed durable CI failure history")
             if failure in seen:
                 return self._escalate(
-                    issue, state, "no converging signal: repeated CI failure after remediation",
+                    issue,
+                    state,
+                    "no converging signal: repeated CI failure after remediation",
                     now=now,
                 )
             state = self._save_fresh(
@@ -587,7 +591,9 @@ class ForemanPolicyLoop:
         started = state.extras.get("run_started_at")
         if started is None:
             return self._save_fresh(
-                issue, state, extras={**state.extras, "run_started_at": current.isoformat()}
+                issue,
+                state,
+                extras={**state.extras, "run_started_at": current.isoformat()},
             )
         try:
             elapsed = (current - _parse_timestamp(started)).total_seconds()
@@ -612,11 +618,17 @@ class ForemanPolicyLoop:
             {
                 "patch": self._git.patch_digest(worktree, self._git.default_branch()),
                 "findings": sorted(
-                    (normalize_claim(f.claim or f.body), f.path or "", f.line or 0, f.severity)
+                    (
+                        normalize_claim(f.claim or f.body),
+                        f.path or "",
+                        f.line or 0,
+                        f.severity,
+                    )
                     for f in findings
                 ),
                 "decisions": sorted(
-                    (d.finding_id, d.action, normalize_claim(d.rationale)) for d in decisions
+                    (d.finding_id, d.action, normalize_claim(d.rationale))
+                    for d in decisions
                 ),
             }
         )
@@ -953,7 +965,10 @@ class ForemanPolicyLoop:
                 requests = self._review_requests(lane_name, registry, proposals, state)
                 independent_of = self._adjudication_peers(state, registry, requests)
                 lease, fallbacks = self._reserve(
-                    lane, state, peers=tuple(peers), in_flight=in_flight,
+                    lane,
+                    state,
+                    peers=tuple(peers),
+                    in_flight=in_flight,
                     independent_of=independent_of,
                 )
                 worktree = f"{self._worktree_root}/issue-{issue.number}-{round_id}-{lane_name}"
@@ -988,7 +1003,9 @@ class ForemanPolicyLoop:
         return state, seats
 
     @staticmethod
-    def _needs_independent_review(finding: ReviewerFinding, state: WorkflowState) -> bool:
+    def _needs_independent_review(
+        finding: ReviewerFinding, state: WorkflowState
+    ) -> bool:
         return bool(finding.conflict_group_id) or any(
             d.finding_id == finding.id and d.action == "fix" and d.response_to_round_id
             for d in state.dispositions
@@ -1002,12 +1019,14 @@ class ForemanPolicyLoop:
     ) -> tuple[str, ...]:
         requested = {fid for fid, _ in requests}
         findings = [
-            f for f in registry.findings
+            f
+            for f in registry.findings
             if f.id in requested and self._needs_independent_review(f, state)
         ]
         groups = {f.conflict_group_id for f in findings if f.conflict_group_id}
         sources = [
-            f for f in registry.findings
+            f
+            for f in registry.findings
             if f in findings or (f.conflict_group_id and f.conflict_group_id in groups)
         ]
         waves = state.extras.get("review_waves", {})
@@ -1031,7 +1050,8 @@ class ForemanPolicyLoop:
         return tuple(
             (finding.id, proposals[finding.id].round_id)
             for finding in registry.findings
-            if finding.id in proposals and self._adjudicator(finding, registry, state) == lane_name
+            if finding.id in proposals
+            and self._adjudicator(finding, registry, state) == lane_name
         )
 
     def _materialize_review_seats(
@@ -1202,7 +1222,8 @@ class ForemanPolicyLoop:
             return finding.lane if finding.lane in lanes else lanes[0]
         origins = {finding.lane}
         origins.update(
-            f.lane for f in registry.findings
+            f.lane
+            for f in registry.findings
             if finding.conflict_group_id and f.conflict_group_id == finding.conflict_group_id
         )
         candidate = next((name for name in lanes if name not in origins), None)

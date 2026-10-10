@@ -412,16 +412,20 @@ def test_conflict_group_changes_do_not_mutate_review_cas_baseline(fake_cao, fore
         "requirements-reviewer",
         [
             [finding("guard", "guard is missing")],
-            {"findings": [], "dispositions": [decide("guard", "accept")]},
             [],
+            {"findings": [], "dispositions": [decide("race", "fix", "response-2")]},
         ],
     )
+    output("breaker-reviewer", [[finding("race", "guard is harmful")], [], []])
     output(
-        "breaker-reviewer",
+        "architecture-reviewer",
         [
-            [finding("race", "guard is harmful")],
-            {"findings": [], "dispositions": [decide("race", "fix")]},
-            {"findings": [], "dispositions": [decide("race", "fix", "response-2")]},
+            [],
+            {
+                "findings": [],
+                "dispositions": [decide("guard", "accept"), decide("race", "fix")],
+            },
+            [],
         ],
     )
     output(
