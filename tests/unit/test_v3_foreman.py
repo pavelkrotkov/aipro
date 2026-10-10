@@ -243,6 +243,9 @@ class FakeGitOperations:
     def commit_count(self, workdir: str, base_ref: str) -> int:
         return 0
 
+    def patch_digest(self, workdir: str, base_ref: str) -> str:
+        return "|".join(sorted(self.touched.get(workdir, [])))
+
     def push(self, branch: str) -> None:
         pass
 
@@ -711,6 +714,163 @@ def test_stagnation_threshold_escalates():
     assert "converging" in outcome.reason
     state = queue.load_state("owner/repo#1")
     assert state is not None and state.phase == "escalated"
+
+
+@pytest.mark.parametrize(
+    "previous_action,proposal_action,evidence,rejected",
+    [
+        ("fix", "rebut", "  SAME   PROOF  ", True),
+        ("fix", "rebut", "new falsifiable proof", False),
+        ("accept", "rebut", "same proof", False),
+        ("fix", "fix", "same proof", False),
+    ],
+)
+def test_repeated_rejected_rebuttal_requires_new_evidence(
+    previous_action, proposal_action, evidence, rejected
+):
+    prior = FindingDisposition(
+        finding_id="guard",
+        action="rebut",
+        rationale="same proof",
+        decided_by="developer",
+        run_id="run-1",
+        round_id="response-1",
+    )
+    decision = FindingDisposition(
+        finding_id="guard",
+        action=previous_action,
+        rationale="reviewed",
+        decided_by="requirements-reviewer",
+        run_id="run-1",
+        round_id="review-2",
+        response_to_round_id="response-1",
+    )
+    proposal = replace(
+        prior,
+        action=proposal_action,
+        rationale=evidence,
+        round_id="response-2",
+    )
+    state = WorkflowState(
+        work_item_id=ISSUE.slug(),
+        run_id="run-1",
+        phase="coding",
+        dispositions=[prior, decision],
+    )
+    if rejected:
+        with pytest.raises(_ForemanEscalation, match="repeated rejected rebuttal"):
+            ForemanPolicyLoop._reject_repeated_rebuttals(state, [proposal])
+    else:
+        ForemanPolicyLoop._reject_repeated_rebuttals(state, [proposal])
+
+
+def test_stagnation_fingerprint_ignores_volatile_provenance():
+    git = FakeGitOperations()
+    loop, _ = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), git=git)
+    finding = _finding(1)
+    decision = FindingDisposition(
+        finding_id=finding.id,
+        action="fix",
+        rationale=" Tests  PASSED ",
+        decided_by="requirements-reviewer",
+        run_id="run-1",
+        round_id="review-1",
+    )
+    baseline = loop._review_signature("/wt/issue-1", (finding,), [decision])
+    repeated = loop._review_signature(
+        "/wt/issue-1",
+        (
+            replace(
+                finding,
+                id="new-review-id",
+                run_id="run-2",
+                round_id="review-7",
+                head_sha="new",
+            ),
+        ),
+        [
+            replace(
+                decision,
+                run_id="run-2",
+                round_id="review-7",
+                rationale="tests passed",
+            ),
+        ],
+    )
+    assert baseline == repeated
+    assert baseline != loop._review_signature(
+        "/wt/issue-1",
+        (replace(finding, body="different claim"),),
+        [decision],
+    )
+    git.touched["/wt/issue-1"] = ["src/changed.py"]
+    assert baseline != loop._review_signature("/wt/issue-1", (finding,), [decision])
+
+
+def test_repeated_ci_failure_after_repair_never_retries_indefinitely():
+    cfg = V3Config(
+        safety=SafetyPolicyConfig(
+            max_total_iterations=8,
+            max_coder_invocations_per_run=8,
+            max_reviewer_triggers_per_run=24,
+            max_commits_per_run=8,
+        ),
+        review_policy=ReviewPolicyConfig(max_review_rounds=8),
+        escalation=EscalationPolicyConfig(stagnation_rounds_threshold=5),
+    )
+    loop, queue = _foreman(
+        _ready_fake(),
+        ScriptedExecutor(),
+        _gate(GateDecision(False, (), ("build",))),
+        cfg,
+    )
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "repeated CI failure" in outcome.reason
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None
+    assert len(state.extras["ci_failure_hashes"]) == 1
+    assert outcome.final_phase == state.phase
+
+
+def test_run_deadline_survives_authoritative_reload():
+    cfg = V3Config(escalation=EscalationPolicyConfig(max_run_seconds=60))
+    loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), cfg)
+    state = queue.claim(ISSUE, "run-1", branch="aipro-issue-1", now=NOW)
+    state = loop._enforce_deadline(ISSUE, state, now=NOW)
+    assert queue.load_state(ISSUE.slug()).extras["run_started_at"] == NOW.isoformat()
+    with pytest.raises(_ForemanEscalation, match="wall-clock deadline"):
+        loop._enforce_deadline(ISSUE, state, now=NOW.replace(hour=NOW.hour + 1))
+
+
+def test_conflicted_findings_are_routed_outside_origin_lanes():
+    loop, _ = _foreman(_ready_fake(), ScriptedExecutor(), _gate())
+    a = replace(
+        _finding(1),
+        lane="requirements-reviewer",
+        path="src/a.py",
+        line=7,
+        claim="eager",
+    )
+    b = replace(a, id="f-2", lane="breaker-reviewer", claim="lazy")
+    registry = FindingRegistry(findings=[a, b])
+    registry.detect_conflicts()
+    state = WorkflowState(work_item_id=ISSUE.slug(), run_id="run-1", phase="reviewing")
+    assert loop._adjudicator(a, registry, state) == "architecture-reviewer"
+    assert loop._adjudicator(b, registry, state) == "architecture-reviewer"
+    wave = {
+        "review-1": {
+            "lanes": {
+                "requirements-reviewer": {"assignment": {"model_ref": "origin-a"}},
+                "breaker-reviewer": {"assignment": {"model_ref": "origin-b"}},
+            },
+        },
+    }
+    state = replace(state, extras={"review_waves": wave})
+    assert loop._adjudication_peers(state, registry, ((a.id, "response-1"),)) == (
+        "origin-a",
+        "origin-b",
+    )
 
 
 def test_consecutive_coder_failures_escalate():

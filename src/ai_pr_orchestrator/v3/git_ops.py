@@ -184,6 +184,19 @@ class GitWorktreeOps:
         paths.extend(record[3:] for record in pending.split("\x00") if record)
         return list(dict.fromkeys(paths))
 
+    def patch_digest(self, workdir: str, base_ref: str) -> str:
+        diff = self._run(
+            "-C",
+            str(self._workdir(workdir)),
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            f"{base_ref}...HEAD",
+        )
+        return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+
     def push(self, branch: str) -> None:
         self._run("push", "-u", "origin", branch)
 

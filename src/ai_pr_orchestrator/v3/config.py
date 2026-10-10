@@ -354,6 +354,7 @@ class EscalationPolicyConfig:
 
     max_consecutive_coder_failures: int = 3
     stagnation_rounds_threshold: int = 3
+    max_run_seconds: int = 21600
     escalation_label: str = "needs-human"
     notify_comment_marker: str = "v3-escalation"
     #: Unknown keys from a newer writer, preserved for forward compatibility.
@@ -642,6 +643,8 @@ class V3Config:
             raise V3ConfigError("max_consecutive_coder_failures must be >= 1")
         if self.escalation.stagnation_rounds_threshold < 1:
             raise V3ConfigError("stagnation_rounds_threshold must be >= 1")
+        if self.escalation.max_run_seconds < 1:
+            raise V3ConfigError("max_run_seconds must be >= 1")
 
         if self.ci_policy.ci_wait_timeout_seconds < 1:
             raise V3ConfigError("ci_policy.ci_wait_timeout_seconds must be >= 1")

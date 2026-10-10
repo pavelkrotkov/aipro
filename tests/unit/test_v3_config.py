@@ -95,6 +95,8 @@ class TestValidation:
     def test_remaining_positive_limits_rejected(self) -> None:
         with pytest.raises(V3ConfigError, match="stagnation_rounds_threshold"):
             V3Config(escalation={"stagnation_rounds_threshold": 0}).validate()  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        with pytest.raises(V3ConfigError, match="max_run_seconds"):
+            V3Config(escalation={"max_run_seconds": 0}).validate()  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
         with pytest.raises(V3ConfigError, match="session_timeout_seconds"):
             V3Config(cao={"session_timeout_seconds": 0}).validate()  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
         with pytest.raises(V3ConfigError, match="ci_wait_timeout_seconds"):
