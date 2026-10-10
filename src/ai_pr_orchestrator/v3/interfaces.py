@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from math import isfinite
 from typing import Protocol, runtime_checkable
 
 from .domain import (
@@ -44,6 +45,15 @@ class ModelLease:
 
     lease_id: str
     assignment: ModelAssignment
+    #: A broker-verified maximum incremental cash charge, None when unbounded/unknown.
+    max_charge_usd: float | None = None
+
+    def __post_init__(self) -> None:
+        value = self.max_charge_usd
+        if value is not None and (
+            type(value) not in (int, float) or not isfinite(value) or value < 0
+        ):
+            raise ValueError("max_charge_usd must be finite and nonnegative")
 
 
 @dataclass(frozen=True)

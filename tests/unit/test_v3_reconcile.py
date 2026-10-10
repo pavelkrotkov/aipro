@@ -233,6 +233,18 @@ def assert_only_kind(actions: list[Action], kind: ActionKind) -> Action:
     return matched[0]
 
 
+@pytest.mark.parametrize("phase", ["done", "failed", "escalated", "cancelled"])
+def test_terminal_phase_never_relaunches_even_with_stale_resources(phase):
+    state = make_state().transition(phase, terminal_reason="terminal by policy")
+    inputs = make_inputs(
+        state=state,
+        sessions=(make_session(work_item_id=state.work_item_id, run_id=state.run_id),),
+        worktrees=(make_worktree(),),
+    )
+    actions = ReconcilePlanner().plan(inputs)
+    assert [a.kind for a in actions] == [ActionKind.NOOP]
+
+
 # --- Crash points (the table) ---------------------------------------------
 
 

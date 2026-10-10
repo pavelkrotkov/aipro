@@ -44,6 +44,7 @@ WorkItemPhase = Literal[
     "escalated",
     "done",
     "failed",
+    "cancelled",
 ]
 
 VALID_PHASES: frozenset[str] = frozenset(
@@ -58,10 +59,11 @@ VALID_PHASES: frozenset[str] = frozenset(
         "escalated",
         "done",
         "failed",
+        "cancelled",
     )
 )
 
-TERMINAL_PHASES: frozenset[str] = frozenset(("done", "failed", "escalated"))
+TERMINAL_PHASES: frozenset[str] = frozenset(("done", "failed", "escalated", "cancelled"))
 
 #: Phases that require a terminal reason when entered.
 PHASES_REQUIRING_REASON: frozenset[str] = TERMINAL_PHASES

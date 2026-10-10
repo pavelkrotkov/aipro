@@ -67,6 +67,7 @@ from typing import Any, cast
 from ..github.protocol import GitHubClient as GitHubClientProtocol
 from .config import GitHubQueueConfig
 from .domain import (
+    TERMINAL_PHASES,
     VALID_PHASES,
     DomainError,
     GitHubIssueRef,
@@ -74,9 +75,6 @@ from .domain import (
     WorkItem,
 )
 from .interfaces import StateConflictError
-
-#: Terminal phases that must never be reopened by lease reconciliation.
-_TERMINAL_PHASES = ("done", "failed", "escalated")
 
 #: Claim/lease keys stored in ``WorkflowState.extras``. ``run_id`` and ``phase`` are
 #: NOT included: they are first-class ``WorkflowState`` fields already (the extras
@@ -559,6 +557,8 @@ class GitHubIssueQueue:
 
         if phase not in VALID_PHASES:
             raise DomainError(f"Invalid phase {phase!r}")
+        if state.phase in TERMINAL_PHASES:
+            raise NoActiveClaimError(f"Terminal work item cannot transition from {state.phase!r}")
         self._require_same_identity(issue, state)
         new_state = state.transition(
             cast(Any, phase), round_id=round_id, terminal_reason=terminal_reason
@@ -596,6 +596,9 @@ class GitHubIssueQueue:
     def fail(self, issue: GitHubIssueRef, state: WorkflowState, *, reason: str) -> WorkflowState:
         return self.transition(issue, state, "failed", terminal_reason=reason)
 
+    def cancel(self, issue: GitHubIssueRef, state: WorkflowState, *, reason: str) -> WorkflowState:
+        return self.transition(issue, state, "cancelled", terminal_reason=reason)
+
     def mark_review(self, issue: GitHubIssueRef, state: WorkflowState) -> WorkflowState:
         return self.transition(issue, state, "reviewing")
 
@@ -632,7 +635,7 @@ class GitHubIssueQueue:
 
         now = _utc(now or datetime.now(UTC))
         self._require_same_identity(issue, stale_state)
-        if stale_state.phase in _TERMINAL_PHASES:
+        if stale_state.phase in TERMINAL_PHASES:
             raise NoActiveClaimError(
                 f"State for {stale_state.work_item_id} is terminal "
                 f"({stale_state.phase!r}) and cannot be reclaimed"
@@ -734,6 +737,7 @@ class GitHubIssueQueue:
             "escalated": self._cfg.needs_human_label,
             "done": self._cfg.done_label,
             "failed": self._cfg.error_label,
+            "cancelled": None,
         }
         if phase in mapping:
             return mapping[phase]

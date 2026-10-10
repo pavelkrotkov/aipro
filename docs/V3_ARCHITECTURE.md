@@ -149,3 +149,27 @@ or mismatched file must be reported as a failure, never a clean review. A remote
 or container backend mounting only tracked worktree content does not satisfy
 this contract; it must expose the linked Git metadata too. No GitHub credentials
 are needed in the worker to read these inputs.
+
+## Review-loop terminal states and bounded spending
+
+Review clearance hands work to the CI/PR gate (`ci_gating`); a pending check
+parks the work item in `queued` and is **not** a terminal result. The actual
+terminal phases are `done` (CI green or reviewed, explicit no-change),
+`escalated` (needs human), `failed`, and `cancelled`. Cancel is a deliberate
+`GitHubIssueQueue.cancel(..., reason=...)` transition: it is durable, removes
+lifecycle labels, preserves finding/disposition history, and cannot be
+reclaimed or reopened. Stop owned CAO sessions before cancelling; checkout
+cleanup is deferred rather than deleting files under a possibly live agent.
+
+`safety.max_run_spend_usd` is an optional **hard admission ceiling**, not an
+invoice or estimated-usage report. When configured, each developer and reviewer
+dispatch must carry a broker-verified maximum incremental cash charge; that
+ceiling is reserved in the GitHub state **before** launching the agent, and
+replays cannot reset the ledger. Any unknown charge, missing provenance, or
+exhausted ceiling escalates without dispatch. The current production broker
+can prove a zero ceiling only for permanently free models; it deliberately
+does not assume metered, promotional, or prepaid subscription capacity has a
+hard per-session dollar maximum. Consequently a configured USD ceiling rejects
+those sessions until their execution layer can supply an enforceable ceiling.
+With no USD ceiling configured, existing model-broker quota and prompt/round/
+invocation limits continue to apply unchanged.

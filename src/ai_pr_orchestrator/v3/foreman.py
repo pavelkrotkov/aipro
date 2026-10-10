@@ -37,6 +37,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
@@ -277,19 +278,24 @@ class ForemanPolicyLoop:
             except Exception as exc:
                 reason = f"foreman error: {exc}"
                 self._persist_crash(issue, reason)
-                outcomes.append(
-                    WorkItemOutcome(
-                        issue=issue,
-                        final_phase="escalated",
-                        reason=reason,
-                        escalated=True,
-                    )
+                cancelled = self._cancelled_outcome(issue)
+                outcome = cancelled or WorkItemOutcome(
+                    issue=issue, final_phase="escalated", reason=reason, escalated=True
                 )
+                outcomes.append(outcome)
             # CI-only claims own no local checkout; a retained path can belong
             # to unrelated work on this host. Keep its attribution for recovery.
             if not resume_at_gate:
                 self._cleanup_terminal_worktree(issue)
         return outcomes
+
+    def _cancelled_outcome(self, issue: GitHubIssueRef) -> WorkItemOutcome | None:
+        state = self._queue.load_state(issue.slug())
+        if state is not None and state.run_id == self._run_id and state.phase == "cancelled":
+            return WorkItemOutcome(
+                issue=issue, final_phase="cancelled", reason=state.terminal_reason or ""
+            )
+        return None
 
     def _persist_crash(self, issue: GitHubIssueRef, reason: str) -> None:
         """Persist an in-pass crash against the authoritative issue.
@@ -316,7 +322,12 @@ class ForemanPolicyLoop:
                 exc_info=True,
             )
             return
-        if state is None or state.run_id != self._run_id or state.phase not in TERMINAL_PHASES:
+        if (
+            state is None
+            or state.run_id != self._run_id
+            or state.phase not in TERMINAL_PHASES
+            or state.phase == "cancelled"
+        ):
             return
         worktree = state.extras.get("worktree")
         if worktree:
@@ -362,7 +373,9 @@ class ForemanPolicyLoop:
                 issue, state, worktree, branch, now=now, resume_at_gate=resume_at_gate
             )
         except _ForemanEscalation as exc:
-            return self._escalate(issue, state, exc.reason, now=now)
+            return self._cancelled_outcome(issue) or self._escalate(
+                issue, state, exc.reason, now=now
+            )
 
     def _run_loop(
         self,
@@ -386,6 +399,9 @@ class ForemanPolicyLoop:
         head_sha: str | None = None
 
         while True:
+            cancelled = self._cancelled_outcome(issue)
+            if cancelled is not None:
+                return cancelled
             state = self._enforce_deadline(issue, state, now=now)
             if resume_at_gate:
                 # PR #73 review thread 16 / issue #85: requeued pending-CI
@@ -994,7 +1010,12 @@ class ForemanPolicyLoop:
                 cast(dict[str, dict[str, object]], state.extras.get("review_waves", {}))
             )
             waves[round_id] = wave
-            state = self._save_fresh(issue, state, extras={**state.extras, "review_waves": waves})
+            extras = state.extras
+            for seat in seats:
+                extras = self._authorize_spend(
+                    replace(state, extras=extras), seat.lease, f"{round_id}:{seat.lane.lane}"
+                )
+            state = self._save_fresh(issue, state, extras={**extras, "review_waves": waves})
         except Exception:
             for seat in seats:
                 self._release(seat.lease)
@@ -1388,6 +1409,8 @@ class ForemanPolicyLoop:
         clobber this write (round-2 #4).
         """
         fresh = self._load(issue, state)
+        if fresh.phase in TERMINAL_PHASES:
+            raise _ForemanEscalation(f"cannot modify terminal work item {fresh.phase!r}")
         if "updated_at" not in changes:
             changes = {**changes, "updated_at": datetime.now(UTC)}
         updated = replace(fresh, **changes)  # type: ignore[arg-type]
@@ -1447,6 +1470,58 @@ class ForemanPolicyLoop:
 
     # --- Lane execution ---------------------------------------------------------
 
+    @staticmethod
+    def _spend_charges(state: WorkflowState) -> dict[str, object]:
+        ledger = state.extras.get("spend_authorizations")
+        if ledger is None:
+            return {}
+        if not isinstance(ledger, dict) or ledger.get("run_id") != state.run_id:
+            raise _ForemanEscalation("spend guard: missing or foreign run attribution")
+        charges = ledger.get("charges")
+        if not isinstance(charges, dict):
+            raise _ForemanEscalation("spend guard: malformed durable authorizations")
+        return charges
+
+    @staticmethod
+    def _cash_total(charges: dict[str, object]) -> float:
+        total = 0.0
+        for row in charges.values():
+            if not isinstance(row, dict):
+                raise _ForemanEscalation("spend guard: invalid persisted cash-charge ceiling")
+            amount = cast(dict[str, object], row).get("max_charge_usd")
+            if (
+                not isinstance(amount, (int, float))
+                or isinstance(amount, bool)
+                or not math.isfinite(amount)
+                or amount < 0
+            ):
+                raise _ForemanEscalation("spend guard: invalid persisted cash-charge ceiling")
+            total += amount
+        return total
+
+    def _authorize_spend(
+        self, state: WorkflowState, lease: ModelLease, dispatch_id: str
+    ) -> dict[str, object]:
+        limit = self._cfg.safety.max_run_spend_usd
+        if limit is None:
+            return state.extras
+        if lease.max_charge_usd is None:
+            raise _ForemanEscalation("spend guard: broker has no guaranteed cash-charge ceiling")
+        charged = self._spend_charges(state)
+        entry = {
+            "model_ref": lease.assignment.model_ref,
+            "max_charge_usd": lease.max_charge_usd,
+        }
+        if dispatch_id in charged and charged[dispatch_id] != entry:
+            raise _ForemanEscalation("spend guard: conflicting dispatch authorization")
+        charged = {**charged, dispatch_id: entry}
+        if self._cash_total(charged) > limit:
+            raise _ForemanEscalation("spend guard: maximum run cash charge exhausted")
+        return {
+            **state.extras,
+            "spend_authorizations": {"run_id": state.run_id, "charges": charged},
+        }
+
     def _charge_prompt(self, prompt: str) -> None:
         estimated = (len(prompt) + 3) // 4
         if self._prompt_tokens + estimated > self._cfg.safety.max_prompt_tokens:
@@ -1481,11 +1556,12 @@ class ForemanPolicyLoop:
             raise
         try:
             if issue is not None and lane.role == "worker":
+                extras = self._authorize_spend(state, lease, f"coder:{self._coder_usage(state)}")
                 state = self._save_fresh(
                     issue,
                     state,
                     extras={
-                        **state.extras,
+                        **extras,
                         "developer_model": lease.assignment.to_dict(),
                         "developer_fallbacks": list(fallbacks),
                     },
@@ -1569,6 +1645,7 @@ class ForemanPolicyLoop:
                 difficulty=MAX_TASK_DIFFICULTY if independent_of else 1,
                 peers=peers,
                 independent_of=independent_of,
+                require_bounded_spend=self._cfg.safety.max_run_spend_usd is not None,
                 in_flight=in_flight or {},
             )
         )

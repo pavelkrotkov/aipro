@@ -102,6 +102,8 @@ class TaskDemand:
     peers: tuple[ModelRef, ...] = ()
     #: Model refs whose family must not serve an independent adjudication.
     independent_of: tuple[ModelRef, ...] = ()
+    #: Refuse capacity without a broker-verified maximum new cash charge.
+    require_bounded_spend: bool = False
     #: The model this phase is already running on. Kept while it remains
     #: dispatchable, so a phase does not change models mid-thought. Pass
     #: ``None`` at a phase boundary or after an operational failure, which is
@@ -139,6 +141,7 @@ class TaskDemand:
             "difficulty": self.difficulty,
             "peers": list(self.peers),
             "independent_of": list(self.independent_of),
+            "require_bounded_spend": self.require_bounded_spend,
             "incumbent": self.incumbent,
             "in_flight": dict(self.in_flight),
         }
@@ -410,7 +413,14 @@ class PolicyBroker:
             # Retain successful observations until the final local release.
             self._external[assignment.model_ref] = external
             self._leases[lease_id] = assignment.model_ref
-        return ModelLease(lease_id=lease_id, assignment=assignment)
+        permanent_free = bool(
+            entry and (entry.cost_class == "free" or entry.resource_class == "free_tier")
+        )
+        return ModelLease(
+            lease_id=lease_id,
+            assignment=assignment,
+            max_charge_usd=0.0 if permanent_free else None,
+        )
 
     def release(self, lease: ModelLease) -> None:
         """Return the slot taken by :meth:`reserve`.
@@ -683,6 +693,10 @@ class PolicyBroker:
         """Why ``entry`` cannot serve ``demand``, or ``""`` if it can."""
         if not entry.enabled:
             return f"catalog entry {entry.ref!r} is disabled"
+        if demand.require_bounded_spend and not (
+            entry.cost_class == "free" or entry.resource_class == "free_tier"
+        ):
+            return "no guaranteed cash-charge ceiling for bounded-spend dispatch"
         for ref in demand.independent_of:
             peer = self._catalog.get(ref)
             if peer is None or not peer.family or not entry.family or peer.family == entry.family:

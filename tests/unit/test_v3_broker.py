@@ -104,6 +104,28 @@ def test_independent_adjudicator_filters_same_or_unknown_family():
     assert {c.ref for c in decision.rejected} == {"origin", "clone", "unknown"}
 
 
+def test_bounded_spend_selection_requires_a_permanent_no_charge_model():
+    pool = broker(
+        entry("paid"),
+        entry("promo", promotional=True, promo_ends_at=NOW + timedelta(days=1)),
+        entry(
+            "free",
+            resource_class="free_tier",
+            cost_class="free",
+            input_price_per_mtok=0.0,
+            output_price_per_mtok=0.0,
+        ),
+    )
+    decision = pool.select(
+        TaskDemand(lane="developer", role="worker", require_bounded_spend=True), at=NOW
+    )
+    assert decision.assignment is not None
+    assert decision.assignment.model_ref == "free"
+    assert {item.ref for item in decision.rejected} == {"paid", "promo"}
+    assert pool.reserve(decision.assignment).max_charge_usd == 0.0
+    assert pool.reserve(ModelAssignment(lane="developer", model_ref="paid")).max_charge_usd is None
+
+
 class TestUnscoredCandidates:
     def test_an_entry_unscored_for_the_role_is_not_silently_treated_as_adequate(self):
         # Scoring the role is how an operator states a model is fit for it.

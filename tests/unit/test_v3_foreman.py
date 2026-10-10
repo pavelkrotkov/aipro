@@ -873,6 +873,90 @@ def test_conflicted_findings_are_routed_outside_origin_lanes():
     )
 
 
+def test_spend_limit_blocks_unknown_paid_lease_before_any_agent_dispatch():
+    executor = ScriptedExecutor()
+    cfg = V3Config(safety=SafetyPolicyConfig(max_run_spend_usd=0.5))
+    loop, queue = _foreman(_ready_fake(), executor, _gate(), cfg)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "escalated"
+    assert "no guaranteed cash-charge ceiling" in outcome.reason
+    assert executor.calls == []
+    state = queue.load_state(ISSUE.slug())
+    assert state is not None and state.phase == "escalated"
+
+
+def test_spend_limit_admits_broker_verified_zero_charge_and_records_every_dispatch():
+    class FreeBroker(FakeBroker):
+        def reserve(self, assignment):
+            return replace(super().reserve(assignment), max_charge_usd=0.0)
+
+    cfg = V3Config(safety=SafetyPolicyConfig(max_run_spend_usd=0.5))
+    loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), cfg, broker=FreeBroker())
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "done"
+    restored = queue.load_state(ISSUE.slug())
+    assert restored is not None
+    ledger = restored.extras["spend_authorizations"]
+    assert ledger["run_id"] == "run-1"
+    assert len(ledger["charges"]) == 4
+    assert {entry["max_charge_usd"] for entry in ledger["charges"].values()} == {0.0}
+
+
+def test_spend_authorizations_are_cas_persisted_and_replay_safe():
+    cfg = V3Config(safety=SafetyPolicyConfig(max_run_spend_usd=0.5))
+    loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), cfg)
+    state = queue.claim(ISSUE, "run-1")
+    first = ModelLease(
+        "lease-1",
+        ModelAssignment(lane="developer", model_ref="bounded"),
+        max_charge_usd=0.3,
+    )
+    extras = loop._authorize_spend(state, first, "coder:1")
+    state = loop._save_fresh(ISSUE, state, extras=extras)
+    stored = queue.load_state(ISSUE.slug())
+    assert stored is not None
+    assert stored.extras["spend_authorizations"] == extras["spend_authorizations"]
+    assert loop._authorize_spend(state, first, "coder:1") == extras
+    with pytest.raises(_ForemanEscalation, match="conflicting dispatch authorization"):
+        loop._authorize_spend(state, replace(first, max_charge_usd=0.1), "coder:1")
+    with pytest.raises(_ForemanEscalation, match="maximum run cash charge exhausted"):
+        loop._authorize_spend(
+            state, replace(first, max_charge_usd=0.25), "review-1:breaker-reviewer"
+        )
+    altered = replace(
+        state,
+        extras={
+            **state.extras,
+            "spend_authorizations": {
+                "run_id": "run-1",
+                "charges": {"past": {"max_charge_usd": -1}},
+            },
+        },
+    )
+    with pytest.raises(_ForemanEscalation, match="invalid persisted"):
+        loop._authorize_spend(altered, first, "coder:1")
+
+
+def test_operator_cancellation_during_coder_turn_wins_and_preserves_checkout():
+    class CancellingExecutor(ScriptedExecutor):
+        def execute(self, lane, task_prompt, workdir, context, lease=None):
+            result = super().execute(lane, task_prompt, workdir, context, lease)
+            if lane.role == "worker":
+                active = queue.load_state(ISSUE.slug())
+                queue.cancel(ISSUE, active, reason="operator requested stop")
+            return result
+
+    executor = CancellingExecutor()
+    git = FakeGitOperations()
+    loop, queue = _foreman(_ready_fake(), executor, _gate(), git=git)
+    outcome = loop.run_pass()[0]
+    assert outcome.final_phase == "cancelled"
+    assert outcome.reason == "operator requested stop"
+    assert queue.load_state(ISSUE.slug()).phase == "cancelled"
+    assert "/wt/issue-1" in git.worktrees
+    assert not any(lane != "developer" for lane, _ in executor.calls)
+
+
 def test_consecutive_coder_failures_escalate():
     from ai_pr_orchestrator.v3.config import V3Config as Cfg
 

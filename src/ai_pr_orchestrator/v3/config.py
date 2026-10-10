@@ -317,6 +317,7 @@ class SafetyPolicyConfig:
     max_coder_invocations_per_run: int = 1
     max_reviewer_triggers_per_run: int = 3
     max_prompt_tokens: int = 100000
+    max_run_spend_usd: float | None = None
     allowed_pr_author_associations: list[str] = field(
         default_factory=lambda: ["OWNER", "MEMBER", "COLLABORATOR"]
     )
@@ -659,6 +660,11 @@ class V3Config:
                 raise V3ConfigError(f"safety.{budget} must be >= 1")
         if self.safety.max_prompt_tokens < 1:
             raise V3ConfigError("safety.max_prompt_tokens must be >= 1")
+        cap = self.safety.max_run_spend_usd
+        if cap is not None and (
+            type(cap) not in (int, float) or not math.isfinite(cap) or cap <= 0
+        ):
+            raise V3ConfigError("safety.max_run_spend_usd must be finite and > 0")
 
     def _validate_telemetry(self) -> None:
         """Validate the telemetry section and its overlap with the catalog."""
