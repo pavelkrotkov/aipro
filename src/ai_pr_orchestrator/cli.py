@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from collections.abc import Sequence
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from json import JSONDecodeError
 from pathlib import Path
@@ -33,9 +34,7 @@ from ai_pr_orchestrator.v3.reconcile import (
     Action as ReconcileAction,
 )
 from ai_pr_orchestrator.v3.reconcile import (
-    ActionKind as ReconcileActionKind,
-)
-from ai_pr_orchestrator.v3.reconcile import (
+    ActionKind,
     ReconcilePlanner,
     ReconciliationInputs,
     WorkItemObservation,
@@ -503,49 +502,25 @@ def _run_reconcile(args: argparse.Namespace) -> int:
 
     actions: list[ReconcileAction] = planner.plan_many(inputs_list)
 
-    # Manual recovery decisions are visible as a non-zero planning result.
-    manual_actions = [
-        a
-        for a in actions
-        if a.kind in (ReconcileActionKind.ESCALATE, ReconcileActionKind.HALT_BRANCH_MOVED)
-    ]
+    _print_reconcile_actions(actions, json_output=args.json)
+    manual = {ActionKind.ESCALATE, ActionKind.HALT_BRANCH_MOVED}
+    return 2 if any(action.kind in manual for action in actions) else 0
 
-    if args.json:
-        print(
-            json.dumps(
-                {
-                    "actions": [
-                        {
-                            "kind": a.kind.value,
-                            "work_item_id": a.work_item_id,
-                            "run_id": a.run_id,
-                            "session_id": a.session_id,
-                            "branch": a.branch,
-                            "worktree": a.worktree,
-                            "pr_number": a.pr_number,
-                            "reason": a.reason,
-                            "auto_apply": a.auto_apply,
-                        }
-                        for a in actions
-                    ],
-                },
-                indent=2,
-            )
-        )
+
+def _print_reconcile_actions(actions: list[ReconcileAction], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps({"actions": [asdict(action) for action in actions]}, indent=2))
+    elif not actions:
+        print("Nothing to reconcile.")
     else:
-        if not actions:
-            print("Nothing to reconcile.")
-        else:
-            print(f"{'ACTION':<24} {'AUTO':<6} {'WORK_ITEM':<24} REASON")
-            for action in actions:
-                print(
-                    f"{action.kind.value:<24} "
-                    f"{'yes' if action.auto_apply else 'no':<6} "
-                    f"{action.work_item_id or '-':<24} "
-                    f"{action.reason}"
-                )
-
-    return 2 if manual_actions else 0
+        print(f"{'ACTION':<24} {'AUTO':<6} {'WORK_ITEM':<24} REASON")
+        for action in actions:
+            print(
+                f"{action.kind.value:<24} "
+                f"{'yes' if action.auto_apply else 'no':<6} "
+                f"{action.work_item_id or '-':<24} "
+                f"{action.reason}"
+            )
 
 
 def _resolve_repo_credentials(
