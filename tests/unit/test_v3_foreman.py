@@ -746,7 +746,10 @@ def test_repeated_rejected_rebuttal_requires_new_evidence(
         response_to_round_id="response-1",
     )
     proposal = replace(
-        prior, action=proposal_action, rationale=evidence, round_id="response-2"
+        prior,
+        action=proposal_action,
+        rationale=evidence,
+        round_id="response-2",
     )
     state = WorkflowState(
         work_item_id=ISSUE.slug(),
@@ -787,13 +790,18 @@ def test_stagnation_fingerprint_ignores_volatile_provenance():
         ),
         [
             replace(
-                decision, run_id="run-2", round_id="review-7", rationale="tests passed"
-            )
+                decision,
+                run_id="run-2",
+                round_id="review-7",
+                rationale="tests passed",
+            ),
         ],
     )
     assert baseline == repeated
     assert baseline != loop._review_signature(
-        "/wt/issue-1", (replace(finding, body="different claim"),), [decision]
+        "/wt/issue-1",
+        (replace(finding, body="different claim"),),
+        [decision],
     )
     git.touched["/wt/issue-1"] = ["src/changed.py"]
     assert baseline != loop._review_signature("/wt/issue-1", (finding,), [decision])
@@ -855,8 +863,8 @@ def test_conflicted_findings_are_routed_outside_origin_lanes():
             "lanes": {
                 "requirements-reviewer": {"assignment": {"model_ref": "origin-a"}},
                 "breaker-reviewer": {"assignment": {"model_ref": "origin-b"}},
-            }
-        }
+            },
+        },
     }
     state = replace(state, extras={"review_waves": wave})
     assert loop._adjudication_peers(state, registry, ((a.id, "response-1"),)) == (

@@ -627,10 +627,9 @@ class ForemanPolicyLoop:
                     for f in findings
                 ),
                 "decisions": sorted(
-                    (d.finding_id, d.action, normalize_claim(d.rationale))
-                    for d in decisions
+                    (d.finding_id, d.action, normalize_claim(d.rationale)) for d in decisions
                 ),
-            }
+            },
         )
 
     def _coder_usage(self, state: WorkflowState) -> int:
@@ -1003,9 +1002,7 @@ class ForemanPolicyLoop:
         return state, seats
 
     @staticmethod
-    def _needs_independent_review(
-        finding: ReviewerFinding, state: WorkflowState
-    ) -> bool:
+    def _needs_independent_review(finding: ReviewerFinding, state: WorkflowState) -> bool:
         return bool(finding.conflict_group_id) or any(
             d.finding_id == finding.id and d.action == "fix" and d.response_to_round_id
             for d in state.dispositions
@@ -1050,8 +1047,7 @@ class ForemanPolicyLoop:
         return tuple(
             (finding.id, proposals[finding.id].round_id)
             for finding in registry.findings
-            if finding.id in proposals
-            and self._adjudicator(finding, registry, state) == lane_name
+            if finding.id in proposals and self._adjudicator(finding, registry, state) == lane_name
         )
 
     def _materialize_review_seats(
