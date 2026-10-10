@@ -374,3 +374,61 @@ def test_push_sha_uses_explicit_refspec(real_repo: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(ops, "_run", lambda *args, **kwargs: calls.append(args) or "")
     ops.push_sha("abc123", "reviewed")
     assert calls == [("push", "origin", "abc123:refs/heads/reviewed")]
+
+
+def test_authoritative_git_ignores_worker_hooks_and_inherited_controls(
+    real_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    marker = tmp_path / "hook-ran"
+    hook = real_repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf executed > '{marker}'\n")
+    hook.chmod(0o755)
+    monkeypatch.setenv("AIPRO_AUTHORITY_CANARY", "private")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(hook.parent))
+    ops = GitWorktreeOps(real_repo)
+    assert "AIPRO_AUTHORITY_CANARY" not in ops._env
+    assert "GIT_CONFIG_COUNT" not in ops._env
+    assert "GIT_CONFIG_KEY_0" not in ops._env
+    (real_repo / "file.txt").write_text("changed\n")
+    ops.commit(str(real_repo), "safe", name="T", email="t@example.com")
+    assert not marker.exists()
+
+
+def test_authoritative_git_refuses_worker_filters(real_repo: Path, tmp_path: Path):
+    ops = GitWorktreeOps(real_repo)
+    marker = tmp_path / "filter-ran"
+    (real_repo / ".gitattributes").write_text("*.txt filter=probe\n")
+    command = ["git", "config", "--local", "filter.probe.clean", f"sh -c 'touch {marker}; cat'"]
+    subprocess.run(command, cwd=real_repo, check=True)
+    (real_repo / "file.txt").write_text("changed\n")
+    with pytest.raises(GitOpsError, match=r"unsafe Git configuration.*filter\.probe\.clean"):
+        ops.commit(str(real_repo), "unsafe", name="T", email="t@example.com")
+    assert not marker.exists()
+
+
+def test_authoritative_push_pins_remote_and_rejects_rewrites(real_repo: Path, tmp_path: Path):
+    trusted = tmp_path / "trusted.git"
+    redirected = tmp_path / "redirected.git"
+    for bare in (trusted, redirected):
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(trusted)], cwd=real_repo, check=True)
+    ops = GitWorktreeOps(real_repo)
+    sha = ops.head_sha(str(real_repo))
+    ops.push_sha(sha, "main")
+    command = ["git", "-C", str(trusted), "rev-parse", "main"]
+    assert subprocess.check_output(command, text=True).strip() == sha
+
+    config_key = f"url.{redirected}.insteadOf"
+    command = ["git", "config", "--local", config_key, str(trusted)]
+    subprocess.run(command, cwd=real_repo, check=True)
+    with pytest.raises(GitOpsError, match=r"unsafe Git configuration.*url\."):
+        ops.push_sha(sha, "main")
+    subprocess.run(["git", "config", "--local", "--unset", config_key], cwd=real_repo, check=True)
+    command = ["git", "remote", "set-url", "origin", str(redirected)]
+    subprocess.run(command, cwd=real_repo, check=True)
+    with pytest.raises(GitOpsError, match="origin URL changed"):
+        ops.push_sha(sha, "main")
+    command = ["git", "-C", str(redirected), "show-ref", "--verify", "refs/heads/main"]
+    assert subprocess.run(command, capture_output=True).returncode != 0
