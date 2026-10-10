@@ -149,6 +149,7 @@ class FakeCAOServer:
 
     def __init__(self) -> None:
         self._sessions: dict[str, _SessionState] = {}
+        self._next_terminal_id = 0
         self._lock = threading.Lock()
         # Per-session status sequence overrides; fall back to DEFAULT.
         self._status_overrides: dict[str, Sequence[str]] = {}
@@ -457,7 +458,8 @@ class _FakeHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            terminal_id = f"term-{len(self._fake._sessions) + 1:04d}"
+            self._fake._next_terminal_id += 1
+            terminal_id = f"term-{self._fake._next_terminal_id:04d}"
             state = _SessionState(
                 session_name=session_name,
                 terminal_id=terminal_id,

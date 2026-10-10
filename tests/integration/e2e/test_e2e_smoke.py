@@ -72,7 +72,7 @@ def test_foreman_drives_one_fake_cao_session_to_completion(
     # The foreman reaches the ``done`` phase, the gate passed, and the
     # queue persisted authoritative state.
     assert outcome.final_phase == "done", (
-        f"expected 'done', got {outcome.final_phase!r}; terminal_reason={outcome.terminal_reason!r}"
+        f"expected 'done', got {outcome.final_phase!r}; terminal_reason={outcome.reason!r}"
     )
     assert outcome.gate is not None and outcome.gate.passed
     # The queue advanced the labels.

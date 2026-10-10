@@ -144,6 +144,9 @@ class FakeLaneExecutor:
             changed_files=[],
         )
 
+    def terminate_session(self, handle: SessionHandle) -> None:
+        pass
+
 
 class FakeReviewerLaneExecutor:
     """A reviewer lane executor returning structured findings."""
@@ -182,6 +185,9 @@ class FakeReviewerLaneExecutor:
                 )
             ],
         )
+
+    def terminate_session(self, handle: SessionHandle) -> None:
+        pass
 
 
 class FakeCIPRGate:

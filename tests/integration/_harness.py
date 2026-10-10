@@ -87,6 +87,10 @@ class FakeGitOperations:
         self.worktrees[path] = branch
         return path
 
+    def create_review_checkout(self, path: str, source_workdir: str, head_sha: str) -> str:
+        self.worktrees[path] = f"detached:{head_sha}"
+        return path
+
     def head_sha(self, workdir: str) -> str:
         return "sha"
 
@@ -109,13 +113,17 @@ class FakeGitOperations:
     def push(self, branch: str) -> None:
         return None
 
+    def push_sha(self, head_sha: str, branch: str) -> None:
+        return None
+
     def cleanup_worktree(self, path: str) -> None:
         self.worktrees.pop(path, None)
 
+    def cleanup_review_checkout(self, path: str, head_sha: str) -> None:
+        self.worktrees.pop(path, None)
+
     def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
-        # Test stub: every commit registers a synthetic touched file so the
-        # foreman's workflow-file policy has something to act on.
-        return [f"src/{workdir.strip('/').replace('/', '_') or 'x'}.py"]
+        return [f"src/{workdir.strip('/').replace('/', '_') or 'x'}.py"] if base_ref else []
 
 
 __all__ = [
@@ -155,6 +163,7 @@ def script_protocol(
         safety=SafetyPolicyConfig(
             max_coder_invocations_per_run=3,
             max_reviewer_triggers_per_run=9,
+            max_commits_per_run=3,
         )
     )
     coder = developer_output(

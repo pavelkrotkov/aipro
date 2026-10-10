@@ -105,6 +105,8 @@ class ScriptedExecutor:
     calls: list[tuple[str, str]] = field(default_factory=list)
     round_counter: dict[str, int] = field(default_factory=dict)
     prompts: list[str] = field(default_factory=list)
+    contexts: list[LaneExecutionContext] = field(default_factory=list)
+    terminated: list[SessionHandle] = field(default_factory=list)
 
     def execute(
         self,
@@ -116,13 +118,24 @@ class ScriptedExecutor:
     ) -> LaneResult:
         self.calls.append((lane.lane, workdir))
         self.prompts.append(task_prompt)
+        self.contexts.append(context)
         if lane.role == "reviewer":
             n = self.round_counter.get(lane.lane, 0) + 1
             self.round_counter[lane.lane] = n
             scripted = self.reviewer_findings_by_round.get(n, [])
             # Each reviewer lane reports its own copy with a lane-unique id,
             # mirroring independent reviewers; dedup merges identical claims.
-            findings = [replace(f, id=f"{f.id}-{lane.lane}", lane=lane.lane) for f in scripted]
+            findings = [
+                replace(
+                    f,
+                    id=f"{f.id}-{lane.lane}",
+                    lane=lane.lane,
+                    run_id=context.run_id,
+                    round_id=context.round_id or f.round_id,
+                    head_sha=context.head_sha,
+                )
+                for f in scripted
+            ]
             return LaneResult(
                 session=HANDLE,
                 exit_code=self.reviewer_exit,
@@ -175,6 +188,9 @@ class ScriptedExecutor:
             dispositions=dispositions,
         )
 
+    def terminate_session(self, handle: SessionHandle) -> None:
+        self.terminated.append(handle)
+
 
 class StaticGate:
     def __init__(self, decision: GateDecision) -> None:
@@ -205,6 +221,10 @@ class FakeGitOperations:
         self.worktrees[path] = branch
         return path
 
+    def create_review_checkout(self, path: str, source_workdir: str, head_sha: str) -> str:
+        self.worktrees[path] = f"detached:{head_sha}"
+        return path
+
     def head_sha(self, workdir: str) -> str:
         return "sha"
 
@@ -226,6 +246,9 @@ class FakeGitOperations:
     def push(self, branch: str) -> None:
         pass
 
+    def push_sha(self, head_sha: str, branch: str) -> None:
+        pass
+
     def changed_files(self, workdir: str, base_ref: str | None = None) -> list[str]:
         # PR #73 review thread 8 / issue #78: the foreman's policy layer
         # now derives changed files from the worktree. The unit-test fake
@@ -234,6 +257,9 @@ class FakeGitOperations:
         return list(getattr(self, "touched", {}).get(workdir, []))
 
     def cleanup_worktree(self, path: str) -> None:
+        self.worktrees.pop(path, None)
+
+    def cleanup_review_checkout(self, path: str, head_sha: str) -> None:
         self.worktrees.pop(path, None)
 
 
@@ -259,12 +285,13 @@ def _foreman(
     config: V3Config | None = None,
     git: Any = None,
     lanes: LaneRegistry | None = None,
+    broker: Any = None,
 ):
     cfg = config or V3Config()
     queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-A")
     loop = ForemanPolicyLoop(
         queue,
-        FakeBroker(),
+        broker or FakeBroker(),
         lanes or LaneRegistry.default(),
         executor,
         gate,
@@ -739,6 +766,9 @@ class RecordingGit(FakeGitOperations):
     def push(self, branch: str) -> None:
         self.pushed.append(branch)
 
+    def push_sha(self, head_sha: str, branch: str) -> None:
+        self.pushed.append(branch)
+
 
 def test_ci_failure_loops_back_to_coding_then_done():
     """A failed CI check becomes findings for the next coding round; when the
@@ -897,7 +927,8 @@ def test_review_round_cap_never_accepts_unreviewed_fixes(findings, gate_calls):
     assert executor.calls.count(("developer", "/wt/issue-1")) == 2
     assert len(executor.calls) == 5  # two coder turns and three reviewers
     assert len(gate.seen) == gate_calls
-    assert len(git.commits) == len(git.pushed) == len(gate.seen)
+    assert len(git.commits) == 1
+    assert len(git.pushed) == len(gate.seen)
     assert len(fake.list_open_prs()) == gate_calls
     state = queue.load_state(ISSUE.slug())
     assert state is not None and state.phase == "escalated"
@@ -1274,16 +1305,15 @@ def test_crash_path_cleans_up_worktree(monkeypatch):
     assert "/wt/issue-1" in git.cleanups  # leaked no worktree on the crash path
 
 
-def test_reviewer_workflow_file_change_is_a_policy_violation():
-    """A reviewer lane editing .github/workflows/ hits the same policy check
-    as the coder — it escalates instead of being staged and pushed (#9)."""
+def test_reviewer_workflow_file_experiment_is_disposable():
     fake = _ready_fake()
-    executor = ScriptedExecutor()
-    executor.reviewer_files = [".github/workflows/evil.yml"]
-    loop, _ = _foreman(fake, executor, _gate())
+    executor = ScriptedExecutor(reviewer_files=[".github/workflows/evil.yml"])
+    git = RecordingGit()
+    loop, _ = _foreman(fake, executor, _gate(), git=git)
     outcome = loop.run_pass()[0]
-    assert outcome.final_phase == "escalated"
-    assert "policy violation" in outcome.reason
+    assert outcome.final_phase == "done"
+    assert "aipro-issue-1" in git.pushed
+    assert all("review-" not in workdir for workdir, _ in git.commits)
 
 
 def test_coder_reply_is_actually_posted_to_the_review_thread():

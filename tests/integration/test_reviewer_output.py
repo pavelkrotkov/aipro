@@ -16,7 +16,7 @@ from ai_pr_orchestrator.v3.lanes import LaneRegistry
 @pytest.fixture
 def review_lane(cao_lane_executor, fake_cao, lane_registry, tmp_path):
     lane = lane_registry.get("requirements-reviewer")
-    context = LaneExecutionContext("review-output", round_id="review-1")
+    context = LaneExecutionContext("review-output", round_id="review-1", head_sha="snapshot-123")
 
     def execute(output, *, role_lane=lane):
         fake_cao.set_output(session_name_for(context.run_id, role_lane.lane), output)
@@ -43,6 +43,7 @@ def test_unparsed_reviewer_output_fails_closed(review_lane, output):
         {"lane": "breaker-reviewer"},
         {"run_id": "other"},
         {"round_id": "review-0"},
+        {"head_sha": "other-snapshot"},
         {"path": "../secret"},
         {"line": True},
         {"confidence": float("nan")},
@@ -85,6 +86,7 @@ def test_review_findings_reuse_domain_schema_and_current_turn(review_lane):
         line=3,
         evidence=[Evidence(kind="command", text="pytest tests/test_example.py")],
         falsification="Add the guard and rerun the failing test",
+        head_sha="snapshot-123",
     )
     payload = finding.to_dict()
     del payload["created_at"]
@@ -110,6 +112,7 @@ def test_review_minimal_finding_uses_confirmed_attribution(review_lane):
         "review-1",
     )
     assert finding.status == "open"
+    assert finding.head_sha == "snapshot-123"
 
 
 def test_only_explicit_empty_array_is_clean(review_lane):

@@ -170,6 +170,19 @@ def test_terminate_session_makes_subsequent_lookup_404(fake_cao: FakeCAOServer, 
         controller.adopt_session(expected)
 
 
+def test_recreated_sessions_have_distinct_terminals(fake_cao: FakeCAOServer, tmp_path):
+    with CaoSessionController(_control_plane(fake_cao.url), LaneRegistry.default()) as controller:
+        specs = [_spec(run, str(tmp_path)) for run in ("reviewer-a", "reviewer-b")]
+        handles = [controller.start_session(spec) for spec in specs]
+        for handle in handles:
+            controller.terminate_session(handle)
+
+        handles = [controller.start_session(spec) for spec in specs]
+        ids = {fake_cao._sessions[handle.session_id].terminal_id for handle in handles}
+        assert len(ids) == len(handles)
+        assert all(controller.observe(handle).state == "started" for handle in handles)
+
+
 def test_fault_injection_returns_injected_status(fake_cao: FakeCAOServer, tmp_path):
     """A configured ``FaultSpec`` causes the matching request to return the
     injected HTTP status; the controller maps non-2xx to a control-plane
