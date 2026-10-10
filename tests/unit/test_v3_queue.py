@@ -104,6 +104,26 @@ def test_complete_sets_done_label_and_terminal_reason():
     assert "v3-work-active" not in fake.get_labels(1)
 
 
+def test_cancelled_run_clears_lifecycle_labels_and_is_not_reopened():
+    fake = _ready_fake()
+    queue = _queue(fake)
+    initial = queue.claim(_issue(), "run-1", branch="feature", worktree="/wt")
+    cancelled = queue.cancel(_issue(), initial, reason="operator cancelled")
+    restored = _queue(fake).load_state(initial.work_item_id)
+    assert restored == cancelled
+    assert restored.phase == "cancelled" and restored.terminal_reason == "operator cancelled"
+    assert not set(fake.get_labels(1)) & set(queue._lifecycle_labels)
+    with pytest.raises(q.NoActiveClaimError):
+        queue.reclaim_expired(
+            _issue(),
+            cancelled,
+            "run-2",
+            now=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(days=3650),
+        )
+    with pytest.raises(q.NoActiveClaimError):
+        queue.transition(_issue(), cancelled, "coding")
+
+
 def test_label_transitions_are_idempotent():
     fake = _ready_fake()
     queue = _queue(fake)

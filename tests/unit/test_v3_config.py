@@ -92,6 +92,11 @@ class TestValidation:
         with pytest.raises(V3ConfigError, match="poll_interval"):
             V3Config(cao={"session_poll_interval_seconds": 0}).validate()  # ty: ignore[invalid-argument-type]
 
+    @pytest.mark.parametrize("cap", [0, -1, float("inf"), float("nan"), True])
+    def test_spend_cap_rejects_unbounded_or_nonpositive_values(self, cap) -> None:
+        with pytest.raises(V3ConfigError, match="max_run_spend_usd"):
+            V3Config(safety={"max_run_spend_usd": cap}).validate()  # ty: ignore[invalid-argument-type]
+
     def test_remaining_positive_limits_rejected(self) -> None:
         with pytest.raises(V3ConfigError, match="stagnation_rounds_threshold"):
             V3Config(escalation={"stagnation_rounds_threshold": 0}).validate()  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]

@@ -85,6 +85,15 @@ class TestWorkflowState:
         )
         assert state.terminal_reason == "merged"
 
+    def test_cancelled_is_terminal_and_requires_an_auditable_reason(self) -> None:
+        with pytest.raises(DomainError, match="terminal_reason"):
+            WorkflowState(work_item_id="wi-1", run_id="run-1", phase="cancelled")
+        state = WorkflowState(
+            work_item_id="wi-1", run_id="run-1",
+            phase="cancelled", terminal_reason="operator stopped the run",
+        )
+        assert WorkflowState.from_dict(state.to_dict()) == state
+
     def test_reason_on_transient_phase_is_invalid(self) -> None:
         with pytest.raises(DomainError, match="only valid in terminal phases"):
             WorkflowState(
