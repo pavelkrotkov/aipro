@@ -2148,23 +2148,23 @@ class ForemanPolicyLoop:
             for turn, wave in sorted(waves.items())
             for lane, record in sorted(wave["lanes"].items())
         ]
-        developer = state.extras.get("developer_model", {})
-        models = ", ".join([f"developer: {developer.get('model_ref', 'unknown')}", *reviewers])
+        developer_ref = state.extras.get("developer_model", {}).get("model_ref", "unknown")
+        models = ", ".join([f"developer: {developer_ref}", *reviewers])
+        test_results = [f"{test['command']} ({test['result']})" for test in report.get("tests", [])]
+        tests = ", ".join(test_results) or "not reported"
         dispositions = ", ".join(sorted(d.action for d in state.dispositions)) or "none"
-        tests = ", ".join(
-            f"{test['command']} ({test['result']})" for test in report.get("tests", [])
-        ) or "not reported"
-        return (
-            "<!-- aipro-summary:start -->\n"
-            f"Refs #{issue.number}\n"
-            f"Run: `{state.run_id}` | Head: `{state.extras.get('head_sha', '')}`\n"
-            f"Implementation: {report.get('summary', 'not reported')}\n"
-            f"Tests: {tests}\n"
-            f"Review: {len(state.findings)} active, {len(state.archived)} archived; "
-            f"dispositions: {dispositions}\n"
-            f"Models: {models}\n"
-            "<!-- aipro-summary:end -->"
-        )
+        review = f"{len(state.findings)} active, {len(state.archived)} archived"
+        summary = report.get("summary", "not reported")
+        head = state.extras.get("head_sha", "")
+        parts = [
+            f"Refs #{issue.number}",
+            f"Run: `{state.run_id}` | Head: `{head}`",
+            f"Implementation: {summary}",
+            f"Tests: {tests}",
+            f"Review: {review}; dispositions: {dispositions}",
+            f"Models: {models}",
+        ]
+        return "<!-- aipro-summary:start -->\n" + "\n".join(parts) + "\n<!-- aipro-summary:end -->"
 
     @staticmethod
     def _with_pr_summary(body: str, summary: str) -> str:
