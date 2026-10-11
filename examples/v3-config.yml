@@ -1,0 +1,38 @@
+# Edit the illustrative model catalog and account rows before enabling issues.
+github_queue:
+  enabled_label: v3-work
+  opt_in_label: v3-work-enabled
+  # For GitHub App tokens, pin this to the exact bot comment writer login.
+  state_author_login: ""
+
+cao:
+  base_url: http://127.0.0.1:9889
+
+model_router:
+  catalog_path: model-catalog.yml
+
+telemetry:
+  # Set hermes_python to the coordinator's Hermes interpreter on deployment.
+  resources:
+    - {name: anthropic-sub, provider: anthropic, resource_class: subscription}
+    - {name: codex-sub, provider: openai-codex, resource_class: subscription}
+    - {name: openrouter, provider: openrouter, resource_class: metered, ttl_seconds: 60}
+
+broker:
+  reserves:
+    - {resource: anthropic-sub, fraction: 0.2}
+    - {resource: codex-sub, fraction: 0.2}
+
+ci_policy:
+  # Replace with the target repository's required check names, case-sensitive.
+  required_checks: [Tests]
+
+safety:
+  allowed_pr_author_associations: [OWNER, MEMBER, COLLABORATOR]
+  disallow_forks: true
+  disallow_workflow_file_changes: true
+  max_total_iterations: 3
+  max_commits_per_run: 3
+  max_coder_invocations_per_run: 3
+  max_reviewer_triggers_per_run: 9
+  max_prompt_tokens: 100000

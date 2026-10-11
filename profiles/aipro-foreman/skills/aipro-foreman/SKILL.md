@@ -3,7 +3,7 @@ name: aipro-foreman
 description: Operate the persistent AIPRO V3 scheduler and inspect recovery requirements.
 ---
 
-Read `docs/V3_FOREMAN.md` in the checkout named by `AIPRO_CHECKOUT` before
+Read `docs/V3_FOREMAN.md` in the checkout named by `AIPRO_SOURCE` before
 operating the service. `AIPRO_V3_CONFIG` is the shared policy file; its `cao`
 section supplies control-plane access. Keep that endpoint coordinator-only.
 

@@ -30,7 +30,8 @@ comments before changing writers. See [acceptance boundaries](V3_SOAK.md).
   service. Follow [CAO provisioning](V3_CAO.md) for the pinned Hermes image,
   whole-process container wrapper, separate lane homes, consent bootstrap,
   and profiles. Keep CAO's unauthenticated control endpoint loopback-only.
-- A shared V3 YAML file with `github_queue`, `cao`, `hermes_lanes`, safety/CI
+- A shared V3 YAML file (start with [the V3 sample](../examples/v3-config.yml))
+  with `github_queue`, `cao`, `hermes_lanes`, safety/CI
   policy, and `model_router.catalog_path` or inline catalog. Relative catalog
   paths resolve beside that YAML file. The configured catalog must be nonempty.
   Account usage and provider health use the existing `telemetry` section and
@@ -47,19 +48,23 @@ From the checkout, install the package with the repository's usual `uv sync`
 workflow. Install the reusable supervisor profile into Hermes:
 
 ```sh
-hermes profile install "$AIPRO_CHECKOUT/profiles/aipro-foreman"
+AIPRO_SOURCE=/home/you/dev/aipro
+hermes profile install "$AIPRO_SOURCE/profiles/aipro-foreman"
 ```
 
 The distribution contains no account credentials or model pin. Select the
 profile explicitly in your Hermes CLI/gateway configuration; do not change
-unrelated profiles. Set its `AIPRO_CHECKOUT` and `AIPRO_V3_CONFIG` variables.
+unrelated profiles. Set its `AIPRO_SOURCE` (package checkout), `AIPRO_CHECKOUT`
+(target repository checkout), and `AIPRO_V3_CONFIG` variables. These paths may
+coincide when aipro works on its own repository.
 
 The supplied user unit defaults to `$HOME/dev/aipro`. For another checkout,
 edit its `WorkingDirectory` and executable path before installing it.
 Create `$HOME/.config/aipro/foreman.env`, mode 600, with your own values:
 
 ```ini
-AIPRO_CHECKOUT=/home/you/dev/aipro
+AIPRO_SOURCE=/home/you/dev/aipro
+AIPRO_CHECKOUT=/home/you/dev/target-repository
 AIPRO_V3_CONFIG=/home/you/.config/aipro/v3.yml
 AIPRO_REPOSITORY=owner/repo
 AIPRO_COMMITTER_NAME="AIPRO Foreman"
