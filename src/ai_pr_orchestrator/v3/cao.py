@@ -25,7 +25,6 @@ See ``docs/V3_CAO.md`` for the minimum CAO version and profile provisioning.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import hashlib
 import json
@@ -197,6 +196,7 @@ class CaoSessionMetadata:
     # metadata, so a restarted process restores the idle-settle guard
     # instead of treating a finished session as one that never ran.
     activity_seen: bool = False
+    input_digest: str | None = None
     launched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @property
@@ -223,6 +223,7 @@ class CaoSessionMetadata:
                 self.model_assignment.to_dict() if self.model_assignment is not None else None
             ),
             "activity_seen": self.activity_seen,
+            "input_digest": self.input_digest,
             "launched_at": self.launched_at.isoformat(),
         }
 
@@ -270,9 +271,28 @@ class CaoSessionMetadata:
             model_assignment=(
                 ModelAssignment.from_dict(assignment) if assignment is not None else None
             ),
-            activity_seen=bool(data.get("activity_seen", False)),
+            activity_seen=data.get("activity_seen") is True,
+            input_digest=_input_digest(data),
             launched_at=parsed_launched_at,
         )
+
+
+def message_digest(message: str, context: LaneExecutionContext) -> str:
+    payload = json.dumps([message, dataclasses.asdict(context)], sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _input_digest(data: dict[str, Any]) -> str | None:
+    digest = data.get("input_digest", object())
+    if digest is None:
+        return None
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(c not in "0123456789abcdef" for c in digest)
+    ):
+        raise CaoMetadataError("CAO metadata has no valid input digest; reconcile the turn")
+    return digest
 
 
 @dataclass(frozen=True)
@@ -597,7 +617,9 @@ class CaoSessionController:
 
     # --- Work submission ---------------------------------------------------
 
-    def submit_work(self, handle: SessionHandle, message: str) -> None:
+    def submit_work(
+        self, handle: SessionHandle, message: str, *, context: LaneExecutionContext | None = None
+    ) -> None:
         """Send work to the session and return without waiting for a result.
 
         Used for both the first task and every follow-up: CAO keeps the
@@ -609,19 +631,27 @@ class CaoSessionController:
         if not message:
             raise ValueError("message must be non-empty")
         metadata = self._metadata_for(handle)
+        if metadata.input_digest is not None and self.observe(handle).state != "completed":
+            raise SessionBusyError("Previous turn has not completed; reconcile before new input")
+        context = context or metadata.context
+        self._clear_activity(
+            dataclasses.replace(
+                metadata, context=context, input_digest=message_digest(message, context)
+            )
+        )
         response = self._request(
             "POST",
             f"/terminals/{metadata.terminal_id}/input",
             params={"message": message},
         )
+        if response.status_code == 409:
+            try:
+                self._restore_activity(metadata)
+            except CaoControlPlaneError as exc:
+                raise SessionBusyError(
+                    f"Input rejected; activity restore failed, reconciliation required: {exc}"
+                ) from exc
         self._raise_for_status(response, f"submit work to session {metadata.session_name!r}")
-        # New work invalidates the previous turn's evidence in full: any idle
-        # streak AND any recorded activity. Acceptance is not activity, though:
-        # the control plane accepts input while the provider is still starting,
-        # so only a status response showing a post-start state (see observe)
-        # may count again. Without this clearing, an accepted follow-up could
-        # be reported complete while it is still queued.
-        self._clear_activity(metadata)
 
     # --- Observation -------------------------------------------------------
 
@@ -824,6 +854,10 @@ class CaoSessionController:
         if metadata.activity_seen:
             self._active_seen.add(metadata.session_name)
             self._durable_activity_confirmed.add(metadata.session_name)
+        else:
+            self._active_seen.discard(metadata.session_name)
+            self._durable_activity_confirmed.discard(metadata.session_name)
+            self._idle_readings[metadata.session_name] = 0
 
     def _mark_active(self, session_name: str) -> None:
         """Record observed post-start activity, in memory and durably.
@@ -861,27 +895,28 @@ class CaoSessionController:
         self._durable_activity_confirmed.add(session_name)
 
     def _clear_activity(self, metadata: CaoSessionMetadata) -> None:
-        """Drop all activity evidence for a session, in memory and durably.
-
-        Used when new work is accepted: a queued follow-up must not inherit
-        the previous turn's activity, or idle-settle could complete the
-        follow-up before it ever executed.
-        """
+        """Reset durable turn evidence before input can be delivered."""
         name = metadata.session_name
+        updated = dataclasses.replace(metadata, activity_seen=False)
+        response = self._request(
+            "PATCH",
+            f"/terminals/{metadata.terminal_id}/metadata",
+            json={"metadata": updated.to_dict()},
+        )
+        self._raise_for_status(response, f"reset activity before input for {name!r}")
         self._active_seen.discard(name)
         self._idle_readings[name] = 0
         self._durable_activity_confirmed.discard(name)
-        updated = dataclasses.replace(metadata, activity_seen=False)
         self._sessions[name] = updated
-        # A failed clear is left best-effort on purpose: stale durable
-        # evidence only keeps the idle-settle guard armed longer, which can
-        # delay completion but never wrongly complete a queued follow-up.
-        with contextlib.suppress(CaoControlPlaneError):
-            self._request(
-                "PATCH",
-                f"/terminals/{metadata.terminal_id}/metadata",
-                json={"metadata": updated.to_dict()},
-            )
+
+    def _restore_activity(self, metadata: CaoSessionMetadata) -> None:
+        response = self._request(
+            "PATCH",
+            f"/terminals/{metadata.terminal_id}/metadata",
+            json={"metadata": metadata.to_dict()},
+        )
+        self._raise_for_status(response, f"restore activity for {metadata.session_name!r}")
+        self._register(metadata)
 
     def _stop_session(self, metadata: CaoSessionMetadata) -> None:
         """Delete the remote session and drop every piece of local per-name
@@ -985,6 +1020,8 @@ class CaoSessionController:
         if status != "idle":
             self._idle_readings[session_name] = 0
             mapped = _STATUS_LIFECYCLE.get(status or "", "started")
+            if self._unobserved_completion(session_name, mapped):
+                return "running"
             # Only statuses proving the agent picked work up count as activity:
             # a fresh terminal is idle before it starts, and treating that idle
             # as "settled" would complete a lane that never ran its message.
@@ -996,6 +1033,13 @@ class CaoSessionController:
         readings = self._idle_readings.get(session_name, 0) + 1
         self._idle_readings[session_name] = readings
         return "completed" if readings >= self._idle_settle_polls else "running"
+
+    def _unobserved_completion(self, name: str, lifecycle: SessionLifecycle) -> bool:
+        return (
+            lifecycle == "completed"
+            and self._sessions[name].input_digest is not None
+            and name not in self._active_seen
+        )
 
     def _is_expired(self, metadata: CaoSessionMetadata, now: datetime | None) -> bool:
         moment = now if now is not None else datetime.now(UTC)

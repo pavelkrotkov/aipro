@@ -141,8 +141,23 @@ refuses rather than silently running the session somewhere else.
   the error carries `.session_name` and the caller must reconcile with
   `adopt_session()` instead.
 
-The same rule applies to `submit_work`: on `CaoTransportError`, observe the
-session before resending, because a resent instruction can double-apply.
+Before input, `submit_work` writes the turn context, SHA-256 input fingerprint,
+and `activity_seen: false` together. If that write fails, no input is sent.
+The fingerprint covers the prompt and full execution context. On restart,
+`CaoLaneExecutor.execute` collects a matching turn without resending input;
+a different turn requires the previous one to have completed. Transport
+failures preserve the worker and workflow state for reconciliation.
+
+A recorded fingerprint proves dispatch intent, not delivery. If a crash
+happens between metadata preparation and input, collection cannot fabricate
+completion from the previous turn's idle/completed status. It needs new
+observed activity, otherwise the existing timeout applies. Do not resend a
+possibly delivered turn. A definitive input rejection restores the previous
+metadata; a failed restoration requires reconciliation.
+
+Older sessions without an explicit `input_digest` are refused: reconcile or
+stop them before upgrading. Do not add a fingerprint to an unknown in-flight
+turn to force adoption.
 
 ## 4. Provisioning the Hermes lane profiles
 
