@@ -429,8 +429,26 @@ class GitHubIssueQueue:
     # --- Queue operations --------------------------------------------------
 
     def list_ready(self) -> list[GitHubIssueRef]:
-        numbers = self._client.list_issues_by_label(self._cfg.enabled_label)
-        return [GitHubIssueRef(owner=self._owner, repo=self._repo, number=n) for n in numbers]
+        ready = []
+        for n in sorted(self._client.list_issues_by_label(self._cfg.enabled_label)):
+            issue = GitHubIssueRef(self._owner, self._repo, n)
+            state = self.load_state(issue.slug())
+            if state is None or state.phase == "queued":
+                ready.append(issue)
+        return ready
+
+    @property
+    def host_id(self) -> str:
+        return self._host_id
+
+    def list_active(self) -> list[GitHubIssueRef]:
+        numbers = set(self._client.list_issues_by_label(self._cfg.active_label))
+        numbers.update(self._client.list_issues_by_label(self._cfg.review_label))
+        for n in self._client.list_issues_by_label(self._cfg.enabled_label):
+            state = self.load_state(work_item_id_of(GitHubIssueRef(self._owner, self._repo, n)))
+            if state is not None and state.phase not in {*TERMINAL_PHASES, "queued"}:
+                numbers.add(n)
+        return [GitHubIssueRef(self._owner, self._repo, n) for n in sorted(numbers)]
 
     def claim(
         self,
@@ -565,7 +583,7 @@ class GitHubIssueQueue:
         )
         self.save_state(new_state, expected_updated_at=state.updated_at)
         try:
-            self._apply_phase_labels(issue, phase)
+            self._apply_state_labels(issue, new_state)
         except Exception as exc:  # state committed; labels need repair, not a full retry
             raise LabelSyncError(
                 f"State for {issue.slug()} committed to {phase!r} but label update failed: {exc}"
@@ -586,7 +604,16 @@ class GitHubIssueQueue:
         current = self.load_state(work_item_id_of(issue))
         if current is None:
             return
-        self._apply_phase_labels(issue, current.phase)
+        self._apply_state_labels(issue, current)
+
+    def _apply_state_labels(self, issue, state):
+        unconfirmed = "coder_turn" in state.extras and not state.extras.get("lanes_stopped")
+        if state.phase in TERMINAL_PHASES and unconfirmed:
+            self._apply_phase_labels(issue, "coding")
+            raise RuntimeError(
+                "Terminal run has an unconfirmed developer; reconcile before release"
+            )
+        self._apply_phase_labels(issue, state.phase)
 
     def complete(
         self, issue: GitHubIssueRef, state: WorkflowState, *, reason: str = "done"
@@ -650,7 +677,7 @@ class GitHubIssueQueue:
             host_id=self._host_id,
             claimed_at=now,
             lease_expires_at=now + timedelta(seconds=self._cfg.lease_seconds),
-            phase="claiming",
+            phase=stale_state.phase,
             branch=branch,
             worktree=worktree,
             pr_number=pr_number,
@@ -662,7 +689,7 @@ class GitHubIssueQueue:
         new_state = WorkflowState(
             work_item_id=stale_state.work_item_id,
             run_id=run_id,
-            phase="claiming",
+            phase=stale_state.phase,
             round_id=stale_state.round_id,
             updated_at=now,
             findings=list(stale_state.findings),
@@ -672,7 +699,7 @@ class GitHubIssueQueue:
         )
         self.save_state(new_state, expected_updated_at=stale_state.updated_at)
         try:
-            self._apply_phase_labels(issue, "claiming")
+            self._apply_phase_labels(issue, stale_state.phase)
         except Exception as exc:
             raise LabelSyncError(
                 f"Reclaim for {issue.slug()} committed but label update failed: {exc}"

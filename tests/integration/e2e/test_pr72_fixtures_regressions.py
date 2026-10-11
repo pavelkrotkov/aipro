@@ -168,7 +168,8 @@ def test_harness_inspects_cao_sessions_via_public_api(fake_cao, foreman_harness)
     loop.run_pass()
 
     # Use the public inspection helper rather than touching privates.
-    assert session_name in fake_cao.session_names()
+    assert _queue.load_state("owner/repo#1").extras["developer_session"] == session_name
+    assert session_name not in fake_cao.session_names()
 
 
 @pytest.mark.usefixtures("cao_lane_executor", "lane_registry")

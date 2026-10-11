@@ -1,0 +1,10 @@
+name: aipro-foreman
+version: 0.1.0
+description: Orchestration-only supervisor for the deterministic AIPRO V3 service
+env_requires:
+  - name: AIPRO_CHECKOUT
+    description: Absolute coordinator checkout path
+    required: true
+  - name: AIPRO_V3_CONFIG
+    description: Absolute V3 policy and CAO control-plane configuration path
+    required: true

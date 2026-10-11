@@ -1,0 +1,15 @@
+[Unit]
+Description=AIPRO V3 continuous issue foreman
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/dev/aipro
+EnvironmentFile=%h/.config/aipro/foreman.env
+ExecStart=%h/dev/aipro/.venv/bin/aipro foreman --config ${AIPRO_V3_CONFIG} --checkout ${AIPRO_CHECKOUT} --repo ${AIPRO_REPOSITORY} --committer-name ${AIPRO_COMMITTER_NAME} --committer-email ${AIPRO_COMMITTER_EMAIL}
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

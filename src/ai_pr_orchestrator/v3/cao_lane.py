@@ -128,6 +128,8 @@ class CaoLaneExecutor:
         workdir: str,
         context: LaneExecutionContext,
         lease: ModelLease | None = None,
+        *,
+        resume: bool = False,
     ) -> LaneResult:
         """Submit a new turn once, or collect its matching durable result."""
         registered_lane = self._lanes.get(lane.lane)
@@ -141,7 +143,11 @@ class CaoLaneExecutor:
             model_lease=lease,
         )
 
-        handle = self._controller.start_session(spec)
+        handle = (
+            self._controller.recover_session(spec)
+            if resume
+            else self._controller.start_session(spec)
+        )
         try:
             metadata = self._controller._metadata_for(handle)
             digest = message_digest(task_prompt, context)

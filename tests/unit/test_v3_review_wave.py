@@ -34,7 +34,7 @@ class ConcurrentExecutor(ScriptedExecutor):
         self.seen = {}
         self.lock = threading.Lock()
 
-    def execute(self, lane, task_prompt, workdir, context, lease=None):
+    def execute(self, lane, task_prompt, workdir, context, lease=None, *, resume=False):
         if lane.role == "reviewer":
             self.barrier.wait(timeout=2)
             with self.lock:
@@ -95,11 +95,14 @@ def test_default_reviewers_are_blind_isolated_concurrent_and_diverse():
         "architecture-reviewer": "ref-architecture-reviewer",
     }
     assert all(path not in git.worktrees for path in workdirs)
-    assert len(executor.terminated) == 3
+    assert {"developer", "requirements-reviewer", "breaker-reviewer", "architecture-reviewer"} <= {
+        handle.lane for handle in executor.terminated
+    }
+    assert executor.terminated[-1].lane == "developer"
 
 
 class BreakerCrashExecutor(ScriptedExecutor):
-    def execute(self, lane, task_prompt, workdir, context, lease=None):
+    def execute(self, lane, task_prompt, workdir, context, lease=None, *, resume=False):
         if lane.lane == "breaker-reviewer":
             raise RuntimeError("breaker exploded")
         return super().execute(lane, task_prompt, workdir, context, lease)
@@ -148,7 +151,8 @@ def test_result_persistence_failure_retains_review_resources(monkeypatch):
     outcome = loop.run_pass()[0]
 
     assert outcome.final_phase == "escalated"
-    assert executor.terminated == []
+    assert len({handle.lane for handle in executor.terminated}) == 4
+    assert executor.terminated[-1].lane == "developer"
     retained = {path for path in git.worktrees if "-review-1-" in path}
     assert retained == {
         "/wt/issue-1-review-1-requirements-reviewer",
@@ -220,5 +224,6 @@ def test_failed_finding_persistence_does_not_claim_completed_reviews(monkeypatch
     assert "finding persistence failed" in outcome.reason
     wave = queue.load_state("owner/repo#1").extras["review_waves"]["review-1"]
     assert {record["status"] for record in wave["lanes"].values()} == {"planned"}
-    assert executor.terminated == []
+    assert len({handle.lane for handle in executor.terminated}) == 4
+    assert executor.terminated[-1].lane == "developer"
     assert len([path for path in git.worktrees if "-review-1-" in path]) == 3

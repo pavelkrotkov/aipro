@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from json import JSONDecodeError
@@ -39,6 +41,7 @@ from ai_pr_orchestrator.v3.reconcile import (
     ReconciliationInputs,
     WorkItemObservation,
 )
+from ai_pr_orchestrator.v3.scheduler import ContinuousForeman
 from ai_pr_orchestrator.v3.telemetry import redact_secrets
 from ai_pr_orchestrator.v3.telemetry_hermes import build_telemetry
 
@@ -48,17 +51,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "catalog":
-        return _run_catalog(args)
-
-    if args.command == "telemetry":
-        return _run_telemetry(args)
-
-    if args.command == "route":
-        return _run_route_explain(args)
-
-    if args.command == "reconcile":
-        return _run_reconcile(args)
+    handlers = {
+        "catalog": _run_catalog,
+        "telemetry": _run_telemetry,
+        "route": _run_route_explain,
+        "reconcile": _run_reconcile,
+        "foreman": _run_foreman,
+    }
+    if args.command in handlers:
+        return handlers[args.command](args)
 
     if args.command == "inspect":
         return runner.inspect(pr_number=args.pr)
@@ -79,9 +80,119 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
 
+def _add_foreman_arguments(subparsers) -> None:
+    parser = subparsers.add_parser("foreman", help="Continuously schedule and recover V3 issues")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--checkout", required=True)
+    parser.add_argument("--repo")
+    parser.add_argument("--token")
+    parser.add_argument("--committer-name", required=True)
+    parser.add_argument("--committer-email", required=True)
+    parser.add_argument("--poll-seconds", type=float, default=30)
+    parser.add_argument(
+        "--once", action="store_true", help="Perform one reconciliation/scheduling pass"
+    )
+
+
+def _run_foreman(args: argparse.Namespace) -> int:
+    import socket
+    from math import isfinite
+
+    from ai_pr_orchestrator.github.client import GitHubClient
+    from ai_pr_orchestrator.v3.cao import CaoSessionController
+    from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
+    from ai_pr_orchestrator.v3.ci_gate import CIPRGateImpl
+    from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop
+    from ai_pr_orchestrator.v3.git_ops import GitWorktreeOps
+    from ai_pr_orchestrator.v3.lanes import LaneRegistry
+
+    if not isfinite(args.poll_seconds) or args.poll_seconds <= 0:
+        raise SystemExit("--poll-seconds must be finite and positive")
+    config_path = Path(args.config).resolve()
+    config = load_v3_config(config_path)
+    owner, repo, token = _resolve_repo_credentials(args, config.github_queue)
+    if not token:
+        raise SystemExit("Foreman requires GITHUB_TOKEN or --token")
+    catalog = resolve_catalog(config, base_dir=config_path.parent)
+    if not catalog.entries:
+        raise SystemExit("Foreman requires a configured model catalog")
+    checkout = Path(args.checkout).resolve()
+    lanes = LaneRegistry.from_config(config.hermes_lanes)
+    git = GitWorktreeOps(checkout)
+    telemetry, _ = build_telemetry(config.telemetry, catalog=catalog)
+    with (
+        _coordinator_lock(checkout),
+        GitHubClient(token, owner, repo) as client,
+        CaoSessionController(config.cao, lanes) as controller,
+    ):
+        queue = GitHubIssueQueue(
+            client, owner, repo, config.github_queue, host_id=socket.gethostname()
+        )
+        executor = CaoLaneExecutor(
+            controller,
+            lanes,
+            git=git,
+            catalog=catalog,
+            poll_interval_seconds=config.cao.session_poll_interval_seconds,
+        )
+
+        def loop_factory(run_id: str) -> ForemanPolicyLoop:
+            broker = build_model_broker(
+                config, telemetry_source=telemetry, base_dir=config_path.parent, catalog=catalog
+            )
+            return ForemanPolicyLoop(
+                queue,
+                broker,
+                lanes,
+                executor,
+                CIPRGateImpl(client, config.ci_policy),
+                git,
+                config,
+                run_id=run_id,
+                worktree_root=str(checkout / ".worktrees"),
+                committer_name=args.committer_name,
+                committer_email=args.committer_email,
+            )
+
+        return _serve_foreman(
+            ContinuousForeman(queue, loop_factory), args.poll_seconds, once=args.once
+        )
+
+
+@contextmanager
+def _coordinator_lock(checkout: Path):
+    import fcntl
+
+    git_dir = checkout / ".git"
+    if not git_dir.is_dir() or git_dir.is_symlink():
+        raise ValueError(
+            "Foreman checkout must be a primary repository with its own .git directory"
+        )
+    with (git_dir / "aipro-foreman.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def _serve_foreman(scheduler: ContinuousForeman, poll_seconds: float, *, once: bool = False) -> int:
+    while True:
+        exit_code = 0
+        try:
+            outcomes = scheduler.step()
+            print(json.dumps({"outcomes": list(map(asdict, outcomes))}), flush=True)
+        except Exception as exc:
+            print(json.dumps({"reconciliation_required": redact_secrets(str(exc))}), flush=True)
+            exit_code, outcomes = 2, []
+        if once:
+            return exit_code
+        if not outcomes or all(o.final_phase == "ci_gating" for o in outcomes):
+            time.sleep(poll_seconds)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aipro")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    _add_foreman_arguments(subparsers)
 
     run_parser = subparsers.add_parser("run", help="Run the PR review loop")
     _add_run_arguments(run_parser)
