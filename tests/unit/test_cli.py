@@ -16,6 +16,14 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     assert "usage:" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("command", ["run", "dry-run", "inspect"])
+def test_retired_command_is_rejected_before_execution(command, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main([command, "--pr", "123"])
+    assert exc.value.code == 2
+    assert f"invalid choice: '{command}'" in capsys.readouterr().err
+
+
 CATALOG_YML = """
 models:
   - ref: free-any-role
