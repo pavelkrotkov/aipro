@@ -1,6 +1,7 @@
 # aipro V3 Cutover Plan (issue #55) — rev 6
 
-Status: **P1–P6 implemented; P7 tracking closure follows green retirement CI**. The plan is the gate; the foreman drives each phase
+Status: **P1–P6 passed on main; P7 acceptance record and tracking closure**.
+See [the acceptance record](V3_ACCEPTANCE.md) for verified evidence and limits. The plan is the gate; the foreman drives each phase
 behind its own CI/objective gate and reports at phase boundaries. V1 is deleted
 in P6 only when P2–P5 are green on main and the documented rollback path
 (revert P6 then P5 after drain) remains valid. Operator can stop the run at
