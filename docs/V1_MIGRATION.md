@@ -1,10 +1,26 @@
 # V1 migration and rollback
 
-V3 is the deployment default. P5 ships its replacement configuration, trigger
-and runbook before P6 removes V1. V1 `run`, `dry-run`, `inspect`, provider adapters,
-`examples/sample-config.yml` and `examples/target-repo-workflow.yml` are deprecated
-in P5. Do not install them for new deployments. P6 removes them without aliases
-or a compatibility loader.
+V3 is the sole supported runtime. P5 shipped its replacement configuration,
+trigger and runbook before P6 removed V1. There are no aliases, compatibility
+shims, or V1 config/state loaders.
+
+| Removed surface | V3 operation |
+| --- | --- |
+| `run --pr`, `run --event-path` | `foreman` schedules opted-in GitHub issues |
+| `dry-run --pr` | `step --issue N --dry-run` previews V3 policy |
+| `inspect --pr` | `status --issue N` inspects authoritative issue state |
+| `examples/sample-config.yml` | `examples/v3-config.yml` and shared catalog |
+| `examples/target-repo-workflow.yml` | `examples/v3-queue-workflow.yml` |
+
+The old runner, provider adapters, V1 domain/state/config, agent prompt/output
+helpers, decision application and `git.repo` helper were deleted. V3 already
+owns those responsibilities and had no consumers of the old helpers. Shared
+GitHub transport/fake models and secret-redacting logging remain; Git mutations
+use `v3.git_ops`. Historical design plans and Git history retain the V1 record.
+
+The new issue-oriented commands do not automatically adopt or convert V1 PRs.
+All V3 commands require their documented arguments; `reconcile` remains a
+read-only recovery plan, and its `--apply` mode is unsupported.
 
 ## Switch an existing repository
 
@@ -33,7 +49,11 @@ accepted DELETE, expired lease, or elapsed TTL is insufficient proof.
 
 Use the native controller's `require_run_stopped(run_id, work_item_id,
 developer_session=..., reviewer_lanes=...)` with the saved developer session
-and all historical reviewer-wave lanes. After successful verification, persist
+and all historical reviewer-wave lanes. If a developer launch has no saved
+session name, derive its name with `session_name_for` from the durable
+`developer_model.lane`, run id and work-item id, as the foreman does. Never
+substitute a renamed current lane; missing or invalid attribution keeps the
+claim held for manual reconciliation. After successful verification, persist
 `lanes_stopped: true` in the current trusted state with its `updated_at`
 precondition. The Python queue API `queue.abandon(issue, current_state)` then
 requeues that owned claim and removes lease attribution while retaining its run,

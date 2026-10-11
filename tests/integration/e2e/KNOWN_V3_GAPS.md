@@ -36,13 +36,13 @@ replaying submissions. Shared CAO teardown confirms disappearance on ordinary,
 timeout and replacement stops. Surviving sessions hold scheduler capacity, and
 opt-out cancellation stops saved historical lanes after a configuration rename.
 
-Cutover still requires replacement configuration, trigger and migration docs
-before V1 retirement. The Git soak exercises native
-branches, commits, reviewer clones and local-remote pushes; CAO HTTP/GitHub
-and model output remain external fixtures. OS isolation is separately covered
-by the native container authority checks.
-V1 remains supported until those gates pass. Closed issue #55 alone is not
-acceptance evidence, and historical PR #89 must not be merged as proof.
+Replacement configuration, trigger and migration docs shipped in PR #133 before
+P6 retirement. The Git soak exercises native branches, commits, reviewer clones
+and local-remote pushes; CAO HTTP/GitHub and model output remain external
+fixtures. OS isolation and physical container teardown are separately verified
+on native Hermes/CAO. Historical PR #89 is superseded acceptance work, not proof
+or an additional implementation to merge. See the migration runbook for the
+ordered rollback and tracking-issue reopening procedure.
 
 Legacy findings without run/model provenance remain readable; missing fields
 are not retroactively proof of independent adjudication.

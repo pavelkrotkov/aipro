@@ -15,9 +15,6 @@ from ai_pr_orchestrator.logging import (
     SecretRedactingFilter,
     SecretRedactor,
     collect_secret_values,
-    log_action,
-    log_error,
-    log_state_transition,
     setup_logging,
 )
 
@@ -48,7 +45,7 @@ def test_every_log_line_is_valid_json() -> None:
     stream, logger, _ = _configure("aipro_test_json")
     logger.info("plain message")
     logger.warning("another %s line", "formatted")
-    log_action(logger, pr=1, action_type="add_label")
+    logger.info("structured message", extra={"event": "test"})
 
     lines = stream.getvalue().splitlines()
     assert len(lines) == 3
@@ -59,39 +56,14 @@ def test_every_log_line_is_valid_json() -> None:
         assert parsed["logger"] == "aipro_test_json"
 
 
-def test_state_transition_log_fields() -> None:
-    stream, logger, _ = _configure("aipro_test_transition")
-    log_state_transition(
-        logger, pr=42, from_status="waiting", to_status="handling", head_sha="abc123"
-    )
-    (record,) = _records(stream)
-    assert record["event"] == "state_transition"
-    assert record["pr"] == 42
-    assert record["from"] == "waiting"
-    assert record["to"] == "handling"
-    assert record["head_sha"] == "abc123"
-    assert "ts" in record
-
-
-def test_action_execution_log_fields() -> None:
-    stream, logger, _ = _configure("aipro_test_action")
-    log_action(logger, pr=7, action_type="push_branch")
-    (record,) = _records(stream)
-    assert record["event"] == "action"
-    assert record["action_type"] == "push_branch"
-    assert record["pr"] == 7
-
-
 def test_error_log_fields_include_traceback() -> None:
     stream, logger, _ = _configure("aipro_test_error")
     try:
         raise RuntimeError("boom")
     except RuntimeError as exc:
-        log_error(logger, error=exc, pr=3)
+        logger.exception("%s", exc)
     (record,) = _records(stream)
-    assert record["event"] == "error"
-    assert "boom" in str(record["error"])
-    assert record["pr"] == 3
+    assert "boom" in str(record["message"])
     assert "Traceback" in str(record["traceback"])
     assert "RuntimeError: boom" in str(record["traceback"])
 
@@ -404,24 +376,6 @@ def test_mixed_key_types_in_extra_do_not_crash() -> None:
 
 
 # ---- Dry-run tagging ----
-
-
-def test_dry_run_flag_on_action_and_transition() -> None:
-    stream, logger, _ = _configure("aipro_test_dry_flag")
-    log_action(logger, pr=5, action_type="add_label", dry_run=True)
-    log_state_transition(
-        logger, pr=5, from_status="init", to_status="triggering", head_sha="s", dry_run=True
-    )
-    action_record, transition_record = _records(stream)
-    assert action_record["dry_run"] is True
-    assert transition_record["dry_run"] is True
-
-
-def test_no_dry_run_flag_by_default() -> None:
-    stream, logger, _ = _configure("aipro_test_no_dry_flag")
-    log_action(logger, pr=5, action_type="add_label")
-    (record,) = _records(stream)
-    assert "dry_run" not in record
 
 
 @pytest.mark.parametrize(

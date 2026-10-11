@@ -1,5 +1,7 @@
 # AI PR Review Orchestrator — V2 and Beyond
 
+> Historical V1/V2 design record. For the supported runtime, use [the V3 runbook](README.md) and [architecture](docs/V3_ARCHITECTURE.md).
+
 Everything in this document was carved out of V1 to keep the initial loop
 minimal. Each section is self-contained and can be picked up independently once
 V1 is stable and idempotent.

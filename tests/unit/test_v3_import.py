@@ -22,3 +22,16 @@ def test_v3_imports_only_stdlib_and_yaml() -> None:
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "[]"
+
+
+def test_supported_package_has_no_retired_provider_imports() -> None:
+    code = (
+        "import importlib, pkgutil, sys, ai_pr_orchestrator; "
+        "[importlib.import_module(m.name) for m in "
+        "pkgutil.walk_packages(ai_pr_orchestrator.__path__, ai_pr_orchestrator.__name__ + '.')]; "
+        "retired = {'runner', 'models', 'config', 'state_machine', 'state_storage', "
+        "'decision_application', 'agents', 'coders', 'reviewers', 'git'}; "
+        "print(sorted(set(sys.modules) & {'ai_pr_orchestrator.' + n for n in retired}))"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "[]"

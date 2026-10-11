@@ -252,9 +252,7 @@ def test_get_comment_returns_none_on_404() -> None:
 
 
 @respx.mock
-def test_get_review_threads_cached_within_tick() -> None:
-    """Two get_review_threads calls issue one GraphQL request until the cache is
-    reset; resetting forces a fresh request."""
+def test_external_thread_resolution_is_visible_without_runner_cache_reset() -> None:
     call_count = 0
 
     def responder(request: httpx.Request) -> httpx.Response:
@@ -268,7 +266,14 @@ def test_get_review_threads_cached_within_tick() -> None:
                         "pullRequest": {
                             "reviewThreads": {
                                 "pageInfo": {"hasNextPage": False, "endCursor": None},
-                                "nodes": [],
+                                "nodes": [
+                                    {
+                                        "id": "thread-1",
+                                        "isOutdated": False,
+                                        "isResolved": call_count > 1,
+                                        "comments": {"nodes": []},
+                                    }
+                                ],
                             }
                         }
                     }
@@ -278,12 +283,8 @@ def test_get_review_threads_cached_within_tick() -> None:
 
     respx.post(GQL).mock(side_effect=responder)
     with _make_client() as client:
-        client.get_review_threads(42)
-        client.get_review_threads(42)
-        assert call_count == 1  # second call served from cache
-        client.reset_request_cache()
-        client.get_review_threads(42)
-        assert call_count == 2  # fresh request after reset
+        assert not client.get_review_threads(42)[0].is_resolved
+        assert client.get_review_threads(42)[0].is_resolved
 
 
 @respx.mock

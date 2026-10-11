@@ -14,11 +14,6 @@ from ai_pr_orchestrator.github.models import (
     ReviewComment,
     ReviewThread,
 )
-from ai_pr_orchestrator.models import RuntimeState
-from ai_pr_orchestrator.state_storage import (
-    find_state_comment,
-    serialize_state_comment,
-)
 
 NOW = datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -344,49 +339,6 @@ def test_optimistic_edit_fails_with_stale_timestamp() -> None:
 
 
 # --- State comment round-trip ---
-
-
-def test_state_comment_round_trip() -> None:
-    client = _make_client()
-
-    state = RuntimeState(
-        version=1,
-        pr_number=42,
-        status="collecting",
-        head_sha="abc123",
-        round_index=1,
-        updated_at=NOW,
-    )
-    body = serialize_state_comment(state)
-    comment = client.post_comment(42, body)
-
-    comments = client.get_pr_comments(42)
-    comment_dicts = [{"id": c.id, "body": c.body} for c in comments]
-    found = find_state_comment(comment_dicts)
-
-    assert found is not None
-    assert found.state.status == "collecting"
-    assert found.state.head_sha == "abc123"
-    assert found.state.round_index == 1
-
-    new_state = RuntimeState(
-        version=1,
-        pr_number=42,
-        status="handling",
-        head_sha="abc123",
-        round_index=2,
-        updated_at=datetime.now(UTC),
-    )
-    new_body = serialize_state_comment(new_state)
-    client.edit_comment(comment.id, new_body)
-
-    comments = client.get_pr_comments(42)
-    comment_dicts = [{"id": c.id, "body": c.body} for c in comments]
-    found = find_state_comment(comment_dicts)
-
-    assert found is not None
-    assert found.state.status == "handling"
-    assert found.state.round_index == 2
 
 
 # --- Seeding: pre-load test scenarios ---

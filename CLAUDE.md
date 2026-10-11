@@ -30,27 +30,14 @@ gh api graphql -f query='
                { thread { id isResolved } } }'
 ```
 
-## RuntimeState concurrency: serialize runner jobs per PR
+## V3 state concurrency
 
-The orchestrator persists `RuntimeState` in a single hidden PR comment and
-guards concurrent writers with an **optimistic lock** on `updated_at`
-(`_save_state` checks the expected `updated_at` before editing, and re-reads
-after editing to confirm our write landed — raising `StateConflictError` if a
-concurrent runner clobbered it). This is best-effort: GitHub's issue-comment
-`PATCH` has **no conditional/If-Match support**, so the read-then-PATCH window
-cannot be closed at the API level — two runners racing within that window can
-still interleave, and the re-read only *detects* it after the fact.
-
-**The real fix is deployment-level:** run the orchestrator workflow under a
-GitHub Actions [`concurrency:`](https://docs.github.com/actions/using-jobs/using-concurrency)
-group keyed by PR number so only one runner job is in flight per PR at a time,
-e.g.
-
-```yaml
-concurrency:
-  group: ai-pr-orchestrator-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: false
-```
-
-With that group in place the optimistic lock + re-read is a backstop, not the
-primary serialization mechanism.
+V3 persists issue workflow state in trusted GitHub comments. Timestamp
+preconditions plus readback are best-effort: GitHub comment PATCH provides no
+conditional/If-Match update, so deployment serialization remains necessary.
+Use one persistent coordinator per repository; a native Git-metadata singleton
+lock prevents a second local process, and GitHub leases gate foreign owners.
+An unknown write or native stop outcome retains capacity for reconciliation.
+The thin Actions trigger only queues issues and does not run orchestration.
+See `docs/V3_FOREMAN.md` and `docs/V1_MIGRATION.md`; the V1 runner and PR-event
+commands are retired.

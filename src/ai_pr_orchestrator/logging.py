@@ -1,21 +1,4 @@
-"""Structured JSON logging with secret redaction.
-
-The orchestrator runs inside GitHub Actions where logs are world-readable to
-anyone with repo access. Two properties matter:
-
-* **Structured** — every emitted line is a single JSON object so downstream
-  tooling can parse state transitions, action executions, and errors without
-  scraping free-form text.
-* **Redacted** — configured secret values (``GH_TOKEN`` and any env var names
-  the operator lists in ``main_coder.env``) must never appear verbatim in the
-  log stream, even when they leak into an exception message or a multi-line
-  subprocess dump.
-
-``setup_logging`` wires a :class:`JsonFormatter` and a
-:class:`SecretRedactingFilter` (sharing one :class:`SecretRedactor`) onto the
-package logger. The structured ``log_*`` helpers emit the specific event
-shapes the rest of the orchestrator relies on.
-"""
+"""Structured JSON logging and recursive secret redaction for the V3 coordinator."""
 
 from __future__ import annotations
 
@@ -352,78 +335,6 @@ def _coerce_level(level: int | str) -> int:
         # than raising; fall back to INFO so a typo never silences logging.
         return resolved if isinstance(resolved, int) else logging.INFO
     return logging.INFO
-
-
-# ---- Structured event helpers ----
-#
-# These emit the specific record shapes the orchestrator's observability relies
-# on. Keeping them here (rather than scattering ``extra={...}`` dicts across the
-# runner) means the field names live in one place.
-
-
-def log_state_transition(
-    logger: logging.Logger,
-    *,
-    pr: int,
-    from_status: str,
-    to_status: str,
-    head_sha: str,
-    level: int = logging.INFO,
-    dry_run: bool = False,
-) -> None:
-    """Emit a ``state_transition`` event with ``pr``/``from``/``to``/``head_sha``.
-
-    When ``dry_run`` is set the record carries ``dry_run: true`` so downstream
-    observability/auditing tools don't mistake a planned transition for one that
-    actually executed.
-    """
-    extra: dict[str, object] = {
-        "event": "state_transition",
-        "pr": pr,
-        "from": from_status,
-        "to": to_status,
-        "head_sha": head_sha,
-    }
-    if dry_run:
-        extra["dry_run"] = True
-    logger.log(level, "PR #%s: %s -> %s", pr, from_status, to_status, extra=extra)
-
-
-def log_action(
-    logger: logging.Logger,
-    *,
-    pr: int,
-    action_type: str,
-    level: int = logging.INFO,
-    dry_run: bool = False,
-) -> None:
-    """Emit an ``action`` event with ``action_type`` and ``pr``.
-
-    When ``dry_run`` is set the record carries ``dry_run: true`` so a *planned*
-    action is never mistaken for one that actually ran.
-    """
-    extra: dict[str, object] = {"event": "action", "action_type": action_type, "pr": pr}
-    if dry_run:
-        extra["dry_run"] = True
-    logger.log(level, "PR #%s: executing action %s", pr, action_type, extra=extra)
-
-
-def log_error(
-    logger: logging.Logger,
-    *,
-    error: object,
-    pr: int | None = None,
-    exc_info: bool | BaseException = True,
-) -> None:
-    """Emit an ``error`` event carrying the error message and a ``traceback``.
-
-    ``exc_info`` defaults to ``True`` so the active exception's traceback is
-    captured; pass an explicit exception (or ``False``) to override.
-    """
-    extra: dict[str, object] = {"event": "error", "error": str(error)}
-    if pr is not None:
-        extra["pr"] = pr
-    logger.error("error: %s", error, exc_info=exc_info, extra=extra)
 
 
 def emit_workflow_state(state: WorkflowState, *, action: str | None = None) -> None:
