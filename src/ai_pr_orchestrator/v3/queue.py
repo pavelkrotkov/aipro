@@ -709,6 +709,24 @@ class GitHubIssueQueue:
     def cancel(self, issue: GitHubIssueRef, state: WorkflowState, *, reason: str) -> WorkflowState:
         return self.transition(issue, state, "cancelled", terminal_reason=reason)
 
+    def abandon(self, issue: GitHubIssueRef, state: WorkflowState) -> WorkflowState:
+        """Requeue a stopped, owned claim without discarding its durable history."""
+        self._require_same_identity(issue, state)
+        if self.load_state(state.work_item_id) != state:
+            raise StateConflictError("Drain requires the current authoritative state")
+        if state.phase == "queued" and "host_id" not in state.extras:
+            self.repair_labels(issue, state)
+            return state
+        if claim_from_state(state).host_id != self._host_id:
+            raise ClaimConflictError("Only the owning host may drain a claim")
+        if state.extras.get("lanes_stopped") is not True:
+            raise ClaimConflictError("Drain requires confirmed lane termination")
+        lease_keys = (*_REQUIRED_CLAIM_KEYS, "heartbeat_at")
+        extras = dict(state.extras)
+        for key in lease_keys:
+            extras.pop(key, None)
+        return self.transition(issue, replace(state, extras=extras), "queued")
+
     def mark_review(self, issue: GitHubIssueRef, state: WorkflowState) -> WorkflowState:
         return self.transition(issue, state, "reviewing")
 
