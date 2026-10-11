@@ -1,24 +1,30 @@
-# V3 E2E coverage and remaining gaps
+# V3 acceptance coverage and remaining gates
 
-Scenarios 2 and 3 now exercise the real CAO HTTP/controller/executor path,
-strict normalized finding/disposition parsing, foreman policy, and serialized
-GitHub workflow state. They no longer use the `hybrid_findings` scripted
-executor or carry an xfail marker.
+Scenarios 1–5 now traverse the real CAO HTTP/controller/executor path,
+policy broker, GitHub CI adapter, foreman and serialized workflow state.
+Scenario 4 verifies stronger, different-family adjudication of conflicting
+claims and has no xfail. Explicit gate overrides remain available for focused
+pending/error tests. GitHub, Git and model responses remain external test
+boundaries; the fixture no longer offers a scripted lane executor.
 
-- #74/#75 fixed adopted-session follow-up submission and per-turn attribution.
-- #76 requires structured reviewer findings or fails closed.
-- #87 records actual fix/rebut proposals and explicit independent acceptance,
-  preserving both turns and rationale. Empty reviewer output never accepts a
-  pending proposal. `test_v3_dispositions.py` covers malformed/stale/self-accepted
-  output, rejected proposals, partial persistence and object-loss reconstruction.
+Scenarios 7/8 verify actual dispatch against subscription reserves and catalog
+promotion expiry. Continuous scheduling tests cover scenario 9 (cold developer
+and reviewer recovery) and 12 (sequential issues with three reviewers).
+The configurable multi-issue soak checks completed work and duplicate/leaked
+side effects; see [V3_SOAK.md](../../../docs/V3_SOAK.md).
 
-The remaining scenario 4 xfail represents broader #51 stronger-family conflict
-adjudication. #49 still owns immutable reviewed HEAD and isolated reviewer
-laboratories; #53 owns autonomous cold-start scheduling. These tests use a fake
-CAO HTTP service and fake external GitHub/Git/broker/gate boundaries; they do
-not establish live Hermes reasoning, OS isolation, production deployment, or
-#55 cutover/soak acceptance.
+Control-plane 429 coverage is distinct from model-provider fallback. A bounded
+native Hermes test on the Hermes host successfully switched from a loopback
+provider returning 429 to a loopback fallback using invented credentials.
+This does not establish live-provider availability or deployed 24/7 service.
 
-Legacy disposition/archive records remain readable. Missing run/turn provenance
-is not retroactively treated as proof of independent adjudication; #87 does not
-revalidate historical archives or change #85's existing CI-only resume policy.
+Cutover still requires the safety-parity matrix, originating-issue authorization
+before resources, stable opt-in cancellation during active work, safe orphan
+cleanup with complete runtime/Git inventories, and replacement configuration,
+trigger and migration docs. Current fake Git boundaries do not prove OS-level
+workspace isolation; native container authority checks provide separate evidence.
+V1 remains supported until those gates pass. Closed issue #55 alone is not
+acceptance evidence, and historical PR #89 must not be merged as proof.
+
+Legacy findings without run/model provenance remain readable; missing fields
+are not retroactively proof of independent adjudication.
