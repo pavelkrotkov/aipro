@@ -48,6 +48,7 @@ from typing import Protocol, cast
 
 import httpx
 
+from ai_pr_orchestrator.github.models import PullRequest
 from ai_pr_orchestrator.github.protocol import GitHubClient
 
 from .broker import BrokerError, TaskDemand
@@ -396,7 +397,7 @@ class ForemanPolicyLoop:
         state = self._enforce_deadline(issue, state, now=now)
         fix_findings = tuple(f for f in state.findings if f.status == "open")
         result: LaneResult | None = None
-        head_sha: str | None = None
+        head_sha: str | None = state.extras.get("head_sha")
 
         while True:
             cancelled = self._cancelled_outcome(issue)
@@ -478,6 +479,8 @@ class ForemanPolicyLoop:
                 state = self._persist_resources(issue, state, branch=branch, worktree=worktree)
             try:
                 pr = self._ensure_pr(issue, state, branch, head_sha)
+            except _ForemanEscalation:
+                raise
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 404 and state.extras.get("pr_number") is not None:
                     raise _ForemanEscalation(
@@ -491,7 +494,7 @@ class ForemanPolicyLoop:
             # authoritative state.
             state = self._load(issue, state)
             decision = self._gate.evaluate(issue, pr)
-            self._validate_ci_head(pr)
+            self._validate_ci_head(pr, branch, state.extras.get("pr_base_ref"))
             if decision.passed:
                 state = self._transition(issue, state, "updating_pr", now=now)
                 state = self._transition(issue, state, "done", terminal_reason="ci green", now=now)
@@ -1793,6 +1796,7 @@ class ForemanPolicyLoop:
     def _verify_checkout(
         self, issue: GitHubIssueRef, state: WorkflowState, branch: str, worktree: str
     ) -> WorkflowState:
+        self._validate_branch(branch)
         actual_branch = self._git.current_branch(worktree)
         if actual_branch != branch:
             raise _ForemanEscalation(
@@ -1802,12 +1806,12 @@ class ForemanPolicyLoop:
         same_checkout = (
             state.extras.get("branch") == branch and state.extras.get("worktree") == worktree
         )
-        expected = state.extras.get("head_sha")
-        if same_checkout and expected is not None and expected != actual:
+        expected = state.extras.get("head_sha") if same_checkout else None
+        if expected is not None and expected != actual:
             raise _ForemanEscalation(
                 f"unexpected developer HEAD movement: expected {expected}, found {actual}"
             )
-        if same_checkout and expected == actual:
+        if expected == actual:
             return state
         return self._persist_resources(issue, state, branch=branch, worktree=worktree)
 
@@ -1822,8 +1826,11 @@ class ForemanPolicyLoop:
         return self._lanes.get(DEVELOPER_LANE)
 
     def _policy_violation(self, result: LaneResult) -> str | None:
+        return self._path_policy_violation(result.changed_files)
+
+    def _path_policy_violation(self, paths: list[str]) -> str | None:
         if self._cfg.safety.disallow_workflow_file_changes and any(
-            f.startswith(".github/workflows/") for f in result.changed_files
+            f.startswith(".github/workflows/") for f in paths
         ):
             return "policy violation: lane modified files under .github/workflows/"
         return None
@@ -2072,8 +2079,13 @@ class ForemanPolicyLoop:
         state = self._save_fresh(issue, state, extras={**state.extras, "head_sha": sha})
         return state, sha
 
+    def _validate_branch(self, branch: str) -> None:
+        if branch == self._git.default_branch():
+            raise _ForemanEscalation("policy violation: developer branch is the default branch")
+
     def _publish_snapshot(self, worktree: str, branch: str, head_sha: str) -> None:
         """Publish exactly the reviewed SHA, never post-review working-tree state."""
+        self._validate_branch(branch)
         actual_branch = self._git.current_branch(worktree)
         if actual_branch != branch:
             raise _ForemanEscalation(
@@ -2087,6 +2099,11 @@ class ForemanPolicyLoop:
             )
         if self._git.changed_files(worktree):
             raise _ForemanEscalation("developer worktree changed after the reviewed snapshot")
+        violation = self._path_policy_violation(
+            self._git.changed_files(worktree, self._git.default_branch())
+        )
+        if violation:
+            raise _ForemanEscalation(violation)
         self._git.push_sha(head_sha, branch)
 
     def _ensure_pr(
@@ -2096,48 +2113,62 @@ class ForemanPolicyLoop:
         branch: str,
         head_sha: str | None,
     ) -> GitHubPullRequestRef:
-        """Refresh a known PR or reconcile by branch before creating one.
-
-        Lookup and persistence failures propagate: a missing response never
-        proves the PR does not exist, including after a successful create.
-        """
         client = getattr(self._queue, "_client", None)
-        pr_number = state.extras.get("pr_number")
-        if pr_number is not None:
-            pr = cast(GitHubClient, client).get_pr(int(pr_number))
+        pr = self._reconcile_pr(issue, state, branch)
+        if head_sha is None or pr.head_sha != head_sha:
+            raise PRReconciliationError("PR head differs from the reviewed snapshot")
+        body = self._with_pr_summary(pr.body, self._pr_body(issue, state))
+        if body != pr.body:
+            expected_head = pr.head_sha
+            pr = cast(GitHubClient, client).update_pr_body(pr.number, body)
+            self._validate_pr_identity(
+                pr, branch, self._load(issue, state).extras.get("pr_base_ref")
+            )
+            if pr.head_sha != expected_head:
+                raise PRReconciliationError("PR head changed during summary update")
+        return GitHubPullRequestRef(
+            owner=issue.owner, repo=issue.repo, number=pr.number, head_sha=pr.head_sha
+        )
+
+    def _reconcile_pr(
+        self, issue: GitHubIssueRef, state: WorkflowState, branch: str
+    ) -> PullRequest:
+        client = getattr(self._queue, "_client", None)
+        if client is None:
+            raise ForemanQueueError("PR reconciliation requires a GitHub client")
+        number = state.extras.get("pr_number")
+        if number is not None:
+            pr = client.get_pr(int(number))
+            base = state.extras.get("pr_base_ref")
         else:
+            base = self._git.default_branch()
             pr = self._discover_open_pr(client, branch)
-            if pr is None and hasattr(client, "create_pr"):
+            if pr is None:
                 pr = client.create_pr(
                     f"[aipro] issue #{issue.number}: automated change",
                     self._pr_body(issue, state),
                     head=branch,
-                    base=self._git.default_branch(),
+                    base=base,
                 )
-            if pr is not None:
-                self._record_pr(issue, state, pr.number)
-        if pr is not None:
-            body = self._with_pr_summary(pr.body, self._pr_body(issue, state))
-            if body != pr.body:
-                expected_head = pr.head_sha
-                pr = cast(GitHubClient, client).update_pr_body(pr.number, body)
-                if pr.head_sha != expected_head:
-                    raise PRReconciliationError("PR head changed during summary update")
-            return GitHubPullRequestRef(
-                owner=issue.owner,
-                repo=issue.repo,
-                number=pr.number,
-                head_sha=pr.head_sha,
-            )
-        # Deterministic fallback for fakes that track PRs 1:1 with issues.
-        number = issue.number
-        self._record_pr(issue, state, number)
-        return GitHubPullRequestRef(
-            owner=issue.owner,
-            repo=issue.repo,
-            number=number,
-            head_sha=head_sha or f"head-{number}",
-        )
+        self._validate_pr_identity(pr, branch, base)
+        if number is None:
+            self._record_pr(issue, state, pr.number, pr.base_ref)
+        return pr
+
+    def _validate_pr_identity(self, pr: PullRequest, branch: str, base: object) -> None:
+        if not isinstance(base, str):
+            raise PRReconciliationError("recorded PR base is unknown; reconciliation required")
+        if pr.head_ref != branch or pr.base_ref != base:
+            raise _ForemanEscalation("policy violation: recorded PR branch/base changed")
+        self._validate_pr_authority(pr)
+
+    def _validate_pr_authority(self, pr: PullRequest) -> None:
+        if self._cfg.safety.disallow_forks and pr.is_fork:
+            raise _ForemanEscalation("policy violation: recorded PR comes from a fork")
+        if pr.author_association not in self._cfg.safety.allowed_pr_author_associations:
+            raise _ForemanEscalation("policy violation: untrusted PR author association")
+        if pr.state != "open":
+            raise _ForemanEscalation("policy violation: recorded PR is no longer open")
 
     @staticmethod
     def _pr_body(issue: GitHubIssueRef, state: WorkflowState) -> str:
@@ -2177,14 +2208,16 @@ class ForemanPolicyLoop:
             raise PRReconciliationError("malformed aipro PR summary markers")
         return prefix + summary + suffix
 
-    def _validate_ci_head(self, pr: GitHubPullRequestRef) -> None:
+    def _validate_ci_head(self, pr: GitHubPullRequestRef, branch: str, base: object) -> None:
         client = getattr(self._queue, "_client", None)
         if client is None:
             return
         try:
-            actual = client.get_pr(pr.number).head_sha
+            actual_pr = client.get_pr(pr.number)
+            actual = actual_pr.head_sha
         except Exception as exc:
             raise PRReconciliationError(f"PR head recheck failed: {exc}") from exc
+        self._validate_pr_identity(actual_pr, branch, base)
         if actual != pr.head_sha:
             raise PRReconciliationError(
                 f"PR head changed during CI gate: expected {pr.head_sha}, got {actual}"
@@ -2203,10 +2236,13 @@ class ForemanPolicyLoop:
                 return pr
         return None
 
-    def _record_pr(self, issue: GitHubIssueRef, state: WorkflowState, pr_number: int) -> None:
+    def _record_pr(
+        self, issue: GitHubIssueRef, state: WorkflowState, pr_number: int, base: str
+    ) -> None:
         fresh = self._load(issue, state)
         extras = dict(fresh.extras)
         extras["pr_number"] = pr_number
+        extras["pr_base_ref"] = base
         self._save_fresh(issue, fresh, extras=extras)
 
     def _escalate(

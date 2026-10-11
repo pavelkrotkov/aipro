@@ -250,3 +250,29 @@ def test_commit_budget_uses_current_worktree_after_review(
     else:
         assert len(pushed) == 1
         assert len(gate.evaluated) == 1
+
+
+def test_workflow_added_after_lane_observation_never_publishes(foreman_runtime, monkeypatch):
+    loop, queue, controller, gate, pushed = foreman_runtime
+    submit = controller.submit_work
+    commit = loop._git.commit
+
+    def create_safe_edit(handle, prompt):
+        submit(handle, prompt)
+        if handle.lane == "developer":
+            (Path(loop._worktree_root) / "issue-1/safe.py").write_text("safe")
+
+    def introduce_workflow(workdir, *args, **kwargs):
+        path = Path(workdir) / ".github/workflows/late.yml"
+        path.parent.mkdir(parents=True)
+        path.write_text("protected content introduced after observation")
+        return commit(workdir, *args, **kwargs)
+
+    monkeypatch.setattr(controller, "submit_work", create_safe_edit)
+    monkeypatch.setattr(loop._git, "commit", introduce_workflow)
+    outcome = loop.run_pass()[0]
+    assert outcome.escalated, outcome.reason
+    assert ".github/workflows/" in outcome.reason
+    assert pushed == []
+    assert gate.evaluated == []
+    assert queue.load_state("owner/repo#1").phase == "escalated"

@@ -281,6 +281,16 @@ def _gate(decision: GateDecision | None = None) -> StaticGate:
     return StaticGate(decision or GateDecision(passed=True, pending_checks=(), failed_checks=()))
 
 
+def _record_fake_push(fake, git):
+    push = git.push_sha
+
+    def publish(head_sha, branch):
+        push(head_sha, branch)
+        fake.record_branch_head(branch, head_sha)
+
+    git.push_sha = publish
+
+
 def _foreman(
     fake: FakeGitHubClient,
     executor: LaneExecutor,
@@ -291,6 +301,8 @@ def _foreman(
     broker: Any = None,
 ):
     cfg = config or V3Config()
+    git = git if git is not None else FakeGitOperations()
+    _record_fake_push(fake, git)
     queue = GitHubIssueQueue(fake, "owner", "repo", cfg.github_queue, host_id="host-A")
     loop = ForemanPolicyLoop(
         queue,
@@ -298,7 +310,7 @@ def _foreman(
         lanes or LaneRegistry.default(),
         executor,
         gate,
-        git if git is not None else FakeGitOperations(),
+        git,
         cfg,
         run_id="run-1",
         worktree_root="/wt",
@@ -1865,7 +1877,6 @@ def test_recorded_pr_refresh_failure_never_discovers_or_creates(monkeypatch):
     assert state is not None and state.phase == "ci_gating"
     assert state.extras["pr_number"] == original.number
     assert git.cleanups == []
-    fake._prs[original.number] = replace(original, head_sha="updated-head")
     outcome = loop._run_loop(
         ISSUE,
         state,
@@ -1876,7 +1887,7 @@ def test_recorded_pr_refresh_failure_never_discovers_or_creates(monkeypatch):
     )
     assert outcome.final_phase == "done"
     assert executor.calls == calls
-    assert gate.seen[-1] == (original.number, "updated-head")
+    assert gate.seen[-1] == (original.number, original.head_sha)
     assert len(fake.list_open_prs()) == 1
 
 
@@ -1889,7 +1900,7 @@ def test_pr_discovery_excludes_other_repository_or_base(mismatch):
     gate = RecordingGate([GateDecision(passed=True, pending_checks=(), failed_checks=())])
     loop, queue = _foreman(fake, ScriptedExecutor(), gate)
     assert loop.run_pass()[0].final_phase == "done"
-    assert gate.seen == [(matching.number, matching.head_sha)]
+    assert gate.seen == [(matching.number, fake.get_pr(matching.number).head_sha)]
     assert len(fake.list_open_prs()) == 2
     state = queue.load_state(ISSUE.slug())
     assert state is not None and state.extras["pr_number"] == matching.number
@@ -1913,7 +1924,6 @@ def test_cold_ci_resume_needs_only_recorded_pr(monkeypatch, tmp_path, retained_p
         (tmp_path / "other-host-checkout").mkdir()
     queue.save_state(replace(state, extras=extras), expected_updated_at=state.updated_at)
     original = fake.get_pr(extras["pr_number"])
-    fake._prs[original.number] = replace(original, head_sha="live-pr-head")
     decision = GateDecision(
         passed=settled == "green",
         pending_checks=("build",) if settled == "pending" else (),
@@ -1935,7 +1945,7 @@ def test_cold_ci_resume_needs_only_recorded_pr(monkeypatch, tmp_path, retained_p
     outcome = resumed.run_pass()[0]
     expected = {"green": "done", "pending": "ci_gating", "failed": "escalated"}
     assert outcome.final_phase == expected[settled]
-    assert gate.seen == [(original.number, "live-pr-head")]
+    assert gate.seen == [(original.number, original.head_sha)]
     assert git.cleanups == []
     assert executor.calls == []
     persisted = resumed_queue.load_state(ISSUE.slug())
@@ -2123,3 +2133,123 @@ def test_existing_pr_audit_updates_without_erasing_human_text_or_reviews():
     assert current.body.count("<!-- aipro-summary:start -->") == 1
     assert len(fake.list_open_prs()) == 1
     assert fake.get_pull_request_reviews(human.number)[0].body == "Keep this review"
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {"is_fork": True},
+        {"base_ref": "release"},
+        {"head_ref": "other"},
+        {"state": "closed"},
+        {"author_association": "NONE"},
+    ],
+)
+def test_recorded_pr_identity_is_rechecked_before_ci(mismatch):
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    gate = RecordingGate([GateDecision(passed=False, pending_checks=("build",), failed_checks=())])
+    loop, queue = _foreman(fake, executor, gate)
+    assert loop.run_pass()[0].final_phase == "ci_gating"
+    pr = fake.list_open_prs()[0]
+    fake._prs[pr.number] = replace(pr, body="Human context\n" + pr.body, **mismatch)
+    calls = list(executor.calls)
+    seen = list(gate.seen)
+    outcome = loop.run_pass()[0]
+    assert outcome.escalated, outcome.reason
+    assert executor.calls == calls
+    assert gate.seen == seen
+    assert fake.get_pr(pr.number).body == "Human context\n" + pr.body
+    assert queue.load_state(ISSUE.slug()).phase == "escalated"
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {"is_fork": True},
+        {"base_ref": "release"},
+        {"head_ref": "other"},
+        {"state": "closed"},
+        {"author_association": "NONE"},
+    ],
+)
+def test_pr_retarget_during_green_ci_cannot_complete(monkeypatch, mismatch):
+    fake = _ready_fake()
+    gate = RecordingGate([GateDecision(passed=True, pending_checks=(), failed_checks=())])
+    evaluate = gate.evaluate
+
+    def retarget(issue, pr):
+        decision = evaluate(issue, pr)
+        fake._prs[pr.number] = replace(fake.get_pr(pr.number), **mismatch)
+        return decision
+
+    monkeypatch.setattr(gate, "evaluate", retarget)
+    loop, queue = _foreman(fake, ScriptedExecutor(), gate)
+    outcome = loop.run_pass()[0]
+    assert outcome.escalated, outcome.reason
+    assert queue.load_state(ISSUE.slug()).phase == "escalated"
+
+
+def test_retained_default_branch_is_rejected_before_worker():
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    git = RecordingGit()
+    loop, queue = _foreman(fake, executor, _gate(), git=git)
+    state = queue.claim(ISSUE, "run-1", branch="main", worktree="retained")
+    queue.transition(ISSUE, state, "queued")
+    git.worktrees["retained"] = "main"
+    outcome = loop.run_pass()[0]
+    assert outcome.escalated, outcome.reason
+    assert executor.calls == []
+    assert git.pushed == []
+
+
+@pytest.mark.parametrize("reviewed_head", [None, "unreviewed-newer-head"])
+def test_cold_ci_resume_refuses_missing_or_changed_reviewed_head(reviewed_head):
+    from ai_pr_orchestrator.v3.foreman import PRReconciliationError
+
+    fake = _ready_fake()
+    executor = ScriptedExecutor()
+    gate = RecordingGate([GateDecision(passed=False, pending_checks=("build",), failed_checks=())])
+    loop, queue = _foreman(fake, executor, gate)
+    loop.run_pass()
+    state = queue.load_state(ISSUE.slug())
+    pr = fake.get_pr(state.extras["pr_number"])
+    fake._prs[pr.number] = replace(pr, body="Human context\n" + pr.body)
+    if reviewed_head is None:
+        extras = {key: value for key, value in state.extras.items() if key != "head_sha"}
+        queue.save_state(replace(state, extras=extras), expected_updated_at=state.updated_at)
+    else:
+        fake._prs[pr.number] = replace(fake.get_pr(pr.number), head_sha=reviewed_head)
+    calls, seen = list(executor.calls), list(gate.seen)
+    with pytest.raises(PRReconciliationError, match="reviewed snapshot"):
+        loop.run_pass()
+    assert (executor.calls, gate.seen) == (calls, seen)
+    assert fake.get_pr(pr.number).body == "Human context\n" + pr.body
+    assert (
+        queue.load_state(ISSUE.slug()).phase,
+        "v3-work-done" in fake.get_labels(ISSUE.number),
+    ) == ("ci_gating", False)
+
+
+def test_pr_head_movement_after_push_halts_before_summary_or_ci(monkeypatch):
+    from ai_pr_orchestrator.v3.foreman import PRReconciliationError
+
+    fake = _ready_fake()
+    create = fake.create_pr
+    gate = RecordingGate([])
+
+    def moved_head(*args, **kwargs):
+        pr = replace(
+            create(*args, **kwargs), head_sha="unreviewed-newer-head", body="Human context"
+        )
+        fake._prs[pr.number] = pr
+        return pr
+
+    monkeypatch.setattr(fake, "create_pr", moved_head)
+    loop, queue = _foreman(fake, ScriptedExecutor(), gate)
+    with pytest.raises(PRReconciliationError, match="reviewed snapshot"):
+        loop.run_pass()
+    assert gate.seen == []
+    assert fake.list_open_prs()[0].body == "Human context"
+    assert queue.load_state(ISSUE.slug()).phase == "ci_gating"

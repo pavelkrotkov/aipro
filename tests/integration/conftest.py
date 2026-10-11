@@ -168,6 +168,9 @@ def foreman_harness(
                 }
             )
 
+        from tests.unit.test_v3_foreman import _record_fake_push
+
+        _record_fake_push(fake, git_ops)
         queue = GitHubIssueQueue(fake, "owner", "repo", V3Config().github_queue, host_id="host-e2e")
         # Collision-proof run id: the millisecond-only counter collides
         # when two harnesses are constructed in the same tick (which

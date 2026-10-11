@@ -177,29 +177,81 @@ by absolute path or inspect other same-user processes. Deployments that need
 protection against a malicious reviewer must add OS/container isolation around
 the CAO/Hermes lane.
 
-### Step 1 — one isolated Hermes home per lane
+### Step 1 — wrap the whole lane process
 
-CAO's Hermes provider launches whatever command the profile's `hermesProfile`
-field names. Use that indirection to give each lane its own state directory:
-install the shared model-environment bridge on `PATH` from this checkout:
+On a Linux Docker host, install `scripts/aipro-container` on the coordinator's
+`PATH`. Pull the official Hermes image once and pin its returned digest in the
+lane wrappers; do not resolve a mutable tag at each session launch:
 
 ```sh
-install -m 755 scripts/aipro-hermes "$HOME/.local/bin/aipro-hermes"
+install -m 755 scripts/aipro-container "$HOME/.local/bin/aipro-container"
+docker pull nousresearch/hermes-agent:stable
+docker image inspect nousresearch/hermes-agent:stable --format '{{index .RepoDigests 0}}'
 ```
 
-Then create one small wrapper per lane on `PATH`, e.g. `aipro-hermes-developer`:
+Create one wrapper per lane, using the digest printed above:
 
 ```sh
 #!/bin/sh
 export HERMES_HOME="$HOME/.aipro/hermes/developer"
-exec aipro-hermes "$@"
+export AIPRO_HERMES_IMAGE='nousresearch/hermes-agent@sha256:REPLACE_WITH_VERIFIED_DIGEST'
+exec aipro-container hermes "$@" --model "${AIPRO_MODEL:?broker model required}" \
+    --provider "${AIPRO_PROVIDER:?broker provider required}"
 ```
 
-Repeat for `aipro-hermes-requirements-reviewer`,
-`aipro-hermes-breaker-reviewer`, and `aipro-hermes-architecture-reviewer`,
-each pointing at a distinct directory. (If your Hermes build isolates state
-via a different variable, set that one instead — the requirement is only that
-no two lanes share a state directory.)
+Repeat for the three reviewer wrappers with distinct homes. Create these homes
+from scratch, with only the model credentials/configuration each lane needs;
+never copy the coordinator's home, GitHub credentials, SSH keys, agent sockets,
+Docker socket, or general Hermes profile. Run the coordinator as a non-root user.
+
+Initialize each fresh lane home's first-run choices using the pinned image before
+CAO starts its interactive session. For the verified image below, disable shared
+metrics through Hermes's own consent function (which also records the current
+offer version); setting only `enabled: false` leaves a first-run prompt:
+
+```sh
+HERMES_HOME="$HOME/.aipro/hermes/developer" AIPRO_HERMES_IMAGE="$VERIFIED_IMAGE" \
+    aipro-container python3 -c \
+    'from hermes_cli.observability.shared_metrics_consent import save_consent; save_consent(False, False)'
+```
+
+Run this from a Git checkout, and repeat for each distinct lane home.
+
+The wrapper runs the complete Hermes process tree in a separate container,
+without host environment inheritance, host PID/network namespaces or capabilities.
+Only source and the lane home are writable; the checkout's Git entry and common
+Git metadata are read-only. This supports linked developer worktrees and independent
+review clones while preventing worker hooks/config/ref/index changes. Worker-side
+Git staging/committing is deliberately unavailable; the coordinator owns those steps.
+The image root is read-only, with container-private `/tmp` for tests and tools.
+
+Keep CAO and every other unauthenticated coordinator control endpoint bound to
+host loopback. The container uses Docker bridge networking for model APIs; it is
+not an egress allowlist and must not be given access to an unauthenticated host
+control endpoint. Provision required toolchains in the pinned image, not with
+privileged host mounts.
+
+Validate the exact deployed image before enabling a lane:
+
+```sh
+AIPRO_ISOLATION_IMAGE='nousresearch/hermes-agent@sha256:VERIFIED_DIGEST' \
+    uv run pytest tests/integration/test_container_authority.py
+```
+
+This check uses invented credential canaries, verifies Git metadata is unwritable,
+and starts the real Hermes executable under the same wrapper. It does not by itself
+prove CAO turn handling, live model behavior, cold-start composition, or all #52
+acceptance criteria; those still require the provisioned CAO/foreman integration.
+
+On 2026-10-10, the native check passed on the Tailscale `hermes` host with
+`nousresearch/hermes-agent@sha256:9774f4f39a9bb8c2f68ce728ed5e99ddbad282163be56764afacf88ed952b784`.
+A separate temporary CAO 2.5.0 server also launched real Hermes through this wrapper
+with invented model credentials. Canaries executed inside that CAO-owned container
+confirmed that host credential files, sockets, coordinator process environments,
+writable Git metadata and the host-loopback CAO endpoint were unavailable. The
+owned session, container and server were removed afterward. No model turn was
+submitted; this establishes the deployed launch boundary, not live reasoning,
+foreman recovery or the #55 soak.
 
 ### Step 2 — one CAO agent profile per lane
 
@@ -237,10 +289,12 @@ these become `AIPRO_MODEL` and `AIPRO_PROVIDER` in the CAO session environment.
 Optional constructor `env` defaults are copied and preserved, with the selected
 model/provider taking precedence. Coordinator process environment is never copied.
 
-The installed `aipro-hermes` bridge translates those variables to Hermes's
-supported `chat --model` and `--provider` arguments. Hermes does not natively
+The container lane wrapper translates those variables to Hermes's
+supported `chat --model` and `--provider` arguments. The native
+`scripts/aipro-hermes` bridge supplies the same translation for control-plane
+smoke tests but does not provide process isolation. Hermes does not natively
 consume `AIPRO_MODEL`, `LLM_MODEL`, or `OPENAI_MODEL`: merely setting a variable
-without installing this bridge does not select the model. The lane wrapper
+without translating it to CLI arguments does not select the model. The lane wrapper
 continues to own `HERMES_HOME`; do not pin `model:` in the CAO profile.
 
 Leased aliases absent from the supplied catalog, missing explicit providers, and
