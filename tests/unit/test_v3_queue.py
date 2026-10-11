@@ -799,7 +799,8 @@ def test_stable_opt_in_cannot_alias_lifecycle_labels(label):
         GitHubQueueConfig(opt_in_label=label)
 
 
-def test_drain_retains_history_and_requires_authoritative_owned_stops():
+@pytest.mark.parametrize("phase", ["coding", "queued"])
+def test_drain_retains_history_and_requires_authoritative_owned_stops(phase):
     fake = _ready_fake()
     queue = _queue(fake)
     state = queue.claim(_issue(), "run-1", branch="b", worktree="/wt", pr_number=7)
@@ -809,7 +810,7 @@ def test_drain_retains_history_and_requires_authoritative_owned_stops():
     with pytest.raises(StateConflictError, match="authoritative"):
         queue.abandon(_issue(), forged)
     queue.save_state(forged, expected_updated_at=state.updated_at)
-    forged = queue.transition(_issue(), forged, "queued")
+    forged = queue.transition(_issue(), forged, phase)
     foreign = q.GitHubIssueQueue(fake, "owner", "repo", GitHubQueueConfig(), host_id="host-B")
     with pytest.raises(q.ClaimConflictError, match="owning host"):
         foreign.abandon(_issue(), forged)
