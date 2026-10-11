@@ -425,7 +425,7 @@ def test_no_dry_run_flag_by_default() -> None:
 
 
 @pytest.mark.parametrize(
-    "name,secret",
+    "name,canary",
     [
         ("GITHUB_TOKEN", "ghp_testcredential123456"),
         ("OPENROUTER_API_KEY", "sk-or-v1-testcredential123456"),
@@ -435,14 +435,14 @@ def test_no_dry_run_flag_by_default() -> None:
         ("CUSTOM_PROVIDER_API_KEY", 'custom\\credential"with\nnewlines'),
     ],
 )
-def test_provider_secrets_are_redacted_before_json_escaping(monkeypatch, name, secret):
+def test_provider_secrets_are_redacted_before_json_escaping(monkeypatch, name, canary):
     from ai_pr_orchestrator.logging import collect_secret_values
 
-    monkeypatch.setenv(name, secret)
+    monkeypatch.setenv(name, canary)
     stream, logger, _ = _configure("aipro_test_provider_shapes", secrets=collect_secret_values(()))
     logger.info(
         "unlabelled credential %s",
-        secret,
+        canary,
         extra={
             "CUSTOM_API_KEY": 123456,
             "nested": {
@@ -451,11 +451,11 @@ def test_provider_secrets_are_redacted_before_json_escaping(monkeypatch, name, s
                 "tokens": 42,
                 "token_count": 7,
             },
-            "detail": "Authorization: Bearer " + secret,
+            "detail": "Authorization: Bearer " + canary,
         },
     )
     payload = _records(stream)[0]
-    assert secret not in stream.getvalue() and "dXNlcjpwYXNz" not in stream.getvalue()
+    assert canary not in stream.getvalue() and "dXNlcjpwYXNz" not in stream.getvalue()
     nested = cast(dict[str, Any], payload["nested"])
     assert payload["CUSTOM_API_KEY"] == REDACTION_PLACEHOLDER
     assert nested["CUSTOM_API_KEY"] == REDACTION_PLACEHOLDER
