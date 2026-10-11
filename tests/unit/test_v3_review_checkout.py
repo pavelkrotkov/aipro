@@ -40,12 +40,32 @@ def test_review_checkouts_are_independent_detached_repositories(tmp_path: Path):
     root = _repo(tmp_path)
     ops = GitWorktreeOps(root)
     ops.create_branch("feature", "main")
-    developer = Path(ops.create_worktree(str(tmp_path / "developer"), "feature"))
+    developer = Path(
+        ops.create_worktree(
+            str(tmp_path / "developer"), "feature", run_id="test-run", work_item_id="owner/repo#1"
+        )
+    )
     (developer / "tracked.txt").write_text("snapshot\n")
     head = ops.commit(str(developer), "snapshot", name="T", email="t@example.com")
 
-    review_a = Path(ops.create_review_checkout(str(tmp_path / "review-a"), str(developer), head))
-    review_b = Path(ops.create_review_checkout(str(tmp_path / "review-b"), str(developer), head))
+    review_a = Path(
+        ops.create_review_checkout(
+            str(tmp_path / "review-a"),
+            str(developer),
+            head,
+            run_id="test-run",
+            work_item_id="owner/repo#1",
+        )
+    )
+    review_b = Path(
+        ops.create_review_checkout(
+            str(tmp_path / "review-b"),
+            str(developer),
+            head,
+            run_id="test-run",
+            work_item_id="owner/repo#1",
+        )
+    )
     try:
         for review in (review_a, review_b):
             assert _git(review, "rev-parse", "HEAD") == head
@@ -81,6 +101,41 @@ def test_review_cleanup_refuses_unowned_path(tmp_path: Path):
     root = _repo(tmp_path)
     unknown = tmp_path / "unknown"
     (unknown / ".git").mkdir(parents=True)
-    with pytest.raises(GitOpsError, match="unowned review checkout"):
+    with pytest.raises(GitOpsError, match="protected ownership record"):
         GitWorktreeOps(root).cleanup_review_checkout(str(unknown), _git(root, "rev-parse", "HEAD"))
     assert unknown.exists()
+
+
+@pytest.mark.parametrize("role", ["worker", "reviewer"])
+def test_checkout_cleanup_cannot_follow_a_late_symlink(tmp_path, monkeypatch, role):
+    root = _repo(tmp_path)
+    ops = GitWorktreeOps(root)
+    ops.create_branch("feature", "main")
+    developer = ops.create_worktree(
+        str(tmp_path / "developer"), "feature", run_id="run", work_item_id="owner/repo#1"
+    )
+    head = ops.head_sha(developer)
+    review = Path(
+        ops.create_review_checkout(
+            str(tmp_path / "review"), developer, head, run_id="run", work_item_id="owner/repo#1"
+        )
+    )
+    human = tmp_path / "human"
+    human.mkdir()
+    (human / "keep.py").write_text("irreplaceable = True\n")
+    method = "_verify_developer_repository" if role == "worker" else "_verify_checkout_record"
+    verify = getattr(ops, method)
+
+    def replace_after_verification(workdir, *args):
+        verify(workdir, *args)
+        workdir.rename(tmp_path / "retained-checkout")
+        workdir.symlink_to(human, target_is_directory=True)
+
+    monkeypatch.setattr(ops, method, replace_after_verification)
+    with pytest.raises((OSError, GitOpsError)):
+        if role == "worker":
+            ops.cleanup_worktree(developer)
+        else:
+            ops.cleanup_review_checkout(str(review), head)
+    assert (human / "keep.py").read_text() == "irreplaceable = True\n"
+    assert (tmp_path / "retained-checkout" / "tracked.txt").read_text() == "base\n"

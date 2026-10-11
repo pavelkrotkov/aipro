@@ -219,16 +219,21 @@ class FakeGitOperations:
     def create_branch(self, branch: str, from_ref: str) -> None:
         self.branches.append(branch)
 
-    def create_worktree(self, path: str, branch: str) -> str:
+    def create_worktree(self, path: str, branch: str, *, run_id: str, work_item_id: str) -> str:
         self.worktrees[path] = branch
         return path
 
-    def create_review_checkout(self, path: str, source_workdir: str, head_sha: str) -> str:
+    def create_review_checkout(
+        self, path: str, source_workdir: str, head_sha: str, *, run_id: str, work_item_id: str
+    ) -> str:
         self.worktrees[path] = f"detached:{head_sha}"
         return path
 
     def head_sha(self, workdir: str) -> str:
         return "sha"
+
+    def verify_checkout(self, path: str, run_id: str, work_item_id: str) -> None:
+        pass
 
     def current_branch(self, workdir: str) -> str:
         return self.worktrees.get(workdir, "aipro-issue-1")
@@ -2001,7 +2006,7 @@ def test_ci_resume_preserves_unrelated_real_worktree(monkeypatch, real_repo, tmp
     git = GitWorktreeOps(real_repo)
     git.create_branch("human-work", "main")
     checkout = tmp_path / "human-work"
-    git.create_worktree(str(checkout), "human-work")
+    git.create_worktree(str(checkout), "human-work", run_id="test-run", work_item_id="owner/repo#1")
     (checkout / "file.txt").write_text("unsaved tracked change")
     (checkout / "unsaved-human-work").write_text("irreplaceable")
     fake = _ready_fake()

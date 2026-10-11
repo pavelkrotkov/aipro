@@ -388,7 +388,15 @@ class _FakeHandler(BaseHTTPRequestHandler):
         if self._apply_fault_or(self.command, self.path) is not None:
             return
         path = self._strip_query()
-        if path.startswith("/sessions/"):
+        if path == "/sessions":
+            with self._fake._lock:
+                rows = [
+                    {"id": state.session_name}
+                    for state in self._fake._sessions.values()
+                    if not state.deleted
+                ]
+            self._write_json(200, rows)
+        elif path.startswith("/sessions/"):
             self._handle_get_session()
         elif "/output" in path:
             self._handle_get_output()

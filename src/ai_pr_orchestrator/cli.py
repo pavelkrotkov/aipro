@@ -173,6 +173,7 @@ def _run_foreman(args: argparse.Namespace) -> int:
     from ai_pr_orchestrator.v3.cao import CaoSessionController
     from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
     from ai_pr_orchestrator.v3.ci_gate import CIPRGateImpl
+    from ai_pr_orchestrator.v3.cleanup import CleanupSweeper
     from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop
     from ai_pr_orchestrator.v3.git_ops import GitWorktreeOps
     from ai_pr_orchestrator.v3.lanes import LaneRegistry
@@ -227,7 +228,10 @@ def _run_foreman(args: argparse.Namespace) -> int:
             )
 
         return _serve_foreman(
-            ContinuousForeman(queue, loop_factory), args.poll_seconds, once=args.once
+            ContinuousForeman(queue, loop_factory),
+            args.poll_seconds,
+            cleanup=CleanupSweeper(queue, controller, git, config.cleanup),
+            once=args.once,
         )
 
 
@@ -245,10 +249,13 @@ def _coordinator_lock(checkout: Path):
         yield
 
 
-def _serve_foreman(scheduler: ContinuousForeman, poll_seconds: float, *, once: bool = False) -> int:
+def _serve_foreman(
+    scheduler: ContinuousForeman, poll_seconds: float, *, cleanup, once: bool = False
+) -> int:
     while True:
         exit_code = 0
         try:
+            cleanup_outcomes = cleanup.sweep(now=datetime.now(UTC))
             outcomes = scheduler.step()
             print(
                 json.dumps(
@@ -256,6 +263,7 @@ def _serve_foreman(scheduler: ContinuousForeman, poll_seconds: float, *, once: b
                         {
                             "schema_version": 1,
                             "event": "scheduler_outcomes",
+                            "cleanup_outcomes": cleanup_outcomes,
                             "outcomes": list(map(asdict, outcomes)),
                         }
                     )

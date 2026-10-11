@@ -191,10 +191,12 @@ def test_review_wave_uses_broker_fallbacks_when_primary_capacity_is_full():
 
 def test_partial_checkout_failure_cleans_previously_materialized_reviews():
     class FailingGit(RecordingGit):
-        def create_review_checkout(self, path, source_workdir, head_sha):
+        def create_review_checkout(self, path, source_workdir, head_sha, *, run_id, work_item_id):
             if "breaker-reviewer" in path:
                 raise RuntimeError("review checkout creation failed")
-            return super().create_review_checkout(path, source_workdir, head_sha)
+            return super().create_review_checkout(
+                path, source_workdir, head_sha, run_id=run_id, work_item_id=work_item_id
+            )
 
     git = FailingGit()
     loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), git=git)

@@ -4,7 +4,7 @@ Run from an installed development checkout:
 
 ```sh
 uv run pytest tests/integration/e2e tests/integration/test_continuous_foreman.py
-uv run pytest tests/integration/test_continuous_foreman.py::test_multi_issue_soak_has_no_duplicate_or_unmanaged_side_effects --soak-issues=40
+uv run pytest tests/integration/test_continuous_foreman.py::test_multi_issue_soak_has_no_duplicate_or_unmanaged_side_effects tests/integration/test_v3_cleanup_soak.py --soak-issues=40
 ```
 
 CI runs six sequential issues by default; `--soak-issues` accepts at least two.
@@ -36,11 +36,15 @@ installations must pin their bot login explicitly. Preserve that login across
 credential rotation; drain and migrate authoritative comments before changing
 writers. Comments from other accounts remain human input.
 
-Developer cleanup requires a path/branch marker in the coordinator's protected
-Git administration directory. Existing unmarked checkouts require manual
-inspection; they are never force-deleted by the new guard.
+The native Git soak also runs the production sweeper after each issue. It uses
+real branches, commits, reviewer clones and pushes to a local bare remote;
+model tool effects, CAO HTTP and GitHub are the external boundaries. A failed
+immediate checkout removal leaves a protected artifact, which the sweeper
+must remove after its inactivity TTL. Completed durable records stay unchanged.
 
-These tests do not establish cutover readiness by themselves. Orphan cleanup
-still needs verified attribution and complete runtime/Git inventories.
-The replacement config, queue trigger and migration docs must ship before V1
+Cleanup tests retain active work and human checkouts, delay recently modified
+files, and reject changed GitHub authority, empty runtime inventories with live
+sessions, and acknowledged deletions that leave sessions alive.
+
+These tests do not establish cutover readiness by themselves. The replacement config, queue trigger and migration docs must ship before V1
 retirement. Keep V1 and historical epic #16 until the full cutover gate passes.

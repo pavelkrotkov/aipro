@@ -454,3 +454,18 @@ def emit_workflow_state(state: WorkflowState, *, action: str | None = None) -> N
             "audit projection failed",
             extra={**correlation, "event": "audit_error", "error_type": type(exc).__name__},
         )
+
+
+def emit_cleanup_event(state: WorkflowState, kind: str, **target) -> dict[str, object]:
+    from .v3.audit import cleanup_event
+
+    redactor = SecretRedactor(collect_secret_values(()))
+    event = {
+        key: redactor.redact_recursive(value)
+        for key, value in cleanup_event(state, kind, **target).items()
+    }
+    logging.getLogger(__name__).info(
+        "owned resource cleaned",
+        extra={"schema_version": 1, "event": "owned_resource_cleanup", **event},
+    )
+    return event

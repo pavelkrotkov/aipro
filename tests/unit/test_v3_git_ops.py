@@ -38,12 +38,14 @@ class FakeGitOperations:
         self.calls.append(("create_branch", branch, from_ref))
         self.branches.add(branch)
 
-    def create_worktree(self, path: str, branch: str) -> str:
+    def create_worktree(self, path: str, branch: str, *, run_id: str, work_item_id: str) -> str:
         self.calls.append(("create_worktree", path, branch))
         self.worktrees[path] = branch
         return path
 
-    def create_review_checkout(self, path: str, source_workdir: str, head_sha: str) -> str:
+    def create_review_checkout(
+        self, path: str, source_workdir: str, head_sha: str, *, run_id: str, work_item_id: str
+    ) -> str:
         self.calls.append(("create_review_checkout", path, source_workdir, head_sha))
         self.worktrees[path] = f"detached:{head_sha}"
         return path
@@ -51,6 +53,9 @@ class FakeGitOperations:
     def head_sha(self, workdir: str) -> str:
         self.calls.append(("head_sha", workdir))
         return self.commits.get(workdir, ["sha"])[-1]
+
+    def verify_checkout(self, path: str, run_id: str, work_item_id: str) -> None:
+        pass
 
     def current_branch(self, workdir: str) -> str:
         self.calls.append(("current_branch", workdir))
@@ -179,7 +184,7 @@ def test_worktree_commit_push_round_trip(real_repo: Path, tmp_path: Path):
     base = ops.default_branch()
     ops.create_branch("feat/y", base)
     wt = tmp_path / "wt"
-    workdir = ops.create_worktree(str(wt), "feat/y")
+    workdir = ops.create_worktree(str(wt), "feat/y", run_id="test-run", work_item_id="owner/repo#1")
     assert Path(workdir).is_dir()
 
     (wt / "out.txt").write_text("work\n")
@@ -248,7 +253,9 @@ def test_commit_on_clean_worktree_is_a_noop(real_repo: Path, tmp_path: Path):
     base = ops.default_branch()
     ops.create_branch("feat/noop", base)
     wt = tmp_path / "wt-noop"
-    workdir = ops.create_worktree(str(wt), "feat/noop")
+    workdir = ops.create_worktree(
+        str(wt), "feat/noop", run_id="test-run", work_item_id="owner/repo#1"
+    )
     head_before = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True, text=True, check=True
     ).stdout.strip()
@@ -288,7 +295,9 @@ def test_relative_worktree_path_returns_absolute_path(real_repo: Path):
     ops = GitWorktreeOps(real_repo)
     base = ops.default_branch()
     ops.create_branch("feat/rel", base)
-    returned = ops.create_worktree("rel-wt", "feat/rel")
+    returned = ops.create_worktree(
+        "rel-wt", "feat/rel", run_id="test-run", work_item_id="owner/repo#1"
+    )
     try:
         assert os.path.isabs(returned)
         assert Path(returned) == real_repo / "rel-wt"
@@ -305,7 +314,9 @@ def test_bounded_prompts_deliver_complete_issue_context(real_repo: Path, tmp_pat
 
     ops = GitWorktreeOps(real_repo)
     ops.create_branch("issue84", "main")
-    workdir = ops.create_worktree(str(tmp_path / "worker"), "issue84")
+    workdir = ops.create_worktree(
+        str(tmp_path / "worker"), "issue84", run_id="test-run", work_item_id="owner/repo#1"
+    )
     fake = _ready_fake()
     fake._issue_bodies[1] = body
     loop, _ = _foreman(fake, ScriptedExecutor(), _gate(), git=ops)
@@ -342,7 +353,9 @@ def test_bounded_prompts_deliver_complete_issue_context(real_repo: Path, tmp_pat
 def test_issue_input_stays_unstaged_and_shares_worktree_cleanup(real_repo: Path, tmp_path: Path):
     ops = GitWorktreeOps(real_repo)
     ops.create_branch("issue84", "main")
-    workdir = ops.create_worktree(str(tmp_path / "worker"), "issue84")
+    workdir = ops.create_worktree(
+        str(tmp_path / "worker"), "issue84", run_id="test-run", work_item_id="owner/repo#1"
+    )
     path, _ = ops.write_issue_description(workdir, "Complete requirements.")
     assert ops.changed_files(workdir) == []
     subprocess.run(["git", "add", "-A"], cwd=workdir, check=True)
@@ -357,7 +370,9 @@ def test_issue_input_stays_unstaged_and_shares_worktree_cleanup(real_repo: Path,
 def test_issue_input_versions_do_not_replace_inflight_context(real_repo: Path, tmp_path: Path):
     ops = GitWorktreeOps(real_repo)
     ops.create_branch("issue84", "main")
-    workdir = ops.create_worktree(str(tmp_path / "worker"), "issue84")
+    workdir = ops.create_worktree(
+        str(tmp_path / "worker"), "issue84", run_id="test-run", work_item_id="owner/repo#1"
+    )
     first, _ = ops.write_issue_description(workdir, "Original criteria.")
     second, _ = ops.write_issue_description(workdir, "Updated criteria.")
     assert first != second
@@ -454,7 +469,11 @@ def test_cleanup_refuses_unowned_dirty_checkout_and_removes_owned_checkout(real_
     with pytest.raises(GitOpsError):
         ops.cleanup_worktree(str(link))
     ops.create_branch("owned", "main")
-    owned = Path(ops.create_worktree(str(tmp_path / "owned"), "owned"))
+    owned = Path(
+        ops.create_worktree(
+            str(tmp_path / "owned"), "owned", run_id="test-run", work_item_id="owner/repo#1"
+        )
+    )
     (owned / "file.txt").write_text("unfinished owned edits")
     subprocess.run(
         ["git", "checkout", "-b", "changed-identity"], cwd=owned, check=True, capture_output=True
@@ -466,3 +485,52 @@ def test_cleanup_refuses_unowned_dirty_checkout_and_removes_owned_checkout(real_
     ops.cleanup_worktree(str(owned))
     ops.cleanup_worktree(str(owned))
     assert not owned.exists() and human.exists()
+
+
+def test_checkout_inventory_binds_runs_and_failed_creation_cannot_authorize_human_work(
+    real_repo, tmp_path
+):
+    ops = GitWorktreeOps(real_repo)
+    ops.create_branch("owned-inventory", "main")
+    owned = ops.create_worktree(
+        str(tmp_path / "owned-inventory"),
+        "owned-inventory",
+        run_id="run-1",
+        work_item_id="owner/repo#1",
+    )
+    ops.verify_checkout(owned, "run-1", "owner/repo#1")
+    with pytest.raises(GitOpsError, match="different issue or run"):
+        ops.verify_checkout(owned, "run-2", "owner/repo#1")
+    review = ops.create_review_checkout(
+        str(tmp_path / "review-inventory"),
+        owned,
+        ops.head_sha(owned),
+        run_id="run-1",
+        work_item_id="owner/repo#1",
+    )
+    inventory = ops.checkout_inventory()
+    assert {(r["role"], r.get("run_id")) for r in inventory} == {
+        ("worker", "run-1"),
+        ("reviewer", "run-1"),
+        ("unowned", None),
+    }
+    assert {r["path"] for r in inventory} == {str(real_repo), owned, review}
+    human = tmp_path / "failed-allocation"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "human-inventory", str(human)],
+        cwd=real_repo,
+        check=True,
+        capture_output=True,
+    )
+    (human / "file.txt").write_text("irreplaceable human edits")
+    with pytest.raises(GitOpsError):
+        ops.create_worktree(
+            str(human), "human-inventory", run_id="run-3", work_item_id="owner/repo#3"
+        )
+    with pytest.raises(GitOpsError):
+        ops.cleanup_worktree(str(human))
+    assert (human / "file.txt").read_text() == "irreplaceable human edits"
+    assert (
+        next(r for r in ops.checkout_inventory() if r["path"] == str(human))["materialized"]
+        is False
+    )

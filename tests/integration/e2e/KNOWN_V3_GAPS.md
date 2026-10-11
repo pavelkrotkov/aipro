@@ -22,10 +22,17 @@ Originating-issue authorization, trusted machine-state writers, stable opt-in
 cancellation (including late parallel dispatch), and protected developer
 checkout cleanup now have production guards and boundary tests.
 
-Cutover still requires the remaining safety-parity matrix, safe orphan
-cleanup with complete runtime/Git inventories, and replacement configuration,
-trigger and migration docs. Current fake Git boundaries do not prove OS-level
-workspace isolation; native container authority checks provide separate evidence.
+The production TTL sweeper is invoked by the service and the real-Git soak.
+Protected allocation records distinguish successful owned creation from intent;
+cleanup confirms native lane absence independently of list results. Boundary
+tests retain active/human resources and fail closed on changed authority or
+ineffective runtime deletion.
+
+Cutover still requires the remaining safety-parity matrix and replacement
+configuration, trigger and migration docs. The Git soak exercises native
+branches, commits, reviewer clones and local-remote pushes; CAO HTTP/GitHub
+and model output remain external fixtures. OS isolation is separately covered
+by the native container authority checks.
 V1 remains supported until those gates pass. Closed issue #55 alone is not
 acceptance evidence, and historical PR #89 must not be merged as proof.
 
