@@ -53,6 +53,9 @@ def test_reconcile_json_output(tmp_path, capsys, monkeypatch, kind) -> None:
     exit_code = cli.main(["reconcile", "--config", str(config_path), "--json"])
     assert exit_code == (0 if kind == ActionKind.NOOP else 2)
     assert json.loads(capsys.readouterr().out) == {
+        "schema_version": 1,
+        "dry_run": True,
+        "inventory_complete": False,
         "actions": [
             {
                 "kind": kind.value,
@@ -65,7 +68,7 @@ def test_reconcile_json_output(tmp_path, capsys, monkeypatch, kind) -> None:
                 "reason": action.reason,
                 "auto_apply": kind == ActionKind.NOOP,
             }
-        ]
+        ],
     }
 
 

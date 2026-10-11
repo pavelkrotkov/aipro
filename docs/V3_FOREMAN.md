@@ -102,7 +102,9 @@ relaunch. Older active runs without dispatch intent require manual migration.
 A cancelled run with unconfirmed worker termination retains its active label
 and blocks capacity until an operator confirms termination; cancellation alone
 does not authorize reuse of its lane home.
-Inspect the issue record and actual CAO/GitHub/Git state before changing it;
+Use [operator diagnostics](V3_OBSERVABILITY.md) to inspect durable state,
+live attribution, routing, findings, and CI. Inspect actual CAO/GitHub/Git
+state before changing it;
 `aipro reconcile --apply` remains unsupported.
 
 For needs-human work, fix the stated cause and explicitly transition its

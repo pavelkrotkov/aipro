@@ -67,3 +67,5 @@ uv run pre-commit install
 ```
 
 For the persistent V3 service and Hermes supervisor profile, see [the foreman runbook](docs/V3_FOREMAN.md).
+
+See [V3 operator diagnostics](docs/V3_OBSERVABILITY.md) for status, dry-run steps, routing, telemetry, and audit events.

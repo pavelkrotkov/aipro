@@ -162,7 +162,7 @@ def test_token_shaped_value_redacted_without_configuration() -> None:
     logger.info("token ghp_abcdefghijklmnopqrstuvwxyz0123456789 leaked")
     output = stream.getvalue()
     assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in output
-    assert f"ghp_{REDACTION_PLACEHOLDER}" in output
+    assert REDACTION_PLACEHOLDER in output
 
 
 # ---- Configurable level ----
@@ -422,3 +422,42 @@ def test_no_dry_run_flag_by_default() -> None:
     log_action(logger, pr=5, action_type="add_label")
     (record,) = _records(stream)
     assert "dry_run" not in record
+
+
+@pytest.mark.parametrize(
+    "name,canary",
+    [
+        ("GITHUB_TOKEN", "ghp_testcredential123456"),
+        ("OPENROUTER_API_KEY", "sk-or-v1-testcredential123456"),
+        ("ANTHROPIC_API_KEY", "sk-ant-api03-testcredential123456"),
+        ("OPENAI_API_KEY", "sk-proj-testcredential123456"),
+        ("CODEX_ACCESS_TOKEN", "eyJheader123456.eyJpayload123456.signature123456"),
+        ("CUSTOM_PROVIDER_API_KEY", 'custom\\credential"with\nnewlines'),
+    ],
+)
+def test_provider_secrets_are_redacted_before_json_escaping(monkeypatch, name, canary):
+    from ai_pr_orchestrator.logging import collect_secret_values
+
+    monkeypatch.setenv(name, canary)
+    stream, logger, _ = _configure("aipro_test_provider_shapes", secrets=collect_secret_values(()))
+    logger.info(
+        "unlabelled credential %s",
+        canary,
+        extra={
+            "CUSTOM_API_KEY": 123456,
+            "nested": {
+                "Authorization": "Basic dXNlcjpwYXNz",
+                "CUSTOM_API_KEY": 123456,
+                "tokens": 42,
+                "token_count": 7,
+            },
+            "detail": "Authorization: Bearer " + canary,
+        },
+    )
+    payload = _records(stream)[0]
+    assert canary not in stream.getvalue() and "dXNlcjpwYXNz" not in stream.getvalue()
+    nested = cast(dict[str, Any], payload["nested"])
+    assert payload["CUSTOM_API_KEY"] == REDACTION_PLACEHOLDER
+    assert nested["CUSTOM_API_KEY"] == REDACTION_PLACEHOLDER
+    assert nested["tokens"] == 42 and nested["token_count"] == 7
+    assert REDACTION_PLACEHOLDER in cast(str, payload["message"])

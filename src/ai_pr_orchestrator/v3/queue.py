@@ -65,6 +65,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from ..github.protocol import GitHubClient as GitHubClientProtocol
+from ..logging import emit_workflow_state
 from .config import GitHubQueueConfig
 from .domain import (
     TERMINAL_PHASES,
@@ -311,8 +312,10 @@ class GitHubIssueQueue:
 
         if expected_updated_at is None:
             self._save_create_only(issue, comment, block)
-            return
-        self._save_update(issue, comment, state, block, expected_updated_at)
+        else:
+            self._save_update(issue, comment, state, block, expected_updated_at)
+        if not self._dry_run:
+            emit_workflow_state(state)
 
     def _save_create_only(
         self,
@@ -427,6 +430,12 @@ class GitHubIssueQueue:
             )
 
     # --- Queue operations --------------------------------------------------
+
+    def list_work_items(self) -> list[GitHubIssueRef]:
+        numbers = {
+            n for label in self._lifecycle_labels for n in self._client.list_issues_by_label(label)
+        }
+        return [GitHubIssueRef(self._owner, self._repo, n) for n in sorted(numbers)]
 
     def list_ready(self) -> list[GitHubIssueRef]:
         ready = []
@@ -698,6 +707,7 @@ class GitHubIssueQueue:
             extras=extras,
         )
         self.save_state(new_state, expected_updated_at=stale_state.updated_at)
+        emit_workflow_state(new_state, action="reclaim_expired_lease")
         try:
             self._apply_phase_labels(issue, stale_state.phase)
         except Exception as exc:

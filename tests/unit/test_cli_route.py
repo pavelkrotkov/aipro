@@ -137,7 +137,7 @@ def test_route_redacts_catalog_strings_before_json(
     assert cli.main([*ARGS, "--config", str(config_path), *(["--json"] if as_json else [])]) == 0
     out = capsys.readouterr().out
     assert secret not in out
-    assert "REDACTED" in out
+    assert "***" in out
     if as_json:
         payload = json.loads(out)
         assert payload["decision"]["demand"]["difficulty"] == 1
