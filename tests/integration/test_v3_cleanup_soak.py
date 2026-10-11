@@ -4,6 +4,8 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from ai_pr_orchestrator.v3.cleanup import CleanupSweeper
 from ai_pr_orchestrator.v3.git_ops import GitOpsError, GitWorktreeOps
 from tests.integration.test_continuous_foreman import _assert_completed_once, _scheduler
@@ -58,12 +60,23 @@ def test_native_git_soak_sweeps_retained_checkouts_after_every_issue(
     monkeypatch.setattr(git, "cleanup_worktree", temporary_cleanup_failure)
     scheduler = _scheduler(template, queue, template._executor, fake_cao)
     sweeper = CleanupSweeper(queue, cao_controller, git, template._cfg.cleanup)
+    human = tmp_path / "human"
+    human.mkdir()
+    (human / "keep.py").write_text("irreplaceable = True\n")
     states = []
     for number in range(1, count + 1):
         outcome = scheduler.step()
         assert len(outcome) == 1 and outcome[0].final_phase == "done", outcome
         state = _assert_completed_once(queue, fake_cao, number)
         states.append(state)
+        if number == 1:
+            with pytest.raises(GitOpsError):
+                git.create_worktree(
+                    str(human),
+                    state.extras["branch"],
+                    run_id=state.run_id,
+                    work_item_id=state.work_item_id,
+                )
         assert Path(state.extras["worktree"]).exists()
         assert sweeper.sweep(now=datetime.now(UTC) + timedelta(hours=25)) == [
             {
@@ -74,7 +87,11 @@ def test_native_git_soak_sweeps_retained_checkouts_after_every_issue(
             }
         ]
         assert not Path(state.extras["worktree"]).exists()
-        assert git.checkout_inventory() == [{"path": str(root), "role": "unowned"}]
+        inventory = git.checkout_inventory()
+        assert len(inventory) == 2
+        assert {r["path"] for r in inventory} == {str(root), str(human)}
+        assert next(r for r in inventory if r["path"] == str(human))["materialized"] is False
+        assert (human / "keep.py").read_text() == "irreplaceable = True\n"
         assert not queue.list_active()
         assert len(github.list_open_prs()) == number
     assert scheduler.step() == []

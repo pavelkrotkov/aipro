@@ -259,6 +259,8 @@ class GitWorktreeOps:
         if not workdir.exists():
             return
         self._verify_checkout_record(workdir, "reviewer", head_sha)
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise GitOpsError("review cleanup requires descriptor-based symlink protection")
         shutil.rmtree(workdir)
         self._checkout_index(workdir).unlink()
 
@@ -383,11 +385,15 @@ class GitWorktreeOps:
         latest = datetime.fromisoformat(record["created_at"]).timestamp()
         if workdir.is_symlink():
             raise GitOpsError("checkout activity cannot follow a symlink")
-        for root, dirs, files in os.walk(workdir, followlinks=False):
+        for root, dirs, files in os.walk(workdir, followlinks=False, onerror=self._activity_error):
             latest = max(
                 latest, Path(root).lstat().st_mtime, self._entry_activity(Path(root), dirs + files)
             )
         return datetime.fromtimestamp(latest, UTC)
+
+    @staticmethod
+    def _activity_error(error: OSError) -> None:
+        raise GitOpsError("checkout activity inventory is incomplete") from error
 
     @staticmethod
     def _entry_activity(root: Path, names: list[str]) -> float:

@@ -145,13 +145,15 @@ The coordinator records checkout path, role, branch/head, run and issue in its
 protected Git administration directory. Allocation intent alone cannot authorize
 deletion: a record becomes materialized only after successful native creation.
 Existing unmarked checkouts and unknown or mismatched ownership require manual
-inspection. Human checkouts are retained. Reviewer-local metadata cannot grant
+inspection. Unmaterialized allocation records for terminal runs are retained
+for manual review without blocking unrelated work; their paths are never deleted. Human checkouts are retained. Reviewer-local metadata cannot grant
 cleanup authority.
 
 The sweeper discovers attributed native CAO sessions, developer worktrees and
 reviewer clones. It confirms session disappearance after termination and probes
-every deterministic run lane before deleting a checkout, even when CAO lists
+every current and saved historical run lane before deleting a checkout, even when CAO lists
 no sessions. Unknown inventories or unconfirmed stops emit
 `reconciliation_required` and hold new work. Recent file activity postpones
-checkout removal. Each confirmed removal emits a correlated, redacted
+checkout removal. An unreadable activity inventory retains all checkouts;
+review deletion requires the native descriptor-based symlink protection. Each confirmed removal emits a correlated, redacted
 `owned_resource_cleanup` event and appears in the service's `cleanup_outcomes`.

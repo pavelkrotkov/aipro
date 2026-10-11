@@ -44,13 +44,25 @@ class CleanupSweeper:
 
     def _checkouts(self, records, states, now):
         actions = []
-        for record, state in self.queue.cleanup_checkout_targets(records, states):
-            if not self.git.checkout_expired(
+        targets = [
+            (record, state)
+            for record, state in self.queue.cleanup_checkout_targets(records, states)
+            if self.git.checkout_expired(
                 record, state.updated_at, now, self.config.worktree_inactivity_ttl_seconds
-            ):
-                continue
+            )
+        ]
+        for record, state in targets:
             self.queue.verify_cleanup_state(state)
-            self.controller.require_run_stopped(state.run_id, state.work_item_id)
+            self.controller.require_run_stopped(
+                state.run_id,
+                state.work_item_id,
+                developer_session=state.extras.get("developer_session"),
+                reviewer_lanes=(
+                    lane
+                    for wave in state.extras.get("review_waves", {}).values()
+                    for lane in wave["lanes"]
+                ),
+            )
             self.git.retire_checkout(record, state.run_id, state.work_item_id)
             actions.append(
                 emit_cleanup_event(state, "clean_orphan_worktree", worktree=record["path"])

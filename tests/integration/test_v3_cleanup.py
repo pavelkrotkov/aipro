@@ -67,6 +67,7 @@ def _resources(tmp_path, controller, *, terminal=True):
         extras={
             **state.extras,
             "worktree": developer,
+            "developer_session": sessions[0].session_id,
             "coder_turn": {},
             "lanes_stopped": True,
             "review_waves": {
@@ -113,7 +114,15 @@ def test_sweep_removes_only_verified_terminal_resources_after_inactivity(
 
 
 @pytest.mark.parametrize(
-    "failure", ["empty_inventory", "accepted_delete", "young_orphan", "changed_authority"]
+    "failure",
+    [
+        "empty_inventory",
+        "accepted_delete",
+        "young_orphan",
+        "changed_authority",
+        "renamed_worker",
+        "renamed_reviewer",
+    ],
 )
 def test_unverified_runtime_or_changed_authority_cannot_release_checkout(
     tmp_path, cao_controller, fake_cao, monkeypatch, failure
@@ -126,7 +135,17 @@ def test_unverified_runtime_or_changed_authority_cannot_release_checkout(
 
     git, queue, _state, paths, sessions = _resources(tmp_path, cao_controller)
     request = cao_controller._request
-    if failure == "empty_inventory":
+    if failure.startswith("renamed_"):
+        survivor = sessions[0 if failure == "renamed_worker" else 1]
+        for handle in sessions:
+            if handle != survivor:
+                cao_controller.terminate_session(handle)
+        sessions = [survivor]
+        cao_controller._lanes = LaneRegistry(
+            replace(lane, lane="new-" + lane.lane) for lane in LaneRegistry.default()
+        )
+        cao_controller._sessions.clear()
+    if failure in ("empty_inventory", "renamed_worker", "renamed_reviewer"):
 
         def missing_inventory(method, url, **kwargs):
             if method == "GET" and url == "/sessions":
@@ -180,3 +199,24 @@ def test_foreign_repository_runtime_is_retained_during_owned_cleanup(
     assert all(fake_cao._sessions[handle.session_id].deleted for handle in sessions)
     assert not fake_cao._sessions[foreign.session_id].deleted and foreign_path.exists()
     assert queue.load_state(state.work_item_id) == state
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory read permissions")
+def test_unreadable_activity_retains_every_checkout(tmp_path, cao_controller):
+    from ai_pr_orchestrator.v3.git_ops import GitOpsError
+
+    git, queue, state, paths, _ = _resources(tmp_path, cao_controller)
+    private = Path(paths[0]) / "private"
+    private.mkdir()
+    (private / "uninspected.py").write_text("irreplaceable = True\n")
+    private.chmod(0)
+    try:
+        with pytest.raises(GitOpsError, match="activity inventory is incomplete"):
+            CleanupSweeper(queue, cao_controller, git, CleanupConfig()).sweep(
+                now=datetime.now(UTC) + timedelta(hours=25)
+            )
+        assert all(Path(path).exists() for path in paths)
+        assert queue.load_state(state.work_item_id) == state
+    finally:
+        private.chmod(0o700)
+    assert (private / "uninspected.py").read_text() == "irreplaceable = True\n"

@@ -495,7 +495,7 @@ class GitHubIssueQueue:
             state = states.get((record["work_item_id"], record["run_id"]))
             if state is None:
                 raise StateConflictError("protected checkout has no matching durable authority")
-            if self._can_cleanup(state):
+            if self._can_cleanup(state) and record["materialized"]:
                 targets.append((record, state))
         return targets
 

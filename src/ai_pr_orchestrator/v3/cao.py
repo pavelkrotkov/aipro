@@ -29,6 +29,7 @@ import dataclasses
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -830,15 +831,26 @@ class CaoSessionController:
         self.terminate_session(SessionHandle(metadata.session_name, metadata.lane.lane))
         self.require_session_absent(metadata.session_name)
 
-    def require_run_stopped(self, run_id: str, work_item_id: str) -> None:
-        for lane in self._lanes:
-            scope = work_item_id if lane.role == "worker" else None
-            self.require_session_absent(session_name_for(run_id, lane.lane, scope))
+    def require_run_stopped(
+        self,
+        run_id: str,
+        work_item_id: str,
+        *,
+        developer_session: str | None,
+        reviewer_lanes: Iterable[str],
+    ) -> None:
+        names = {
+            session_name_for(run_id, lane.lane, work_item_id if lane.role == "worker" else None)
+            for lane in self._lanes
+        }
+        names.update(session_name_for(run_id, lane) for lane in reviewer_lanes)
+        if developer_session is not None:
+            names.add(developer_session)
+        for name in names:
+            self.require_session_absent(name)
 
     def require_session_absent(self, name: str) -> None:
-        try:
-            self.inspect_session(name)
-        except CaoSessionNotFoundError:
+        if self._lookup_session(name) is None:
             return
         raise CaoSessionNotReadyError("checkout cleanup requires confirmed session termination")
 
