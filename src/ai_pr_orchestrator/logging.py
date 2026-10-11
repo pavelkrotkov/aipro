@@ -327,6 +327,7 @@ def setup_logging(
     pkg_logger.handlers.clear()
     pkg_logger.addHandler(handler)
     pkg_logger.setLevel(_coerce_level(level))
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     # Don't propagate to the root logger: that would re-emit each line through
     # any root handler (e.g. pytest's) as unstructured text.
     pkg_logger.propagate = False

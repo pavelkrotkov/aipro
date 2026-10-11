@@ -8,22 +8,23 @@ from ai_pr_orchestrator.v3.cao import CaoSessionController, CaoTransportError, s
 from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
 from ai_pr_orchestrator.v3.ci_gate import GateDecision
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop, PRReconciliationError
+from ai_pr_orchestrator.v3.model_router import build_model_broker
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue, LabelSyncError
 from ai_pr_orchestrator.v3.scheduler import ContinuousForeman
 from tests.integration._harness import FakeGitOperations, developer_output, developer_session_name
-from tests.unit.test_v3_foreman import FakeBroker, RecordingGate, RecordingGit
+from tests.unit.test_v3_foreman import RecordingGate, RecordingGit
 
 
-def _scheduler(template, queue, executor, fake_cao):
+def _scheduler(template, queue, executor, fake_cao, *, broker=None):
     def factory(run_id):
-        for number in (1, 2):
-            fake_cao.set_output(developer_session_name(run_id, number), developer_output())
+        for issue in queue.list_work_items():
+            fake_cao.set_output(developer_session_name(run_id, issue.number), developer_output())
         for lane in template._lanes:
             if lane.role == "reviewer":
                 fake_cao.set_output(session_name_for(run_id, lane.lane), "[]")
         return ForemanPolicyLoop(
             queue,
-            FakeBroker(),
+            broker or build_model_broker(template._cfg),
             template._lanes,
             executor,
             template._gate,
@@ -215,3 +216,26 @@ def test_unconfirmed_reviewer_stop_keeps_capacity_reserved(fake_cao, foreman_har
         _scheduler(template, queue, template._executor, fake_cao).step()
     assert queue.load_state("owner/repo#1").phase == "reviewing"
     assert queue.load_state("owner/repo#2") is None
+
+
+def test_multi_issue_soak_has_no_duplicate_or_unmanaged_side_effects(
+    fake_cao, foreman_harness, request
+):
+    count = request.config.getoption("--soak-issues")
+    template, queue, github = foreman_harness(list(range(1, count + 1)), git_ops=RecordingGit())
+    scheduler = _scheduler(template, queue, template._executor, fake_cao)
+    states = []
+    for number in range(1, count + 1):
+        outcome = scheduler.step()
+        assert len(outcome) == 1 and outcome[0].issue.number == number
+        states.append(_assert_completed_once(queue, fake_cao, number))
+        assert not queue.list_active()
+        assert not template._git.worktrees
+        assert all(session.deleted for session in fake_cao._sessions.values())
+        assert len(github.list_open_prs()) == number
+    assert scheduler.step() == []
+    assert len({state.run_id for state in states}) == count
+    assert len(template._git.branches) == count + 1
+    assert len(set(template._git.branches)) == count + 1
+    assert len(fake_cao._sessions) == count * 4
+    assert all(queue.load_state(state.work_item_id) == state for state in states)

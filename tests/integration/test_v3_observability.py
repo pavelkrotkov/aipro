@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from ai_pr_orchestrator import cli
-from ai_pr_orchestrator.logging import JsonFormatter, SecretRedactor
+from ai_pr_orchestrator.logging import JsonFormatter, SecretRedactor, setup_logging
 from ai_pr_orchestrator.v3.audit import workflow_snapshot
 from ai_pr_orchestrator.v3.cao import CaoSessionController, CaoUnavailableError
 from ai_pr_orchestrator.v3.status import status_snapshot
@@ -108,7 +108,11 @@ def test_status_retains_durable_context_when_cao_is_unavailable(
     assert all(not lane["runtime"]["verified"] for lane in work["lanes"])
     assert all(lane["last_durable_state"] == "stopped" for lane in work["lanes"])
     assert len(calls) == 1
-    assert work["archived"][0]["origins"][0]["model_ref"] == "ref-requirements-reviewer"
+    origin = queue.load_state("owner/repo#1").extras["review_waves"]["review-1"]["lanes"]
+    assert (
+        work["archived"][0]["origins"][0]["model_ref"]
+        == origin["requirements-reviewer"]["assignment"]["model_ref"]
+    )
 
 
 def test_audit_correlates_findings_to_model_head_and_disposition_without_prompts(
@@ -118,6 +122,8 @@ def test_audit_correlates_findings_to_model_head_and_disposition_without_prompts
     github.seed_issue(1, ["v3-work"], body="private-source-canary-not-for-logs")
     script_protocol(fake_cao, loop)
     logger = logging.getLogger("ai_pr_orchestrator")
+    monkeypatch.setattr(logging.getLogger("httpx"), "level", logging.INFO)
+    setup_logging(logger_name="aipro_test_transport_privacy")
     monkeypatch.setattr(logger, "handlers", [])
     monkeypatch.setattr(logger, "level", logging.INFO)
     monkeypatch.setattr(logger, "propagate", True)
@@ -135,7 +141,11 @@ def test_audit_correlates_findings_to_model_head_and_disposition_without_prompts
     found = next(event for event in events if event.get("work", {}).get("findings"))
     origin = found["work"]["findings"][0]["origin"]
     assert origin["role"] == "reviewer" and origin["head_sha"] == "sha"
-    assert origin["model_ref"] == "ref-requirements-reviewer"
+    first = queue.load_state("owner/repo#1").extras["review_waves"]["review-1"]["lanes"]
+    assert origin["model_ref"] == first["requirements-reviewer"]["assignment"]["model_ref"]
+    assert "private-source-canary-not-for-logs" not in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
     final = events[-1]["work"]
     assert final["phase"] == "done"
     assert [(d["finding_id"], d["action"]) for d in final["dispositions"]] == [
