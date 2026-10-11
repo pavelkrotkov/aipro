@@ -12,7 +12,12 @@ commit `a5ccbe2624aabadfbdf64642c5f1e364db299ec3`. For a reproducible installati
 
 ```sh
 uv tool install 'git+https://github.com/awslabs/cli-agent-orchestrator.git@a5ccbe2624aabadfbdf64642c5f1e364db299ec3'
+cao-server --host 127.0.0.1 --port 9889 --terminal tmux
 ```
+
+Manage `cao-server` separately from the foreman, with the same non-root
+coordinator user and installed lane wrappers on its `PATH`. Keep its
+`CAO_HOME_DIR` stable across restarts so terminal metadata survives.
 
 The previous 2.4.x floor was incorrect: official 2.4.0 and 2.4.1 lack both
 creation attribution fields (`group`/`metadata`) and the metadata PATCH route.

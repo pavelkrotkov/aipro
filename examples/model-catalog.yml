@@ -1,4 +1,7 @@
 # Shared V3 model catalog (machine-level).
+# Illustrative descriptors, prices, quality, and promotions: replace with
+# verified deployment values before opting in work. Custom endpoints are
+# schema examples; the current Hermes lane bridge rejects them.
 #
 # This is the single source of truth about which models/resources the
 # developer, reviewer, and adjudicator lanes may run on. It lives outside any
@@ -82,7 +85,7 @@ models:
   # The difficulty floor keeps it off trivial work.
   - ref: subscription-primary
     descriptor: subscription-primary-descriptor
-    provider: subscription-provider-a
+    provider: anthropic
     resource_class: subscription
     cost_class: high
     input_price_per_mtok: 3.0
@@ -103,7 +106,7 @@ models:
   # blind spots.
   - ref: subscription-secondary
     descriptor: subscription-secondary-descriptor
-    provider: subscription-provider-b
+    provider: openai-codex
     resource_class: subscription
     cost_class: high
     input_price_per_mtok: 2.5
@@ -124,7 +127,7 @@ models:
   # out of rotation does not mean losing its metadata.
   - ref: retired-candidate
     descriptor: retired-descriptor
-    provider: subscription-provider-a
+    provider: anthropic
     resource_class: metered
     cost_class: medium
     input_price_per_mtok: 1.0

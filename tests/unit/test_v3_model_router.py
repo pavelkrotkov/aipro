@@ -16,6 +16,7 @@ from ai_pr_orchestrator.v3.config import (
     TelemetryResourceConfig,
     V3Config,
     V3ConfigError,
+    load_v3_config,
 )
 from ai_pr_orchestrator.v3.model_router import ModelRouterError, build_model_broker, resolve_catalog
 from ai_pr_orchestrator.v3.telemetry import ProviderResourceSnapshot
@@ -219,3 +220,21 @@ def test_catalog_snapshot_cannot_override_explicit_provider_account():
     assert decision.assignment is None
     assert "exhausted" in decision.rejected[0].reason
     assert [call.args[0] for call in telemetry.snapshot.call_args_list] == ["acct-main", "alpha"]
+
+
+def test_deployment_sample_joins_subscription_quota_to_catalog(monkeypatch):
+    path = Path(__file__).resolve().parents[2] / "examples" / "v3-config.yml"
+    config = load_v3_config(path)
+    telemetry = _StaticTelemetry()
+    monkeypatch.setattr(
+        telemetry,
+        "snapshot",
+        lambda resource, at: ProviderResourceSnapshot(
+            resource=resource, observed_at=at, availability="exhausted", cash_balance=0
+        ),
+    )
+    broker = build_model_broker(config, telemetry_source=telemetry, at=NOW, base_dir=path.parent)
+    decision = broker.select(TaskDemand("developer", "worker", 3), at=NOW)
+    reasons = {candidate.ref: candidate.reason for candidate in decision.rejected}
+    assert "exhausted" in reasons["subscription-primary"]
+    assert "exhausted" in reasons["subscription-secondary"]

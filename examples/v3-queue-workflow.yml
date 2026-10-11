@@ -1,0 +1,26 @@
+name: Queue V3 issue
+
+"on":
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: v3-queue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  queue:
+    if: >-
+      contains(github.event.issue.labels.*.name, 'v3-work-enabled') &&
+      (github.event.action == 'opened' || github.event.label.name == 'v3-work-enabled')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark opted-in issue ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: gh issue edit "$ISSUE_NUMBER" --repo "$GH_REPO" --add-label v3-work

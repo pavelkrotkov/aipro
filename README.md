@@ -1,71 +1,71 @@
 # AI PR Orchestrator
 
-AI PR Orchestrator is a Python-based GitHub PR orchestration tool for coordinating
-AI coding agents and AI reviewers.
+aipro V3 runs an issue-to-PR loop through a persistent foreman, Hermes agents,
+and CAO 2.5. GitHub issue comments hold authoritative run state. The coordinator
+owns Git/GitHub mutations; one developer and three independent reviewer lanes
+run through contained Hermes processes. Successful work produces a PR after
+review and CI; merging remains a repository decision.
 
-The current repository contains the orchestrator package, target-repository
-workflow template, sample configuration, and repo hygiene automation.
+## Install in a target repository
 
-## Installing in a target repository
+1. On the coordinator host, clone this package and a primary checkout of the
+   target repository. Install Python 3.12+ and run `uv sync --locked` in the
+   package checkout. Keep coordinator push credentials separate from lane homes.
+2. Follow [CAO provisioning](docs/V3_CAO.md) to install CAO 2.5, bind its control
+   API to loopback, pin the Hermes container image, and provision the four
+   independent lane wrappers and profiles. Verify containment before enabling work.
+3. Copy [v3-config.yml](examples/v3-config.yml) and
+   [model-catalog.yml](examples/model-catalog.yml) beside each other on the host.
+   Replace illustrative model descriptors, providers, prices, promotions, quality
+   and concurrency with verified account values. The catalog is shared across
+   lanes; relative paths resolve beside the policy YAML. Match catalog providers
+   to telemetry rows and reserve resource names. Set `telemetry.hermes_python`
+   to the host Hermes interpreter. Credentials belong in dedicated Hermes homes,
+   never the policy YAML. Custom catalog endpoints are currently unsupported
+   by the lane bridge.
+4. Set the target repository's exact `ci_policy.required_checks` names and the
+   trusted issue-author associations. For a GitHub App, pin
+   `github_queue.state_author_login` to its exact bot writer login. Create the
+   configured lifecycle labels: `v3-work`, `v3-work-enabled`, `v3-work-active`,
+   `v3-work-review`, `v3-work-needs-human`, `v3-work-done`, `v3-work-error`.
+5. Install the Hermes supervisor profile and persistent user service using the
+   [foreman runbook](docs/V3_FOREMAN.md). Its coordinator token needs repository
+   contents/PR/issues write and checks/status read access. Verify noninteractive
+   origin push authentication. Run one coordinator per target repository.
+6. Copy [v3-queue-workflow.yml](examples/v3-queue-workflow.yml) into the target's
+   `.github/workflows/`. It only adds the ready label; it runs no agents and
+   requires only issues write permission. If you rename queue labels, edit
+   both the workflow and host policy.
 
-To set up the review loop on your own repository:
+Inspect policy and live state before opting in:
 
-1. Copy [`examples/target-repo-workflow.yml`](examples/target-repo-workflow.yml)
-   to `.github/workflows/ai-review-loop.yml` and replace `YOUR_ORG` in the
-   install step with the org hosting this package.
-2. Copy [`examples/sample-config.yml`](examples/sample-config.yml) to
-   `.github/ai-review-loop.yml` and adjust it to taste. Only `main_coder` is
-   required; everything else falls back to built-in defaults.
-3. Add the required repository secrets:
-   - `CODEX_API_KEY` — credential for the coder.
-   - `AI_ORCHESTRATOR_GITHUB_TOKEN` *(optional)* — a PAT or app token for the
-     orchestrator; falls back to the workflow's `GITHUB_TOKEN`.
-4. Keep the workflow's coder setup step aligned with `main_coder.command`. The
-   sample workflow installs the OpenAI Codex CLI with npm and keeps `PATH` in
-   `main_coder.env` so the subprocess can find `codex`.
-5. Add the `ai-loop` label to a PR to opt it into the loop.
+```sh
+.venv/bin/aipro catalog --config /path/to/v3-config.yml
+.venv/bin/aipro telemetry --config /path/to/v3-config.yml --json
+.venv/bin/aipro route explain --config /path/to/v3-config.yml --role worker --difficulty 3
+.venv/bin/aipro status --config /path/to/v3-config.yml --repo owner/repo --json
+```
 
-The workflow grants the least-privilege scopes the orchestrator needs
-(`contents: write`, `pull-requests: write`, `issues: write`, `checks: read`,
-`statuses: read`) and serializes runs
-per PR via a `concurrency` group with `cancel-in-progress: false`. The
-orchestrator token is never forwarded to the coder: it is not listed in
-`main_coder.env`, and the coder adapter strips `GH_TOKEN`/`GITHUB_TOKEN` from the
-coder subprocess environment.
+Add `v3-work-enabled` to an issue to queue it through the installed trigger,
+then inspect status and the service journal. Without the trigger, add both
+`v3-work-enabled` and `v3-work`. The foreman independently verifies the
+originating author's authorization. Remove the stable opt-in label to cancel;
+capacity remains reserved until native lane termination is confirmed.
+Needs-human and cancelled records require an explicit operator state decision;
+re-adding a label does not reset their history or budgets.
+
+See [operator diagnostics](docs/V3_OBSERVABILITY.md),
+[acceptance evidence and limits](docs/V3_SOAK.md), and
+[V1 migration and rollback](docs/V1_MIGRATION.md). V1 commands and examples
+are deprecated during P5 and removed in the separately gated P6 retirement.
 
 ## Development
 
-Install the project and development tools:
-
 ```sh
-uv sync --all-extras --dev
-```
-
-Run the test suite:
-
-```sh
+uv sync --locked --all-extras --dev
 uv run pytest
-```
-
-Run linting and formatting:
-
-```sh
 uv run ruff check .
-uv run ruff format .
-```
-
-Run type checking:
-
-```sh
+uv run ruff format --check .
 uv run ty check .
-```
-
-Install pre-commit hooks:
-
-```sh
 uv run pre-commit install
 ```
-
-For the persistent V3 service and Hermes supervisor profile, see [the foreman runbook](docs/V3_FOREMAN.md).
-
-See [V3 operator diagnostics](docs/V3_OBSERVABILITY.md) for status, dry-run steps, routing, telemetry, and audit events.
