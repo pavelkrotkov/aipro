@@ -134,6 +134,7 @@ def test_execute_adopts_existing_session_by_name(fake_cao: FakeCAOServer, tmp_pa
                 executor = CaoLaneExecutor(
                     restarted, registry, git=FakeGitOperations(), poll_interval_seconds=0.01
                 )
+                executor.execute(_lane(), "first task", str(tmp_path), _context(run_id))
                 result = executor.execute(
                     _lane(), "follow-up task", str(tmp_path), _context(run_id)
                 )
@@ -195,18 +196,11 @@ def test_execute_surfaces_uncertain_followup_submission(fake_cao: FakeCAOServer,
             executor.execute(_lane(), "follow-up task", str(tmp_path), _context(run_id))
 
     assert state.submitted_messages == ["first task"]
-    assert state.deleted
+    assert not state.deleted
 
 
 def test_execute_clears_previous_idle_evidence_on_new_work(fake_cao: FakeCAOServer, tmp_path):
-    """The controller clears idle-settle evidence on accepted input
-    (see ``submit_work`` in ``cao.py``). A second ``execute`` therefore
-    starts fresh, not by inheriting the first session's terminal state.
-
-    PR #73 review thread 1: the executor now submits the lane's prompt on
-    every invocation (adopted or fresh). The fake resets its status cursor
-    on submit so the second walk is identical to the first.
-    """
+    """A different turn cannot reuse the prior turn's idle completion evidence."""
     run_id = f"it-{int(time.time() * 1000)}"
     name = session_name_for(run_id, DEVELOPER_LANE)
     fake_cao.set_output(name, MARKER)
@@ -220,7 +214,7 @@ def test_execute_clears_previous_idle_evidence_on_new_work(fake_cao: FakeCAOServ
     )
 
     first = executor.execute(_lane(), f"echo {MARKER}", str(tmp_path), _context(run_id))
-    second = executor.execute(_lane(), f"echo {MARKER}", str(tmp_path), _context(run_id))
+    second = executor.execute(_lane(), f"repeat {MARKER}", str(tmp_path), _context(run_id))
 
     assert first.exit_code == 0
     assert second.exit_code == 0
@@ -452,7 +446,7 @@ def test_execute_refreshes_round_context_durably(fake_cao: FakeCAOServer, tmp_pa
 
 
 @pytest.mark.parametrize("transport_reset", [False, True])
-def test_execute_fails_closed_when_turn_context_update_fails(
+def test_execute_fails_closed_when_pre_input_metadata_reset_fails(
     fake_cao: FakeCAOServer, tmp_path, transport_reset
 ):
     registry = LaneRegistry.default()
@@ -482,8 +476,8 @@ def test_execute_fails_closed_when_turn_context_update_fails(
                 str(tmp_path),
                 LaneExecutionContext(run_id=run_id, round_id="review-2"),
             )
-    assert state.submitted_messages == ["first review", "second review"]
-    assert state.deleted
+    assert state.submitted_messages == ["first review"]
+    assert state.deleted is (not transport_reset)
 
 
 def test_busy_followup_preserves_previous_round(fake_cao: FakeCAOServer, tmp_path):
@@ -515,3 +509,64 @@ def test_busy_followup_preserves_previous_round(fake_cao: FakeCAOServer, tmp_pat
     assert state.metadata == previous_metadata
     assert state.submitted_messages == ["first review"]
     assert not state.deleted
+
+
+def test_restart_collects_accepted_input_after_response_loss(fake_cao, tmp_path, monkeypatch):
+    registry = LaneRegistry.default()
+    context = LaneExecutionContext(run_id="lost-response", round_id="first")
+    followup = LaneExecutionContext(run_id="lost-response", round_id="second")
+    name = session_name_for(context.run_id, DEVELOPER_LANE)
+    with CaoSessionController(_config(fake_cao.url), registry) as controller:
+        executor = CaoLaneExecutor(controller, registry, git=FakeGitOperations())
+        executor.execute(_lane(), "first task", str(tmp_path), context)
+        request = controller._request
+
+        def lose_response(method, url, **kwargs):
+            response = request(method, url, **kwargs)
+            if method == "POST" and url.endswith("/input"):
+                raise CaoTransportError("accepted response lost")
+            return response
+
+        monkeypatch.setattr(controller, "_request", lose_response)
+        fake_cao.set_output(name, "second result")
+        with pytest.raises(CaoTransportError):
+            executor.execute(_lane(), "second task", str(tmp_path), followup)
+    with CaoSessionController(_config(fake_cao.url), registry) as restarted:
+        result = CaoLaneExecutor(restarted, registry, git=FakeGitOperations()).execute(
+            _lane(), "second task", str(tmp_path), followup
+        )
+        assert result.output_summary == "second result"
+        state = fake_cao._sessions[name]
+        assert state.submitted_messages == ["first task", "second task"]
+        assert not state.deleted
+        restarted.terminate_session(result.session)
+
+
+def test_adoption_clears_cached_activity_after_lost_preparation_response(
+    fake_cao, tmp_path, monkeypatch
+):
+    registry = LaneRegistry.default()
+    context = _context("lost-preparation")
+    name = session_name_for(context.run_id, DEVELOPER_LANE)
+    with CaoSessionController(_config(fake_cao.url), registry) as controller:
+        executor = CaoLaneExecutor(controller, registry, git=FakeGitOperations())
+        first = executor.execute(_lane(), "first task", str(tmp_path), context)
+        request = controller._request
+
+        def lose_response(method, url, **kwargs):
+            response = request(method, url, **kwargs)
+            if method == "PATCH" and url.endswith("/metadata"):
+                raise CaoTransportError("preparation response lost")
+            return response
+
+        monkeypatch.setattr(controller, "_request", lose_response)
+        with pytest.raises(CaoTransportError):
+            executor.execute(_lane(), "second task", str(tmp_path), context)
+        observation = controller.adopt_session(name)
+        assert observation.state == "running"
+        assert not observation.metadata.activity_seen
+        assert controller.observe(first.session).state == "running"
+        state = fake_cao._sessions[name]
+        assert state.submitted_messages == ["first task"]
+        assert not state.deleted
+        controller.terminate_session(first.session)

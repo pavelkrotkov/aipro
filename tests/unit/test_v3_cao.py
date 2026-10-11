@@ -458,6 +458,49 @@ def test_accepted_follow_up_clears_prior_activity_evidence(respx_mock):
     assert states == ["running", "running", "running", "running"]
 
 
+@pytest.mark.parametrize("status", [404, 429, 500])
+def test_failed_durable_reset_never_delivers_follow_up(respx_mock, status):
+    controller = make_controller(idle_settle_polls=1)
+    handle = launch(controller, respx_mock)
+    status_route(respx_mock, "processing", "idle")
+    controller.observe(handle)
+    respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+        return_value=httpx.Response(status, text="reset failed")
+    )
+    input_route = respx_mock.post(f"{BASE}/terminals/{TERMINAL}/input")
+    with pytest.raises(CaoControlPlaneError, match="reset activity before input"):
+        controller.submit_work(handle, "new work")
+    assert not input_route.called
+    assert controller.observe(handle).state == "completed"
+
+
+def test_follow_up_resets_durable_evidence_before_delivery(respx_mock):
+    controller = make_controller(idle_settle_polls=1)
+    handle = launch(controller, respx_mock)
+    status_route(respx_mock, "processing")
+    controller.observe(handle)
+    durable = {}
+
+    def persist(request):
+        durable.update(json.loads(request.content)["metadata"])
+        return httpx.Response(200, json=terminal_payload())
+
+    def accept(_request):
+        assert durable["activity_seen"] is False
+        return httpx.Response(200, json={"success": True})
+
+    respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(side_effect=persist)
+    respx_mock.post(f"{BASE}/terminals/{TERMINAL}/input").mock(side_effect=accept)
+    controller.submit_work(handle, "new work")
+    respx_mock.get(f"{BASE}/sessions/{SESSION}").mock(
+        return_value=httpx.Response(200, json={"terminals": [{"id": TERMINAL}]})
+    )
+    respx_mock.get(f"{BASE}/terminals/{TERMINAL}").mock(
+        return_value=httpx.Response(200, json=terminal_payload(status="idle", metadata=durable))
+    )
+    assert make_controller(idle_settle_polls=1).adopt_session(SESSION).state == "running"
+
+
 def test_failed_activity_persistence_is_retried_on_later_activity(respx_mock):
     # A metadata PATCH that fails must not silently cost the durable
     # evidence: the next observed activity re-attempts the write until it
@@ -655,6 +698,9 @@ def test_follow_up_work_goes_to_the_same_session(respx_mock):
     )
 
     controller.submit_work(handle, "address the review findings")
+    status_route(respx_mock, "processing", "idle", "idle", "idle")
+    for _ in range(3):
+        controller.observe(handle)
     controller.submit_work(handle, "and rerun the tests")
 
     assert len(route.calls) == 2
@@ -671,6 +717,21 @@ def test_submitting_work_to_a_busy_session_is_reported_not_swallowed(respx_mock)
 
     with pytest.raises(SessionBusyError, match="terminal input blocked"):
         controller.submit_work(handle, "hurry up")
+
+
+def test_busy_input_with_failed_restore_still_preserves_the_session(respx_mock):
+    controller = make_controller()
+    handle = launch(controller, respx_mock)
+    respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").mock(
+        side_effect=[httpx.Response(200), httpx.Response(500, text="restore failed")]
+    )
+    respx_mock.post(f"{BASE}/terminals/{TERMINAL}/input").mock(
+        return_value=httpx.Response(409, text="input blocked")
+    )
+    teardown = respx_mock.delete(f"{BASE}/sessions/{SESSION}")
+    with pytest.raises(SessionBusyError, match="reconciliation required"):
+        controller.submit_work(handle, "new work")
+    assert not teardown.called
 
 
 def test_empty_work_is_rejected_before_it_reaches_cao(respx_mock):
@@ -1087,3 +1148,32 @@ def test_unsupported_cao_2_4_1_metadata_contract_fails_visibly(respx_mock):
             )
         status_route(respx_mock, "idle")
         assert controller.observe(handle).metadata.context.round_id == "round-2"
+
+
+@pytest.mark.parametrize("digest", ["", "g" * 64, 1, "f" * 63])
+def test_adoption_rejects_invalid_input_fingerprint(digest):
+    payload = attribution_payload()
+    payload["input_digest"] = digest
+    with pytest.raises(CaoMetadataError, match="input digest"):
+        CaoSessionMetadata.from_dict(payload)
+
+
+def test_adoption_requires_explicit_input_fingerprint():
+    payload = attribution_payload()
+    del payload["input_digest"]
+    with pytest.raises(CaoMetadataError, match="input digest"):
+        CaoSessionMetadata.from_dict(payload)
+
+
+def test_pending_input_cannot_collect_previous_completed_status(respx_mock):
+    controller = make_controller()
+    handle = launch(controller, respx_mock)
+    respx_mock.patch(f"{BASE}/terminals/{TERMINAL}/metadata").respond(200)
+    respx_mock.post(f"{BASE}/terminals/{TERMINAL}/input").respond(204)
+    controller.submit_work(handle, "new turn")
+    status_route(respx_mock, "completed", "processing", "completed")
+    assert [controller.observe(handle).state for _ in range(3)] == [
+        "running",
+        "running",
+        "completed",
+    ]

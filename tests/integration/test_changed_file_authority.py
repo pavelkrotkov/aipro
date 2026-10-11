@@ -157,8 +157,8 @@ def test_foreman_rejects_actual_cao_workflow_edits_before_push(
     loop, queue, controller, gate, pushed = foreman_runtime
     submit = controller.submit_work
 
-    def simulate_worker_edit(handle, prompt):
-        submit(handle, prompt)  # Real HTTP input delivery still runs.
+    def simulate_worker_edit(handle, prompt, *, context=None):
+        submit(handle, prompt, context=context)  # Real HTTP input delivery still runs.
         if handle.lane == "developer" and editing_lane != "developer":
             (Path(loop._worktree_root) / "issue-1/safe.py").write_text("safe")
         if handle.lane == editing_lane:
@@ -228,8 +228,8 @@ def test_commit_budget_uses_current_worktree_after_review(
             git(workdir, "commit", "-m", "existing issue commit")
         return workdir
 
-    def simulate_worker_edit(handle, prompt):
-        submit(handle, prompt)
+    def simulate_worker_edit(handle, prompt, *, context=None):
+        submit(handle, prompt, context=context)
         if handle.lane == editing_lane:
             worktree = Path(loop._worktree_root) / "issue-1"
             (worktree / "pending").write_text("must consume a commit")
@@ -257,8 +257,8 @@ def test_workflow_added_after_lane_observation_never_publishes(foreman_runtime, 
     submit = controller.submit_work
     commit = loop._git.commit
 
-    def create_safe_edit(handle, prompt):
-        submit(handle, prompt)
+    def create_safe_edit(handle, prompt, *, context=None):
+        submit(handle, prompt, context=context)
         if handle.lane == "developer":
             (Path(loop._worktree_root) / "issue-1/safe.py").write_text("safe")
 

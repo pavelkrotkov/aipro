@@ -52,7 +52,7 @@ from ai_pr_orchestrator.github.models import PullRequest
 from ai_pr_orchestrator.github.protocol import GitHubClient
 
 from .broker import BrokerError, TaskDemand
-from .cao import SessionBusyError
+from .cao import CaoTransportError, SessionBusyError, SessionIdentityUncertainError
 from .catalog import MAX_TASK_DIFFICULTY
 from .config import V3Config
 from .domain import (
@@ -273,7 +273,12 @@ class ForemanPolicyLoop:
                 outcomes.append(
                     self._drive(issue, existing, now=now, resume_at_gate=resume_at_gate)
                 )
-            except (SessionBusyError, PRReconciliationError):
+            except (
+                CaoTransportError,
+                SessionBusyError,
+                SessionIdentityUncertainError,
+                PRReconciliationError,
+            ):
                 # Uncertain effects require reconciliation, not terminal cleanup.
                 raise
             except Exception as exc:

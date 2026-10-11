@@ -1,37 +1,18 @@
-"""Production :class:`LaneExecutor` bridge over :class:`CaoSessionController`.
-
-The foreman policy loop and the lane-execution contract are defined in
-:mod:`ai_pr_orchestrator.v3.interfaces`; this module is the production
-implementation that satisfies the :class:`LaneExecutor` Protocol by
-delegating every unit of work to a CAO session. The unit tests in
-``test_v3_foreman.py`` use ``ScriptedExecutor`` so the foreman's branch
-logic can be exercised without spinning up a CAO; this module is the
-real-execution counterpart, used by the E2E harness and the future
-production path.
-
-Three properties are load-bearing:
-
-- **The session's name is a pure function of (run, lane)**, so a crashed
-  foreman adopting a previous process's session by name rebuilds the
-  full identity from CAO's metadata, not from this module's local state.
-- **Termination is idempotent and best-effort**: an exception mid-poll
-  triggers ``terminate_session`` so the CAO session is not orphaned. A
-  re-raise surfaces the typed lane error to the caller so the foreman
-  can classify it (transient vs permanent).
-- **The poll loop honors the controller's own idle-settle and timeout
-  rules**: this module never invents its own timeout; it just calls
-  ``poll_session`` in a loop with a derived safety budget and reports
-  the controller's normalized lifecycle. The controller already maps
-  ``observed terminal-status`` onto ``LaneResult.exit_code`` (0 on
-  completed, 1 otherwise).
-"""
+"""CAO lane execution with durable turn identity and bounded result collection."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from math import isfinite
 
-from .cao import CaoSessionController, SessionBusyError
+from .cao import (
+    CaoAdoptionMismatchError,
+    CaoSessionController,
+    CaoTransportError,
+    SessionBusyError,
+    SessionIdentityUncertainError,
+    message_digest,
+)
 from .catalog import ModelCatalog
 from .domain import LaneIdentity
 from .interfaces import (
@@ -148,24 +129,7 @@ class CaoLaneExecutor:
         context: LaneExecutionContext,
         lease: ModelLease | None = None,
     ) -> LaneResult:
-        """Run one unit of work on a CAO session and return its result.
-
-        The lifecycle:
-
-        1. Resolve the lane via the registry (a reconfigured registry
-           wins here; this is the only reason a registry is needed).
-        2. Build a :class:`SessionSpec` carrying the typed run/round
-           context and the optional :class:`ModelLease`.
-        3. ``start_session`` adopts an existing session if one is alive
-           under the same deterministic name; otherwise it creates one.
-        4. Submit this turn's prompt, persist its context, then poll
-           ``poll_session`` until the controller reports terminal
-           state or the wall-clock budget is exhausted.
-        5. Preserve a busy session when CAO rejects input. On other
-           exceptions, terminate and re-raise for the foreman to classify.
-        """
-        import time
-
+        """Submit a new turn once, or collect its matching durable result."""
         registered_lane = self._lanes.get(lane.lane)
         spec = SessionSpec(
             lane=registered_lane,
@@ -178,47 +142,58 @@ class CaoLaneExecutor:
         )
 
         handle = self._controller.start_session(spec)
-        deadline = time.monotonic() + self._max_poll
         try:
-            self._controller.submit_work(handle, task_prompt)
-            self._controller.update_turn_context(handle, context)
-            while True:
-                result = self._controller.poll_session(handle)
-                if result is not None:
-                    # ``poll_session`` already builds a LaneResult; rewrite
-                    # the ``session`` field with the live handle so the
-                    # foreman can address the session that produced it.
-                    base_ref = (
-                        context.head_sha
-                        if lane.role == "reviewer" and context.head_sha
-                        else self._git.default_branch()
+            metadata = self._controller._metadata_for(handle)
+            digest = message_digest(task_prompt, context)
+            if metadata.input_digest == digest:
+                if metadata.context != context:
+                    raise SessionIdentityUncertainError(
+                        handle.session_id, "matching input has different turn attribution"
                     )
-                    return LaneResult(
-                        session=handle,
-                        exit_code=result.exit_code,
-                        output_summary=result.output_summary,
-                        changed_files=self._git.changed_files(workdir, base_ref),
-                        findings=list(result.findings),
-                        dispositions=list(result.dispositions),
-                    )
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"CaoLaneExecutor exceeded its {self._max_poll:.0f}s poll "
-                        f"budget waiting for session {handle.session_id!r} on "
-                        f"lane {lane.lane!r}; the controller's "
-                        "session_timeout_seconds is the authoritative cap on "
-                        "the session's life and should be configured below "
-                        "this executor's max_poll_seconds"
-                    )
-                time.sleep(self._poll_interval)
-        except SessionBusyError:
-            # Rejected input does not give us ownership of the work already running.
+            else:
+                self._controller.submit_work(handle, task_prompt, context=context)
+            return self.collect(handle, registered_lane, workdir, context)
+        except (CaoTransportError, SessionBusyError, SessionIdentityUncertainError):
             raise
         except BaseException:
-            # Best-effort teardown so the CAO session is not orphaned; a
-            # session CAO has already forgotten is a no-op here.
             self._controller.terminate_session(handle)
             raise
+
+    def collect(
+        self, handle: SessionHandle, lane: LaneIdentity, workdir: str, context: LaneExecutionContext
+    ) -> LaneResult:
+        import time
+
+        metadata = self._controller._metadata_for(handle)
+        if (
+            metadata.context,
+            metadata.workdir,
+            metadata.lane,
+            metadata.input_digest is not None,
+        ) != (context, workdir, lane, True):
+            raise CaoAdoptionMismatchError("Cannot collect a different attributed turn")
+        deadline = time.monotonic() + self._max_poll
+        while True:
+            result = self._controller.poll_session(handle)
+            if result is not None:
+                base_ref = (
+                    context.head_sha
+                    if lane.role == "reviewer" and context.head_sha
+                    else self._git.default_branch()
+                )
+                return LaneResult(
+                    session=handle,
+                    exit_code=result.exit_code,
+                    output_summary=result.output_summary,
+                    changed_files=self._git.changed_files(workdir, base_ref),
+                    findings=list(result.findings),
+                    dispositions=list(result.dispositions),
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"CaoLaneExecutor exceeded its {self._max_poll:.0f}s poll budget for {handle.session_id!r}"
+                )
+            time.sleep(self._poll_interval)
 
     def terminate_session(self, handle: SessionHandle) -> None:
         """Confirm remote teardown before a disposable checkout is removed."""

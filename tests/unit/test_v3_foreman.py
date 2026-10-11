@@ -1743,8 +1743,10 @@ def test_busy_cao_submission_preserves_active_run_despite_heartbeat_failure(monk
             monkeypatch.setattr(queue, "heartbeat", fail_background_heartbeat)
 
             def capture_state(request):
-                if request.url.path.endswith("/input"):
-                    assert heartbeat_failed.wait(2), "background heartbeat must fail before HTTP409"
+                if request.url.path == f"/terminals/{session.terminal_id}":
+                    assert heartbeat_failed.wait(2), (
+                        "background heartbeat must fail before busy detection"
+                    )
                     before_submission.append(queue.load_state(ISSUE.slug()))
 
             client.event_hooks["request"].append(capture_state)
