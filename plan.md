@@ -1,5 +1,7 @@
 # AI PR Review Orchestrator — V1 Implementation Plan
 
+> Historical V1/V2 design record. For the supported runtime, use [the V3 runbook](README.md) and [architecture](docs/V3_ARCHITECTURE.md).
+
 ## 1. Objective
 
 Build a standalone Python CLI that coordinates one AI coding agent and one AI

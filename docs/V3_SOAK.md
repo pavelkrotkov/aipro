@@ -56,5 +56,14 @@ Cleanup tests retain active work and human checkouts, delay recently modified
 files, and reject changed GitHub authority, empty runtime inventories with live
 sessions, and acknowledged deletions that leave sessions alive.
 
-These tests do not establish cutover readiness by themselves. The replacement config, queue trigger and migration docs must ship before V1
-retirement. Keep V1 and historical epic #16 until the full cutover gate passes.
+P5 shipped the replacement configuration, thin queue trigger and migration
+runbook in PR #133 after the acceptance/safety/cleanup gates. P6 retires V1
+only after those changes pass CI on main. Historical epic #16 is closed in P7
+after the retirement itself passes CI. See [ordered rollback](V1_MIGRATION.md).
+
+The native Hermes/CAO 2.5 cleanup canary also confirmed the owned pinned-image
+container was absent before checkout deletion, removed two protected checkouts
+after TTL, and repeated idempotently. Evidence is attached to PR #131. These
+native boundary checks and deterministic model fixtures establish acceptance;
+funded live-provider reasoning and 24/7 host activation remain optional deployment
+checks, not claims made by this repository cutover.

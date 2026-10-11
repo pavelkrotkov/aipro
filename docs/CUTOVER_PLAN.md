@@ -1,6 +1,6 @@
 # aipro V3 Cutover Plan (issue #55) — rev 6
 
-Status: **adopted (rev 6)**. The plan is the gate; the foreman drives each phase
+Status: **P1–P6 implemented; P7 tracking closure follows green retirement CI**. The plan is the gate; the foreman drives each phase
 behind its own CI/objective gate and reports at phase boundaries. V1 is deleted
 in P6 only when P2–P5 are green on main and the documented rollback path
 (revert P6 then P5 after drain) remains valid. Operator can stop the run at
@@ -11,7 +11,7 @@ any phase boundary; the sign-off line is removed in rev 6.
 Prove V3 end-to-end against the **real** adapters, then remove superseded V1
 execution plumbing so the repo has one supported autonomous path: **Hermes
 supervisor + CAO session fabric + GitHub-as-authoritative-state + aipro V3
-policy**. V1 stays runnable and CI-tested throughout; fallback requires **two
+policy**. V1 stayed runnable and CI-tested through P5; fallback requires **two
 ordered reverts (P6 then P5)** after draining in-flight V3 work, so a
 rollback is always possible but never instantaneous.
 
@@ -28,7 +28,7 @@ rollback is always possible but never instantaneous.
    "missing glue" and cannot ship a default that can't execute.
 3. **Every destructive step ships its counterpart first**: the V3 trigger
    replaces the V1 workflow *before* the V1 workflow is deleted; the V3 sample
-   config replaces the V1 sample *before* V1 config is made sole; migration
+   config replaces the V1 sample *before* V3 config is made sole; migration
    notes ship *with* the removal that breaks users, not after.
 4. **Safety parity is an explicit E2E gate.** The safeguards currently declared
    only as `v3.config.safety` fields must be proven enforced before V1's
@@ -40,10 +40,10 @@ rollback is always possible but never instantaneous.
 | --- | --- | --- | --- |
 | **P1** Plan (rev 6) | this doc | docs only | merged (P1) |
 | **P2** Production glue | Foreman policy loop (`v3.foreman` over `GitHubWorkflowStateStore`+broker+lanes+lane-registry), `CaoLaneExecutor` (real `CaoSessionController` + Hermes lane), `CIPRGate`+GitHub CI adapter, GitHub `issue-content`/`pr-create` protocol ops, `git` worktree/branch/commit/push interface+impl, catalog-resolver+`PolicyBroker` wiring, **`GitHubIssueQueue.abandon()` (requeue+clear-claim drain op)**, **`v3.cleanup` production TTL sweeper** (owns CAO-session + worktree TTLs, invoked by the foreman) | adds only | `uv run pytest` + new unit tests green |
-| **P3** E2E harness foundation | `tests/e2e/` deterministic harness; **real adapters** ref`d against a `FakeCAOServer` (real CAO HTTP contract) + `FakeGitHub` boundary + scripted telemetry/clock; scenarios 1–4 (clean issue→draft PR→3 reviews→CI→PR-ready — **draft PR created before the CI gate since `CIPRGate.evaluate()` requires a PR ref**; blocking-fix; rebuttal/independent-acceptance; disagreement→adjudication) | adds only | scenarios 1–4 pass repeatedly |
-| **P4** Soak + failure + safety | `tests/e2e/soak.py` runner **exercising the `v3.cleanup` production sweeper (not its own copy)**; scenarios 5–12; **safety-parity scenarios** (fork reject, workflow-file restriction, iteration/commit/invocation budgets, `max_prompt_tokens`, `allowed_pr_author_associations`, credential-stripping) | adds only | full soak pass, no dup side effects, safety enforced |
+| **P3** E2E harness foundation | `tests/integration/e2e/` deterministic harness; **real adapters** ref`d against a `FakeCAOServer` (real CAO HTTP contract) + `FakeGitHub` boundary + scripted telemetry/clock; scenarios 1–4 (clean issue→draft PR→3 reviews→CI→PR-ready — **draft PR created before the CI gate since `CIPRGate.evaluate()` requires a PR ref**; blocking-fix; rebuttal/independent-acceptance; disagreement→adjudication) | adds only | scenarios 1–4 pass repeatedly |
+| **P4** Soak + failure + safety | native pytest multi-issue soak **exercising the `v3.cleanup` production sweeper (not its own copy)**; scenarios 5–12; **safety-parity scenarios** (fork reject, workflow-file restriction, iteration/commit/invocation budgets, `max_prompt_tokens`, `allowed_pr_author_associations`, credential-stripping) | adds only | full soak pass, no dup side effects, safety enforced |
 | **P5** Default + trigger + docs | V3 thin queue trigger workflow (adds before delete); make Hermes+CAO default; README runbook; **`docs/V1_MIGRATION.md`**; **`examples/v3-config.yml`** (new path, distinct from the V1 sample it supersedes) + update README references | adds, then docs react | P2–P4 green on CI |
-| **P6** V1 retirement | DELETE `coders/`, `reviewers/`, `runner.py` monolithic loop, V1 `workflow.yml`, and now-unused V1 `models`/`state_*`/`config.py` + **the now-superseded `examples/sample-config.yml` (V1 path only)**; adapt `agents/`, `decision_application.py` consumers; rewire `aipro` CLI to V3; migration notes finalize. **The `examples/v3-config.yml` sample survives.** | removes V1 path | P5 shipped; CI green with notes |
+| **P6** V1 retirement | DELETE `coders/`, `reviewers/`, `runner.py` monolithic loop, V1 `workflow.yml`, and now-unused V1 `models`/`state_*`/`config.py` + **the now-superseded `examples/sample-config.yml` (V1 path only)**; remove unused `agents/`, `decision_application.py` helpers; rewire `aipro` CLI to V3; migration notes finalize. **The `examples/v3-config.yml` sample survives.** | removes V1 path | P5 shipped; CI green with notes |
 | **P7** Epic close | close V1 epic #16 pointing to #56; reopen-and-mode notes vs issues **not** handled by a git revert | docs | P6 shipped |
 
 **Deletion gate (before P6):** the complete production path must exist (P2),
@@ -72,7 +72,7 @@ the replacement trigger/sample/docs/migration notes must already be shipped
   (default 2h) without renewal; git worktrees are orphaned past 24h of
   inactivity. `v3.cleanup` is a **production component the foreman invokes**; the
   P4 soak suite calls that same component each round (it does not reimplement
-  cleanup). The sweeper owns its clock and logs each removal. (Config fields for
+  cleanup). The service supplies its UTC clock to the sweeper, which logs each removal. (Config fields for
   the two TTLs are added in P2 under `v3.config`.)
 - **Draining active claims (defined here, implemented P2)**: rollback/shrink
   requires reaching **zero active leases**. `GitHubIssueQueue.reclaim_expired`
@@ -101,10 +101,12 @@ the replacement trigger/sample/docs/migration notes must already be shipped
 | --- | --- | --- |
 | `runner.py` | DELETE (P6) | foreman policy loop absorbs its responsibilities |
 | `coders/`, `reviewers/` | DELETE (P6) | replaced by CAO/Hermes lanes |
-| `models.py`, `state_machine.py`, `state_storage.py` | DELETE (P6) after rewire | `decision_application.py`, `agents/output_validator.py`, `agents/prompt_builder.py`, `logging.py` import V1 types → **adapted to V3 types in P2/P6, never left broken** |
-| `decision_application.py`, `logging.py` | KEEP (adapted to V3 types) | explicit adapter change in P6 |
-| `agents/` (output_validator, prompt_builder) | KEEP (adapted) | see inventory above |
-| `github/`, `git/` | KEEP (extended in P2: issue-content, pr-create, worktree/branch/commit/push) | V3 adapters |
+| `models.py`, `state_machine.py`, `state_storage.py` | DELETE (P6) after rewire | the old agent/decision helpers have no V3 consumers and retire with their types; logging already uses V3 state |
+| `decision_application.py` | DELETE (P6) | V3 findings/foreman already replace it; no adapter layer needed |
+| `logging.py` | KEEP | V3 audit events and secret redaction; remove V1-only event helpers |
+| `agents/` (output_validator, prompt_builder) | DELETE (P6) | CAO lane contracts and V3 prompts already replace them |
+| `github/` | KEEP | V3 transport/fake boundaries; remove runner-dependent review caching |
+| `git/` | DELETE (P6) | No V3 consumer; `v3.git_ops` owns native Git operations |
 | `config.py` (V1), `examples/sample-config.yml` | DELETE (P6); **V3 sample added P5, references updated** | README must copy a V3-valid config after P5 |
 | V1 execution workflow (`examples/target-repo-workflow.yml`) | DELETE (P6) **after** V3 trigger shipped (P5) | GitHub Actions CI only after |
 | `cli.py` `aipro` script | REWIRE (P6) | V3 policy ops (broker dry-run, queue status, state inspect); `aipro run` deprecated in P5 notes, removed in P6 |
@@ -114,10 +116,11 @@ the replacement trigger/sample/docs/migration notes must already be shipped
 Deterministic by construction: real foreman + real `CaoLaneExecutor` + real
 `CIPRGate` + real `PolicyBroker`; **faked only at the external boundary** —
 `FakeCAOServer` (speaks the real CAO HTTP contract), scripted telemetry, a
-fixed clock, and real-provider smoke behind `AIPO_E2E_LIVE=1`. The 12
-issue-#55 scenarios are traced in `tests/e2e/README.md` (written P3); the
-added safety scenarios are documented in P4. `soak.py` runs `--runs N
---jitter`, sweeps orphans by the §3 TTLs, and fails on any duplicate branch/PR,
+fixed clock. Native CAO and containment smoke use the opt-in commands documented
+in `docs/V3_CAO.md`; funded live-provider reasoning is optional. The 12
+issue-#55 scenarios are traced in `docs/V3_SOAK.md`; the
+added safety scenarios are documented in P4. The pytest soak uses `--soak-issues=N`, injects boundary failures, sweeps
+orphans by the §3 TTLs, and fails on any duplicate branch/PR,
 leaked active claim, stuck active label, orphan beyond TTL, or state
 divergence.
 
@@ -147,6 +150,6 @@ divergence.
 ## 7. Issue-scoped acceptance mapping
 
 Traced per criterion to a phase + the specific check each PR must satisfy in
-`tests/e2e/README.md` (written P3). The delete-of-V1 criterion ("no supported
+`docs/V3_SOAK.md`. The delete-of-V1 criterion ("no supported
 production path imports the old provider adapters") resolves to P6 only after
 P2–P5 gates.

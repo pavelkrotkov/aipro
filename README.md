@@ -57,7 +57,7 @@ re-adding a label does not reset their history or budgets.
 See [operator diagnostics](docs/V3_OBSERVABILITY.md),
 [acceptance evidence and limits](docs/V3_SOAK.md), and
 [V1 migration and rollback](docs/V1_MIGRATION.md). V1 commands and examples
-are deprecated during P5 and removed in the separately gated P6 retirement.
+are retired; the supported CLI operates only on V3.
 
 ## Development
 

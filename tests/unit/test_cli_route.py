@@ -80,7 +80,6 @@ def test_route_matches_broker_without_side_effects(
     monkeypatch.setattr(PolicyBroker, "reserve", forbidden)
     monkeypatch.setattr(GitHubIssueQueue, "__init__", forbidden)
     monkeypatch.setattr(CaoSessionController, "__init__", forbidden)
-    monkeypatch.setattr(cli.runner, "run", forbidden)
     argv = [*ARGS, "--config", str(config_path), *(["--json"] if as_json else [])]
     assert cli.main(argv) == 0
     out = capsys.readouterr().out

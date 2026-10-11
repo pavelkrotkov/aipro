@@ -62,23 +62,6 @@ class GitHubClient:
         self._owns_client = http_client is None
         # Per-(pr_number, head_sha) cache of changed files; see get_pr.
         self._pr_files_cache: dict[tuple[int, str], list[str]] = {}
-        # Short-lived cache of review threads, keyed by pr_number. Within one
-        # reviewer-poll tick the runner calls get_review_threads twice (once via
-        # the reviewer's collect_findings, once via has_responded); caching
-        # collapses that to a single GraphQL request. The runner calls
-        # reset_request_cache() at the start of every tick so cross-tick
-        # freshness is preserved — this is a within-tick memo, not a TTL cache.
-        self._review_threads_cache: dict[int, list[models.ReviewThread]] = {}
-
-    def reset_request_cache(self) -> None:
-        """Drop within-tick memoized responses (currently review threads).
-
-        Called by the runner between reviewer-poll iterations so each tick sees
-        fresh data while still de-duplicating the repeated reads inside a single
-        tick. The ``_pr_files_cache`` is intentionally NOT cleared: it is keyed
-        by head SHA and only changes when the PR head moves.
-        """
-        self._review_threads_cache.clear()
 
     def close(self) -> None:
         if self._owns_client:
@@ -353,12 +336,7 @@ class GitHubClient:
     # --- GraphQL API ---
 
     def get_review_threads(self, pr_number: int) -> list[models.ReviewThread]:
-        cached = self._review_threads_cache.get(pr_number)
-        if cached is not None:
-            return cached
-        threads = self._fetch_review_threads(pr_number)
-        self._review_threads_cache[pr_number] = threads
-        return threads
+        return self._fetch_review_threads(pr_number)
 
     def _fetch_review_threads(self, pr_number: int) -> list[models.ReviewThread]:
         threads: list[models.ReviewThread] = []
@@ -420,8 +398,6 @@ class GitHubClient:
         return threads
 
     def reply_to_review_thread(self, thread_id: str, body: str) -> dict[str, Any] | None:
-        # Mutating a thread invalidates the within-tick threads cache.
-        self._review_threads_cache.clear()
         if self._dry_run:
             logger.info("DRY-RUN: would reply to review thread %s", thread_id)
             return {"comment": {"id": "dry-run"}}
@@ -432,8 +408,6 @@ class GitHubClient:
         )
 
     def resolve_review_thread(self, thread_id: str) -> dict[str, Any] | None:
-        # Mutating a thread invalidates the within-tick threads cache.
-        self._review_threads_cache.clear()
         if self._dry_run:
             logger.info("DRY-RUN: would resolve review thread %s", thread_id)
             return {"thread": {"id": thread_id, "isResolved": True}}
