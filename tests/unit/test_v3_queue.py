@@ -797,3 +797,31 @@ def test_ready_label_without_stable_opt_in_cannot_claim():
 def test_stable_opt_in_cannot_alias_lifecycle_labels(label):
     with pytest.raises(ValueError):
         GitHubQueueConfig(opt_in_label=label)
+
+
+def test_drain_retains_history_and_requires_authoritative_owned_stops():
+    fake = _ready_fake()
+    queue = _queue(fake)
+    state = queue.claim(_issue(), "run-1", branch="b", worktree="/wt", pr_number=7)
+    with pytest.raises(q.ClaimConflictError, match="confirmed lane"):
+        queue.abandon(_issue(), state)
+    forged = replace(state, extras={**state.extras, "lanes_stopped": True})
+    with pytest.raises(StateConflictError, match="authoritative"):
+        queue.abandon(_issue(), forged)
+    queue.save_state(forged, expected_updated_at=state.updated_at)
+    forged = queue.transition(_issue(), forged, "queued")
+    foreign = q.GitHubIssueQueue(fake, "owner", "repo", GitHubQueueConfig(), host_id="host-B")
+    with pytest.raises(q.ClaimConflictError, match="owning host"):
+        foreign.abandon(_issue(), forged)
+    drained = queue.abandon(_issue(), forged)
+    assert queue.abandon(_issue(), drained) == drained
+    assert drained.phase == "queued" and drained.run_id == state.run_id
+    assert not set(q._REQUIRED_CLAIM_KEYS) & drained.extras.keys()
+    assert {key: drained.extras[key] for key in ("branch", "worktree", "pr_number")} == {
+        "branch": "b",
+        "worktree": "/wt",
+        "pr_number": 7,
+    }
+    assert queue.list_active() == [] and queue.list_ready() == [_issue()]
+    with pytest.raises(StateConflictError):
+        queue.abandon(_issue(), forged)
