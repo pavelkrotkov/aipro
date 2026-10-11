@@ -6,14 +6,27 @@ from pathlib import Path
 
 import pytest
 
+from ai_pr_orchestrator.v3.cao import CaoTransportError
 from ai_pr_orchestrator.v3.cleanup import CleanupSweeper
 from ai_pr_orchestrator.v3.git_ops import GitOpsError, GitWorktreeOps
-from tests.integration.test_continuous_foreman import _assert_completed_once, _scheduler
+from tests.integration.test_continuous_foreman import (
+    _assert_completed_once,
+    _lose_accepted_input,
+    _resume_cold,
+    _scheduler,
+)
 from tests.unit.test_v3_review_checkout import _repo
 
 
+@pytest.mark.parametrize("restart", [None, "aipro-developer", "aipro-requirements-reviewer"])
 def test_native_git_soak_sweeps_retained_checkouts_after_every_issue(
-    tmp_path, fake_cao, foreman_harness, cao_controller, monkeypatch, request
+    tmp_path,
+    fake_cao,
+    foreman_harness,
+    cao_controller,
+    monkeypatch,
+    request,
+    restart,
 ):
     root = _repo(tmp_path)
     remote = tmp_path / "remote.git"
@@ -65,7 +78,16 @@ def test_native_git_soak_sweeps_retained_checkouts_after_every_issue(
     (human / "keep.py").write_text("irreplaceable = True\n")
     states = []
     for number in range(1, count + 1):
-        outcome = scheduler.step()
+        if number == 1 and restart is not None:
+            _lose_accepted_input(cao_controller, fake_cao, restart, monkeypatch)
+            with pytest.raises(CaoTransportError):
+                scheduler.step()
+            active = queue.load_state("owner/repo#1")
+            assert queue.load_state("owner/repo#2") is None
+            outcome = _resume_cold(template, queue, fake_cao, git)
+            assert queue.load_state("owner/repo#1").run_id == active.run_id
+        else:
+            outcome = scheduler.step()
         assert len(outcome) == 1 and outcome[0].final_phase == "done", outcome
         state = _assert_completed_once(queue, fake_cao, number)
         states.append(state)

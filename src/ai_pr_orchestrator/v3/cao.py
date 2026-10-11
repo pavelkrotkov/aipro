@@ -817,19 +817,14 @@ class CaoSessionController:
         handle is checked against CAO first, so a session still alive out of
         band is still stopped, while an already-deleted one is simply gone.
         """
-        metadata = self._sessions.get(handle.session_id)
-        if metadata is None:
-            remote = self._lookup_session(handle.session_id)
-            if remote is not None:
-                self._stop_session(remote)
-            return
-        self._stop_session(metadata)
+        metadata = self._sessions.get(handle.session_id) or self._lookup_session(handle.session_id)
+        if metadata is not None:
+            self._stop_session(metadata)
 
     def stop_verified_session(self, metadata: CaoSessionMetadata) -> None:
         if self.inspect_session(metadata.session_name).metadata != metadata:
             raise CaoAdoptionMismatchError("orphan session attribution changed")
         self.terminate_session(SessionHandle(metadata.session_name, metadata.lane.lane))
-        self.require_session_absent(metadata.session_name)
 
     def require_run_stopped(
         self,
@@ -1023,6 +1018,7 @@ class CaoSessionController:
         response = self._request("DELETE", f"/sessions/{metadata.session_name}")
         if response.status_code != 404:
             self._raise_for_status(response, f"stop session {metadata.session_name!r}")
+        self.require_session_absent(metadata.session_name)
         self._sessions.pop(metadata.session_name, None)
         self._idle_readings.pop(metadata.session_name, None)
         self._active_seen.discard(metadata.session_name)

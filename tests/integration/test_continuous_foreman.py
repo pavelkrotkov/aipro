@@ -8,6 +8,7 @@ from ai_pr_orchestrator.v3.cao import CaoSessionController, CaoTransportError, s
 from ai_pr_orchestrator.v3.cao_lane import CaoLaneExecutor
 from ai_pr_orchestrator.v3.ci_gate import GateDecision
 from ai_pr_orchestrator.v3.foreman import ForemanPolicyLoop, PRReconciliationError
+from ai_pr_orchestrator.v3.lanes import LaneRegistry
 from ai_pr_orchestrator.v3.model_router import build_model_broker
 from ai_pr_orchestrator.v3.queue import GitHubIssueQueue, LabelSyncError
 from ai_pr_orchestrator.v3.scheduler import ContinuousForeman
@@ -76,6 +77,21 @@ def _assert_completed_once(queue, fake_cao, issue_number):
     return state
 
 
+def _resume_cold(template, queue, fake_cao, git):
+    fresh_queue = GitHubIssueQueue(queue._client, "owner", "repo", host_id=queue.host_id)
+    with CaoSessionController(
+        template._executor._controller._config, template._lanes
+    ) as controller:
+        executor = CaoLaneExecutor(
+            controller,
+            template._lanes,
+            git=git,
+            catalog=template._executor._catalog,
+            poll_interval_seconds=0.01,
+        )
+        return _scheduler(template, fresh_queue, executor, fake_cao).step()
+
+
 def test_unattended_two_issues_are_sequential_with_three_reviewers(fake_cao, foreman_harness):
     template, queue, fake = foreman_harness([1, 2], git_ops=RecordingGit())
     scheduler = _scheduler(template, queue, template._executor, fake_cao)
@@ -101,19 +117,9 @@ def test_cold_restart_collects_existing_turn_and_preserves_capacity(
         scheduler.step()
     active = queue.load_state("owner/repo#1")
     assert queue.load_state("owner/repo#2") is None
-    fresh_queue = GitHubIssueQueue(fake, "owner", "repo", host_id=queue.host_id)
-    with CaoSessionController(cao_controller._config, template._lanes) as fresh_controller:
-        executor = CaoLaneExecutor(
-            fresh_controller,
-            template._lanes,
-            git=FakeGitOperations(),
-            catalog=template._executor._catalog,
-            poll_interval_seconds=0.01,
-        )
-        resumed = _scheduler(template, fresh_queue, executor, fake_cao)
-        outcome = resumed.step()[0]
-        assert outcome.final_phase == "done", outcome.reason
-    finished = _assert_completed_once(fresh_queue, fake_cao, 1)
+    outcome = _resume_cold(template, queue, fake_cao, FakeGitOperations())[0]
+    assert outcome.final_phase == "done", outcome.reason
+    finished = _assert_completed_once(queue, fake_cao, 1)
     assert finished.run_id == active.run_id
     assert queue.load_state("owner/repo#2") is None
     assert template._git.branches == ["main", "aipro-issue-1"]
@@ -351,3 +357,90 @@ def test_cold_review_recovery_preserves_prompt_budget(
         len(session.submitted_messages) == 1 and session.deleted
         for session in fake_cao._sessions.values()
     )
+
+
+def test_accepted_stop_without_disappearance_holds_capacity_and_recovers(
+    fake_cao,
+    foreman_harness,
+    monkeypatch,
+):
+    from ai_pr_orchestrator.v3.foreman import PRReconciliationError
+    from tests.integration._fake_cao_server import FaultSpec
+
+    template, queue, github = foreman_harness([1, 2], git_ops=RecordingGit())
+    fake_cao.add_fault(FaultSpec(method="DELETE", path_prefix="/sessions/", status_code=204))
+    scheduler = _scheduler(template, queue, template._executor, fake_cao)
+    with pytest.raises(PRReconciliationError):
+        scheduler.step()
+    state = queue.load_state("owner/repo#1")
+    assert state.phase == "reviewing" and not state.extras["lanes_stopped"]
+    assert queue.load_state("owner/repo#2") is None
+    assert len(queue.list_active()) == 1
+    assert template._git.worktrees
+    assert not any(session.deleted for session in fake_cao._sessions.values())
+    before = {
+        name: list(session.submitted_messages) for name, session in fake_cao._sessions.items()
+    }
+    fake_cao._faults.clear()
+    outcome = scheduler.step()[0]
+    assert outcome.final_phase == "done", outcome.reason
+    assert all(session.deleted for session in fake_cao._sessions.values())
+    assert before == {name: list(s.submitted_messages) for name, s in fake_cao._sessions.items()}
+    assert not template._git.worktrees and not queue.list_active()
+    assert len(github.list_open_prs()) == 1
+
+
+@pytest.mark.parametrize("profile", ["aipro-developer", "aipro-requirements-reviewer"])
+def test_cold_opt_out_stops_historical_lanes_after_registry_rename(
+    fake_cao,
+    foreman_harness,
+    cao_controller,
+    monkeypatch,
+    profile,
+):
+    template, queue, _ = foreman_harness([1, 2], git_ops=RecordingGit())
+    _lose_accepted_input(cao_controller, fake_cao, profile, monkeypatch)
+    scheduler = _scheduler(template, queue, template._executor, fake_cao)
+    with pytest.raises(CaoTransportError):
+        scheduler.step()
+    old = queue.load_state("owner/repo#1")
+    renamed = LaneRegistry(replace(lane, lane="new-" + lane.lane) for lane in template._lanes)
+    template._lanes = template._executor._lanes = cao_controller._lanes = renamed
+    queue._client.remove_label(1, "v3-work-enabled")
+    outcome = scheduler.step()[0]
+    state = queue.load_state("owner/repo#1")
+    assert outcome.final_phase == state.phase == "cancelled"
+    assert state.run_id == old.run_id and state.extras["lanes_stopped"]
+    assert queue.load_state("owner/repo#2") is None
+    assert all(session.deleted for session in fake_cao._sessions.values())
+    assert all(len(session.submitted_messages) == 1 for session in fake_cao._sessions.values())
+    assert not queue.list_active()
+
+
+@pytest.mark.parametrize("field", ["lane", "model_ref"])
+def test_malformed_assignment_cannot_authorize_unknown_worker_stop(
+    fake_cao,
+    foreman_harness,
+    cao_controller,
+    monkeypatch,
+    field,
+):
+    template, queue, github = foreman_harness([1, 2], git_ops=RecordingGit())
+    _lose_accepted_input(cao_controller, fake_cao, "aipro-developer", monkeypatch)
+    scheduler = _scheduler(template, queue, template._executor, fake_cao)
+    with pytest.raises(CaoTransportError):
+        scheduler.step()
+    state = queue.load_state("owner/repo#1")
+    model = {**state.extras["developer_model"], field: 123}
+    queue.save_state(
+        replace(state, extras={**state.extras, "developer_model": model}),
+        expected_updated_at=state.updated_at,
+    )
+    github.remove_label(1, "v3-work-enabled")
+    with pytest.raises(PRReconciliationError, match="termination is unconfirmed"):
+        scheduler.step()
+    state = queue.load_state("owner/repo#1")
+    assert state.phase == "coding" and not state.extras["lanes_stopped"]
+    assert queue.load_state("owner/repo#2") is None
+    assert not fake_cao._sessions[developer_session_name(state.run_id)].deleted
+    assert template._git.worktrees and len(queue.list_active()) == 1

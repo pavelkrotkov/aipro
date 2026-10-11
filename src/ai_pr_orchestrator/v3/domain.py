@@ -388,10 +388,10 @@ class ModelAssignment:
     model_ref: ModelRef
 
     def __post_init__(self) -> None:
-        if not self.lane:
-            raise DomainError("ModelAssignment.lane must be non-empty")
-        if not self.model_ref:
-            raise DomainError("ModelAssignment.model_ref must be non-empty")
+        if not isinstance(self.lane, str) or not self.lane:
+            raise DomainError("ModelAssignment.lane must be a non-empty string")
+        if not isinstance(self.model_ref, str) or not self.model_ref:
+            raise DomainError("ModelAssignment.model_ref must be a non-empty string")
 
     def to_dict(self) -> dict[str, Any]:
         return {"lane": self.lane, "model_ref": self.model_ref}

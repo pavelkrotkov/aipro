@@ -100,7 +100,10 @@ charge. Reviewer waves persist their immutable head, issue digest, prompts,
 assignments, checkout paths, and individual results before cleanup. Recovery
 reuses these seats and results; it does not create another wave. All attributed developer and reviewer sessions are confirmed stopped before
 a terminal transition or CI requeue releases capacity. Repeated termination
-is idempotent, including a crash after CAO accepted termination.
+is idempotent, including a crash after CAO accepted termination. An accepted
+delete without native disappearance keeps capacity occupied; timeout and model
+replacement use the same verified stop. Cancellation derives historical lane
+identities from the durable assignment and reviewer waves after a registry rename.
 
 Unknown launches/submissions/PR effects stay active and emit
 `reconciliation_required`. A missing checkpoint, missing expected session,
