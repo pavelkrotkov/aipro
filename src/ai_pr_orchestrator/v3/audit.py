@@ -138,3 +138,7 @@ def _disposition(decision: FindingDisposition) -> dict[str, Any]:
         **{key: getattr(decision, key) for key in _DISPOSITION_FIELDS},
         "rationale": decision.rationale[:1000],
     }
+
+
+def cleanup_event(state: WorkflowState, kind: str, **target) -> dict[str, Any]:
+    return {"kind": kind, "work_item_id": state.work_item_id, "run_id": state.run_id, **target}

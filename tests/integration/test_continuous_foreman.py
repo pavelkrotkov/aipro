@@ -31,7 +31,7 @@ def _scheduler(template, queue, executor, fake_cao, *, broker=None):
             template._git,
             template._cfg,
             run_id=run_id,
-            worktree_root="/wt",
+            worktree_root=template._worktree_root,
             committer_name="Test",
             committer_email="test@example.invalid",
         )

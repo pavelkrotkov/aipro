@@ -468,16 +468,8 @@ class ForemanPolicyLoop:
             now=now,
         )
 
-        worktree: str | None = state.extras.get("worktree")
         try:
-            if not worktree and not resume_at_gate:
-                base = self._git.default_branch()
-                self._git.create_branch(branch, base)
-                worktree = self._git.create_worktree(
-                    f"{self._worktree_root}/issue-{issue.number}", branch
-                )
-            if worktree and not resume_at_gate:
-                state = self._verify_checkout(issue, state, branch, worktree)
+            state, worktree = self._acquire_checkout(issue, state, branch, resume_at_gate)
             return self._run_loop(
                 issue, state, worktree, branch, now=now, resume_at_gate=resume_at_gate
             )
@@ -485,6 +477,20 @@ class ForemanPolicyLoop:
             return self._cancelled_outcome(issue) or self._escalate(
                 issue, state, exc.reason, now=now
             )
+
+    def _acquire_checkout(self, issue, state, branch, resume_at_gate):
+        worktree = state.extras.get("worktree")
+        if not worktree and not resume_at_gate:
+            self._git.create_branch(branch, self._git.default_branch())
+            worktree = self._git.create_worktree(
+                f"{self._worktree_root}/issue-{issue.number}",
+                branch,
+                run_id=self._run_id,
+                work_item_id=issue.slug(),
+            )
+        if worktree and not resume_at_gate:
+            state = self._verify_checkout(issue, state, branch, worktree)
+        return state, worktree
 
     def _run_loop(
         self,
@@ -1471,7 +1477,11 @@ class ForemanPolicyLoop:
         try:
             for seat in seats:
                 created = self._git.create_review_checkout(
-                    seat.worktree, developer_worktree, head_sha
+                    seat.worktree,
+                    developer_worktree,
+                    head_sha,
+                    run_id=self._run_id,
+                    work_item_id=issue.slug(),
                 )
                 if created != seat.worktree:
                     raise _ForemanEscalation(
@@ -2315,6 +2325,7 @@ class ForemanPolicyLoop:
         self, issue: GitHubIssueRef, state: WorkflowState, branch: str, worktree: str
     ) -> WorkflowState:
         self._validate_branch(branch)
+        self._git.verify_checkout(worktree, self._run_id, issue.slug())
         actual_branch = self._git.current_branch(worktree)
         if actual_branch != branch:
             raise _ForemanEscalation(

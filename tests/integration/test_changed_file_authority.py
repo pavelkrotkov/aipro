@@ -220,8 +220,8 @@ def test_commit_budget_uses_current_worktree_after_review(
     submit = controller.submit_work
     create_worktree = loop._git.create_worktree
 
-    def create_with_history(path, branch):
-        workdir = create_worktree(path, branch)
+    def create_with_history(path, branch, *, run_id, work_item_id):
+        workdir = create_worktree(path, branch, run_id=run_id, work_item_id=work_item_id)
         for number in range(commits):
             (Path(workdir) / "tracked").write_text(str(number))
             git(workdir, "add", ".")

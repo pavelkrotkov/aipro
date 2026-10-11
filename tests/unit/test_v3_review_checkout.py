@@ -40,12 +40,32 @@ def test_review_checkouts_are_independent_detached_repositories(tmp_path: Path):
     root = _repo(tmp_path)
     ops = GitWorktreeOps(root)
     ops.create_branch("feature", "main")
-    developer = Path(ops.create_worktree(str(tmp_path / "developer"), "feature"))
+    developer = Path(
+        ops.create_worktree(
+            str(tmp_path / "developer"), "feature", run_id="test-run", work_item_id="owner/repo#1"
+        )
+    )
     (developer / "tracked.txt").write_text("snapshot\n")
     head = ops.commit(str(developer), "snapshot", name="T", email="t@example.com")
 
-    review_a = Path(ops.create_review_checkout(str(tmp_path / "review-a"), str(developer), head))
-    review_b = Path(ops.create_review_checkout(str(tmp_path / "review-b"), str(developer), head))
+    review_a = Path(
+        ops.create_review_checkout(
+            str(tmp_path / "review-a"),
+            str(developer),
+            head,
+            run_id="test-run",
+            work_item_id="owner/repo#1",
+        )
+    )
+    review_b = Path(
+        ops.create_review_checkout(
+            str(tmp_path / "review-b"),
+            str(developer),
+            head,
+            run_id="test-run",
+            work_item_id="owner/repo#1",
+        )
+    )
     try:
         for review in (review_a, review_b):
             assert _git(review, "rev-parse", "HEAD") == head
@@ -81,6 +101,6 @@ def test_review_cleanup_refuses_unowned_path(tmp_path: Path):
     root = _repo(tmp_path)
     unknown = tmp_path / "unknown"
     (unknown / ".git").mkdir(parents=True)
-    with pytest.raises(GitOpsError, match="unowned review checkout"):
+    with pytest.raises(GitOpsError, match="protected ownership record"):
         GitWorktreeOps(root).cleanup_review_checkout(str(unknown), _git(root, "rev-parse", "HEAD"))
     assert unknown.exists()

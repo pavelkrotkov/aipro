@@ -19,9 +19,11 @@ No vendor, model, or provider name appears in this module.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -81,25 +83,29 @@ class GitWorktreeOps:
             return
         self._run("branch", branch, from_ref)
 
-    def create_worktree(self, path: str, branch: str) -> str:
+    def create_worktree(self, path: str, branch: str, *, run_id: str, work_item_id: str) -> str:
         workdir = self._checkout_path(path)
+        self._record_checkout(workdir, "worker", branch, run_id, work_item_id)
         self._run("worktree", "add", str(workdir), branch)
-        self._worktree_marker(workdir).write_text(
-            branch + "\n" + str(workdir.resolve()) + "\n", encoding="utf-8"
-        )
+        self._verify_developer_repository(workdir)
+        self._mark_materialized(workdir)
         return str(workdir)
 
-    def create_review_checkout(self, path: str, source_workdir: str, head_sha: str) -> str:
+    def create_review_checkout(
+        self, path: str, source_workdir: str, head_sha: str, *, run_id: str, work_item_id: str
+    ) -> str:
         """Clone an independent, remote-free repository for one reviewer."""
         workdir = self._checkout_path(path)
         source = self._workdir(source_workdir)
+        self.verify_checkout(str(source), run_id, work_item_id)
+        self._record_checkout(workdir, "reviewer", head_sha, run_id, work_item_id)
         self._run("clone", "--no-local", "--no-checkout", str(source), str(workdir))
         self._run("-C", str(workdir), "remote", "remove", "origin")
         self._run("-C", str(workdir), "checkout", "--detach", head_sha)
         actual = self.head_sha(str(workdir))
         if actual != head_sha:
             raise GitOpsError(f"review checkout {workdir} expected HEAD {head_sha}, found {actual}")
-        (workdir / ".git" / "aipro-review-snapshot").write_text(head_sha + "\n", encoding="utf-8")
+        self._mark_materialized(workdir)
         return str(workdir)
 
     def head_sha(self, workdir: str) -> str:
@@ -227,17 +233,16 @@ class GitWorktreeOps:
             raise GitOpsError(f"refusing to remove unowned developer checkout: {workdir}")
         if not workdir.exists():
             return
-        marker = self._worktree_marker(workdir)
-        expected = self.current_branch(str(workdir)) + "\n" + str(workdir.resolve()) + "\n"
-        if (
-            marker.is_symlink()
-            or not marker.is_file()
-            or marker.read_text(encoding="utf-8") != expected
-        ):
-            raise GitOpsError(f"refusing to remove unowned developer checkout: {workdir}")
+        self._verify_developer_cleanup(workdir)
         self._run("worktree", "remove", str(workdir), "--force")
+        self._checkout_index(workdir).unlink()
 
-    def _worktree_marker(self, workdir: Path) -> Path:
+    def _verify_developer_cleanup(self, workdir: Path) -> None:
+        branch = self.current_branch(str(workdir))
+        self._verify_checkout_record(workdir, "worker", branch)
+        self._verify_developer_repository(workdir)
+
+    def _verify_developer_repository(self, workdir: Path) -> None:
         git_dir = Path(
             self._run("-C", str(workdir), "rev-parse", "--absolute-git-dir").strip()
         ).resolve()
@@ -246,7 +251,6 @@ class GitWorktreeOps:
         ).resolve()
         if not git_dir.is_relative_to(common / "worktrees"):
             raise GitOpsError(f"developer checkout does not belong to this repository: {workdir}")
-        return git_dir / "aipro-developer-checkout"
 
     def cleanup_review_checkout(self, path: str, head_sha: str) -> None:
         workdir = self._checkout_path(path)
@@ -254,10 +258,148 @@ class GitWorktreeOps:
             raise GitOpsError(f"refusing to remove unowned review checkout: {workdir}")
         if not workdir.exists():
             return
-        marker = workdir / ".git" / "aipro-review-snapshot"
-        if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != head_sha:
-            raise GitOpsError(f"refusing to remove unowned review checkout: {workdir}")
+        self._verify_checkout_record(workdir, "reviewer", head_sha)
         shutil.rmtree(workdir)
+        self._checkout_index(workdir).unlink()
+
+    def _verify_checkout_record(self, workdir: Path, role: str, ref: str) -> None:
+        record = self._checkout_record(workdir)
+        if record.get("materialized") is not True or (record.get("role"), record.get("ref")) != (
+            role,
+            ref,
+        ):
+            raise GitOpsError(f"refusing to remove a different {role} checkout: {workdir}")
+
+    def verify_checkout(self, path: str, run_id: str, work_item_id: str) -> None:
+        record = self._checkout_record(self._checkout_path(path))
+        if not record.get("materialized") or (record["run_id"], record["work_item_id"]) != (
+            run_id,
+            work_item_id,
+        ):
+            raise GitOpsError("checkout belongs to a different issue or run")
+
+    def _checkout_index(self, workdir: Path) -> Path:
+        common = self._run("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        key = hashlib.sha256(str(workdir.resolve()).encode()).hexdigest()
+        return Path(common) / "aipro-checkouts" / (key + ".json")
+
+    def _record_checkout(self, workdir, role, ref, run_id, work_item_id) -> None:
+        index = self._checkout_index(workdir)
+        index.parent.mkdir(exist_ok=True)
+        record = {
+            "path": str(workdir.resolve()),
+            "role": role,
+            "ref": ref,
+            "run_id": run_id,
+            "work_item_id": work_item_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "materialized": False,
+        }
+        with index.open("x", encoding="utf-8") as target:
+            json.dump(record, target)
+
+    def _checkout_record(self, workdir: Path) -> dict:
+        index = self._checkout_index(workdir)
+        if index.is_symlink() or not index.is_file():
+            raise GitOpsError(f"checkout has no protected ownership record: {workdir}")
+        record = json.loads(index.read_text(encoding="utf-8"))
+        if not isinstance(record, dict) or record.get("path") != str(workdir.resolve()):
+            raise GitOpsError(f"checkout ownership record has a different path: {workdir}")
+        return record
+
+    def _mark_materialized(self, workdir: Path) -> None:
+        index = self._checkout_index(workdir)
+        record = {**self._checkout_record(workdir), "materialized": True}
+        index.write_text(json.dumps(record), encoding="utf-8")
+
+    def checkout_inventory(self) -> list[dict]:
+        common = self._run("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        records = [
+            self._read_checkout_index(index)
+            for index in sorted((Path(common) / "aipro-checkouts").glob("*.json"))
+        ]
+        known = {record["path"] for record in records}
+        unowned = [
+            {"path": path, "role": "unowned"}
+            for path in self._worktree_paths()
+            if path not in known
+        ]
+        return records + unowned
+
+    def _read_checkout_index(self, index: Path) -> dict:
+        if index.is_symlink():
+            raise GitOpsError("checkout inventory contains a symlink")
+        record = json.loads(index.read_text(encoding="utf-8"))
+        self._validate_checkout_record(record)
+        if self._checkout_index(Path(record["path"])) != index:
+            raise GitOpsError("checkout inventory has a different protected identity")
+        return record
+
+    @staticmethod
+    def _validate_checkout_record(record) -> None:
+        if not isinstance(record, dict):
+            raise GitOpsError("checkout inventory contains invalid metadata")
+        for key in ("path", "role", "ref", "run_id", "work_item_id", "created_at"):
+            if not isinstance(record.get(key), str) or not record[key]:
+                raise GitOpsError("checkout inventory contains invalid metadata")
+        if (
+            record["role"] not in ("worker", "reviewer")
+            or type(record.get("materialized")) is not bool
+        ):
+            raise GitOpsError("checkout inventory contains invalid ownership")
+
+    def retire_checkout(self, record: dict, run_id: str, work_item_id: str) -> None:
+        if not Path(record["path"]).exists():
+            self.forget_missing_checkout(record)
+            return
+        self.verify_checkout(record["path"], run_id, work_item_id)
+        if record["role"] == "worker":
+            self.cleanup_worktree(record["path"])
+        else:
+            self.cleanup_review_checkout(record["path"], record["ref"])
+
+    def checkout_expired(self, record: dict, since: datetime, now: datetime, ttl: int) -> bool:
+        from .reconcile import WorktreeObservation, is_orphan_worktree
+
+        if (now - since).total_seconds() < ttl:
+            return False
+        observation = WorktreeObservation(
+            record["path"], record["ref"], max(since, self.checkout_activity(record))
+        )
+        return is_orphan_worktree(
+            observation, branch_has_live_lease=False, now=now, ttl_seconds=ttl
+        )
+
+    def forget_missing_checkout(self, record: dict) -> None:
+        workdir = Path(record["path"])
+        if workdir.exists() or workdir.is_symlink():
+            raise GitOpsError("cannot forget a checkout that still exists")
+        if self._checkout_record(workdir) != record:
+            raise GitOpsError("checkout ownership changed during cleanup")
+        self._checkout_index(workdir).unlink()
+
+    def checkout_activity(self, record: dict) -> datetime:
+        workdir = Path(record["path"])
+        latest = datetime.fromisoformat(record["created_at"]).timestamp()
+        if workdir.is_symlink():
+            raise GitOpsError("checkout activity cannot follow a symlink")
+        for root, dirs, files in os.walk(workdir, followlinks=False):
+            latest = max(
+                latest, Path(root).lstat().st_mtime, self._entry_activity(Path(root), dirs + files)
+            )
+        return datetime.fromtimestamp(latest, UTC)
+
+    @staticmethod
+    def _entry_activity(root: Path, names: list[str]) -> float:
+        return max(((root / name).lstat().st_mtime for name in names), default=0)
+
+    def _worktree_paths(self) -> list[str]:
+        output = self._run("worktree", "list", "--porcelain", "-z")
+        return [
+            field.removeprefix("worktree ")
+            for field in output.split("\0")
+            if field.startswith("worktree ")
+        ]
 
     # --- helpers -------------------------------------------------------------
 

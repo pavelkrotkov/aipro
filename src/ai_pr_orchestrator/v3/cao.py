@@ -655,6 +655,37 @@ class CaoSessionController:
 
     # --- Observation -------------------------------------------------------
 
+    def session_inventory(self) -> list[CaoSessionMetadata]:
+        response = self._request("GET", "/sessions")
+        self._raise_for_status(response, "list session inventory")
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise CaoControlPlaneError("CAO session inventory is not a list")
+        return [self._inventory_metadata(name) for name in self._inventory_names(rows)]
+
+    @staticmethod
+    def _inventory_names(rows: list) -> list[str]:
+        names = []
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                raise CaoControlPlaneError("CAO session inventory has invalid identity")
+            if row["id"].startswith(_CAO_SESSION_PREFIX + "aipro-"):
+                names.append(row["id"])
+        return names
+
+    def _inventory_metadata(self, name: str) -> CaoSessionMetadata:
+        metadata = self._lookup_session(name)
+        if metadata is None:
+            raise CaoSessionNotReadyError("CAO session inventory changed during observation")
+        expected = session_name_for(
+            metadata.context.run_id,
+            metadata.lane.lane,
+            _worker_scope(metadata.lane, metadata.context),
+        )
+        if name != expected:
+            raise CaoAdoptionMismatchError("CAO inventory has a different session identity")
+        return metadata
+
     def inspect_session(self, session_name: str) -> SessionObservation:
         """Read lifecycle without adopting, recording activity, or enforcing timeout."""
         metadata = self._lookup_session(session_name)
@@ -792,6 +823,41 @@ class CaoSessionController:
                 self._stop_session(remote)
             return
         self._stop_session(metadata)
+
+    def stop_verified_session(self, metadata: CaoSessionMetadata) -> None:
+        if self.inspect_session(metadata.session_name).metadata != metadata:
+            raise CaoAdoptionMismatchError("orphan session attribution changed")
+        self.terminate_session(SessionHandle(metadata.session_name, metadata.lane.lane))
+        self.require_session_absent(metadata.session_name)
+
+    def require_run_stopped(self, run_id: str, work_item_id: str) -> None:
+        for lane in self._lanes:
+            scope = work_item_id if lane.role == "worker" else None
+            self.require_session_absent(session_name_for(run_id, lane.lane, scope))
+
+    def require_session_absent(self, name: str) -> None:
+        try:
+            self.inspect_session(name)
+        except CaoSessionNotFoundError:
+            return
+        raise CaoSessionNotReadyError("checkout cleanup requires confirmed session termination")
+
+    @staticmethod
+    def require_session_expired(metadata, since: datetime, now: datetime, ttl: int) -> None:
+        from .reconcile import SessionObservation, is_orphan_session
+
+        observation = SessionObservation(
+            metadata.session_name,
+            metadata.context.work_item_id,
+            metadata.context.run_id,
+            metadata.lane.lane,
+            "unknown",
+            max(since, metadata.launched_at),
+        )
+        if not is_orphan_session(observation, has_live_lease=False, now=now, ttl_seconds=ttl):
+            raise CaoSessionNotReadyError(
+                "retained terminal runtime has not reached its cleanup TTL"
+            )
 
     # --- Internals ---------------------------------------------------------
 

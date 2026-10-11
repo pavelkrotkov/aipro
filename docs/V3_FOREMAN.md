@@ -131,3 +131,27 @@ reserved prompt usage escalates the run. Older active dispatch checkpoints
 without a counter, or malformed counters, require manual accounting before
 recovery; restarting cannot reset the budget. Status reports these estimates
 separately from actual provider token usage.
+
+
+## Retained resource cleanup
+
+Each service pass runs the production TTL sweeper before scheduling. It uses
+the service's UTC clock, the configured session TTL (default two hours) and
+checkout inactivity TTL (default 24 hours). Only terminal runs owned by this
+coordinator with confirmed lane stops authorize cleanup; expired active leases
+do not. GitHub authority is rechecked before each removal.
+
+The coordinator records checkout path, role, branch/head, run and issue in its
+protected Git administration directory. Allocation intent alone cannot authorize
+deletion: a record becomes materialized only after successful native creation.
+Existing unmarked checkouts and unknown or mismatched ownership require manual
+inspection. Human checkouts are retained. Reviewer-local metadata cannot grant
+cleanup authority.
+
+The sweeper discovers attributed native CAO sessions, developer worktrees and
+reviewer clones. It confirms session disappearance after termination and probes
+every deterministic run lane before deleting a checkout, even when CAO lists
+no sessions. Unknown inventories or unconfirmed stops emit
+`reconciliation_required` and hold new work. Recent file activity postpones
+checkout removal. Each confirmed removal emits a correlated, redacted
+`owned_resource_cleanup` event and appears in the service's `cleanup_outcomes`.

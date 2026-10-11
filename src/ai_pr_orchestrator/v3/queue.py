@@ -462,6 +462,65 @@ class GitHubIssueQueue:
         self.save_state(state, expected_updated_at=None)
         self._apply_phase_labels(issue, state.phase)
 
+    def cleanup_states(self, references) -> dict[tuple[str, str], WorkflowState]:
+        prefix = f"{self._owner}/{self._repo}#"
+        states = {key: self.load_state(key) for key in references if key and key.startswith(prefix)}
+        return {
+            (state.work_item_id, state.run_id): state
+            for state in states.values()
+            if state is not None
+        }
+
+    def cleanup_session_targets(self, sessions, states):
+        targets = []
+        prefix = f"{self._owner}/{self._repo}#"
+        for meta in sessions:
+            if not (meta.context.work_item_id or "").startswith(prefix):
+                continue
+            state = states.get((meta.context.work_item_id, meta.context.run_id))
+            if state is None:
+                raise StateConflictError("runtime has no matching durable cleanup authority")
+            if state.phase not in TERMINAL_PHASES:
+                continue
+            if not self._can_cleanup(state):
+                raise StateConflictError("terminal runtime requires manual stop reconciliation")
+            targets.append((meta, state))
+        return targets
+
+    def cleanup_checkout_targets(self, records, states):
+        targets = []
+        for record in records:
+            if record.get("work_item_id") is None:
+                continue
+            state = states.get((record["work_item_id"], record["run_id"]))
+            if state is None:
+                raise StateConflictError("protected checkout has no matching durable authority")
+            if self._can_cleanup(state):
+                targets.append((record, state))
+        return targets
+
+    def _can_cleanup(self, state: WorkflowState) -> bool:
+        if state.phase not in TERMINAL_PHASES:
+            return False
+        if state.extras.get("host_id") != self.host_id:
+            return False
+        dispatch = "coder_turn" in state.extras or "review_waves" in state.extras
+        return not dispatch or state.extras.get("lanes_stopped") is True
+
+    def verify_cleanup_state(self, state: WorkflowState) -> None:
+        if self.load_state(state.work_item_id) != state:
+            raise StateConflictError("cleanup authority changed during observation")
+
+    @staticmethod
+    def cleanup_session_reference(state, workdir: str, role: str) -> bool:
+        if role == "worker":
+            return state.extras.get("worktree") == workdir
+        return any(
+            receipt.get("worktree") == workdir
+            for wave in state.extras.get("review_waves", {}).values()
+            for receipt in wave["lanes"].values()
+        )
+
     @property
     def host_id(self) -> str:
         return self._host_id
