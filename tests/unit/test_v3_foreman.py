@@ -324,7 +324,7 @@ def _foreman(
 
 def _ready_fake() -> FakeGitHubClient:
     fake = FakeGitHubClient()
-    fake.seed_issue(1, labels=["v3-work"])
+    fake.seed_issue(1, labels=["v3-work", "v3-work-enabled"])
     return fake
 
 
@@ -557,7 +557,7 @@ def test_developer_resources_and_task_packet_are_durable():
     fake = FakeGitHubClient()
     fake.seed_issue(
         1,
-        labels=["v3-work"],
+        labels=["v3-work", "v3-work-enabled"],
         title="Implement durable developer lane",
         body="Acceptance: preserve issue context.",
     )
@@ -696,7 +696,7 @@ def test_leases_are_released_even_when_lanes_fail():
 
 def test_max_items_limits_claims():
     fake = _ready_fake()
-    fake.seed_issue(2, labels=["v3-work"])
+    fake.seed_issue(2, labels=["v3-work", "v3-work-enabled"])
     executor = ScriptedExecutor()
     loop, _ = _foreman(fake, executor, _gate())
     outcomes = loop.run_pass(max_items=1)
@@ -1072,7 +1072,7 @@ def test_claim_contention_does_not_leak_resources_or_mark_needs_human():
     branch/worktree behind a lost claim and must not escalate the competitor's
     work (F2 resource order + F9 crash persistence)."""
     fake = FakeGitHubClient()
-    fake.seed_issue(1, labels=["v3-work"])
+    fake.seed_issue(1, labels=["v3-work", "v3-work-enabled"])
     other = GitHubIssueQueue(fake, "owner", "repo", host_id="host-other")
     other.claim(ISSUE, "other-run", now=NOW)
 
@@ -1666,7 +1666,7 @@ def test_crash_state_read_failure_propagates_and_retains_worktree(monkeypatch):
 
 def test_cleanup_read_failure_retains_worktree_and_continues_pass(monkeypatch, caplog):
     fake = _ready_fake()
-    fake.seed_issue(2, labels=["v3-work"])
+    fake.seed_issue(2, labels=["v3-work", "v3-work-enabled"])
     git = RecordingGit()
     loop, queue = _foreman(fake, ScriptedExecutor(), _gate(), git=git)
     load = queue.load_state
@@ -1769,7 +1769,7 @@ def test_successful_lane_cannot_hide_failed_heartbeat(monkeypatch):
     loop, queue = _foreman(_ready_fake(), ScriptedExecutor(), _gate(), config=cfg)
     failed = threading.Event()
 
-    def fail_heartbeat(state):
+    def fail_heartbeat(state, **kwargs):
         failed.set()
         raise RuntimeError("heartbeat network outage")
 

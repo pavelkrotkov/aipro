@@ -1181,3 +1181,34 @@ def test_uncertain_pr_body_update_never_retries_patch(failure):
         with pytest.raises(GitHubClientError):
             client.update_pr_body(42, "keep human text")
     assert len(attempts) == 1
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"author_association": "MEMBER"},
+        {},
+        {"author_association": "MEMBER", "pull_request": {"url": "pr"}},
+    ],
+)
+def test_issue_authorization_rejects_unknown_metadata_and_pull_requests(payload):
+    respx.get(f"{BASE}/user").mock(return_value=httpx.Response(200, json={"login": "writer"}))
+    respx.get(f"{BASE}/repos/{OWNER}/{REPO}/issues/42").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    with _make_client() as client:
+        assert client.authenticated_login() == "writer"
+        if payload == {"author_association": "MEMBER"}:
+            assert client.get_issue_author_association(42) == "MEMBER"
+        else:
+            with pytest.raises(GitHubClientError):
+                client.get_issue_author_association(42)
+
+
+@respx.mock
+@pytest.mark.parametrize("login", [None, "", 42])
+def test_state_writer_requires_a_verified_login(login):
+    respx.get(f"{BASE}/user").mock(return_value=httpx.Response(200, json={"login": login}))
+    with _make_client() as client, pytest.raises(GitHubClientError):
+        client.authenticated_login()

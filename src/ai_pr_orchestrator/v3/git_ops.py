@@ -84,6 +84,9 @@ class GitWorktreeOps:
     def create_worktree(self, path: str, branch: str) -> str:
         workdir = self._checkout_path(path)
         self._run("worktree", "add", str(workdir), branch)
+        self._worktree_marker(workdir).write_text(
+            branch + "\n" + str(workdir.resolve()) + "\n", encoding="utf-8"
+        )
         return str(workdir)
 
     def create_review_checkout(self, path: str, source_workdir: str, head_sha: str) -> str:
@@ -219,7 +222,31 @@ class GitWorktreeOps:
         self._run("push", "origin", f"{head_sha}:refs/heads/{branch}")
 
     def cleanup_worktree(self, path: str) -> None:
-        self._run("worktree", "remove", str(Path(path)), "--force")
+        workdir = self._checkout_path(path)
+        if workdir.is_symlink() or workdir.resolve() == self._root.resolve():
+            raise GitOpsError(f"refusing to remove unowned developer checkout: {workdir}")
+        if not workdir.exists():
+            return
+        marker = self._worktree_marker(workdir)
+        expected = self.current_branch(str(workdir)) + "\n" + str(workdir.resolve()) + "\n"
+        if (
+            marker.is_symlink()
+            or not marker.is_file()
+            or marker.read_text(encoding="utf-8") != expected
+        ):
+            raise GitOpsError(f"refusing to remove unowned developer checkout: {workdir}")
+        self._run("worktree", "remove", str(workdir), "--force")
+
+    def _worktree_marker(self, workdir: Path) -> Path:
+        git_dir = Path(
+            self._run("-C", str(workdir), "rev-parse", "--absolute-git-dir").strip()
+        ).resolve()
+        common = Path(
+            self._run("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        ).resolve()
+        if not git_dir.is_relative_to(common / "worktrees"):
+            raise GitOpsError(f"developer checkout does not belong to this repository: {workdir}")
+        return git_dir / "aipro-developer-checkout"
 
     def cleanup_review_checkout(self, path: str, head_sha: str) -> None:
         workdir = self._checkout_path(path)

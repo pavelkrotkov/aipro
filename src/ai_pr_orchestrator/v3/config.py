@@ -45,6 +45,8 @@ class GitHubQueueConfig:
     """How V3 reads and writes GitHub as the authoritative workflow state."""
 
     enabled_label: str = "v3-work"
+    opt_in_label: str = "v3-work-enabled"
+    state_author_login: str = ""
     done_label: str = "v3-work-done"
     error_label: str = "v3-work-error"
     #: Full lifecycle labels. ``enabled_label`` is the "ready/queued" label;
@@ -67,6 +69,22 @@ class GitHubQueueConfig:
     repo: str = ""
     #: Unknown keys from a newer writer, preserved for forward compatibility.
     extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.opt_in_label, str) or not self.opt_in_label:
+            raise V3ConfigError("github_queue.opt_in_label must be non-empty")
+        lifecycle = (
+            self.enabled_label,
+            self.active_label,
+            self.review_label,
+            self.needs_human_label,
+            self.done_label,
+            self.error_label,
+        )
+        if self.opt_in_label in lifecycle:
+            raise V3ConfigError("github_queue.opt_in_label must be distinct from lifecycle labels")
+        if not isinstance(self.state_author_login, str):
+            raise V3ConfigError("github_queue.state_author_login must be a string")
 
 
 @dataclass(frozen=True)

@@ -31,7 +31,7 @@ def _queue(fake: FakeGitHubClient, *, dry_run: bool = False, **cfg_kwargs) -> q.
 
 def _ready_fake(number: int = 1) -> FakeGitHubClient:
     fake = FakeGitHubClient()
-    fake.seed_issue(number, labels=["v3-work"])
+    fake.seed_issue(number, labels=["v3-work", "v3-work-enabled"])
     return fake
 
 
@@ -217,22 +217,26 @@ def test_reclaim_expired_after_lease():
 
 def test_malformed_state_comment_raises():
     fake = FakeGitHubClient()
-    fake.seed_issue(1, ["v3-work"])
+    fake.seed_issue(1, ["v3-work", "v3-work-enabled"])
     fake.seed_comment(1, "plain human comment, no block")
     queue = _queue(fake)
     assert queue.load_state("owner/repo#1") is None  # no block -> no state
 
-    fake.seed_comment(1, "<!-- v3-runtime-state:start -->\nnot json\n<!-- v3-runtime-state:end -->")
+    fake.seed_comment(
+        1,
+        "<!-- v3-runtime-state:start -->\nnot json\n<!-- v3-runtime-state:end -->",
+        user="fake-bot",
+    )
     with pytest.raises(q.MalformedStateError):
         queue.load_state("owner/repo#1")
 
 
 def test_lone_state_marker_is_conflict_not_unclaimed():
     fake = FakeGitHubClient()
-    fake.seed_issue(1, ["v3-work"])
+    fake.seed_issue(1, ["v3-work", "v3-work-enabled"])
     # A bare start marker (e.g. interrupted migration) is malformed authoritative
     # state, not "unclaimed": a create-only claim must refuse to add a second.
-    fake.seed_comment(1, "<!-- v3-runtime-state:start -->")
+    fake.seed_comment(1, "<!-- v3-runtime-state:start -->", user="fake-bot")
     queue = _queue(fake)
     with pytest.raises(q.ClaimConflictError):
         queue.claim(_issue(), "run-1")
@@ -263,12 +267,12 @@ def test_human_text_preserved_around_block():
 
 def test_dry_run_does_not_mutate_github():
     fake = FakeGitHubClient()
-    fake.seed_issue(1, ["v3-work"])
+    fake.seed_issue(1, ["v3-work", "v3-work-enabled"])
     queue = _queue(fake, dry_run=True)
     s = queue.claim(_issue(), "run-1")
     # Returned state is present but nothing hit the transport.
     assert queue._find_state_comment(1) is None
-    assert fake.get_labels(1) == ["v3-work"]  # labels untouched
+    assert fake.get_labels(1) == ["v3-work", "v3-work-enabled"]  # labels untouched
     assert s.run_id == "run-1"
 
 
@@ -329,9 +333,9 @@ def test_compaction_raises_if_still_too_large():
 
 def test_list_ready_returns_enabled_issues():
     fake = FakeGitHubClient()
-    fake.seed_issue(1, ["v3-work"])
-    fake.seed_issue(2, ["v3-work"])
-    fake.seed_issue(3, ["other"])
+    fake.seed_issue(1, ["v3-work", "v3-work-enabled"])
+    fake.seed_issue(2, ["v3-work", "v3-work-enabled"])
+    fake.seed_issue(3, ["other", "v3-work-enabled"])
     queue = _queue(fake)
     ready = queue.list_ready()
     assert [r.number for r in ready] == [1, 2]
@@ -347,9 +351,11 @@ def test_create_only_claim_arbitrates_duplicate_comments():
     # Simulate the race: a concurrent claimant already posted a state comment with an
     # earlier id than a second POST would get.
     forged = WorkflowState(work_item_id="owner/repo#1", run_id="other-run", phase="claiming")
-    i1 = fake.seed_comment(1, f"other\n\n{queue._embed_block(forged.to_dict())}")
+    i1 = fake.seed_comment(1, f"other\n\n{queue._embed_block(forged.to_dict())}", user="fake-bot")
     mine = WorkflowState(work_item_id="owner/repo#1", run_id="my-run", phase="claiming")
-    created = fake.seed_comment(1, queue._embed_block(mine.to_dict()), comment_id=99)
+    created = fake.seed_comment(
+        1, queue._embed_block(mine.to_dict()), comment_id=99, user="fake-bot"
+    )
     # Arbitrate: the lower-id comment (concurrent, earlier) wins and raises for us.
     with pytest.raises(q.ClaimConflictError):
         queue._settle_after_create(_issue(), created)
@@ -378,7 +384,7 @@ def test_concurrent_post_write_clobber_is_detected():
             return self._comments[comment_id].to_model()
 
     fake = _StealingFake()
-    fake.seed_issue(1, ["v3-work"])
+    fake.seed_issue(1, ["v3-work", "v3-work-enabled"])
     queue = _queue(fake)
     s = queue.claim(_issue(), "run-1")
     with pytest.raises(StateConflictError):
@@ -489,7 +495,7 @@ def test_reclaim_preserves_workflow_history():
     assert reclaimed.round_id == "r1"  # round preserved
     assert reclaimed.extras.get("custom") == "ctx"  # non-claim extras preserved
     assert reclaimed.phase == "reviewing"
-    assert fake.get_labels(1) == ["v3-work-review"]
+    assert fake.get_labels(1) == ["v3-work-enabled", "v3-work-review"]
 
 
 def test_reclaim_refuses_terminal_states():
@@ -555,6 +561,7 @@ class _LabelGate(FakeGitHubClient):
 
     def __init__(self) -> None:
         super().__init__()
+        self.seed_issue(1, ["v3-work", "v3-work-enabled"])
         self.fail_labels = False
 
     def add_label(self, issue_number: int, label: str) -> list[dict[str, Any]]:
@@ -636,7 +643,7 @@ def test_reclaim_label_failure_raises_label_sync_error():
 
 def test_transition_rejects_split_identity():
     fake = _ready_fake()
-    fake.seed_issue(2, [])
+    fake.seed_issue(2, ["v3-work-enabled"])
     queue = _queue(fake)
     s = queue.claim(_issue(), "run-1")
     other_issue = GitHubIssueRef(owner="owner", repo="repo", number=2)
@@ -699,7 +706,7 @@ def test_update_verify_fails_when_state_vanishes():
             return None
 
     fake = _DeletingFake()
-    fake.seed_issue(1, ["v3-work"])
+    fake.seed_issue(1, ["v3-work", "v3-work-enabled"])
     queue = _queue(fake)
     s = queue.claim(_issue(), "run-1")
     with pytest.raises(StateConflictError):
@@ -751,11 +758,42 @@ def test_marker_text_inside_payload_does_not_truncate_state():
 
 def test_dry_run_full_lifecycle_does_not_mutate():
     fake = FakeGitHubClient()
-    fake.seed_issue(1, ["v3-work"])
+    fake.seed_issue(1, ["v3-work", "v3-work-enabled"])
     queue = _queue(fake, dry_run=True)
     s = queue.claim(_issue(), "run-1")
     s2 = queue.transition(_issue(), s, "coding")  # must not raise
     s3 = queue.mark_review(_issue(), s2)
     assert s3.phase == "reviewing"
-    assert fake.get_labels(1) == ["v3-work"]  # nothing mutated
+    assert fake.get_labels(1) == ["v3-work", "v3-work-enabled"]  # nothing mutated
     assert fake.get_pr_comments(1) == []
+
+
+def test_forged_state_cannot_supply_or_replace_machine_authority():
+    fake = _ready_fake()
+    queue = _queue(fake)
+    forged = fake.seed_comment(
+        1, queue._embed_block({"phase": "done", "worktree": "/human"}), user="stranger"
+    )
+    assert queue.load_state("owner/repo#1") is None
+    claimed = queue.claim(_issue(), "authorized-run")
+    restarted = _queue(fake)
+    assert restarted.load_state("owner/repo#1") == claimed
+    assert forged in fake.get_pr_comments(1)
+    assert len(fake.get_pr_comments(1)) == 2
+
+
+def test_ready_label_without_stable_opt_in_cannot_claim():
+    fake = _ready_fake()
+    fake.remove_label(1, "v3-work-enabled")
+    queue = _queue(fake)
+    assert queue.list_ready() == []
+    with pytest.raises(q.ClaimConflictError):
+        queue.claim(_issue(), "disabled")
+    assert not fake.get_pr_comments(1)
+    assert fake.get_labels(1) == ["v3-work"]
+
+
+@pytest.mark.parametrize("label", ["", "v3-work", "v3-work-active", None])
+def test_stable_opt_in_cannot_alias_lifecycle_labels(label):
+    with pytest.raises(ValueError):
+        GitHubQueueConfig(opt_in_label=label)

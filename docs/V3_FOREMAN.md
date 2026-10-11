@@ -12,6 +12,14 @@ the next issue immediately. Pending CI is polled without monopolizing the
 developer slot. Needs-human state is never automatically retried, even if a
 stale ready label remains.
 
+Queue an issue with both `v3-work` and the stable `v3-work-enabled` label
+(configurable under `github_queue`). Remove the stable label to cancel active
+work; the coordinator retains capacity until every attributed session stops.
+The originating issue author must satisfy `safety.allowed_pr_author_associations`.
+Pin `github_queue.state_author_login` to the bot writer for GitHub App tokens;
+otherwise it resolves through the authenticated user. Drain and migrate machine
+comments before changing writers. See [acceptance boundaries](V3_SOAK.md).
+
 ## Prerequisites
 
 - Python 3.12+, a primary Git checkout with a `.git` directory, and the

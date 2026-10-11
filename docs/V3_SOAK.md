@@ -23,8 +23,24 @@ and sequential scheduling. Provider fallback is separate from CAO control-plane
 backpressure. Native Hermes was tested on `hermes` against a local synthetic
 429 provider and fallback, with invented keys and a bounded run.
 
-These tests do not establish cutover readiness by themselves. In particular,
-originating-issue authorization and stable opt-in cancellation need production
-guards and boundary tests; orphan cleanup needs verified attribution/inventories.
+Issue dispatch requires both `v3-work` (ready) and `v3-work-enabled` (stable
+opt-in). Lifecycle transitions preserve the stable label. Removing it cancels
+active work only after all attributed sessions are confirmed stopped; an
+unconfirmed stop retains capacity. Originating issue authors must match
+`safety.allowed_pr_author_associations` before resources are created and while
+work runs. Unknown metadata and PR numbers cannot authorize issue work.
+
+Only comments from `github_queue.state_author_login` supply machine state.
+An empty value resolves the authenticated GitHub user's login. GitHub App
+installations must pin their bot login explicitly. Preserve that login across
+credential rotation; drain and migrate authoritative comments before changing
+writers. Comments from other accounts remain human input.
+
+Developer cleanup requires a path/branch marker in the coordinator's protected
+Git administration directory. Existing unmarked checkouts require manual
+inspection; they are never force-deleted by the new guard.
+
+These tests do not establish cutover readiness by themselves. Orphan cleanup
+still needs verified attribution and complete runtime/Git inventories.
 The replacement config, queue trigger and migration docs must ship before V1
 retirement. Keep V1 and historical epic #16 until the full cutover gate passes.
