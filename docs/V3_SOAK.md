@@ -19,7 +19,8 @@ completed durable records. A controller that does no work cannot pass.
 The E2E suite covers clean work, fix/rebut/independent acceptance, conflicting
 claims with stronger different-family adjudication, bounded CI repair,
 subscription reserve/surplus dispatch, promotion expiry, cold turn recovery,
-and sequential scheduling. Provider fallback is separate from CAO control-plane
+and sequential scheduling. Scenario 10 verifies repeated patch fingerprints
+route to needs-human before more CI or dispatch. Provider fallback is separate from CAO control-plane
 backpressure. Native Hermes was tested on `hermes` against a local synthetic
 429 provider and fallback, with invented keys and a bounded run.
 
@@ -29,6 +30,13 @@ active work only after all attributed sessions are confirmed stopped; an
 unconfirmed stop retains capacity. Originating issue authors must match
 `safety.allowed_pr_author_associations` before resources are created and while
 work runs. Unknown metadata and PR numbers cannot authorize issue work.
+
+The safety matrix exercises fork policy, prompt/iteration/invocation/reviewer
+budgets, elapsed wall-clock limits and credential stripping through actual
+lane dispatch. Real-Git authority tests cover commit budgets and workflow-file
+restriction. Accepted native deletion without disappearance retains active
+capacity; historical developer/reviewer lanes are stopped after a registry
+rename. Native timeout and replacement stops use the same verified teardown.
 
 Only comments from `github_queue.state_author_login` supply machine state.
 An empty value resolves the authenticated GitHub user's login. GitHub App
@@ -40,7 +48,9 @@ The native Git soak also runs the production sweeper after each issue. It uses
 real branches, commits, reviewer clones and pushes to a local bare remote;
 model tool effects, CAO HTTP and GitHub are the external boundaries. A failed
 immediate checkout removal leaves a protected artifact, which the sweeper
-must remove after its inactivity TTL. Completed durable records stay unchanged.
+must remove after its inactivity TTL. Completed durable records stay unchanged. Cold developer and reviewer cases
+construct fresh queue/controller/executor objects and recover existing native
+Git artifacts without another submission, branch or PR.
 
 Cleanup tests retain active work and human checkouts, delay recently modified
 files, and reject changed GitHub authority, empty runtime inventories with live

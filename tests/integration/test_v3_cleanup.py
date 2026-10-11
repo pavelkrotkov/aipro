@@ -220,3 +220,20 @@ def test_unreadable_activity_retains_every_checkout(tmp_path, cao_controller):
     finally:
         private.chmod(0o700)
     assert (private / "uninspected.py").read_text() == "irreplaceable = True\n"
+
+
+@pytest.mark.parametrize("operation", ["terminate", "timeout"])
+def test_any_stop_requires_native_disappearance(tmp_path, cao_controller, fake_cao, operation):
+    from ai_pr_orchestrator.v3.cao import CaoSessionNotReadyError
+    from tests.integration._fake_cao_server import FaultSpec
+
+    _, queue, state, paths, sessions = _resources(tmp_path, cao_controller, terminal=False)
+    fake_cao.add_fault(FaultSpec(method="DELETE", path_prefix="/sessions/", status_code=204))
+    with pytest.raises(CaoSessionNotReadyError):
+        if operation == "terminate":
+            cao_controller.terminate_session(sessions[0])
+        else:
+            cao_controller.observe(sessions[0], now=datetime.now(UTC) + timedelta(hours=3))
+    assert all(Path(path).exists() for path in paths)
+    assert not any(fake_cao._sessions[handle.session_id].deleted for handle in sessions)
+    assert queue.load_state(state.work_item_id) == state

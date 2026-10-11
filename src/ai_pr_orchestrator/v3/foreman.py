@@ -427,10 +427,9 @@ class ForemanPolicyLoop:
 
     def _stop_attributed_reviewers(self, state: WorkflowState) -> None:
         waves = state.extras.get("review_waves", {}).values()
-        for lane in self._reviewer_lanes():
-            if any(lane in wave["lanes"] for wave in waves):
-                handle = SessionHandle(session_name_for(self._run_id, lane), lane)
-                self._executor.terminate_session(handle)
+        for lane in {lane for wave in waves for lane in wave["lanes"]}:
+            handle = SessionHandle(session_name_for(self._run_id, lane), lane)
+            self._executor.terminate_session(handle)
 
     def _stop_developer_before_cleanup(self, state: WorkflowState) -> None:
         if state.extras.get("lanes_stopped"):
@@ -440,6 +439,7 @@ class ForemanPolicyLoop:
         if session is None:
             if "coder_turn" not in state.extras:
                 return
+            lane = ModelAssignment.from_dict(state.extras["developer_model"]).lane
             session = session_name_for(self._run_id, lane, state.work_item_id)
         self._executor.terminate_session(SessionHandle(session, lane))
 
