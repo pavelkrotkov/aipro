@@ -42,7 +42,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
@@ -50,6 +50,7 @@ import httpx
 
 from ai_pr_orchestrator.github.models import PullRequest
 from ai_pr_orchestrator.github.protocol import GitHubClient
+from ai_pr_orchestrator.logging import SecretRedactor, collect_secret_values, emit_workflow_state
 
 from .broker import BrokerError, TaskDemand
 from .cao import (
@@ -243,6 +244,7 @@ class ForemanPolicyLoop:
         self._git = git_ops
         self._cfg = config
         self._run_id = run_id
+        self._routing_decisions: dict[str, dict] = {}
         self._worktree_root = worktree_root
         self._name = committer_name
         self._email = committer_email
@@ -309,6 +311,7 @@ class ForemanPolicyLoop:
             raise ForemanOwnershipError("Cannot resume a different owner's run")
         self._validate_recovery_checkpoint(state)
         state = self._heartbeat(issue, state)
+        emit_workflow_state(state, action="resume_checkpoint")
         branch = state.extras.get("branch")
         worktree = state.extras.get("worktree")
         at_gate = state.phase in {"ci_gating", "updating_pr"}
@@ -395,7 +398,18 @@ class ForemanPolicyLoop:
             self._stop_developer_before_cleanup(state)
         except Exception as exc:
             raise PRReconciliationError("Lane termination is unconfirmed") from exc
-        return self._save_fresh(issue, state, extras={**state.extras, "lanes_stopped": True})
+        return self._save_fresh(
+            issue,
+            state,
+            extras={
+                **state.extras,
+                "lanes_stopped": True,
+                "routing_decisions": {
+                    **state.extras.get("routing_decisions", {}),
+                    **self._routing_decisions,
+                },
+            },
+        )
 
     def _stop_attributed_reviewers(self, state: WorkflowState) -> None:
         waves = state.extras.get("review_waves", {}).values()
@@ -592,6 +606,9 @@ class ForemanPolicyLoop:
         state = self._load(issue, state)
         decision = self._gate.evaluate(issue, pr)
         self._validate_ci_head(pr, branch, state.extras.get("pr_base_ref"))
+        state = self._save_fresh(
+            issue, state, extras={**state.extras, "ci_status": asdict(decision)}
+        )
         return state, decision
 
     def _reconcile_gate_pr(self, issue, state, branch, head_sha):
@@ -1345,9 +1362,11 @@ class ForemanPolicyLoop:
                 "lanes": {
                     seat.lane.lane: {
                         "worktree": seat.worktree,
+                        "profile": seat.lane.profile_template,
                         "assignment": seat.lease.assignment.to_dict(),
                         "fallbacks": list(seat.fallbacks),
                         "status": "planned",
+                        "routing": self._routing_decisions.get(seat.lane.lane),
                         "requests": list(seat.requests),
                     }
                     for seat in seats
@@ -1947,6 +1966,11 @@ class ForemanPolicyLoop:
             extras={
                 **extras,
                 "lanes_stopped": False,
+                "routing_decisions": {
+                    **state.extras.get("routing_decisions", {}),
+                    **self._routing_decisions,
+                },
+                "developer_profile": self._worker_lane().profile_template,
                 "developer_model": lease.assignment.to_dict(),
                 "developer_fallbacks": list(fallbacks),
                 "coder_usage": {"run_id": self._run_id, "invocations": invocation},
@@ -2027,9 +2051,17 @@ class ForemanPolicyLoop:
         if saved is not None:
             assignment, fallbacks = saved
             return self._broker.reserve(assignment), fallbacks
-        ref = self._cfg.model_router.lane_assignments.get(lane.lane)
-        if ref and not independent_of:
-            assignment = ModelAssignment(lane=lane.lane, model_ref=ref)
+        assignment = self._pinned_assignment(lane, independent_of)
+        if assignment is not None:
+            self._record_routing(
+                lane,
+                state,
+                {
+                    "source": "configured_lane_assignment",
+                    "assignment": assignment.to_dict(),
+                    "fallbacks": [],
+                },
+            )
             return self._broker.reserve(assignment), ()
         select = getattr(self._broker, "select", None)
         if select is None:
@@ -2045,9 +2077,34 @@ class ForemanPolicyLoop:
                 in_flight=in_flight or {},
             )
         )
+        self._record_routing(lane, state, decision.to_dict())
         if decision.assignment is None:
             raise ForemanQueueError(f"no model available for lane {lane.lane!r}: {decision.reason}")
         return self._reserve_decision(lane, decision.assignment, tuple(decision.fallbacks))
+
+    def _pinned_assignment(self, lane: LaneIdentity, independent_of: tuple[str, ...]):
+        ref = self._cfg.model_router.lane_assignments.get(lane.lane)
+        if not ref or independent_of:
+            return None
+        return ModelAssignment(lane=lane.lane, model_ref=ref)
+
+    def _record_routing(self, lane: LaneIdentity, state: WorkflowState, decision: dict) -> None:
+        self._routing_decisions[lane.lane] = decision
+        payload = {
+            "schema_version": 1,
+            "event": "model_routing",
+            "run_id": state.run_id,
+            "issue": state.work_item_id,
+            "round_id": state.round_id,
+            "head_sha": state.extras.get("head_sha"),
+            "lane": lane.lane,
+            "role": lane.role,
+            "decision": decision,
+        }
+        redactor = SecretRedactor(collect_secret_values(()))
+        logging.getLogger(__name__).info(
+            "model routing", extra=cast(dict, redactor.redact_recursive(payload))
+        )
 
     def _reserve_decision(
         self,

@@ -152,13 +152,17 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-def _mask_auth_header(match: re.Match[str]) -> str:
+def is_secret_name(name: str) -> bool:
+    return re.fullmatch(rf"(?:{_SECRET_KEY}|(?:proxy[-_])?authorization)", name, re.I) is not None
+
+
+def _mask_auth_header(match: re.Match[str], replacement: str = _REDACTED) -> str:
     key, separator, quote, scheme = match.groups()
     kept = f"{scheme} " if scheme else ""
-    return f"{key}{separator}{quote or ''}{kept}{_REDACTED}"
+    return f"{key}{separator}{quote or ''}{kept}{replacement}"
 
 
-def redact_secrets(text: str) -> str:
+def redact_secrets(text: str, *, replacement: str = _REDACTED) -> str:
     """Mask credential material in operator-facing text.
 
     Snapshots have no field that holds a credential, so the only way one can
@@ -166,10 +170,10 @@ def redact_secrets(text: str) -> str:
     a header, a query string, or a URL. This is that last filter, applied where
     such strings enter the telemetry types.
     """
-    text = _AUTH_HEADER.sub(_mask_auth_header, text)
-    text = _SECRET_KEY_VALUE.sub(rf"\1\2\3{_REDACTED}", text)
+    text = _AUTH_HEADER.sub(lambda match: _mask_auth_header(match, replacement), text)
+    text = _SECRET_KEY_VALUE.sub(rf"\1\2\3{replacement}", text)
     for pattern in _SECRET_PATTERNS:
-        text = pattern.sub(_REDACTED, text)
+        text = pattern.sub(replacement, text)
     return text
 
 

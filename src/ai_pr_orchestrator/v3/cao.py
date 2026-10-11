@@ -655,6 +655,21 @@ class CaoSessionController:
 
     # --- Observation -------------------------------------------------------
 
+    def inspect_session(self, session_name: str) -> SessionObservation:
+        """Read lifecycle without adopting, recording activity, or enforcing timeout."""
+        metadata = self._lookup_session(session_name)
+        if metadata is None:
+            raise CaoSessionNotFoundError(f"CAO has no session named {session_name!r}")
+        self._registered_lane(metadata.lane)
+        response = self._request("GET", f"/terminals/{metadata.terminal_id}?peek=true")
+        self._raise_for_status(response, "inspect attributed terminal")
+        status = response.json().get("status")
+        lifecycle = _STATUS_LIFECYCLE.get(status or "", "started")
+        if lifecycle == "completed" and metadata.input_digest and not metadata.activity_seen:
+            lifecycle = "running"
+        detail = "idle is not proof of completion" if status == "idle" else ""
+        return SessionObservation(metadata, lifecycle, status, detail)
+
     def observe(self, handle: SessionHandle, *, now: datetime | None = None) -> SessionObservation:
         """Return the session's normalized lifecycle state."""
         metadata = self._metadata_for(handle)

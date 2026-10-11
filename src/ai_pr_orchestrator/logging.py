@@ -28,6 +28,9 @@ from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import TextIO, cast
 
+from .v3.domain import WorkflowState
+from .v3.telemetry import is_secret_name, redact_secrets
+
 PACKAGE_LOGGER = "ai_pr_orchestrator"
 REDACTION_PLACEHOLDER = "***"
 
@@ -117,7 +120,7 @@ class SecretRedactor:
         for secret in self._secrets:
             if secret in text:
                 text = text.replace(secret, REDACTION_PLACEHOLDER)
-        return text
+        return redact_secrets(text, replacement=REDACTION_PLACEHOLDER)
 
     def redact_recursive(self, value: object, _active: set[int] | None = None) -> object:
         """Redact secrets from a value, recursing into nested containers.
@@ -137,26 +140,32 @@ class SecretRedactor:
         """
         if isinstance(value, str):
             return self.redact(value)
-        if isinstance(value, dict | list | tuple | set):
-            if _active is None:
-                _active = set()
-            marker = id(value)
-            if marker in _active:
-                return "<circular>"
-            _active.add(marker)
-            try:
-                if isinstance(value, dict):
-                    return {k: self.redact_recursive(v, _active) for k, v in value.items()}
-                if isinstance(value, list):
-                    return [self.redact_recursive(v, _active) for v in value]
-                if isinstance(value, tuple):
-                    return tuple(self.redact_recursive(v, _active) for v in value)
-                # set: return a list so json.dumps serializes it as a native
-                # JSON array rather than falling back to a Python set repr.
-                return [self.redact_recursive(v, _active) for v in value]
-            finally:
-                _active.discard(marker)
-        return value
+        if not isinstance(value, dict | list | tuple | set):
+            return value
+        active = set() if _active is None else _active
+        marker = id(value)
+        if marker in active:
+            return "<circular>"
+        active.add(marker)
+        try:
+            return self._redact_container(value, active)
+        finally:
+            active.discard(marker)
+
+    def _redact_container(self, value, active: set[int]):
+        if isinstance(value, dict):
+            return {self._redact_key(k): self._redact_field(k, v, active) for k, v in value.items()}
+        if isinstance(value, tuple):
+            return tuple(self.redact_recursive(v, active) for v in value)
+        return [self.redact_recursive(v, active) for v in value]
+
+    def _redact_key(self, key: object) -> object:
+        return self.redact(key) if isinstance(key, str) else key
+
+    def _redact_field(self, key: object, value: object, active: set[int]) -> object:
+        if isinstance(key, str) and is_secret_name(key):
+            return REDACTION_PLACEHOLDER
+        return self.redact_recursive(value, active)
 
 
 class SecretRedactingFilter(logging.Filter):
@@ -244,10 +253,10 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": _safe_message(record),
         }
-        for key, value in record.__dict__.items():
-            if key in _RESERVED_RECORD_KEYS or key in payload:
-                continue
-            payload[key] = value
+        reserved = _RESERVED_RECORD_KEYS | payload.keys()
+        payload.update(
+            {key: value for key, value in record.__dict__.items() if key not in reserved}
+        )
         # ``any(...)`` guards against ``exc_info=(None, None, None)`` — what
         # logging stores when ``exc_info=True`` is passed with no active
         # exception — which is truthy but would render a bogus "NoneType: None"
@@ -255,18 +264,12 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info and any(record.exc_info):
             payload["traceback"] = self.formatException(record.exc_info)
         if self._redactor is not None:
-            payload = {k: self._redact_value(v) for k, v in payload.items()}
+            payload = cast(dict, self._redactor.redact_recursive(payload))
         # ``sort_keys`` is intentionally omitted: arbitrary logged ``extra`` data
         # can carry a dict with mixed key types (e.g. int and str), which makes
         # sorting raise ``TypeError`` and crash the formatter. Insertion order is
         # deterministic enough for structured logs, and parsers don't rely on it.
-        formatted = json.dumps(payload, default=self._json_default)
-        if self._redactor is not None:
-            # Final catch-all (defense in depth): redact the serialized string
-            # too. ``_json_default`` already masks custom-object ``__str__``
-            # output before escaping; this pass covers anything else.
-            formatted = self._redactor.redact(formatted)
-        return formatted
+        return json.dumps(payload, default=self._json_default)
 
     def _json_default(self, obj: object) -> str:
         # json.dumps calls this only for values it can't natively serialize
@@ -277,11 +280,6 @@ class JsonFormatter(logging.Formatter):
         text = str(obj)
         return self._redactor.redact(text) if self._redactor is not None else text
 
-    def _redact_value(self, value: object) -> object:
-        if self._redactor is None:
-            return value
-        return self._redactor.redact_recursive(value)
-
 
 def collect_secret_values(env_var_names: Iterable[str]) -> list[str]:
     """Resolve env-var *names* to their current values for redaction.
@@ -290,7 +288,12 @@ def collect_secret_values(env_var_names: Iterable[str]) -> list[str]:
     redacted even if the operator did not list it in ``main_coder.env``.
     Names that are unset in the environment are skipped.
     """
-    names = ["GH_TOKEN", "GITHUB_TOKEN", *env_var_names]
+    names = [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        *env_var_names,
+        *(k for k in os.environ if is_secret_name(k)),
+    ]
     values: list[str] = []
     seen: set[str] = set()
     for name in names:
@@ -420,3 +423,33 @@ def log_error(
     if pr is not None:
         extra["pr"] = pr
     logger.error("error: %s", error, exc_info=exc_info, extra=extra)
+
+
+def emit_workflow_state(state: WorkflowState, *, action: str | None = None) -> None:
+    from .v3.audit import workflow_snapshot
+
+    logger = logging.getLogger(__name__)
+    correlation = {
+        "schema_version": 1,
+        "run_id": state.run_id,
+        "issue": state.work_item_id,
+        "round_id": state.round_id,
+        "head_sha": state.extras.get("head_sha"),
+    }
+    redactor = SecretRedactor(collect_secret_values(()))
+    correlation = {key: redactor.redact_recursive(value) for key, value in correlation.items()}
+    try:
+        logger.info(
+            "workflow state",
+            extra={
+                **correlation,
+                "event": "recovery_action" if action else "workflow_state",
+                "action": action,
+                "work": redactor.redact_recursive(workflow_snapshot(state)),
+            },
+        )
+    except Exception as exc:
+        logger.error(
+            "audit projection failed",
+            extra={**correlation, "event": "audit_error", "error_type": type(exc).__name__},
+        )

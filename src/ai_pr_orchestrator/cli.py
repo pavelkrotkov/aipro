@@ -8,13 +8,14 @@ import os
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
 from ai_pr_orchestrator import runner
+from ai_pr_orchestrator.logging import SecretRedactor, collect_secret_values, setup_logging
 from ai_pr_orchestrator.v3._schema import SchemaError
 from ai_pr_orchestrator.v3.broker import TaskDemand
 from ai_pr_orchestrator.v3.catalog import (
@@ -42,7 +43,6 @@ from ai_pr_orchestrator.v3.reconcile import (
     WorkItemObservation,
 )
 from ai_pr_orchestrator.v3.scheduler import ContinuousForeman
-from ai_pr_orchestrator.v3.telemetry import redact_secrets
 from ai_pr_orchestrator.v3.telemetry_hermes import build_telemetry
 
 
@@ -57,9 +57,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "route": _run_route_explain,
         "reconcile": _run_reconcile,
         "foreman": _run_foreman,
+        "status": _run_status,
+        "step": _run_status,
     }
     if args.command in handlers:
-        return handlers[args.command](args)
+        try:
+            return handlers[args.command](args)
+        except SchemaError as exc:
+            raise SystemExit(_redact_output(str(exc))) from exc
 
     if args.command == "inspect":
         return runner.inspect(pr_number=args.pr)
@@ -94,6 +99,72 @@ def _add_foreman_arguments(subparsers) -> None:
     )
 
 
+def _add_status_arguments(subparsers) -> None:
+    for command in ("status", "step"):
+        parser = subparsers.add_parser(
+            command, help="Inspect work or preview its next deterministic step"
+        )
+        parser.add_argument("--config", required=True)
+        parser.add_argument("--repo")
+        parser.add_argument("--token")
+        parser.add_argument("--issue", type=_positive_int)
+        parser.add_argument("--json", action="store_true")
+        if command == "step":
+            parser.add_argument("--dry-run", action="store_true", default=True)
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    from ai_pr_orchestrator.github.client import GitHubClient
+    from ai_pr_orchestrator.v3.cao import CaoSessionController
+    from ai_pr_orchestrator.v3.lanes import LaneRegistry
+
+    path = Path(args.config).resolve()
+    config = load_v3_config(path)
+    owner, repo, token = _resolve_repo_credentials(args, config.github_queue)
+    if not token:
+        raise SystemExit("Status requires GITHUB_TOKEN or --token; no simulated state is shown")
+    now = datetime.now(UTC)
+    catalog = resolve_model_catalog(config, base_dir=path.parent)
+    telemetry, _ = build_telemetry(config.telemetry, catalog=catalog)
+    resources = telemetry.snapshot_all(at=now)
+    cao_config = replace(
+        config.cao, request_timeout_seconds=min(config.cao.request_timeout_seconds, 5)
+    )
+    with (
+        GitHubClient(token, owner, repo) as client,
+        CaoSessionController(
+            cao_config, LaneRegistry.from_config(config.hermes_lanes)
+        ) as controller,
+    ):
+        queue = GitHubIssueQueue(client, owner, repo, config.github_queue, host_id="status-cli")
+        payload = _status_payload(queue, controller, args, now, resources)
+    payload = _redact_output(payload)
+    if args.json:
+        print(json.dumps(payload, indent=2, allow_nan=False))
+    else:
+        print(_render_status(payload["work_items"]))
+        _print_telemetry(resources, now)
+        if args.command == "step":
+            print("Dry run: " + json.dumps(payload["next_step"]))
+    return 0
+
+
+def _status_payload(queue, controller, args, now, resources):
+    from ai_pr_orchestrator.v3.status import status_snapshot
+
+    issue = GitHubIssueRef(queue._owner, queue._repo, args.issue) if args.issue else None
+    payload = {
+        "schema_version": 1,
+        "repository": f"{queue._owner}/{queue._repo}",
+        "evaluated_at": now.isoformat(),
+        "work_items": status_snapshot(queue, controller, issue),
+        "resources": [resource.to_dict() for resource in resources],
+    }
+    if args.command == "step":
+        payload.update(dry_run=True, next_step=_plan_step(queue), inventory_complete=False)
+    return payload
+
+
 def _run_foreman(args: argparse.Namespace) -> int:
     import socket
     from math import isfinite
@@ -113,6 +184,7 @@ def _run_foreman(args: argparse.Namespace) -> int:
     owner, repo, token = _resolve_repo_credentials(args, config.github_queue)
     if not token:
         raise SystemExit("Foreman requires GITHUB_TOKEN or --token")
+    setup_logging(secrets=[*collect_secret_values(()), token])
     catalog = resolve_catalog(config, base_dir=config_path.parent)
     if not catalog.entries:
         raise SystemExit("Foreman requires a configured model catalog")
@@ -178,9 +250,31 @@ def _serve_foreman(scheduler: ContinuousForeman, poll_seconds: float, *, once: b
         exit_code = 0
         try:
             outcomes = scheduler.step()
-            print(json.dumps({"outcomes": list(map(asdict, outcomes))}), flush=True)
+            print(
+                json.dumps(
+                    _redact_output(
+                        {
+                            "schema_version": 1,
+                            "event": "scheduler_outcomes",
+                            "outcomes": list(map(asdict, outcomes)),
+                        }
+                    )
+                ),
+                flush=True,
+            )
         except Exception as exc:
-            print(json.dumps({"reconciliation_required": redact_secrets(str(exc))}), flush=True)
+            print(
+                json.dumps(
+                    _redact_output(
+                        {
+                            "schema_version": 1,
+                            "event": "reconciliation_required",
+                            "reconciliation_required": str(exc),
+                        }
+                    )
+                ),
+                flush=True,
+            )
             exit_code, outcomes = 2, []
         if once:
             return exit_code
@@ -193,6 +287,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     _add_foreman_arguments(subparsers)
+    _add_status_arguments(subparsers)
 
     run_parser = subparsers.add_parser("run", help="Run the PR review loop")
     _add_run_arguments(run_parser)
@@ -297,22 +392,17 @@ def _build_parser() -> argparse.ArgumentParser:
 def _run_route_explain(args: argparse.Namespace) -> int:
     """Observe current telemetry and explain selection without reserving a lane."""
     now = datetime.now(UTC)
-    try:
-        path = Path(args.config)
-        config = load_v3_config(path)
-        catalog = resolve_catalog(config, base_dir=path.parent)
-        telemetry, _ledger = build_telemetry(config.telemetry, catalog=catalog)
-        broker = build_model_broker(config, telemetry_source=telemetry, at=now, catalog=catalog)
-        decision = broker.select(TaskDemand("route-explain", args.role, args.difficulty), at=now)
-    except SchemaError as exc:
-        raise SystemExit(redact_secrets(str(exc))) from exc
+    path = Path(args.config)
+    config = load_v3_config(path)
+    catalog = resolve_catalog(config, base_dir=path.parent)
+    telemetry, _ledger = build_telemetry(config.telemetry, catalog=catalog)
+    broker = build_model_broker(config, telemetry_source=telemetry, at=now, catalog=catalog)
+    decision = broker.select(TaskDemand("route-explain", args.role, args.difficulty), at=now)
 
     if args.json:
         payload = {"schema_version": 1, "hypothetical": True, "decision": decision.to_dict()}
         try:
-            output = json.dumps(
-                _redact_route_output(payload), indent=2, sort_keys=True, allow_nan=False
-            )
+            output = json.dumps(_redact_output(payload), indent=2, sort_keys=True, allow_nan=False)
         except ValueError as exc:
             raise SystemExit(
                 "Routing explanation contains a non-finite score; check broker weights"
@@ -320,89 +410,83 @@ def _run_route_explain(args: argparse.Namespace) -> int:
         print(output)
     else:
         print("Hypothetical current selection; no incumbent, peers, or active lane counts.")
-        print(redact_secrets(decision.render()))
+        print(_redact_output(decision.render()))
     return 0
 
 
-def _redact_route_output(value: Any) -> Any:
-    """Redact strings in the fixed broker schema before JSON quoting/escaping."""
-    if isinstance(value, str):
-        return redact_secrets(value)
-    if isinstance(value, list):
-        return [_redact_route_output(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _redact_route_output(item) for key, item in value.items()}
-    return value
+def _redact_output(value: Any) -> Any:
+    return SecretRedactor(collect_secret_values(())).redact_recursive(value)
 
 
 def _run_telemetry(args: argparse.Namespace) -> int:
-    """Print normalized telemetry for every configured resource in one pass.
-
-    Diagnostic only: it always exits 0 once the config loads, because an
-    unavailable or exhausted resource is a finding to report, not a failure of
-    the command. Credentials cannot appear in the output — snapshots have no
-    field that holds one, and provider error text is redacted on the way in.
-    """
-    # One timestamp for the whole listing, so two rows cannot disagree about
-    # what time it is when a window resets mid-scan.
     now = datetime.now(UTC)
-    try:
-        config_path = Path(args.config)
-        config = load_v3_config(config_path)
-        catalog = resolve_model_catalog(config, base_dir=config_path.parent)
-        registry, _ledger = build_telemetry(config.telemetry, catalog=catalog)
-    except SchemaError as exc:
-        raise SystemExit(str(exc)) from exc
-
+    config_path = Path(args.config)
+    config = load_v3_config(config_path)
+    catalog = resolve_model_catalog(config, base_dir=config_path.parent)
+    registry, _ledger = build_telemetry(config.telemetry, catalog=catalog)
     snapshots = registry.snapshot_all(at=now)
-
     if args.json:
-        print(
-            json.dumps(
-                {
-                    "evaluated_at": now.isoformat(),
-                    "resources": [snap.to_dict() for snap in snapshots],
-                },
-                indent=2,
-            )
-        )
-        return 0
+        payload = {
+            "schema_version": 1,
+            "evaluated_at": now.isoformat(),
+            "resources": [snap.to_dict() for snap in snapshots],
+        }
+        print(json.dumps(_redact_output(payload), indent=2, allow_nan=False))
+    else:
+        _print_telemetry(snapshots, now)
+    return 0
 
+
+def _print_telemetry(snapshots, now) -> None:
     if not snapshots:
         print("No telemetry resources are configured.")
-        return 0
-
+        return
+    redactor = SecretRedactor(collect_secret_values(()))
     print(f"{'RESOURCE':<20} {'AVAILABILITY':<13} {'CLASS':<13} {'AGE':>8}  SOURCE")
     for snap in snapshots:
-        stale = "" if snap.is_stale(now) is not True else "  [STALE]"
-        age = _format_age(snap.age(now))
-        print(
-            f"{snap.resource:<20} {snap.availability:<13} {snap.resource_class:<13} "
-            f"{age:>8}  {snap.source or '-'}{stale}"
-        )
-        for window in snap.windows:
-            used = "unknown" if window.used_fraction is None else f"{window.used_fraction:.0%}"
-            reset = window.reset_at.isoformat() if window.reset_at else "no reset reported"
-            ttr = window.time_to_reset(now)
-            resets_in = "" if ttr is None else f" (in {_format_duration(ttr)})"
-            print(f"    window {window.label:<18} used {used:>7}  resets {reset}{resets_in}")
-        if snap.cash_balance is not None:
-            print(f"    balance {snap.cash_balance:.2f} {snap.currency}".rstrip())
-        if snap.expires_at is not None:
-            print(f"    expires {snap.expires_at.isoformat()}")
-        for detail in snap.details:
-            print(f"    detail {detail}")
-        if snap.health.total:
-            failure_rate = snap.health.failure_rate
-            print(
-                f"    health {snap.health.total} recent request(s), "
-                f"{failure_rate:.0%} failed, "
-                f"{snap.health.consecutive_failures} consecutive"
-                + (", throttled" if snap.health.is_throttled(now) else "")
-            )
-        if snap.reason:
-            print(f"    reason {snap.reason}")
-    return 0
+        for line in _resource_lines(snap, now):
+            print(redactor.redact(line))
+
+
+def _resource_lines(snap, now) -> list[str]:
+    stale = "" if snap.is_stale(now) is not True else "  [STALE]"
+    lines = [
+        f"{snap.resource:<20} {snap.availability:<13} {snap.resource_class:<13} "
+        f"{_format_age(snap.age(now)):>8}  {snap.source or '-'}{stale}"
+    ]
+    lines.extend(_window_text(window, now) for window in snap.windows)
+    lines.extend(_resource_details(snap))
+    if snap.health.total:
+        lines.append(_health_text(snap.health, now))
+    return lines
+
+
+def _window_text(window, now) -> str:
+    used = "unknown" if window.used_fraction is None else f"{window.used_fraction:.0%}"
+    reset = window.reset_at.isoformat() if window.reset_at else "no reset reported"
+    ttr = window.time_to_reset(now)
+    resets_in = "" if ttr is None else f" (in {_format_duration(ttr)})"
+    return f"    window {window.label:<18} used {used:>7}  resets {reset}{resets_in}"
+
+
+def _resource_details(snap) -> list[str]:
+    lines = []
+    if snap.cash_balance is not None:
+        lines.append(f"    balance {snap.cash_balance:.2f} {snap.currency}".rstrip())
+    if snap.expires_at is not None:
+        lines.append(f"    expires {snap.expires_at.isoformat()}")
+    lines.extend(f"    detail {detail}" for detail in snap.details)
+    if snap.reason:
+        lines.append(f"    reason {snap.reason}")
+    return lines
+
+
+def _health_text(health, now) -> str:
+    throttled = ", throttled" if health.is_throttled(now) else ""
+    return (
+        f"    health {health.total} recent request(s), {health.failure_rate:.0%} failed, "
+        f"{health.consecutive_failures} consecutive{throttled}"
+    )
 
 
 def _format_duration(delta: timedelta) -> str:
@@ -585,10 +669,7 @@ def _run_reconcile(args: argparse.Namespace) -> int:
     from ai_pr_orchestrator.v3.config import load_v3_config
     from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 
-    try:
-        config = load_v3_config(args.config)
-    except SchemaError as exc:
-        raise SystemExit(str(exc)) from exc
+    config = load_v3_config(args.config)
 
     cleanup_cfg = config.cleanup
     queue_cfg = config.github_queue
@@ -611,7 +692,10 @@ def _run_reconcile(args: argparse.Namespace) -> int:
     )
     planner = ReconcilePlanner(cleanup_config=cleanup_cfg, queue_config=queue_cfg)
 
-    actions: list[ReconcileAction] = planner.plan_many(inputs_list)
+    actions: list[ReconcileAction] = [
+        replace(action, auto_apply=False) if action.kind != ActionKind.NOOP else action
+        for action in planner.plan_many(inputs_list)
+    ]
 
     _print_reconcile_actions(actions, json_output=args.json)
     manual = {ActionKind.ESCALATE, ActionKind.HALT_BRANCH_MOVED}
@@ -620,17 +704,30 @@ def _run_reconcile(args: argparse.Namespace) -> int:
 
 def _print_reconcile_actions(actions: list[ReconcileAction], *, json_output: bool) -> None:
     if json_output:
-        print(json.dumps({"actions": [asdict(action) for action in actions]}, indent=2))
+        print(
+            json.dumps(
+                _redact_output(
+                    {
+                        "schema_version": 1,
+                        "dry_run": True,
+                        "inventory_complete": False,
+                        "actions": [asdict(action) for action in actions],
+                    }
+                ),
+                indent=2,
+            )
+        )
     elif not actions:
         print("Nothing to reconcile.")
     else:
+        print("Runtime/Git inventories are unverified; these actions are diagnostic only.")
         print(f"{'ACTION':<24} {'AUTO':<6} {'WORK_ITEM':<24} REASON")
         for action in actions:
             print(
                 f"{action.kind.value:<24} "
                 f"{'yes' if action.auto_apply else 'no':<6} "
                 f"{action.work_item_id or '-':<24} "
-                f"{action.reason}"
+                f"{_redact_output(action.reason)}"
             )
 
 
@@ -720,7 +817,9 @@ def _build_reconciliation_inputs(
         issue = GitHubIssueRef(owner=owner, repo=repo, number=only_issue)
         issues_to_plan = [issue]
     else:
-        issues_to_plan = queue.list_ready()
+        issues_to_plan = sorted(
+            set(queue.list_ready()) | set(queue.list_active()), key=lambda item: item.number
+        )
         # A reconcile pass that finds no ready work items would surface as
         # an empty plan; keep the original "empty inputs list -> single
         # NOOP" behaviour by appending a placeholder observation so the
@@ -767,3 +866,55 @@ def _build_reconciliation_inputs(
             )
         )
     return inputs
+
+
+def _render_status(work_items: list[dict[str, Any]]) -> str:
+    lines = []
+    for work in work_items:
+        lines.append(
+            f"{work['work_item_id']}  {work['phase']}  run={work.get('run_id')} "
+            f"round={work.get('round_id')} head={work.get('head_sha')} PR={work.get('pr_number')}"
+        )
+        lines.append(
+            f"  reason={work.get('terminal_reason')} CI={work.get('ci_status')} usage={work.get('usage')}"
+        )
+        for lane in work["lanes"]:
+            lines.append(_lane_status(lane))
+
+        lines.append(
+            f"  findings={work.get('findings', [])} dispositions={work.get('dispositions', [])}"
+        )
+    return "\n".join(lines) or "No work items with configured lifecycle labels."
+
+
+def _plan_step(queue: GitHubIssueQueue) -> dict[str, Any]:
+    active = queue.list_active()
+    if len(active) > 1:
+        return {
+            "action": "halt",
+            "reason": "Multiple active developer issues",
+            "issues": [i.slug() for i in active],
+        }
+    if active:
+        return {"action": "reconcile_active", "issue": active[0].slug()}
+    ready = queue.list_ready()
+    if not ready:
+        return {"action": "idle"}
+    issue = ready[0]
+    state = queue.load_state(issue.slug())
+    if state is None:
+        return {"action": "claim", "issue": issue.slug(), "run_id": None}
+    action = "poll_ci" if state.extras.get("pr_number") else "claim"
+    return {"action": action, "issue": issue.slug(), "run_id": state.run_id}
+
+
+def _lane_status(lane) -> str:
+    runtime = lane["runtime"]
+    live = runtime.get("state") if runtime["verified"] else "UNVERIFIED: " + runtime["reason"]
+    routing = lane["routing"] or {}
+    reason = routing.get("reason") or routing.get("source", "not_recorded")
+    return (
+        f"  {lane['lane']} ({lane['role']}) session={lane['session_id']} profile={lane['profile']} "
+        f"model={lane['assignment']['model_ref']} fallbacks={lane['fallbacks']} "
+        f"durable={lane['last_durable_state']} runtime={live} routing={reason}"
+    )
