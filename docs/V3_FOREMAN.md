@@ -123,3 +123,11 @@ when resuming the same issue's history.
 The fake-HTTP integration harness covers two sequential issues and cold
 developer/reviewer recovery. It does not establish live model reasoning or
 the separate #55 soak/cutover criteria.
+
+Prompt budget estimates (`ceil(prompt characters / 4)`) are persisted before
+worker or reviewer dispatch and restored on restart. Collecting an existing
+turn does not charge its prompt again. Tightening the cap below already
+reserved prompt usage escalates the run. Older active dispatch checkpoints
+without a counter, or malformed counters, require manual accounting before
+recovery; restarting cannot reset the budget. Status reports these estimates
+separately from actual provider token usage.

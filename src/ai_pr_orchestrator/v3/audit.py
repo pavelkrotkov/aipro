@@ -56,6 +56,7 @@ def workflow_snapshot(state: WorkflowState) -> dict[str, Any]:
             "cash_authorizations": state.extras.get("spend_authorizations"),
             "actual_cash_usd": None,
             "actual_tokens": None,
+            "estimated_prompt_tokens": state.extras.get("prompt_tokens"),
         },
         "findings": [_finding(state, finding) for finding in state.findings],
         "archived": [_archived(state, finding) for finding in state.archived],
