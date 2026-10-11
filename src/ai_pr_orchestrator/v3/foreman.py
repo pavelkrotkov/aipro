@@ -501,7 +501,7 @@ class ForemanPolicyLoop:
         review_rounds = self._saved_review_round(state) - int(recover_review)
         stagnant_rounds = state.extras.get("stagnant_rounds", 0)
         reviewer_triggers = review_rounds * len(self._reviewer_lanes())
-        self._prompt_tokens = 0
+        self._prompt_tokens = self._saved_prompt_tokens(state)
         fix_findings = self._open_findings(state)
         head_sha = state.extras.get("head_sha")
         while True:
@@ -1189,7 +1189,11 @@ class ForemanPolicyLoop:
     ) -> WorkflowState:
         waves = deepcopy(state.extras["review_waves"])
         waves[state.round_id]["prompts"] = prompts
-        return self._save_fresh(issue, state, extras={**state.extras, "review_waves": waves})
+        return self._save_fresh(
+            issue,
+            state,
+            extras={**state.extras, "review_waves": waves, "prompt_tokens": self._prompt_tokens},
+        )
 
     def _record_review_result(
         self,
@@ -1908,6 +1912,18 @@ class ForemanPolicyLoop:
             "spend_authorizations": {"run_id": state.run_id, "charges": charged},
         }
 
+    def _saved_prompt_tokens(self, state: WorkflowState) -> int:
+        tokens = state.extras.get("prompt_tokens")
+        if tokens is None:
+            if state.extras.get("coder_turn") or state.extras.get("review_waves"):
+                raise _ForemanEscalation("dispatch checkpoint lacks durable prompt accounting")
+            return 0
+        if type(tokens) is not int or tokens < 0:
+            raise _ForemanEscalation("invalid durable prompt accounting")
+        if tokens > self._cfg.safety.max_prompt_tokens:
+            raise _ForemanEscalation("saved prompt token budget exceeds configured limit")
+        return tokens
+
     def _charge_prompt(self, prompt: str) -> None:
         estimated = (len(prompt) + 3) // 4
         if self._prompt_tokens + estimated > self._cfg.safety.max_prompt_tokens:
@@ -1937,7 +1953,8 @@ class ForemanPolicyLoop:
             head_sha=cast(str | None, state.extras.get("head_sha")),
         )
         try:
-            self._charge_prompt(prompt)
+            if not resume:
+                self._charge_prompt(prompt)
             if issue is not None and lane.role == "worker":
                 state, context = self._prepare_worker_turn(
                     issue, state, prompt, context, lease, fallbacks, resume=resume
@@ -1980,6 +1997,7 @@ class ForemanPolicyLoop:
             extras={
                 **extras,
                 "lanes_stopped": False,
+                "prompt_tokens": self._prompt_tokens,
                 "routing_decisions": {
                     **state.extras.get("routing_decisions", {}),
                     **self._routing_decisions,

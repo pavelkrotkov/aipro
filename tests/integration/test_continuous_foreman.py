@@ -68,6 +68,11 @@ def _assert_completed_once(queue, fake_cao, issue_number):
         for lane in ("requirements-reviewer", "breaker-reviewer", "architecture-reviewer")
     ]
     assert all(len(s.submitted_messages) == 1 and s.deleted for s in reviewers)
+    assert state.extras["prompt_tokens"] == sum(
+        (len(prompt) + 3) // 4
+        for session in [worker, *reviewers]
+        for prompt in session.submitted_messages
+    )
     return state
 
 
@@ -302,3 +307,47 @@ def test_cold_restart_after_opt_out_cancels_without_replaying_input(
     assert worker.deleted and len(worker.submitted_messages) == 1
     assert queue.load_state("owner/repo#2") is None
     assert not github.list_open_prs() and not queue.list_active()
+
+
+@pytest.mark.parametrize(
+    ("limit_adjustment", "corruption"),
+    [(0, None), (-1, None), (0, "missing"), (0, -1), (0, True)],
+)
+def test_cold_review_recovery_preserves_prompt_budget(
+    fake_cao, foreman_harness, cao_controller, monkeypatch, limit_adjustment, corruption
+):
+    template, queue, github = foreman_harness([1], git_ops=RecordingGit())
+    _lose_accepted_input(cao_controller, fake_cao, "aipro-requirements-reviewer", monkeypatch)
+    scheduler = _scheduler(template, queue, template._executor, fake_cao)
+    with pytest.raises(CaoTransportError):
+        scheduler.step()
+    checkpoint = queue.load_state("owner/repo#1")
+    prompts = [checkpoint.extras["coder_turn"]["prompt"]]
+    for wave in checkpoint.extras["review_waves"].values():
+        prompts.extend(wave["prompts"].values())
+    spent = sum((len(prompt) + 3) // 4 for prompt in prompts)
+    assert checkpoint.extras["prompt_tokens"] == spent
+    if corruption is not None:
+        extras = {**checkpoint.extras}
+        if corruption == "missing":
+            extras.pop("prompt_tokens")
+        else:
+            extras["prompt_tokens"] = corruption
+        queue.save_state(
+            replace(checkpoint, extras=extras), expected_updated_at=checkpoint.updated_at
+        )
+    template._cfg = replace(
+        template._cfg,
+        safety=replace(template._cfg.safety, max_prompt_tokens=spent + limit_adjustment),
+    )
+    outcome = scheduler.step()[0]
+    state = queue.load_state("owner/repo#1")
+    if corruption is None:
+        assert state.extras["prompt_tokens"] == spent
+    successful = limit_adjustment == 0 and corruption is None
+    assert outcome.final_phase == ("done" if successful else "escalated")
+    assert len(github.list_open_prs()) == int(successful)
+    assert all(
+        len(session.submitted_messages) == 1 and session.deleted
+        for session in fake_cao._sessions.values()
+    )
