@@ -101,10 +101,22 @@ class ForemanQueue(GitHubWorkflowStateStore, Protocol):
     it, and tests may supply partial in-memory fakes.
     """
 
+    _client: GitHubClient
+
     @property
     def host_id(self) -> str: ...
 
     def list_ready(self) -> list[GitHubIssueRef]: ...
+
+    def is_enabled(self, issue: GitHubIssueRef) -> bool: ...
+
+    def issue_ref(self, work_item_id: str) -> GitHubIssueRef: ...
+
+    def reject(self, issue: GitHubIssueRef, run_id: str, *, reason: str) -> None: ...
+
+    def cancel(
+        self, issue: GitHubIssueRef, state: WorkflowState, *, reason: str
+    ) -> WorkflowState: ...
 
     def claim(
         self,
@@ -287,6 +299,7 @@ class ForemanPolicyLoop:
             and existing.extras.get("pr_number") is not None
         )
         try:
+            self._authorize_new_work(issue, existing)
             return self._drive(issue, existing, now=now, resume_at_gate=resume_at_gate)
         except (
             CaoTransportError,
@@ -310,8 +323,6 @@ class ForemanPolicyLoop:
         if state.run_id != self._run_id or state.extras.get("host_id") != self._queue.host_id:
             raise ForemanOwnershipError("Cannot resume a different owner's run")
         self._validate_recovery_checkpoint(state)
-        state = self._heartbeat(issue, state)
-        emit_workflow_state(state, action="resume_checkpoint")
         branch = state.extras.get("branch")
         worktree = state.extras.get("worktree")
         at_gate = state.phase in {"ci_gating", "updating_pr"}
@@ -320,6 +331,8 @@ class ForemanPolicyLoop:
             raise PRReconciliationError("Active run has incomplete resource attribution")
         branch = cast(str, branch)
         try:
+            state = self._heartbeat(issue, state)
+            emit_workflow_state(state, action="resume_checkpoint")
             if not at_gate:
                 state = self._verify_checkout(issue, state, branch, cast(str, worktree))
             return self._run_loop(issue, state, worktree, branch, now=None, resume_at_gate=at_gate)
@@ -357,9 +370,7 @@ class ForemanPolicyLoop:
             return
         if state.run_id != self._run_id or state.extras.get("host_id") != self._queue.host_id:
             return
-        self._queue.mark_needs_human(
-            issue, self._confirm_lanes_stopped(issue, state), reason=reason
-        )
+        self._escalate(issue, state, reason)
 
     def _cleanup_terminal_worktree(self, issue: GitHubIssueRef) -> None:
         """Release this run's checkout only after confirming durable termination."""
@@ -393,11 +404,7 @@ class ForemanPolicyLoop:
         state = self._load(issue, state)
         if state.extras.get("lanes_stopped"):
             return state
-        try:
-            self._stop_attributed_reviewers(state)
-            self._stop_developer_before_cleanup(state)
-        except Exception as exc:
-            raise PRReconciliationError("Lane termination is unconfirmed") from exc
+        self._stop_lanes(state)
         return self._save_fresh(
             issue,
             state,
@@ -410,6 +417,13 @@ class ForemanPolicyLoop:
                 },
             },
         )
+
+    def _stop_lanes(self, state: WorkflowState) -> None:
+        try:
+            self._stop_attributed_reviewers(state)
+            self._stop_developer_before_cleanup(state)
+        except Exception as exc:
+            raise PRReconciliationError("Lane termination is unconfirmed") from exc
 
     def _stop_attributed_reviewers(self, state: WorkflowState) -> None:
         waves = state.extras.get("review_waves", {}).values()
@@ -2009,11 +2023,8 @@ class ForemanPolicyLoop:
         heartbeat failure aborts the keeper and the lane's outcome is
         escalated rather than continued on a lost claim.
         """
-        heartbeat = getattr(self._queue, "heartbeat", None)
         interval = max(0.05, self._cfg.github_queue.lease_seconds / 3)
-        if heartbeat is None:
-            yield
-            return
+        issue = self._queue.issue_ref(state.work_item_id)
         stop = threading.Event()
         failures: list[str] = []
         current = state
@@ -2022,7 +2033,7 @@ class ForemanPolicyLoop:
             nonlocal current
             while not stop.wait(interval):
                 try:
-                    current = heartbeat(current)
+                    current = self._heartbeat(issue, current, in_flight=True)
                 except Exception as exc:
                     failures.append(str(exc))
                     return
@@ -2188,7 +2199,12 @@ class ForemanPolicyLoop:
         )
 
     def _heartbeat(
-        self, issue: GitHubIssueRef, state: WorkflowState, *, now: datetime | None = None
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        *,
+        now: datetime | None = None,
+        in_flight: bool = False,
     ) -> WorkflowState:
         """Refresh the queue lease before a lane or gate step.
 
@@ -2197,10 +2213,37 @@ class ForemanPolicyLoop:
         work. A lost claim (heartbeat raises) aborts the item — propagating to
         the crash escalator rather than continuing on a reclaimed item.
         """
-        heartbeat = getattr(self._queue, "heartbeat", None)
-        if heartbeat is None:
-            return state
-        return heartbeat(state, now=now)
+        reason = self._authorization_reason(issue)
+        if reason:
+            if in_flight:
+                self._stop_lanes(self._load(issue, state))
+            else:
+                state = self._confirm_lanes_stopped(issue, state)
+                self._queue.cancel(issue, state, reason=reason)
+            raise _ForemanEscalation(reason)
+        return self._queue.heartbeat(state, now=now)
+
+    def _authorization_reason(self, issue: GitHubIssueRef) -> str | None:
+        if not self._queue.is_enabled(issue):
+            return "stable issue opt-in label removed"
+        return self._issue_authorization_reason(issue)
+
+    def _authorize_new_work(self, issue: GitHubIssueRef, existing: WorkflowState | None) -> None:
+        if existing is not None:
+            return
+        reason = self._issue_authorization_reason(issue)
+        if reason:
+            self._queue.reject(issue, self._run_id, reason=reason)
+            raise _ForemanEscalation(reason)
+
+    def _issue_authorization_reason(self, issue: GitHubIssueRef) -> str | None:
+        try:
+            association = self._queue._client.get_issue_author_association(issue.number)
+        except Exception as exc:
+            return f"originating issue authorization unavailable ({type(exc).__name__})"
+        if association not in self._cfg.safety.allowed_pr_author_associations:
+            return "untrusted originating issue author association"
+        return None
 
     def _transition(
         self,
@@ -2717,9 +2760,15 @@ class ForemanPolicyLoop:
         # whether to retry; the prior ``with suppress(Exception)`` swallowed
         # the error and led to worktree cleanup against a non-terminal
         # state.
-        self._queue.mark_needs_human(
-            issue, self._confirm_lanes_stopped(issue, state), reason=reason
-        )
+        cancelled = self._cancelled_outcome(issue)
+        if cancelled is not None:
+            return cancelled
+        state = self._confirm_lanes_stopped(issue, state)
+        revoked = self._authorization_reason(issue)
+        if revoked:
+            self._queue.cancel(issue, state, reason=revoked)
+            return WorkItemOutcome(issue=issue, final_phase="cancelled", reason=revoked)
+        self._queue.mark_needs_human(issue, state, reason=reason)
         return WorkItemOutcome(issue=issue, final_phase="escalated", reason=reason, escalated=True)
 
     def _fail(

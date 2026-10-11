@@ -147,6 +147,21 @@ class GitHubClient:
         data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
         return data.get("title")
 
+    def authenticated_login(self) -> str:
+        login = self._get("/user").get("login")
+        if not isinstance(login, str) or not login:
+            raise GitHubClientError("Authenticated GitHub actor is unknown")
+        return login
+
+    def get_issue_author_association(self, number: int) -> str:
+        data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
+        if data.get("pull_request") is not None:
+            raise GitHubClientError("Pull requests cannot be used as issue work items")
+        association = data.get("author_association")
+        if not isinstance(association, str) or not association:
+            raise GitHubClientError("Originating issue author association is unknown")
+        return association
+
     def get_issue_body(self, number: int) -> str | None:
         data = self._get(f"/repos/{self._owner}/{self._repo}/issues/{number}")
         return data.get("body")

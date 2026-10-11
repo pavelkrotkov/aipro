@@ -432,3 +432,37 @@ def test_authoritative_push_pins_remote_and_rejects_rewrites(real_repo: Path, tm
         ops.push_sha(sha, "main")
     command = ["git", "-C", str(redirected), "show-ref", "--verify", "refs/heads/main"]
     assert subprocess.run(command, capture_output=True).returncode != 0
+
+
+def test_cleanup_refuses_unowned_dirty_checkout_and_removes_owned_checkout(real_repo, tmp_path):
+    ops = GitWorktreeOps(real_repo)
+    human = tmp_path / "human"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "human", str(human)],
+        cwd=real_repo,
+        check=True,
+        capture_output=True,
+    )
+    (human / "file.txt").write_text("unsaved human edits")
+    with pytest.raises(GitOpsError):
+        ops.cleanup_worktree(str(human))
+    assert (human / "file.txt").read_text() == "unsaved human edits"
+    with pytest.raises(GitOpsError):
+        ops.cleanup_worktree(str(real_repo))
+    link = tmp_path / "human-link"
+    link.symlink_to(human, target_is_directory=True)
+    with pytest.raises(GitOpsError):
+        ops.cleanup_worktree(str(link))
+    ops.create_branch("owned", "main")
+    owned = Path(ops.create_worktree(str(tmp_path / "owned"), "owned"))
+    (owned / "file.txt").write_text("unfinished owned edits")
+    subprocess.run(
+        ["git", "checkout", "-b", "changed-identity"], cwd=owned, check=True, capture_output=True
+    )
+    with pytest.raises(GitOpsError):
+        ops.cleanup_worktree(str(owned))
+    assert owned.exists()
+    subprocess.run(["git", "checkout", "owned"], cwd=owned, check=True, capture_output=True)
+    ops.cleanup_worktree(str(owned))
+    ops.cleanup_worktree(str(owned))
+    assert not owned.exists() and human.exists()

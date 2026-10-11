@@ -770,7 +770,7 @@ def test_queue_ownership_changes_preserve_archived_records():
     from ai_pr_orchestrator.v3.queue import GitHubIssueQueue
 
     fake = FakeGitHubClient()
-    fake.seed_issue(1, ["v3-work"])
+    fake.seed_issue(1, ["v3-work", "v3-work-enabled"])
     queue = GitHubIssueQueue(fake, "owner", "repo", GitHubQueueConfig(), host_id="host-A")
     claim_time = datetime(2026, 1, 1, tzinfo=UTC)
     s = queue.claim(_issue(), "run-1", now=claim_time)

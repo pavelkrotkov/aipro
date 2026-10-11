@@ -106,7 +106,7 @@ def foreman_harness(
         if seed_issue_numbers is None:
             seed_issue_numbers = [1]
         for n in seed_issue_numbers:
-            fake.seed_issue(n, labels=[E2E_WORK_TAG])
+            fake.seed_issue(n, labels=[E2E_WORK_TAG, "v3-work-enabled"])
 
         config = V3Config(
             model_router=ModelRouterConfig(catalog=list(cao_lane_executor._catalog.entries))

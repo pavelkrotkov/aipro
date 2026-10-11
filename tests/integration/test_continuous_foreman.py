@@ -239,3 +239,66 @@ def test_multi_issue_soak_has_no_duplicate_or_unmanaged_side_effects(
     assert len(set(template._git.branches)) == count + 1
     assert len(fake_cao._sessions) == count * 4
     assert all(queue.load_state(state.work_item_id) == state for state in states)
+
+
+@pytest.mark.parametrize("association", ["NONE", "CONTRIBUTOR", ""])
+def test_untrusted_issue_is_quarantined_before_resources(fake_cao, foreman_harness, association):
+    template, queue, github = foreman_harness([1], git_ops=RecordingGit())
+    github.seed_issue(1, labels=["v3-work", "v3-work-enabled"], author_association=association)
+    scheduler = _scheduler(template, queue, template._executor, fake_cao)
+    outcome = scheduler.step()[0]
+    assert outcome.final_phase == "escalated"
+    state = queue.load_state("owner/repo#1")
+    assert "host_id" not in state.extras
+    assert not fake_cao._sessions and not github.list_open_prs()
+    assert template._git.branches == ["main"] and not template._git.worktrees
+    assert scheduler.step() == []
+
+
+@pytest.mark.parametrize("role", ["worker", "reviewer"])
+@pytest.mark.parametrize("revocation", ["label", "author"])
+def test_opt_out_during_late_lane_start_stops_every_session(
+    fake_cao, foreman_harness, monkeypatch, role, revocation
+):
+    import time
+
+    template, queue, github = foreman_harness([1], git_ops=RecordingGit())
+    template._cfg = replace(
+        template._cfg, github_queue=replace(template._cfg.github_queue, lease_seconds=1)
+    )
+    execute = template._executor.execute
+
+    def delayed(lane, *args, **kwargs):
+        if lane.role == role:
+            if revocation == "label":
+                github.remove_label(1, "v3-work-enabled")
+            else:
+                github.seed_issue(1, labels=github.get_labels(1), author_association="NONE")
+            time.sleep(0.7)
+        return execute(lane, *args, **kwargs)
+
+    monkeypatch.setattr(template._executor, "execute", delayed)
+    outcome = _scheduler(template, queue, template._executor, fake_cao).step()[0]
+    assert outcome.final_phase == "cancelled"
+    state = queue.load_state("owner/repo#1")
+    assert state.extras["lanes_stopped"]
+    assert all(session.deleted for session in fake_cao._sessions.values())
+    assert not github.list_open_prs() and not queue.list_active()
+
+
+def test_cold_restart_after_opt_out_cancels_without_replaying_input(
+    fake_cao, foreman_harness, cao_controller, monkeypatch
+):
+    template, queue, github = foreman_harness([1, 2], git_ops=RecordingGit())
+    _lose_accepted_input(cao_controller, fake_cao, "aipro-developer", monkeypatch)
+    scheduler = _scheduler(template, queue, template._executor, fake_cao)
+    with pytest.raises(CaoTransportError):
+        scheduler.step()
+    github.remove_label(1, "v3-work-enabled")
+    outcome = scheduler.step()[0]
+    assert outcome.final_phase == "cancelled"
+    first = queue.load_state("owner/repo#1")
+    worker = fake_cao._sessions[developer_session_name(first.run_id, 1)]
+    assert worker.deleted and len(worker.submitted_messages) == 1
+    assert queue.load_state("owner/repo#2") is None
+    assert not github.list_open_prs() and not queue.list_active()

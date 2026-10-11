@@ -119,7 +119,7 @@ def test_audit_correlates_findings_to_model_head_and_disposition_without_prompts
     fake_cao, foreman_harness, caplog, monkeypatch
 ):
     loop, queue, github = foreman_harness([1])
-    github.seed_issue(1, ["v3-work"], body="private-source-canary-not-for-logs")
+    github.seed_issue(1, ["v3-work", "v3-work-enabled"], body="private-source-canary-not-for-logs")
     script_protocol(fake_cao, loop)
     logger = logging.getLogger("ai_pr_orchestrator")
     monkeypatch.setattr(logging.getLogger("httpx"), "level", logging.INFO)

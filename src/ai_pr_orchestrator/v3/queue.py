@@ -231,6 +231,7 @@ class GitHubIssueQueue:
     ) -> None:
         self._client = client
         self._cfg = config or GitHubQueueConfig()
+        self._state_actor = self._cfg.state_author_login or client.authenticated_login()
         self._owner = owner
         self._repo = repo
         self._host_id = host_id
@@ -294,7 +295,7 @@ class GitHubIssueQueue:
         )
 
     def load_state(self, work_item_id: str) -> WorkflowState | None:
-        issue = self._resolve_issue(work_item_id)
+        issue = self.issue_ref(work_item_id)
         comment = self._find_state_comment(issue.number)
         if comment is None:
             return None
@@ -306,7 +307,7 @@ class GitHubIssueQueue:
     def save_state(self, state: WorkflowState, expected_updated_at: datetime | None) -> None:
         """Persist ``state`` with an optimistic-concurrency precondition."""
 
-        issue = self._resolve_issue(state.work_item_id)
+        issue = self.issue_ref(state.work_item_id)
         block = self._compacted(state)
         comment = self._find_state_comment(issue.number)
 
@@ -325,7 +326,7 @@ class GitHubIssueQueue:
     ) -> None:
         # A bare/lone marker is malformed authoritative state, not "unclaimed": refuse
         # to create a second authoritative comment for an issue that ever had one.
-        if any(self._has_any_marker(c.body) for c in self._client.get_pr_comments(issue.number)):
+        if any(self._has_any_marker(c.body) for c in self._state_comments(issue.number)):
             raise ClaimConflictError(
                 f"Issue {issue.slug()} has malformed or existing state markers; "
                 "refusing a create-only claim"
@@ -409,7 +410,7 @@ class GitHubIssueQueue:
         """
 
         state_comments = [
-            c for c in self._client.get_pr_comments(issue.number) if self._block_re.search(c.body)
+            c for c in self._state_comments(issue.number) if self._block_re.search(c.body)
         ]
         created_id = getattr(created, "id", None)
         if not state_comments:
@@ -420,14 +421,17 @@ class GitHubIssueQueue:
                 "a concurrent claimant's arbitration superseded this claim"
             )
         authoritative = min(state_comments, key=lambda c: getattr(c, "id", 0))
-        for dup in state_comments:
-            if dup.id != authoritative.id and not self._dry_run:
-                self._client.delete_comment(dup.id)
+        self._delete_duplicate_comments(state_comments, authoritative.id)
         if created is not None and created_id != authoritative.id:
             raise ClaimConflictError(
                 f"Concurrent claim won for {issue.slug()}; this foreman did not "
                 "become the authoritative claimant"
             )
+
+    def _delete_duplicate_comments(self, comments, authoritative_id: int) -> None:
+        for comment in comments:
+            if comment.id != authoritative_id and not self._dry_run:
+                self._client.delete_comment(comment.id)
 
     # --- Queue operations --------------------------------------------------
 
@@ -441,10 +445,22 @@ class GitHubIssueQueue:
         ready = []
         for n in sorted(self._client.list_issues_by_label(self._cfg.enabled_label)):
             issue = GitHubIssueRef(self._owner, self._repo, n)
+            if not self.is_enabled(issue):
+                continue
             state = self.load_state(issue.slug())
             if state is None or state.phase == "queued":
                 ready.append(issue)
         return ready
+
+    def is_enabled(self, issue: GitHubIssueRef) -> bool:
+        return self._cfg.opt_in_label in self._client.get_labels(issue.number)
+
+    def reject(self, issue: GitHubIssueRef, run_id: str, *, reason: str) -> None:
+        state = WorkflowState(
+            work_item_id=issue.slug(), run_id=run_id, phase="escalated", terminal_reason=reason
+        )
+        self.save_state(state, expected_updated_at=None)
+        self._apply_phase_labels(issue, state.phase)
 
     @property
     def host_id(self) -> str:
@@ -478,6 +494,8 @@ class GitHubIssueQueue:
         """
 
         now = _utc(now or datetime.now(UTC))
+        if not self.is_enabled(issue):
+            raise ClaimConflictError(f"Issue {issue.slug()} has no stable opt-in label")
         existing = self.load_state(work_item_id_of(issue))
 
         claim = Claim(
@@ -498,31 +516,7 @@ class GitHubIssueQueue:
             extras=claim.to_dict(),
         )
         try:
-            if existing is None:
-                self.save_state(state, expected_updated_at=None)
-            elif existing.phase == "queued":
-                # Preserve workflow history AND non-claim extras across a fresh claim
-                # of requeued work (mixed-version rollouts must not lose fields). Every
-                # claim-attribution key is removed first: optional keys (branch,
-                # worktree, pr_number, heartbeat_at) from the previous owner must not
-                # leak into the new claim.
-                extras = {
-                    k: v for k, v in existing.extras.items() if k not in _CLAIM_ATTRIBUTION_KEYS
-                }
-                extras.update(claim.to_dict())
-                state = replace(
-                    state,
-                    round_id=existing.round_id,
-                    findings=list(existing.findings),
-                    dispositions=list(existing.dispositions),
-                    archived=list(existing.archived),
-                    extras=extras,
-                )
-                self.save_state(state, expected_updated_at=existing.updated_at)
-            else:
-                raise ClaimConflictError(
-                    f"Issue {issue.slug()} is in phase {existing.phase!r} and cannot be claimed"
-                )
+            state = self._save_claim(issue, state, existing)
         except StateConflictError as exc:
             raise ClaimConflictError(str(exc)) from exc
         try:
@@ -531,6 +525,27 @@ class GitHubIssueQueue:
             raise LabelSyncError(
                 f"Claim for {issue.slug()} committed but label update failed: {exc}"
             ) from exc
+        return state
+
+    def _save_claim(self, issue, state: WorkflowState, existing: WorkflowState | None):
+        if existing is None:
+            self.save_state(state, expected_updated_at=None)
+            return state
+        if existing.phase != "queued":
+            raise ClaimConflictError(
+                f"Issue {issue.slug()} is in phase {existing.phase!r} and cannot be claimed"
+            )
+        extras = {k: v for k, v in existing.extras.items() if k not in _CLAIM_ATTRIBUTION_KEYS}
+        extras.update(state.extras)
+        state = replace(
+            state,
+            round_id=existing.round_id,
+            findings=list(existing.findings),
+            dispositions=list(existing.dispositions),
+            archived=list(existing.archived),
+            extras=extras,
+        )
+        self.save_state(state, expected_updated_at=existing.updated_at)
         return state
 
     def heartbeat(self, state: WorkflowState, *, now: datetime | None = None) -> WorkflowState:
@@ -727,35 +742,32 @@ class GitHubIssueQueue:
                 f"Issue {issue.slug()} does not match the state's work item {state.work_item_id!r}"
             )
 
-    def _resolve_issue(self, work_item_id: str) -> GitHubIssueRef:
-        """Parse ``work_item_id`` and refuse identities bound to another repository.
-
-        Without this, two repos' ``owner/repo#42`` would alias to a single issue number
-        on this client, silently reading/mutating the wrong repo.
-        """
-
-        slug = work_item_id.rsplit("#", 1)
-        if len(slug) != 2 or "/" not in slug[0]:
+    def issue_ref(self, work_item_id: str) -> GitHubIssueRef:
+        match = re.fullmatch(r"([^/#]+)/([^/#]+)#([0-9]+)", work_item_id)
+        if match is None:
             raise DomainError(
                 f"Malformed work_item_id {work_item_id!r}, expected owner/repo#number"
             )
-        owner, _, repo = slug[0].partition("/")
-        if not owner or not repo or "/" in repo:
-            raise DomainError(
-                f"Malformed work_item_id {work_item_id!r}, expected owner/repo#number"
-            )
-        if owner != self._owner or repo != self._repo:
+        owner, repo, number = match.groups()
+        if (owner, repo) != (self._owner, self._repo):
             raise DomainError(
                 f"work_item_id {work_item_id!r} is bound to {owner}/{repo} but this "
                 f"queue is configured for {self._owner}/{self._repo}"
             )
-        return GitHubIssueRef(owner=self._owner, repo=self._repo, number=int(slug[1]))
+        return GitHubIssueRef(owner=owner, repo=repo, number=int(number))
 
     def _find_state_comment(self, issue_number: int):
-        for comment in self._client.get_pr_comments(issue_number):
+        for comment in self._state_comments(issue_number):
             if self._block_re.search(comment.body):
                 return comment
         return None
+
+    def _state_comments(self, issue_number: int):
+        return [
+            comment
+            for comment in self._client.get_pr_comments(issue_number)
+            if comment.user == self._state_actor
+        ]
 
     def _apply_phase_labels(self, issue: GitHubIssueRef, phase: str) -> None:
         target = self._phase_label(phase)

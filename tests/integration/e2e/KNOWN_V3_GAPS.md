@@ -18,8 +18,11 @@ native Hermes test on the Hermes host successfully switched from a loopback
 provider returning 429 to a loopback fallback using invented credentials.
 This does not establish live-provider availability or deployed 24/7 service.
 
-Cutover still requires the safety-parity matrix, originating-issue authorization
-before resources, stable opt-in cancellation during active work, safe orphan
+Originating-issue authorization, trusted machine-state writers, stable opt-in
+cancellation (including late parallel dispatch), and protected developer
+checkout cleanup now have production guards and boundary tests.
+
+Cutover still requires the remaining safety-parity matrix, safe orphan
 cleanup with complete runtime/Git inventories, and replacement configuration,
 trigger and migration docs. Current fake Git boundaries do not prove OS-level
 workspace isolation; native container authority checks provide separate evidence.

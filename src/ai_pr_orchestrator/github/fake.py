@@ -82,6 +82,7 @@ class FakeGitHubClient:
         self._branch_heads: dict[str, str] = {}
         self._issue_titles: dict[int, str] = {}
         self._issue_bodies: dict[int, str] = {}
+        self._issue_associations: dict[int, str] = {}
         self._next_pr_number = 1
         self._comments: dict[int, _MutableComment] = {}
         self._labels: dict[int, list[str]] = {}
@@ -113,8 +114,10 @@ class FakeGitHubClient:
         *,
         body: str | None = None,
         title: str | None = None,
+        author_association: str = "MEMBER",
     ) -> None:
         self._labels[number] = list(labels) if labels else []
+        self._issue_associations[number] = author_association
         if title is not None:
             self._issue_titles[number] = title
         if body is not None:
@@ -250,6 +253,16 @@ class FakeGitHubClient:
 
     def get_issue_title(self, number: int) -> str | None:
         return self._issue_titles.get(number)
+
+    def authenticated_login(self) -> str:
+        return "fake-bot"
+
+    def get_issue_author_association(self, number: int) -> str:
+        if number in self._prs:
+            raise ValueError("Pull requests cannot be used as issue work items")
+        if number not in self._issue_associations:
+            raise ValueError("Originating issue author association is unknown")
+        return self._issue_associations[number]
 
     def get_issue_body(self, number: int) -> str | None:
         return self._issue_bodies.get(number)
