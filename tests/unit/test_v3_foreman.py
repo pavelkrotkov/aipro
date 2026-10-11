@@ -115,6 +115,8 @@ class ScriptedExecutor:
         workdir: str,
         context: LaneExecutionContext,
         lease=None,
+        *,
+        resume=False,
     ) -> LaneResult:
         self.calls.append((lane.lane, workdir))
         self.prompts.append(task_prompt)
@@ -431,7 +433,7 @@ def test_failed_developer_attempt_advances_durable_fallback_route():
             self.worker_models = []
             self.worker_attempts = 0
 
-        def execute(self, lane, task_prompt, workdir, context, lease=None):
+        def execute(self, lane, task_prompt, workdir, context, lease=None, *, resume=False):
             if lane.role != "worker":
                 return super().execute(lane, task_prompt, workdir, context, lease)
             self.worker_attempts += 1
@@ -951,7 +953,7 @@ def test_spend_authorizations_are_cas_persisted_and_replay_safe():
 
 def test_operator_cancellation_during_coder_turn_wins_and_preserves_checkout():
     class CancellingExecutor(ScriptedExecutor):
-        def execute(self, lane, task_prompt, workdir, context, lease=None):
+        def execute(self, lane, task_prompt, workdir, context, lease=None, *, resume=False):
             result = super().execute(lane, task_prompt, workdir, context, lease)
             if lane.role == "worker":
                 active = queue.load_state(ISSUE.slug())
@@ -1542,7 +1544,7 @@ def test_crash_path_cleans_up_worktree(monkeypatch):
     """A crash releases its worktree only after the terminal write succeeds."""
 
     class CrashingExecutor(ScriptedExecutor):
-        def execute(self, lane, task_prompt, workdir, context, lease=None):
+        def execute(self, lane, task_prompt, workdir, context, lease=None, *, resume=False):
             raise RuntimeError("lane exploded")
 
     fake = _ready_fake()
@@ -2255,3 +2257,24 @@ def test_pr_head_movement_after_push_halts_before_summary_or_ci(monkeypatch):
     assert gate.seen == []
     assert fake.list_open_prs()[0].body == "Human context"
     assert queue.load_state(ISSUE.slug()).phase == "ci_gating"
+
+
+def test_former_foreman_cannot_mutate_a_reclaimed_run():
+    from datetime import timedelta
+
+    from ai_pr_orchestrator.v3.foreman import ForemanOwnershipError
+
+    fake = _ready_fake()
+    loop, queue = _foreman(fake, ScriptedExecutor(), _gate())
+    state = queue.claim(ISSUE, loop.run_id)
+    next_queue = GitHubIssueQueue(fake, "owner", "repo", host_id="replacement")
+    recovered = next_queue.reclaim_expired(
+        ISSUE,
+        state,
+        state.run_id,
+        now=state.updated_at + timedelta(seconds=901),
+    )
+    with pytest.raises(ForemanOwnershipError):
+        loop._save_fresh(ISSUE, state, extras={**state.extras, "wrong": True})
+    loop._persist_crash(ISSUE, "late failure from previous owner")
+    assert queue.load_state(ISSUE.slug()) == recovered

@@ -752,6 +752,11 @@ class CaoSessionController:
             SessionHandle(session_id=metadata.session_name, lane=metadata.lane.lane)
         )
 
+    def recover_session(self, spec: SessionSpec) -> SessionHandle:
+        name = session_name_for(spec.run_id, spec.lane.lane, _worker_scope(spec.lane, spec.context))
+        self.adopt_session(name, spec)
+        return SessionHandle(session_id=name, lane=spec.lane.lane)
+
     def terminate_session(self, handle: SessionHandle) -> None:
         """Delete the session and drop its local bookkeeping.
 

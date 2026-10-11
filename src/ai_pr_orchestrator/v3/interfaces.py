@@ -12,11 +12,12 @@ depends on a specific implementation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from math import isfinite
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
+from ._schema import SchemaError, validate_declared_shapes
 from .domain import (
     FindingDisposition,
     GitHubIssueRef,
@@ -73,6 +74,20 @@ class LaneExecutionContext:
     disposition_requests: tuple[tuple[str, str | None], ...] = ()
     # Immutable repository snapshot this turn reviews, when applicable.
     head_sha: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LaneExecutionContext:
+        validate_declared_shapes(cls, data, "execution context", SchemaError)
+        return cls(
+            run_id=data["run_id"],
+            round_id=data["round_id"],
+            work_item_id=data["work_item_id"],
+            disposition_requests=tuple((r[0], r[1]) for r in data["disposition_requests"]),
+            head_sha=data["head_sha"],
+        )
 
     def __post_init__(self) -> None:
         if self.head_sha is not None and (
@@ -178,6 +193,29 @@ class LaneResult:
     changed_files: list[str]
     findings: list[ReviewerFinding] = field(default_factory=list)
     dispositions: list[FindingDisposition] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session": {"session_id": self.session.session_id, "lane": self.session.lane},
+            "exit_code": self.exit_code,
+            "output_summary": self.output_summary,
+            "changed_files": list(self.changed_files),
+            "findings": [f.to_dict() for f in self.findings],
+            "dispositions": [d.to_dict() for d in self.dispositions],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LaneResult:
+        validate_declared_shapes(cls, data, "lane result", SchemaError)
+        validate_declared_shapes(SessionHandle, data["session"], "session", SchemaError)
+        return cls(
+            session=SessionHandle(**data["session"]),
+            exit_code=data["exit_code"],
+            output_summary=data["output_summary"],
+            changed_files=list(data["changed_files"]),
+            findings=[ReviewerFinding.from_dict(f) for f in data["findings"]],
+            dispositions=[FindingDisposition.from_dict(d) for d in data["dispositions"]],
+        )
 
 
 @dataclass(frozen=True)
@@ -304,6 +342,8 @@ class LaneExecutor(Protocol):
         workdir: str,
         context: LaneExecutionContext,
         lease: ModelLease | None = None,
+        *,
+        resume: bool = False,
     ) -> LaneResult: ...
 
     def terminate_session(self, handle: SessionHandle) -> None:

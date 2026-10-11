@@ -134,6 +134,8 @@ class FakeLaneExecutor:
         workdir: str,
         context: LaneExecutionContext,
         lease: ModelLease | None = None,
+        *,
+        resume: bool = False,
     ) -> LaneResult:
         self.leases.append(lease)
         self.contexts.append(context)
@@ -162,6 +164,8 @@ class FakeReviewerLaneExecutor:
         workdir: str,
         context: LaneExecutionContext,
         lease: ModelLease | None = None,
+        *,
+        resume: bool = False,
     ) -> LaneResult:
         self.leases.append(lease)
         self.contexts.append(context)

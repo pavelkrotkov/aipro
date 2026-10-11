@@ -52,7 +52,12 @@ from ai_pr_orchestrator.github.models import PullRequest
 from ai_pr_orchestrator.github.protocol import GitHubClient
 
 from .broker import BrokerError, TaskDemand
-from .cao import CaoTransportError, SessionBusyError, SessionIdentityUncertainError
+from .cao import (
+    CaoTransportError,
+    SessionBusyError,
+    SessionIdentityUncertainError,
+    session_name_for,
+)
 from .catalog import MAX_TASK_DIFFICULTY
 from .config import V3Config
 from .domain import (
@@ -77,6 +82,7 @@ from .interfaces import (
     LaneResult,
     ModelBroker,
     ModelLease,
+    SessionHandle,
 )
 from .lanes import (
     ARCHITECTURE_REVIEWER_LANE,
@@ -93,6 +99,9 @@ class ForemanQueue(GitHubWorkflowStateStore, Protocol):
     Structural on purpose: the production :class:`GitHubIssueQueue` satisfies
     it, and tests may supply partial in-memory fakes.
     """
+
+    @property
+    def host_id(self) -> str: ...
 
     def list_ready(self) -> list[GitHubIssueRef]: ...
 
@@ -141,6 +150,10 @@ class WorkItemOutcome:
     escalated: bool = False
 
 
+class ForemanOwnershipError(RuntimeError):
+    """The active claim changed ownership; this process must stop mutation."""
+
+
 class ForemanQueueError(RuntimeError):
     """Raised when the foreman is handed a queue missing the claim verbs."""
 
@@ -183,6 +196,7 @@ class _ReviewSeat:
     lease: ModelLease
     fallbacks: tuple[str, ...]
     requests: tuple[tuple[str, str | None], ...]
+    resume: bool = False
 
 
 def _parse_timestamp(value: object) -> datetime:
@@ -262,38 +276,63 @@ class ForemanPolicyLoop:
         issues = self._list_ready()
         if max_items is not None:
             issues = issues[:max_items]
-        outcomes: list[WorkItemOutcome] = []
-        for issue in issues:
-            existing = self._queue.load_state(issue.slug())
-            resume_at_gate = existing is not None and (
-                existing.phase in ("queued", "ci_gating")
-                and existing.extras.get("pr_number") is not None
+        return [self.run_work(issue, now=now) for issue in issues]
+
+    def run_work(self, issue: GitHubIssueRef, *, now: datetime | None = None) -> WorkItemOutcome:
+        existing = self._queue.load_state(issue.slug())
+        resume_at_gate = existing is not None and (
+            existing.phase in ("queued", "ci_gating")
+            and existing.extras.get("pr_number") is not None
+        )
+        try:
+            return self._drive(issue, existing, now=now, resume_at_gate=resume_at_gate)
+        except (
+            CaoTransportError,
+            SessionBusyError,
+            SessionIdentityUncertainError,
+            PRReconciliationError,
+            ForemanOwnershipError,
+        ):
+            raise
+        except Exception as exc:
+            reason = f"foreman error: {exc}"
+            self._persist_crash(issue, reason)
+            return self._cancelled_outcome(issue) or WorkItemOutcome(
+                issue=issue, final_phase="escalated", reason=reason, escalated=True
             )
-            try:
-                outcomes.append(
-                    self._drive(issue, existing, now=now, resume_at_gate=resume_at_gate)
-                )
-            except (
-                CaoTransportError,
-                SessionBusyError,
-                SessionIdentityUncertainError,
-                PRReconciliationError,
-            ):
-                # Uncertain effects require reconciliation, not terminal cleanup.
-                raise
-            except Exception as exc:
-                reason = f"foreman error: {exc}"
-                self._persist_crash(issue, reason)
-                cancelled = self._cancelled_outcome(issue)
-                outcome = cancelled or WorkItemOutcome(
-                    issue=issue, final_phase="escalated", reason=reason, escalated=True
-                )
-                outcomes.append(outcome)
-            # CI-only claims own no local checkout; a retained path can belong
-            # to unrelated work on this host. Keep its attribution for recovery.
+        finally:
             if not resume_at_gate:
                 self._cleanup_terminal_worktree(issue)
-        return outcomes
+
+    def resume_work(self, issue: GitHubIssueRef, state: WorkflowState) -> WorkItemOutcome:
+        if state.run_id != self._run_id or state.extras.get("host_id") != self._queue.host_id:
+            raise ForemanOwnershipError("Cannot resume a different owner's run")
+        self._validate_recovery_checkpoint(state)
+        state = self._heartbeat(issue, state)
+        branch = state.extras.get("branch")
+        worktree = state.extras.get("worktree")
+        at_gate = state.phase in {"ci_gating", "updating_pr"}
+        required = (branch,) if at_gate else (branch, worktree)
+        if not all(required):
+            raise PRReconciliationError("Active run has incomplete resource attribution")
+        branch = cast(str, branch)
+        try:
+            if not at_gate:
+                state = self._verify_checkout(issue, state, branch, cast(str, worktree))
+            return self._run_loop(issue, state, worktree, branch, now=None, resume_at_gate=at_gate)
+        except _ForemanEscalation as exc:
+            return self._escalate(issue, state, exc.reason, now=None)
+        finally:
+            self._cleanup_terminal_worktree(issue)
+
+    @staticmethod
+    def _validate_recovery_checkpoint(state: WorkflowState) -> None:
+        if state.phase == "coding" and "coder_turn" not in state.extras:
+            raise PRReconciliationError("Active coder has no durable dispatch intent")
+        if state.phase == "reviewing" and state.round_id not in state.extras.get(
+            "review_waves", {}
+        ):
+            raise PRReconciliationError("Active reviewers have no durable wave intent")
 
     def _cancelled_outcome(self, issue: GitHubIssueRef) -> WorkItemOutcome | None:
         state = self._queue.load_state(issue.slug())
@@ -313,9 +352,11 @@ class ForemanPolicyLoop:
         state = self._queue.load_state(issue.slug())
         if state is None or state.phase in TERMINAL_PHASES:
             return
-        if state.run_id != self._run_id:
+        if state.run_id != self._run_id or state.extras.get("host_id") != self._queue.host_id:
             return
-        self._queue.mark_needs_human(issue, state, reason=reason)
+        self._queue.mark_needs_human(
+            issue, self._confirm_lanes_stopped(issue, state), reason=reason
+        )
 
     def _cleanup_terminal_worktree(self, issue: GitHubIssueRef) -> None:
         """Release this run's checkout only after confirming durable termination."""
@@ -328,17 +369,51 @@ class ForemanPolicyLoop:
                 exc_info=True,
             )
             return
-        if (
-            state is None
-            or state.run_id != self._run_id
-            or state.phase not in TERMINAL_PHASES
-            or state.phase == "cancelled"
-        ):
+        if state is None:
+            return
+        owner = (state.run_id, state.extras.get("host_id"))
+        if owner != (self._run_id, self._queue.host_id) or state.phase not in TERMINAL_PHASES - {
+            "cancelled"
+        }:
             return
         worktree = state.extras.get("worktree")
         if worktree:
-            with suppress(Exception):
+            try:
+                self._stop_developer_before_cleanup(state)
                 self._git.cleanup_worktree(worktree)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Retaining checkout for %s: cleanup unconfirmed", issue.slug(), exc_info=True
+                )
+
+    def _confirm_lanes_stopped(self, issue: GitHubIssueRef, state: WorkflowState) -> WorkflowState:
+        state = self._load(issue, state)
+        if state.extras.get("lanes_stopped"):
+            return state
+        try:
+            self._stop_attributed_reviewers(state)
+            self._stop_developer_before_cleanup(state)
+        except Exception as exc:
+            raise PRReconciliationError("Lane termination is unconfirmed") from exc
+        return self._save_fresh(issue, state, extras={**state.extras, "lanes_stopped": True})
+
+    def _stop_attributed_reviewers(self, state: WorkflowState) -> None:
+        waves = state.extras.get("review_waves", {}).values()
+        for lane in self._reviewer_lanes():
+            if any(lane in wave["lanes"] for wave in waves):
+                handle = SessionHandle(session_name_for(self._run_id, lane), lane)
+                self._executor.terminate_session(handle)
+
+    def _stop_developer_before_cleanup(self, state: WorkflowState) -> None:
+        if state.extras.get("lanes_stopped"):
+            return
+        session = state.extras.get("developer_session")
+        lane = self._worker_lane().lane
+        if session is None:
+            if "coder_turn" not in state.extras:
+                return
+            session = session_name_for(self._run_id, lane, state.work_item_id)
+        self._executor.terminate_session(SessionHandle(session, lane))
 
     # --- Lifecycle -----------------------------------------------------------
 
@@ -393,221 +468,247 @@ class ForemanPolicyLoop:
         now: datetime | None,
         resume_at_gate: bool = False,
     ) -> WorkItemOutcome:
-        safety = self._cfg.safety
-        coder_invocations = 0 if resume_at_gate else self._coder_usage(state)
-        review_rounds = self._saved_review_round(state)
-        stagnant_rounds = 0
+        coder_invocations = 0
+        recover_review = state.phase == "reviewing"
+        review_rounds = self._saved_review_round(state) - int(recover_review)
+        stagnant_rounds = state.extras.get("stagnant_rounds", 0)
         reviewer_triggers = review_rounds * len(self._reviewer_lanes())
         self._prompt_tokens = 0
-        state = self._enforce_deadline(issue, state, now=now)
-        fix_findings = tuple(f for f in state.findings if f.status == "open")
-        result: LaneResult | None = None
-        head_sha: str | None = state.extras.get("head_sha")
-
+        fix_findings = self._open_findings(state)
+        head_sha = state.extras.get("head_sha")
         while True:
             cancelled = self._cancelled_outcome(issue)
             if cancelled is not None:
                 return cancelled
             state = self._enforce_deadline(issue, state, now=now)
-            if resume_at_gate:
-                # PR #73 review thread 16 / issue #85: requeued pending-CI
-                # items are claimable by a different foreman host whose
-                # local worktree path does not exist. Skip the
-                # commit/push step and re-evaluate the retained PR head
-                # against the recorded PR number — the worktree is not
-                # the source of truth for a CI-only resume.
-                result = None
-            else:
-                if worktree is None:
-                    raise _ForemanEscalation("coding requires a local worktree")
-                requests = tuple((f.id, None) for f in fix_findings if f.lane != "ci")
-                if not self._resume_proposals(state):
-                    state, result, coder_invocations = self._run_coder(
-                        issue, state, worktree, fix_findings, now=now
-                    )
-                    violation = self._policy_violation(result)
-                    if violation:
-                        return self._fail(issue, state, violation, now=now)
-                    if requests:
-                        state = self._record_proposals(state, result)
-                # --- Review rounds --------------------------------------------
-                state = self._enforce_deadline(issue, state, now=now)
-                report = self._review(
+            if not resume_at_gate:
+                developed = self._development_round(
                     issue,
                     state,
                     worktree,
                     branch,
+                    fix_findings,
                     review_rounds,
                     stagnant_rounds,
                     reviewer_triggers,
+                    recover_review,
                     now=now,
                 )
-                reviewer_triggers = report.triggers
-                review_rounds = report.rounds
-                head_sha = report.head_sha
-                stagnant_rounds = report.stagnant_rounds
-                state = self._enforce_deadline(issue, self._load(issue, state), now=now)
+                if isinstance(developed, WorkItemOutcome):
+                    return developed
+                state, report, coder_invocations = developed
+                recover_review = False
+                review_rounds, stagnant_rounds = report.rounds, report.stagnant_rounds
+                reviewer_triggers, head_sha = report.triggers, report.head_sha
                 if report.remaining:
-                    if review_rounds >= safety.max_total_iterations:
-                        return self._escalate(
-                            issue,
-                            state,
-                            f"unresolved findings after {review_rounds} review rounds",
-                            now=now,
-                        )
                     fix_findings = report.remaining
-                    continue  # fixes dispositioned; run the coder again
-                if self._clean_no_change(state, worktree):
-                    state = self._transition(
-                        issue,
-                        state,
-                        "done",
-                        terminal_reason="developer reported no changes",
-                        now=now,
-                    )
-                    return WorkItemOutcome(
-                        issue=issue,
-                        final_phase="done",
-                        reason="developer reported no changes",
-                        review_rounds=review_rounds,
-                        coder_invocations=coder_invocations,
-                    )
-
-            # --- CI gate ------------------------------------------------------
-            state = self._transition(issue, state, "ci_gating", now=now)
-            state = self._heartbeat(issue, state, now=now)
-            if not resume_at_gate:
-                assert worktree is not None  # Coding requires a checkout above.
-                if head_sha is None:
-                    raise _ForemanEscalation("review completed without a recorded snapshot")
-                self._publish_snapshot(worktree, branch, head_sha)
-                state = self._persist_resources(issue, state, branch=branch, worktree=worktree)
-            try:
-                pr = self._ensure_pr(issue, state, branch, head_sha)
-            except _ForemanEscalation:
-                raise
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404 and state.extras.get("pr_number") is not None:
-                    raise _ForemanEscalation(
-                        f"recorded PR #{state.extras['pr_number']} could not be found"
-                    ) from exc
-                raise PRReconciliationError(f"PR reconciliation required: {exc}") from exc
-            except Exception as exc:
-                raise PRReconciliationError(f"PR reconciliation required: {exc}") from exc
-            # _ensure_pr may persist the recorded PR number (advancing the CAS
-            # version): reload so the subsequent transitions expect the
-            # authoritative state.
-            state = self._load(issue, state)
-            decision = self._gate.evaluate(issue, pr)
-            self._validate_ci_head(pr, branch, state.extras.get("pr_base_ref"))
-            if decision.passed:
-                state = self._transition(issue, state, "updating_pr", now=now)
-                state = self._transition(issue, state, "done", terminal_reason="ci green", now=now)
-                return WorkItemOutcome(
-                    issue=issue,
-                    final_phase="done",
-                    reason="ci green",
-                    review_rounds=review_rounds,
-                    coder_invocations=coder_invocations,
-                    gate=decision,
-                )
-            if decision.pending_checks:
-                # Not a failure and not ours to busy-wait. Requeue onto the
-                # enabled label so a later pass re-selects it (list_ready only
-                # sees the enabled label) and re-evaluates the same head. The
-                # worktree/branch are retained for that reuse. The wait start
-                # is persisted on the first pending requeue so a head that
-                # never settles cannot pend forever: once
-                # ci_wait_timeout_seconds is exceeded the item escalates
-                # (round-2 #5).
-                now_dt = now or datetime.now(UTC)
-                started = state.extras.get("ci_wait_started_at")
-                if started is not None:
-                    elapsed = (now_dt - _parse_timestamp(started)).total_seconds()
-                    if elapsed > self._cfg.ci_policy.ci_wait_timeout_seconds:
-                        return self._escalate(
-                            issue,
-                            state,
-                            "CI checks pending longer than "
-                            f"ci_wait_timeout_seconds "
-                            f"({self._cfg.ci_policy.ci_wait_timeout_seconds}s)",
-                            now=now,
-                        )
-                else:
-                    state = self._save_fresh(
-                        issue,
-                        state,
-                        extras={**state.extras, "ci_wait_started_at": now_dt.isoformat()},
-                    )
-                state = self._transition(issue, state, "queued", now=now)
-                return WorkItemOutcome(
-                    issue=issue,
-                    final_phase="ci_gating",
-                    reason="CI checks pending: " + ", ".join(decision.pending_checks),
-                    review_rounds=review_rounds,
-                    coder_invocations=coder_invocations,
-                    gate=decision,
-                )
-            if resume_at_gate:
-                return self._escalate(
-                    issue, state, "CI-only resume cannot safely dispatch local remediation", now=now
-                )
-            # Real CI failures become findings for the next coding round —
-            # unless the review budget is spent and reviews keep reporting
-            # nothing new: that is stagnation, not fixable work.
-            if state.extras.get("ci_wait_started_at") is not None:
-                # The wait is over (the checks settled): drop the stale wait
-                # start so a later pending requeue measures a fresh window.
-                extras = {k: v for k, v in state.extras.items() if k != "ci_wait_started_at"}
-                state = self._save_fresh(issue, state, extras=extras)
-            if stagnant_rounds >= self._cfg.escalation.stagnation_rounds_threshold:
-                return self._escalate(
-                    issue,
-                    state,
-                    f"no converging signal after {review_rounds} review rounds",
-                    now=now,
-                )
-            if review_rounds >= safety.max_total_iterations:
-                return self._escalate(
-                    issue, state, f"CI failing after {review_rounds} iterations", now=now
-                )
-            if not decision.failed_checks:
-                # A gate that is neither passing, pending, nor naming a failed
-                # check (e.g. "no checks reported and green required") has no
-                # signal to turn into findings — loop back would spin forever.
-                return self._escalate(
-                    issue, state, f"CI gate cannot progress: {decision.detail}", now=now
-                )
-            signals = sorted(normalize_claim(name) for name in decision.failed_checks)
-            signals.append(normalize_claim(decision.detail))
-            failure = self._signal_hash(signals)
-            seen = state.extras.get("ci_failure_hashes", [])
-            if not isinstance(seen, list):
-                raise _ForemanEscalation("malformed durable CI failure history")
-            if failure in seen:
-                return self._escalate(
-                    issue,
-                    state,
-                    "no converging signal: repeated CI failure after remediation",
-                    now=now,
-                )
-            state = self._save_fresh(
+                    continue
+            state, decision = self._evaluate_gate(
+                issue, state, worktree, branch, head_sha, resume_at_gate, now=now
+            )
+            gated = self._settle_gate(
                 issue,
                 state,
-                extras={**state.extras, "ci_failure_hashes": [*seen, failure]},
+                decision,
+                review_rounds,
+                stagnant_rounds,
+                coder_invocations,
+                resume_at_gate,
+                now=now,
             )
-            fix_findings = tuple(
-                ReviewerFinding(
-                    id=f"ci-failed-{name}",
-                    lane="ci",
-                    body=f"CI check {name} failed. {decision.detail[:1000]}",
-                    severity="major",
-                    run_id=self._run_id,
-                    round_id=state.round_id or "ci",
+            if isinstance(gated, WorkItemOutcome):
+                return gated
+            state, fix_findings = gated
+
+    @staticmethod
+    def _open_findings(state: WorkflowState) -> tuple[ReviewerFinding, ...]:
+        return tuple(f for f in state.findings if f.status == "open")
+
+    def _development_round(
+        self,
+        issue,
+        state,
+        worktree,
+        branch,
+        findings,
+        review_rounds,
+        stagnant_rounds,
+        reviewer_triggers,
+        recover_review,
+        *,
+        now,
+    ):
+        if worktree is None:
+            raise _ForemanEscalation("coding requires a local worktree")
+        invocations = self._coder_usage(state)
+        if not recover_review and not self._resume_proposals(state):
+            coded = self._develop(issue, state, worktree, findings, now=now)
+            if isinstance(coded, WorkItemOutcome):
+                return coded
+            state, invocations = coded
+        state = self._enforce_deadline(issue, state, now=now)
+        report = self._review(
+            issue,
+            state,
+            worktree,
+            branch,
+            review_rounds,
+            stagnant_rounds,
+            reviewer_triggers,
+            now=now,
+        )
+        state = self._enforce_deadline(issue, self._load(issue, state), now=now)
+        if not report.remaining and self._clean_no_change(state, worktree):
+            self._transition(
+                issue, state, "done", terminal_reason="developer reported no changes", now=now
+            )
+            return WorkItemOutcome(
+                issue=issue,
+                final_phase="done",
+                reason="developer reported no changes",
+                review_rounds=report.rounds,
+                coder_invocations=invocations,
+            )
+        return state, report, invocations
+
+    def _develop(self, issue, state, worktree, findings, *, now):
+        state, result, invocations = self._run_coder(issue, state, worktree, findings, now=now)
+        violation = self._policy_violation(result)
+        if violation:
+            return self._fail(issue, state, violation, now=now)
+        if any(f.lane != "ci" for f in findings):
+            state = self._record_proposals(state, result)
+        return state, invocations
+
+    def _evaluate_gate(self, issue, state, worktree, branch, head_sha, resume_at_gate, *, now):
+        state = self._transition(issue, state, "ci_gating", now=now)
+        state = self._heartbeat(issue, state, now=now)
+        if not resume_at_gate:
+            if worktree is None or head_sha is None:
+                raise _ForemanEscalation("review completed without a recorded snapshot")
+            self._publish_snapshot(worktree, branch, head_sha)
+            state = self._persist_resources(issue, state, branch=branch, worktree=worktree)
+        pr = self._reconcile_gate_pr(issue, state, branch, head_sha)
+        state = self._load(issue, state)
+        decision = self._gate.evaluate(issue, pr)
+        self._validate_ci_head(pr, branch, state.extras.get("pr_base_ref"))
+        return state, decision
+
+    def _reconcile_gate_pr(self, issue, state, branch, head_sha):
+        try:
+            return self._ensure_pr(issue, state, branch, head_sha)
+        except _ForemanEscalation:
+            raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404 and state.extras.get("pr_number") is not None:
+                raise _ForemanEscalation(
+                    f"recorded PR #{state.extras['pr_number']} could not be found"
+                ) from exc
+            raise PRReconciliationError(f"PR reconciliation required: {exc}") from exc
+        except Exception as exc:
+            raise PRReconciliationError(f"PR reconciliation required: {exc}") from exc
+
+    def _settle_gate(
+        self,
+        issue,
+        state,
+        decision,
+        review_rounds,
+        stagnant_rounds,
+        coder_invocations,
+        resume_at_gate,
+        *,
+        now,
+    ):
+        if decision.passed:
+            state = self._transition(issue, state, "updating_pr", now=now)
+            self._transition(issue, state, "done", terminal_reason="ci green", now=now)
+            return WorkItemOutcome(
+                issue=issue,
+                final_phase="done",
+                reason="ci green",
+                review_rounds=review_rounds,
+                coder_invocations=coder_invocations,
+                gate=decision,
+            )
+        if decision.pending_checks:
+            return self._pending_ci(
+                issue, state, decision, review_rounds, coder_invocations, now=now
+            )
+        if resume_at_gate:
+            return self._escalate(
+                issue, state, "CI-only resume cannot safely dispatch local remediation", now=now
+            )
+        return self._prepare_ci_repair(
+            issue, state, decision, review_rounds, stagnant_rounds, now=now
+        )
+
+    def _pending_ci(self, issue, state, decision, review_rounds, coder_invocations, *, now):
+        now_dt = now or datetime.now(UTC)
+        started = state.extras.get("ci_wait_started_at")
+        if started is not None:
+            elapsed = (now_dt - _parse_timestamp(started)).total_seconds()
+            if elapsed > self._cfg.ci_policy.ci_wait_timeout_seconds:
+                return self._escalate(
+                    issue,
+                    state,
+                    "CI checks pending longer than ci_wait_timeout_seconds "
+                    f"({self._cfg.ci_policy.ci_wait_timeout_seconds}s)",
+                    now=now,
                 )
-                for name in decision.failed_checks
+        else:
+            state = self._save_fresh(
+                issue, state, extras={**state.extras, "ci_wait_started_at": now_dt.isoformat()}
             )
-            # Loop back to coding with the CI-check findings.
+        self._transition(issue, state, "queued", now=now)
+        return WorkItemOutcome(
+            issue=issue,
+            final_phase="ci_gating",
+            reason="CI checks pending: " + ", ".join(decision.pending_checks),
+            review_rounds=review_rounds,
+            coder_invocations=coder_invocations,
+            gate=decision,
+        )
+
+    def _prepare_ci_repair(self, issue, state, decision, review_rounds, stagnant_rounds, *, now):
+        if stagnant_rounds >= self._cfg.escalation.stagnation_rounds_threshold:
+            return self._escalate(
+                issue, state, f"no converging signal after {review_rounds} review rounds", now=now
+            )
+        if review_rounds >= self._cfg.safety.max_total_iterations:
+            return self._escalate(
+                issue, state, f"CI failing after {review_rounds} iterations", now=now
+            )
+        if not decision.failed_checks:
+            return self._escalate(
+                issue, state, f"CI gate cannot progress: {decision.detail}", now=now
+            )
+        state = self._record_ci_failure(issue, state, decision)
+        findings = tuple(
+            ReviewerFinding(
+                id=f"ci-failed-{name}",
+                lane="ci",
+                body=f"CI check {name} failed. {decision.detail[:1000]}",
+                severity="major",
+                run_id=self._run_id,
+                round_id=state.round_id or "ci",
+            )
+            for name in decision.failed_checks
+        )
+        return state, findings
+
+    def _record_ci_failure(self, issue, state, decision):
+        signals = sorted(normalize_claim(name) for name in decision.failed_checks)
+        signals.append(normalize_claim(decision.detail))
+        failure = self._signal_hash(signals)
+        seen = state.extras.get("ci_failure_hashes", [])
+        if not isinstance(seen, list):
+            raise _ForemanEscalation("malformed durable CI failure history")
+        if failure in seen:
+            raise _ForemanEscalation("no converging signal: repeated CI failure after remediation")
+        extras = {**state.extras, "ci_failure_hashes": [*seen, failure]}
+        extras.pop("ci_wait_started_at", None)
+        return self._save_fresh(issue, state, extras=extras)
 
     def _enforce_deadline(
         self, issue: GitHubIssueRef, state: WorkflowState, *, now: datetime | None
@@ -683,72 +784,106 @@ class ForemanPolicyLoop:
         *,
         now: datetime | None,
     ) -> tuple[WorkflowState, LaneResult, int]:
-        """Run the existing bounded coder attempts until success or escalation.
-
-        Invocation budget spans successful turns; consecutive failures reset only
-        after success. Failed attempts do not consume a reviewer round.
-        """
-        failures = 0
-        invocations = self._coder_usage(state)
-        cap = self._cfg.safety.max_coder_invocations_per_run
-        requests = tuple((f.id, None) for f in findings if f.lane != "ci")
         while True:
-            if invocations >= cap:
-                raise _ForemanEscalation("coder invocation budget exhausted with open findings")
-            state = self._transition(
-                issue,
-                state,
-                "coding",
-                round_id=f"response-{self._saved_review_round(state)}",
-                now=now,
-            )
-            state = self._heartbeat(issue, state, now=now)
-            # Reserve the attempt durably before dispatch; uncertain outcomes retain the charge.
-            invocations += 1
-            charged = replace(
-                state,
-                updated_at=datetime.now(UTC),
-                extras={
-                    **state.extras,
-                    "coder_usage": {"run_id": self._run_id, "invocations": invocations},
-                },
-            )
-            self._queue.save_state(charged, expected_updated_at=state.updated_at)
-            state = charged
-            state = self._save_fresh(
-                issue,
-                state,
-                extras={**state.extras, "head_sha": self._git.head_sha(worktree)},
-            )
-            worker_lane = self._worker_lane()
-            result = self._run_lane(
-                worker_lane,
-                worktree,
-                state,
-                self._coder_prompt(issue, findings, worktree, state.dispositions, state),
-                requests,
-                issue=issue,
-            )
-            state = self._load(issue, state)
-            checkout_violation = self._developer_head_violation(state, worktree)
-            if checkout_violation:
-                raise _ForemanEscalation(checkout_violation)
+            state, result = self._coder_attempt(issue, state, worktree, findings, now=now)
+            invocations = self._coder_usage(state)
+            violation = self._developer_head_violation(state, worktree)
+            if violation:
+                raise _ForemanEscalation(violation)
             if result.exit_code == 0:
-                violation = self._developer_report_violation(result)
-                if violation:
-                    raise _ForemanEscalation(violation)
-                state = self._save_fresh(
-                    issue,
-                    state,
-                    extras={**state.extras, "developer_report": json.loads(result.output_summary)},
-                )
-                return state, result, invocations
-            failures += 1
-            if invocations >= cap:
+                return self._finish_coder(issue, state, result), result, invocations
+            state = self._failed_coder(issue, state, result)
+            if invocations >= self._cfg.safety.max_coder_invocations_per_run:
                 raise _ForemanEscalation("coder budget exhausted on failing attempts")
-            if failures >= self._cfg.escalation.max_consecutive_coder_failures:
-                raise _ForemanEscalation(f"coder failed {failures}x consecutively")
-            state = self._advance_worker_route(issue, state, worker_lane)
+            if (
+                state.extras["coder_failures"]
+                >= self._cfg.escalation.max_consecutive_coder_failures
+            ):
+                raise _ForemanEscalation(
+                    f"coder failed {state.extras['coder_failures']}x consecutively"
+                )
+            state = self._advance_worker_route(issue, state, self._worker_lane())
+
+    def _coder_attempt(
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        worktree: str,
+        findings: tuple[ReviewerFinding, ...],
+        *,
+        now: datetime | None,
+    ) -> tuple[WorkflowState, LaneResult]:
+        turn = state.extras.get("coder_turn") if state.phase == "coding" else None
+        if turn is not None and not turn.get("consumed", False):
+            prompt = turn["prompt"]
+            resume = True
+        else:
+            state = self._prepare_coder(issue, state, worktree, now=now)
+            prompt = self._coder_prompt(issue, findings, worktree, state.dispositions, state)
+            prompt += f"\nCoder invocation: {self._coder_usage(state) + 1}."
+            resume = False
+        requests = tuple((f.id, None) for f in findings if f.lane != "ci")
+        result = self._run_lane(
+            self._worker_lane(), worktree, state, prompt, requests, issue=issue, resume=resume
+        )
+        return self._load(issue, state), result
+
+    def _prepare_coder(
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        worktree: str,
+        *,
+        now: datetime | None,
+    ) -> WorkflowState:
+        invocations = self._coder_usage(state)
+        if invocations >= self._cfg.safety.max_coder_invocations_per_run:
+            raise _ForemanEscalation("coder invocation budget exhausted with open findings")
+        state = self._save_fresh(
+            issue,
+            state,
+            extras={
+                **state.extras,
+                "head_sha": self._git.head_sha(worktree),
+                "coder_usage": {"run_id": self._run_id, "invocations": invocations},
+            },
+        )
+        state = self._transition(
+            issue, state, "coding", round_id=f"response-{self._saved_review_round(state)}", now=now
+        )
+        return self._heartbeat(issue, state, now=now)
+
+    def _finish_coder(
+        self, issue: GitHubIssueRef, state: WorkflowState, result: LaneResult
+    ) -> WorkflowState:
+        violation = self._developer_report_violation(result)
+        if violation:
+            raise _ForemanEscalation(violation)
+        return self._save_fresh(
+            issue,
+            state,
+            extras={
+                **state.extras,
+                "developer_report": json.loads(result.output_summary),
+                "coder_failures": 0,
+            },
+        )
+
+    def _failed_coder(
+        self, issue: GitHubIssueRef, state: WorkflowState, result: LaneResult
+    ) -> WorkflowState:
+        turn = {**state.extras["coder_turn"], "consumed": True}
+        state = self._save_fresh(
+            issue,
+            state,
+            extras={
+                **state.extras,
+                "coder_turn": turn,
+                "coder_failures": state.extras.get("coder_failures", 0) + 1,
+            },
+        )
+        self._executor.terminate_session(result.session)
+        return state
 
     # --- Review ---------------------------------------------------------------
 
@@ -765,11 +900,21 @@ class ForemanPolicyLoop:
         now: datetime | None,
     ) -> _RoundReport:
         """Run one blind, isolated reviewer wave against one immutable snapshot."""
-        state, round_id, reviewer_lanes = self._begin_review_round(
-            issue, state, review_rounds, reviewer_triggers, now=now
-        )
-        issue_body = self._read_issue_body(issue)
-        state, head_sha = self._snapshot(issue, state, developer_worktree, branch)
+        existing_wave = state.extras.get("review_waves", {}).get(state.round_id)
+        if state.phase == "reviewing" and existing_wave is not None:
+            reviewer_lanes = list(existing_wave["lanes"])
+            head_sha = existing_wave["head_sha"]
+            issue_body = self._read_issue_body(issue)
+            self._validate_recovered_wave(existing_wave, state, developer_worktree, issue_body)
+            if "report" in existing_wave:
+                return self._recovered_review_report(existing_wave, state)
+        else:
+            existing_wave = None
+            state, _round_id, reviewer_lanes = self._begin_review_round(
+                issue, state, review_rounds, reviewer_triggers, now=now
+            )
+            issue_body = self._read_issue_body(issue)
+            state, head_sha = self._snapshot(issue, state, developer_worktree, branch)
         policy = self._cfg.review_policy
         registry = FindingRegistry(
             findings=deepcopy(state.findings),
@@ -778,25 +923,96 @@ class ForemanPolicyLoop:
             quarantine_unknown_head_sha=False,
         )
         proposals = self._pending_proposals(state)
-        state, seats = self._plan_review_seats(
-            issue, state, round_id, head_sha, reviewer_lanes, registry, proposals, issue_body
+        state, seats, outcomes, heartbeat_error = self._dispatch_review_wave(
+            issue,
+            state,
+            developer_worktree,
+            issue_body,
+            head_sha,
+            reviewer_lanes,
+            registry,
+            proposals,
+            existing_wave,
         )
-        try:
-            prompts = self._materialize_review_seats(
-                issue,
-                round_id,
-                head_sha,
-                developer_worktree,
-                issue_body,
-                registry,
-                proposals,
-                seats,
+        return self._finish_review_wave(
+            issue,
+            state,
+            developer_worktree,
+            head_sha,
+            registry,
+            proposals,
+            seats,
+            outcomes,
+            heartbeat_error,
+            review_rounds,
+            stagnant_rounds,
+            reviewer_triggers,
+        )
+
+    def _dispatch_review_wave(
+        self,
+        issue,
+        state,
+        developer_worktree,
+        issue_body,
+        head_sha,
+        reviewer_lanes,
+        registry,
+        proposals,
+        existing_wave,
+    ):
+        round_id = state.round_id
+        if existing_wave is None:
+            state, seats = self._plan_review_seats(
+                issue, state, round_id, head_sha, reviewer_lanes, registry, proposals, issue_body
             )
-            outcomes, heartbeat_error = self._run_review_seats(state, head_sha, seats, prompts)
+        else:
+            seats = self._restore_review_seats(existing_wave)
+        try:
+            if existing_wave is None:
+                prompts = self._materialize_review_seats(
+                    issue,
+                    round_id,
+                    head_sha,
+                    developer_worktree,
+                    issue_body,
+                    registry,
+                    proposals,
+                    seats,
+                )
+                state = self._record_review_prompts(issue, state, prompts)
+            else:
+                prompts = existing_wave["prompts"]
+            outcomes, heartbeat_error = self._run_review_seats(
+                issue, state, head_sha, seats, prompts
+            )
         finally:
             for seat in seats:
                 self._release(seat.lease)
+        state = self._load(issue, state)
+        for outcome in outcomes.values():
+            if isinstance(
+                outcome, (CaoTransportError, SessionBusyError, SessionIdentityUncertainError)
+            ):
+                raise outcome
+        return state, seats, outcomes, heartbeat_error
 
+    def _finish_review_wave(
+        self,
+        issue,
+        state,
+        developer_worktree,
+        head_sha,
+        registry,
+        proposals,
+        seats,
+        outcomes,
+        heartbeat_error,
+        review_rounds,
+        stagnant_rounds,
+        reviewer_triggers,
+    ) -> _RoundReport:
+        round_id = state.round_id
         waves = deepcopy(cast(dict[str, dict[str, object]], state.extras.get("review_waves", {})))
         wave = waves[round_id]
         registry, dispositions, completed, failures = self._collect_review_outcomes(
@@ -808,10 +1024,60 @@ class ForemanPolicyLoop:
         registry.compact()
 
         self._persist_round(issue, state, round_id, registry, dispositions)
+        report = self._save_review_progress(
+            issue,
+            state,
+            developer_worktree,
+            remaining,
+            dispositions,
+            had_signal,
+            failures,
+            waves,
+            wave,
+            review_rounds,
+            stagnant_rounds,
+            reviewer_triggers + len(seats),
+            head_sha,
+        )
+        if heartbeat_error is None:
+            failures.extend(self._cleanup_review_results(completed, head_sha))
+        if failures:
+            raise _ForemanEscalation("review wave incomplete: " + "; ".join(failures))
+        self._validate_review_progress(report)
+        return report
+
+    def _save_review_progress(
+        self,
+        issue,
+        state,
+        developer_worktree,
+        remaining,
+        dispositions,
+        had_signal,
+        failures,
+        waves,
+        wave,
+        review_rounds,
+        stagnant_rounds,
+        reviewer_triggers,
+        head_sha,
+    ) -> _RoundReport:
+        round_id = state.round_id
         signature = self._review_signature(developer_worktree, remaining, dispositions)
         seen = state.extras.get("review_signatures", [])
         if not isinstance(seen, list):
             raise _ForemanEscalation("malformed durable review progress history")
+        rounds = review_rounds + 1
+        stagnant = stagnant_rounds + 1 if signature in seen or not had_signal else 0
+        report = _RoundReport(remaining, rounds, stagnant, reviewer_triggers, head_sha)
+        if not failures:
+            wave["report"] = {
+                "remaining": [f.id for f in remaining],
+                "rounds": rounds,
+                "stagnant_rounds": stagnant,
+                "triggers": report.triggers,
+                "head_sha": head_sha,
+            }
         waves[round_id] = wave
         self._save_fresh(
             issue,
@@ -820,24 +1086,95 @@ class ForemanPolicyLoop:
                 **state.extras,
                 "review_waves": waves,
                 "review_signatures": [*seen, signature],
+                "stagnant_rounds": stagnant,
             },
         )
-        if heartbeat_error is None:
-            failures.extend(self._cleanup_review_results(completed, head_sha))
-        if failures:
-            raise _ForemanEscalation("review wave incomplete: " + "; ".join(failures))
+        return report
 
-        rounds = review_rounds + 1
-        stagnant = stagnant_rounds + 1 if signature in seen or not had_signal else 0
-        if rounds > 1 and stagnant >= self._cfg.escalation.stagnation_rounds_threshold:
+    def _validate_review_progress(self, report: _RoundReport) -> None:
+        if report.remaining and report.rounds >= self._cfg.safety.max_total_iterations:
+            raise _ForemanEscalation(f"unresolved findings after {report.rounds} review rounds")
+        if (
+            report.rounds > 1
+            and report.stagnant_rounds >= self._cfg.escalation.stagnation_rounds_threshold
+        ):
             raise _ForemanEscalation("review rounds produced no converging signal")
-        return _RoundReport(
-            remaining,
-            rounds,
-            stagnant,
-            reviewer_triggers + len(reviewer_lanes),
-            head_sha,
+
+    def _recovered_review_report(self, wave: dict, state: WorkflowState) -> _RoundReport:
+        for receipt in wave["lanes"].values():
+            result = LaneResult.from_dict(receipt["result"])
+            self._executor.terminate_session(result.session)
+            self._git.cleanup_review_checkout(receipt["worktree"], wave["head_sha"])
+        report = wave["report"]
+        recovered = _RoundReport(
+            tuple(f for f in state.findings if f.id in report["remaining"]),
+            report["rounds"],
+            report["stagnant_rounds"],
+            report["triggers"],
+            report["head_sha"],
         )
+        self._validate_review_progress(recovered)
+        return recovered
+
+    def _validate_recovered_wave(
+        self, wave: dict, state: WorkflowState, worktree: str, issue_body: str
+    ) -> None:
+        identity = (wave["run_id"], wave["round_id"], wave["head_sha"], wave["issue_sha256"])
+        expected = (
+            self._run_id,
+            state.round_id,
+            self._git.head_sha(worktree),
+            hashlib.sha256(issue_body.encode()).hexdigest(),
+        )
+        if identity != expected or "prompts" not in wave:
+            raise _ForemanEscalation("review wave changed or lacks durable dispatch prompts")
+        if self._git.changed_files(worktree):
+            raise _ForemanEscalation("developer checkout changed during review")
+
+    def _restore_review_seats(self, wave: dict) -> list[_ReviewSeat]:
+        seats = []
+        try:
+            for name, receipt in wave["lanes"].items():
+                lane = self._lanes.get(name)
+                lease = self._broker.reserve(ModelAssignment.from_dict(receipt["assignment"]))
+                seats.append(
+                    _ReviewSeat(
+                        lane,
+                        receipt["worktree"],
+                        lease,
+                        tuple(receipt["fallbacks"]),
+                        tuple((r[0], r[1]) for r in receipt["requests"]),
+                        True,
+                    )
+                )
+        except Exception:
+            for seat in seats:
+                self._release(seat.lease)
+            raise
+        return seats
+
+    def _record_review_prompts(
+        self, issue: GitHubIssueRef, state: WorkflowState, prompts: dict[str, str]
+    ) -> WorkflowState:
+        waves = deepcopy(state.extras["review_waves"])
+        waves[state.round_id]["prompts"] = prompts
+        return self._save_fresh(issue, state, extras={**state.extras, "review_waves": waves})
+
+    def _record_review_result(
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        lane: str,
+        result: LaneResult | Exception,
+    ) -> WorkflowState:
+        fresh = self._load(issue, state)
+        waves = deepcopy(fresh.extras["review_waves"])
+        receipt = waves[state.round_id]["lanes"][lane]
+        if isinstance(result, LaneResult):
+            receipt["result"] = result.to_dict()
+        else:
+            receipt["error"] = str(result)
+        return self._save_fresh(issue, fresh, extras={**fresh.extras, "review_waves": waves})
 
     def _begin_review_round(
         self,
@@ -1011,6 +1348,7 @@ class ForemanPolicyLoop:
                         "assignment": seat.lease.assignment.to_dict(),
                         "fallbacks": list(seat.fallbacks),
                         "status": "planned",
+                        "requests": list(seat.requests),
                     }
                     for seat in seats
                 },
@@ -1124,6 +1462,7 @@ class ForemanPolicyLoop:
 
     def _run_review_seats(
         self,
+        issue: GitHubIssueRef,
         state: WorkflowState,
         head_sha: str,
         seats: list[_ReviewSeat],
@@ -1140,18 +1479,7 @@ class ForemanPolicyLoop:
             ):
                 futures = {
                     pool.submit(
-                        self._executor.execute,
-                        seat.lane,
-                        prompts[seat.lane.lane],
-                        seat.worktree,
-                        LaneExecutionContext(
-                            run_id=self._run_id,
-                            round_id=state.round_id,
-                            work_item_id=state.work_item_id,
-                            disposition_requests=seat.requests,
-                            head_sha=head_sha,
-                        ),
-                        seat.lease,
+                        self._execute_review_seat, seat, state, head_sha, prompts[seat.lane.lane]
                     ): seat.lane.lane
                     for seat in seats
                 }
@@ -1161,9 +1489,25 @@ class ForemanPolicyLoop:
                         outcomes[lane_name] = future.result()
                     except Exception as exc:
                         outcomes[lane_name] = exc
+                    state = self._record_review_result(issue, state, lane_name, outcomes[lane_name])
         except _ForemanEscalation as exc:
             heartbeat_error = exc.reason
         return outcomes, heartbeat_error
+
+    def _execute_review_seat(
+        self, seat: _ReviewSeat, state: WorkflowState, head_sha: str, prompt: str
+    ) -> LaneResult:
+        receipt = state.extras["review_waves"][state.round_id]["lanes"][seat.lane.lane]
+        if "result" in receipt:
+            return LaneResult.from_dict(receipt["result"])
+        if self._git.head_sha(seat.worktree) != head_sha:
+            raise _ForemanEscalation("review checkout moved from its attributed snapshot")
+        context = LaneExecutionContext(
+            self._run_id, state.round_id, state.work_item_id, seat.requests, head_sha
+        )
+        return self._executor.execute(
+            seat.lane, prompt, seat.worktree, context, seat.lease, resume=seat.resume
+        )
 
     def _review_result_error(
         self,
@@ -1291,7 +1635,7 @@ class ForemanPolicyLoop:
         return pending
 
     def _record_proposals(self, state: WorkflowState, result: LaneResult) -> WorkflowState:
-        requests = tuple((f.id, None) for f in state.findings if f.status == "open")
+        requests = tuple((f.id, None) for f in self._open_findings(state))
         LaneExecutionContext(
             self._run_id, state.round_id, disposition_requests=requests
         ).validate_dispositions(result.dispositions, self._worker_lane())
@@ -1549,6 +1893,7 @@ class ForemanPolicyLoop:
         disposition_requests: tuple[tuple[str, str | None], ...] = (),
         *,
         issue: GitHubIssueRef | None = None,
+        resume: bool = False,
     ) -> LaneResult:
         lease, fallbacks = self._reserve(lane, state)
         context = LaneExecutionContext(
@@ -1560,33 +1905,75 @@ class ForemanPolicyLoop:
         )
         try:
             self._charge_prompt(prompt)
-        except Exception:
-            self._release(lease)
-            raise
-        try:
             if issue is not None and lane.role == "worker":
-                extras = self._authorize_spend(state, lease, f"coder:{self._coder_usage(state)}")
-                state = self._save_fresh(
-                    issue,
-                    state,
-                    extras={
-                        **extras,
-                        "developer_model": lease.assignment.to_dict(),
-                        "developer_fallbacks": list(fallbacks),
-                    },
+                state, context = self._prepare_worker_turn(
+                    issue, state, prompt, context, lease, fallbacks, resume=resume
                 )
+                receipt = state.extras["coder_turn"].get("result")
+                if receipt is not None:
+                    return LaneResult.from_dict(receipt)
             with self._lease_heartbeat(state):
-                result = self._executor.execute(lane, prompt, worktree, context, lease)
-            if issue is not None and lane.role == "worker":
-                fresh = self._load(issue, state)
-                self._save_fresh(
-                    issue,
-                    fresh,
-                    extras={**fresh.extras, "developer_session": result.session.session_id},
+                result = self._executor.execute(
+                    lane, prompt, worktree, context, lease, resume=resume
                 )
+            if issue is not None and lane.role == "worker":
+                self._record_worker_result(issue, state, result)
             return result
         finally:
             self._release(lease)
+
+    def _prepare_worker_turn(
+        self,
+        issue: GitHubIssueRef,
+        state: WorkflowState,
+        prompt: str,
+        context: LaneExecutionContext,
+        lease: ModelLease,
+        fallbacks: tuple[str, ...],
+        *,
+        resume: bool,
+    ) -> tuple[WorkflowState, LaneExecutionContext]:
+        if resume:
+            turn = state.extras["coder_turn"]
+            saved = LaneExecutionContext.from_dict(turn["context"])
+            if saved != context or turn["invocation"] != self._coder_usage(state):
+                raise _ForemanEscalation("saved coder turn no longer matches active state")
+            return state, saved
+        invocation = self._coder_usage(state) + 1
+        extras = self._authorize_spend(state, lease, f"coder:{invocation}")
+        state = self._save_fresh(
+            issue,
+            state,
+            extras={
+                **extras,
+                "lanes_stopped": False,
+                "developer_model": lease.assignment.to_dict(),
+                "developer_fallbacks": list(fallbacks),
+                "coder_usage": {"run_id": self._run_id, "invocations": invocation},
+                "coder_turn": {
+                    "invocation": invocation,
+                    "prompt": prompt,
+                    "context": context.to_dict(),
+                    "consumed": False,
+                },
+            },
+        )
+        return state, context
+
+    def _record_worker_result(
+        self, issue: GitHubIssueRef, state: WorkflowState, result: LaneResult
+    ) -> None:
+        fresh = self._load(issue, state)
+        turn = {**fresh.extras["coder_turn"], "result": result.to_dict()}
+        self._save_fresh(
+            issue,
+            fresh,
+            extras={
+                **fresh.extras,
+                "developer_session": result.session.session_id,
+                "coder_turn": turn,
+            },
+        )
 
     @contextlib.contextmanager
     def _lease_heartbeat(self, state: WorkflowState):
@@ -1769,13 +2156,21 @@ class ForemanPolicyLoop:
         now: datetime | None = None,
     ) -> WorkflowState:
         del now  # the queue stamps updated_at itself; a caller clock cannot be injected here
+        if phase in TERMINAL_PHASES or phase == "queued":
+            state = self._confirm_lanes_stopped(issue, state)
         return self._queue.transition(
             issue, state, phase, round_id=round_id, terminal_reason=terminal_reason
         )
 
     def _load(self, issue: GitHubIssueRef, fallback: WorkflowState) -> WorkflowState:
         fresh = self._queue.load_state(issue.slug())
-        return fresh if fresh is not None else fallback
+        if fresh is None:
+            raise ForemanOwnershipError("Authoritative claim disappeared")
+        if fresh.run_id != fallback.run_id or any(
+            fresh.extras.get(k) != fallback.extras.get(k) for k in ("host_id", "claimed_at")
+        ):
+            raise ForemanOwnershipError("Authoritative claim changed ownership")
+        return fresh
 
     def _persist_resources(
         self,
@@ -2265,7 +2660,9 @@ class ForemanPolicyLoop:
         # whether to retry; the prior ``with suppress(Exception)`` swallowed
         # the error and led to worktree cleanup against a non-terminal
         # state.
-        self._queue.mark_needs_human(issue, self._load(issue, state), reason=reason)
+        self._queue.mark_needs_human(
+            issue, self._confirm_lanes_stopped(issue, state), reason=reason
+        )
         return WorkItemOutcome(issue=issue, final_phase="escalated", reason=reason, escalated=True)
 
     def _fail(
@@ -2279,5 +2676,5 @@ class ForemanPolicyLoop:
         # Same fix as ``_escalate`` (thread 10): a failed ``queue.fail`` is
         # an authoritative-write failure and must propagate rather than be
         # silently absorbed.
-        self._queue.fail(issue, self._load(issue, state), reason=reason)
+        self._queue.fail(issue, self._confirm_lanes_stopped(issue, state), reason=reason)
         return WorkItemOutcome(issue=issue, final_phase="failed", reason=reason)

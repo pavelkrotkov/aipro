@@ -488,7 +488,8 @@ def test_reclaim_preserves_workflow_history():
     assert [f.id for f in reclaimed.findings] == ["f1"]  # findings preserved
     assert reclaimed.round_id == "r1"  # round preserved
     assert reclaimed.extras.get("custom") == "ctx"  # non-claim extras preserved
-    assert "v3-work-active" in fake.get_labels(1)
+    assert reclaimed.phase == "reviewing"
+    assert fake.get_labels(1) == ["v3-work-review"]
 
 
 def test_reclaim_refuses_terminal_states():

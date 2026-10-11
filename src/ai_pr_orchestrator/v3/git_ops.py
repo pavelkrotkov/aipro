@@ -225,6 +225,8 @@ class GitWorktreeOps:
         workdir = self._checkout_path(path)
         if workdir.is_symlink() or workdir.resolve() == self._root.resolve():
             raise GitOpsError(f"refusing to remove unowned review checkout: {workdir}")
+        if not workdir.exists():
+            return
         marker = workdir / ".git" / "aipro-review-snapshot"
         if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != head_sha:
             raise GitOpsError(f"refusing to remove unowned review checkout: {workdir}")

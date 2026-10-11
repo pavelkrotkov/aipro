@@ -65,3 +65,5 @@ Install pre-commit hooks:
 ```sh
 uv run pre-commit install
 ```
+
+For the persistent V3 service and Hermes supervisor profile, see [the foreman runbook](docs/V3_FOREMAN.md).

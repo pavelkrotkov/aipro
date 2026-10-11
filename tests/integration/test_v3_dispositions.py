@@ -606,11 +606,12 @@ def test_saved_rejection_does_not_reset_coder_budget(fake_cao, foreman_harness, 
 def test_unknown_initial_coder_attempt_remains_charged(
     fake_cao, foreman_harness, monkeypatch, after_dispatch
 ):
-    from ai_pr_orchestrator.v3.foreman import _ForemanEscalation
+    from ai_pr_orchestrator.v3.cao import CaoSessionNotFoundError
 
     loop, queue, gh = foreman_harness()
     for lane in loop._lanes:
         fake_cao.set_output(session_name_for(loop.run_id, lane.lane), "[]")
+    fake_cao.set_output(developer_session_name(loop.run_id), developer_output())
     execute = loop._executor.execute
 
     def crash(*args, **kwargs):
@@ -636,20 +637,20 @@ def test_unknown_initial_coder_attempt_remains_charged(
         committer_name="test",
         committer_email="test@invalid",
     )
-    monkeypatch.setattr(
-        loop._executor,
-        "execute",
-        lambda *a, **kw: pytest.fail("restarted initial attempt exceeded cap1"),
-    )
-    with pytest.raises(_ForemanEscalation, match="budget"):
-        fresh._run_loop(
-            GitHubIssueRef("owner", "repo", 1),
-            state,
-            state.extras["worktree"],
-            state.extras["branch"],
-            now=None,
-        )
-    assert not gh.list_open_prs()
+    monkeypatch.setattr(loop._executor, "execute", execute)
+    issue = GitHubIssueRef("owner", "repo", 1)
+    if after_dispatch:
+        outcome = fresh.resume_work(issue, state)
+        assert outcome.final_phase == "done", outcome.reason
+        worker = fake_cao._sessions[developer_session_name(loop.run_id)]
+        assert len(worker.submitted_messages) == 1
+    else:
+        with pytest.raises(CaoSessionNotFoundError):
+            fresh.resume_work(issue, state)
+        assert not fake_cao._sessions
+        assert not gh.list_open_prs()
+    recovered = queue.load_state(issue.slug())
+    assert recovered.extras["coder_usage"]["invocations"] == 1
 
 
 @pytest.mark.parametrize(
